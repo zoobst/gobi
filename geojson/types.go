@@ -16,8 +16,8 @@ type GeoJSONFeature struct {
 
 // GeoJSONGeometry represents the geometry of a GeoJSON feature
 type GeoJSONGeometry struct {
-	Type        string `json:"type"`
-	Coordinates any    `json:"coordinates"`
+	Type        string         `json:"type"`
+	Coordinates [][][2]float64 `json:"coordinates"`
 }
 
 // GeoJSONMarshaler is an interface for types that can marshal themselves into GeoJSON format.

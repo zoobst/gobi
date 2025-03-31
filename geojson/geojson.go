@@ -36,7 +36,7 @@ func (fc *GeoJSONFeatureCollection) AddFeature(properties map[string]any, geomet
 }
 
 // Create a new GeoJSON Point Feature
-func NewGeoJSONPointGeometry(coordinates [2]float64) GeoJSONGeometry {
+func NewGeoJSONPointGeometry(coordinates [][][2]float64) GeoJSONGeometry {
 	return GeoJSONGeometry{
 		Type:        "Point",
 		Coordinates: coordinates,

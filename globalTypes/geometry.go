@@ -62,7 +62,7 @@ func (g GeometryType) MinY() float64 { return g.Geometry.MinY() }
 func (g GeometryType) GeoJSONGeometry() geojson.GeoJSONGeometry {
 	return geojson.GeoJSONGeometry{
 		Type:        g.Geometry.GeoJSONGeometry().Type,
-		Coordinates: g.Geometry.Coords(),
+		Coordinates: [][][2]float64{g.Geometry.Coords()},
 	}
 }
 

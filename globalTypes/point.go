@@ -73,7 +73,7 @@ func (p Point) MinY() float64 { return p.Y }
 func (p Point) GeoJSONGeometry() geojson.GeoJSONGeometry {
 	return geojson.GeoJSONGeometry{
 		Type:        "Point",
-		Coordinates: p.Coords(),
+		Coordinates: [][][2]float64{p.Coords()},
 	}
 }
 
