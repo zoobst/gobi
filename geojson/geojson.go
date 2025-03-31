@@ -111,3 +111,11 @@ func UnmarshalGeoJSON[T *[]byte](buf T) (fc GeoJSONFeatureCollection, err error)
 	}
 	return fc, nil
 }
+
+func UnmarshalJSON[T []byte](data T) error {
+	var featureCollection GeoJSONFeatureCollection
+	if err := json.Unmarshal(data, &featureCollection); err != nil {
+		return err
+	}
+	return nil
+}
