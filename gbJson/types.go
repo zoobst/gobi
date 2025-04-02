@@ -5,13 +5,13 @@ import (
 )
 
 type GeoJSONReadOptions struct {
-	SkipRows        int
+	SkipRows        *int
 	SkipSlice       [2]int
-	IgnoreErrors    bool
-	TryToParseDates bool
-	MaxWorkers      int
-	BatchSize       int
-	NumRows         int
-	SampleSize      int
-	Compression     cmprssn.CompressionType
+	IgnoreErrors    *bool
+	TryToParseDates *bool
+	MaxWorkers      *int
+	BatchSize       *int
+	NumRows         *int
+	SampleSize      *int
+	Compression     *cmprssn.CompressionType
 }

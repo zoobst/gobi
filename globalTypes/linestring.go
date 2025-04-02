@@ -16,9 +16,7 @@ func (l LineString) String() (strList string) {
 	return strList[2:]
 }
 
-func (l LineString) Type() string {
-	return "LineString"
-}
+func (l LineString) Type() string { return "LineString" }
 
 func (l LineString) WKT() (strList string) {
 	strList = "LINESTRING ("
@@ -36,21 +34,13 @@ func (l LineString) Coords() (fList [][2]float64) {
 	return fList
 }
 
-func (l LineString) MaxX() float64 {
-	return maxX(&l.Points)
-}
+func (l LineString) MaxX() float64 { return maxX(&l.Points) }
 
-func (l LineString) MaxY() float64 {
-	return maxY(&l.Points)
-}
+func (l LineString) MaxY() float64 { return maxY(&l.Points) }
 
-func (l LineString) MinX() float64 {
-	return minX(&l.Points)
-}
+func (l LineString) MinX() float64 { return minX(&l.Points) }
 
-func (l LineString) MinY() float64 {
-	return minY(&l.Points)
-}
+func (l LineString) MinY() float64 { return minY(&l.Points) }
 
 // GetGeometry returns the GeoJSON geometry representation of the geometry.
 func (l LineString) GeoJSONGeometry() geojson.GeoJSONGeometry {
@@ -60,6 +50,4 @@ func (l LineString) GeoJSONGeometry() geojson.GeoJSONGeometry {
 	}
 }
 
-func (l LineString) length(units string) float64 {
-	return 0.0
-}
+func (l LineString) length(units string) float64 { return 0.0 }

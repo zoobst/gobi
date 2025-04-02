@@ -12,13 +12,9 @@ import (
 
 func (p Point) String() string { return fmt.Sprintf("X: %f, Y: %f", p.X, p.Y) }
 
-func (p *Point) ID() arrow.Type {
-	return arrow.EXTENSION
-}
+func (p *Point) ID() arrow.Type { return arrow.EXTENSION }
 
-func (p *Point) Name() string {
-	return "Point"
-}
+func (p *Point) Name() string { return "Point" }
 
 func (p *Point) StorageType(dt arrow.DataType) arrow.DataType {
 	return arrow.ListOf(arrow.PrimitiveTypes.Float64) // Storage as list of floats (x,y)
@@ -38,21 +34,13 @@ func (p *Point) Equal(other arrow.DataType) bool {
 	return false
 }
 
-func (p *Point) Serialize() string {
-	return p.Name()
-}
+func (p *Point) Serialize() string { return p.String() }
 
-func (p *Point) Deserialize(s string) arrow.DataType {
-	return &Point{}
-}
+func (p *Point) Deserialize(s string) arrow.DataType { return &Point{} }
 
-func (p *Point) ExtensionName() string {
-	return p.Name()
-}
+func (p *Point) ExtensionName() string { return p.Name() }
 
-func (p *Point) ExtensionMetadata() string {
-	return ""
-}
+func (p *Point) ExtensionMetadata() string { return "" }
 
 func (p Point) WKT() string { return fmt.Sprintf("POINT (%f %f)", p.X, p.Y) }
 
@@ -92,9 +80,7 @@ func (a *PointArray) DataType() arrow.DataType { return &Point{} }
 
 func (a *PointArray) Data() *array.Data { return a.listArray.Data() }
 
-func (a *PointArray) String() string {
-	return fmt.Sprintf("%v", a.listArray)
-}
+func (a *PointArray) String() string { return fmt.Sprintf("%v", a.listArray) }
 
 func (a *PointArray) GetPoint(i int) []float64 {
 	listArray := a.listArray.ListValues()

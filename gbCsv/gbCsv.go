@@ -5,7 +5,6 @@ import (
 	"encoding/csv"
 	"io"
 	"os"
-	"runtime"
 	"time"
 
 	"github.com/zoobst/gobi/cmprssn"
@@ -17,30 +16,6 @@ import (
 	"github.com/apache/arrow/go/arrow"
 )
 
-func (cro *CsvReadOptions) Default() *CsvReadOptions {
-	return &CsvReadOptions{
-		HasHeader:       true,
-		Columns:         make(map[string]gTypes.GBType),
-		Separator:       ',',
-		CommentPrefix:   '#',
-		QuoteChar:       '"',
-		SkipRows:        0,
-		SkipSlice:       [2]int{-1, -1},
-		InferSchema:     true,
-		Schema:          &arrow.Schema{},
-		SchemaOverrides: make(map[string]any),
-		NullValues:      nil,
-		IgnoreErrors:    false,
-		TryToParseDates: false,
-		MaxWorkers:      runtime.NumCPU() / 2,
-		BatchSize:       8192,
-		NumRows:         -1,
-		Encoding:        &gTypes.Utf8Type,
-		SampleSize:      1024,
-		Compression:     &cmprssn.None{},
-	}
-}
-
 func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 	df := gTypes.NewDataFrame()
 
@@ -49,30 +24,36 @@ func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 		return df, err
 	}
 
-	data, err := handleCompression(options, &file, false)
+	err = handleCompression(options.Compression, &file, false)
 	if err != nil {
 		return df, err
 	}
 
-	csvReader := csv.NewReader(bytes.NewReader(data)) // TODO: Fix this
-	csvReader.Comma = options.Separator
-	csvReader.Comment = options.CommentPrefix
-	if len(options.Columns) > 0 {
-		csvReader.FieldsPerRecord = len(options.Columns)
+	csvReader := csv.NewReader(bytes.NewReader(file))
+	if options.Separator != nil {
+		csvReader.Comma = *options.Separator
 	}
 
-	if options.HasHeader {
+	if options.CommentPrefix != nil {
+		csvReader.Comment = *options.CommentPrefix
+	}
+
+	if len(*options.Columns) > 0 {
+		csvReader.FieldsPerRecord = len(*options.Columns)
+	}
+
+	if *options.HasHeader {
 		headerRow, err := csvReader.Read()
 		if err != nil {
 			return df, err
 		}
-		err = handleHeader(df, headerRow, options.Columns) // read the first row
+		err = handleHeader(df, headerRow, *options.Columns) // read the first row
 		if err != nil {
 			return df, err
 		}
 	}
 	// Skip initial rows if specified
-	for range options.SkipRows {
+	for range *options.SkipRows {
 		_, err := csvReader.Read() // Skip row
 		if err != nil {
 			return df, err
@@ -89,17 +70,18 @@ func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 	var (
 		timeFormat string
 		timeCol    int
+		t          bool = true
 	)
 
-	if options.TryToParseDates {
+	if *options.TryToParseDates {
 		timeFormat, timeCol, err = tryToParseDates(firstRecord)
 		if err != nil {
 			return df, err
 		}
 	}
 
-	if len(options.Schema.Fields()) == 0 {
-		options.Schema, err = inferSchema(firstRecord)
+	if options.Schema == nil {
+		options.InferSchema = &t
 		if err != nil {
 			return df, err
 		}
@@ -118,14 +100,14 @@ func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 			break // End of file reached
 		}
 		if err != nil {
-			if options.IgnoreErrors {
+			if *options.IgnoreErrors {
 				continue // Skip this row on error
 			}
 			return df, err
 		}
 
 		// Apply skipping slice logic if necessary
-		if options.SkipSlice != [2]int{-1, -1} {
+		if *options.SkipSlice != [2]int{-1, -1} {
 			start, end := options.SkipSlice[0], options.SkipSlice[1]
 			if start >= 0 && end > start && rowCount >= start && rowCount <= end {
 				continue // Skip this row based on the SkipSlice
@@ -133,7 +115,7 @@ func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 		}
 
 		rowCount++
-		if options.NumRows != -1 && rowCount >= options.NumRows {
+		if *options.NumRows != -1 && rowCount >= *options.NumRows {
 			break // Stop reading if we have reached the desired number of rows
 		}
 	}
@@ -141,18 +123,19 @@ func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 	return df, nil
 }
 
-func handleCompression(options CsvReadOptions, data *[]byte, compress bool) (*[]byte, error) {
-	switch c := options.Compression.(type) {
+func handleCompression(compression *cmprssn.CompressionType, data *[]byte, compress bool) error {
+	cType := *compression
+	switch c := cType.(type) {
 	case *cmprssn.GzipCompression:
 		if compress {
-			return c.Compress(data)
+			c.Compress(data)
 		} else {
-			return c.Decompress(data)
+			c.Decompress(data)
 		}
-	case *cmprssn.None:
-		return c.Compress(data)
+	case nil:
+		return nil
 	default:
-		return nil, berrors.ErrUnsupportedCompressionType
+		return berrors.ErrUnsupportedCompressionType
 	}
 }
 

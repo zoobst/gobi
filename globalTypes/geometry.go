@@ -23,8 +23,6 @@ func (g *GeometryType) StorageType(dt arrow.DataType) arrow.DataType {
 }
 
 func (g *GeometryType) Fingerprint() string {
-	// Implement the Fingerprint method.
-
 	h := fnv.New64a()
 	h.Write([]byte(g.Name())) // Use name as part of the fingerprint.
 	return string(h.Sum(nil))
@@ -38,7 +36,7 @@ func (g *GeometryType) Equal(other arrow.DataType) bool {
 	return false
 }
 
-func (g *GeometryType) Serialize() string { return g.Name() }
+func (g *GeometryType) Serialize() string { return g.String() }
 
 func (g *GeometryType) Deserialize(s string) arrow.DataType { return &GeometryType{} }
 

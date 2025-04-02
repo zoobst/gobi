@@ -8,52 +8,43 @@ import (
 )
 
 // Compress compresses data using Gzip.
-func (g *GzipCompression) Compress(data *[]byte) (*[]byte, error) {
+func (g *GzipCompression) Compress(data *[]byte) error {
 	var buf bytes.Buffer
 	writer := gzip.NewWriter(&buf)
 	_, err := writer.Write(*data)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	err = writer.Close()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	outData := buf.Bytes()
-	return &outData, nil
+	*data = buf.Bytes()
+	return nil
 }
 
 // Decompress decompresses data using Gzip.
-func (g *GzipCompression) Decompress(data *[]byte) (*[]byte, error) {
+func (g *GzipCompression) Decompress(data *[]byte) error {
 	reader, err := gzip.NewReader(bytes.NewReader(*data))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer reader.Close()
 	var buf bytes.Buffer
 	_, err = io.Copy(&buf, reader)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	outData := buf.Bytes()
-	return &outData, nil
+	*data = buf.Bytes()
+	return nil
 }
 
-func (s *SnappyCompression) Compress(data *[]byte) (*[]byte, error) {
+func (s *SnappyCompression) Compress(data *[]byte) error {
 	// Implement Snappy compression logic here
-	return nil, errors.New("not implemented")
+	return errors.New("not implemented")
 }
 
-func (s *SnappyCompression) Decompress(data *[]byte) (*[]byte, error) {
+func (s *SnappyCompression) Decompress(data *[]byte) error {
 	// Implement Snappy decompression logic here
-	return nil, errors.New("not implemented")
-}
-
-// Compress compresses data using Gzip.
-func (n *None) Compress(data *[]byte) (*[]byte, error) {
-	return data, nil
-}
-
-func (n *None) Decompress(data *[]byte) (*[]byte, error) {
-	return data, nil
+	return errors.New("not implemented")
 }
