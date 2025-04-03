@@ -137,12 +137,12 @@ func featureCollectionToDataFrame(fc *geojson.GeoJSONFeatureCollection, schema *
 
 		switch feature.Geometry.Type {
 		case "Point":
-			coords, ok := feature.Geometry.Coordinates.([]interface{})
-			if !ok || len(coords) != 2 {
+			coords := feature.Geometry.Coordinates
+			if len(coords) != 2 {
 				return nil, fmt.Errorf("invalid point coordinates")
 			}
 
-			coordsArray := [2]float64{coords[0].(float64), coords[1].(float64)}
+			coordsArray := [][][2]float64{coords[0].(float64), coords[1].(float64)}
 			listBuilder := geoBuilder.(*array.ListBuilder)
 
 			// Append the coordinates to the list builder

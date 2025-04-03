@@ -3,8 +3,11 @@ package gbcsv
 import (
 	"bytes"
 	"encoding/csv"
+	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/zoobst/gobi/cmprssn"
@@ -17,6 +20,11 @@ import (
 )
 
 func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
+	var (
+		timeFormat string
+		timeCol    int
+		headerRow  []string
+	)
 	df := gTypes.NewDataFrame()
 
 	file, err := os.ReadFile(path)
@@ -43,7 +51,7 @@ func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 	}
 
 	if *options.HasHeader {
-		headerRow, err := csvReader.Read()
+		headerRow, err = csvReader.Read()
 		if err != nil {
 			return df, err
 		}
@@ -65,30 +73,27 @@ func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 		return df, err
 	}
 
-	// Optionally parse dates if the flag is enabled
 	// TODO: Fix all this
-	var (
-		timeFormat string
-		timeCol    int
-		t          bool = true
-	)
-
 	if *options.TryToParseDates {
-		timeFormat, timeCol, err = tryToParseDates(firstRecord)
-		if err != nil {
-			return df, err
+		for col, r := range firstRecord {
+			timeFormat, err = tryToParseDate(r)
+			if err != nil {
+				return df, err
+			}
+			timeCol = col
 		}
 	}
 
 	if options.Schema == nil {
-		options.InferSchema = &t
-		if err != nil {
-			return df, err
-		}
+		*options.InferSchema = true
 	} else {
 		if !checkSchema(options.Schema, firstRecord) {
 			return df, berrors.ErrSchemaMismatch
 		}
+	}
+
+	if *options.InferSchema == true {
+		options.Schema, err = inferSchema(firstRecord, headerRow)
 	}
 
 	var rows [][]string
@@ -143,7 +148,7 @@ func handleHeader(df *gTypes.DataFrame, row []string, schema map[string]gTypes.G
 	if len(schema) > 0 {
 		for idx, val := range row {
 			if t, ok := schema[val]; ok {
-				df.Columns[val] = gTypes.Series{
+				df.Series[val] = gTypes.Series{
 					Type:  t,
 					Index: idx,
 				}
@@ -153,7 +158,7 @@ func handleHeader(df *gTypes.DataFrame, row []string, schema map[string]gTypes.G
 		}
 	} else {
 		for idx, val := range row {
-			df.Columns[val] = gTypes.Series{
+			df.Series[val] = gTypes.Series{
 				Index: idx,
 			}
 		}
@@ -161,22 +166,82 @@ func handleHeader(df *gTypes.DataFrame, row []string, schema map[string]gTypes.G
 	return nil
 }
 
-func tryToParseDates(row []string) (format string, col int, err error) {
-	for col, value := range row {
-		for _, format := range TimeFormatsList {
-			_, err = time.Parse(format, value)
-			if err == nil {
-				return format, col, nil
-			}
+func tryToParseDate(s string) (format string, err error) {
+	for _, format := range TimeFormatsList {
+		if _, err = time.Parse(format, s); err == nil {
+			return format, nil
 		}
 	}
-	return "", 0, err
+	return "", err
 }
 
 func checkSchema(schema *arrow.Schema, record []string) bool {
 
 }
 
-func inferSchema(record []string) (*arrow.Schema, error) {
+func inferSchema(record []string, headers []string) (*arrow.Schema, error) {
+	typeMap := make(map[int]arrow.DataType)
+	for idx, feature := range record {
+		switch inferType(feature) {
+		case "date":
+			typeMap[idx] = &arrow.Date64Type{}
+		case "float":
+			typeMap[idx] = &arrow.Float64Type{}
+		case "string":
+			typeMap[idx] = &arrow.StringType{}
+		case "bool":
+			typeMap[idx] = &arrow.BooleanType{}
+		case "int":
+			typeMap[idx] = &arrow.Int64Type{}
+		case "geometry":
+			typeMap[idx] = &arrow.ExtensionBase{}
+		default:
+			typeMap[idx] = &arrow.StringType{}
+		}
+	}
 
+	var fieldsList []arrow.Field
+
+	for key, val := range typeMap {
+		var name string
+		if len(headers) >= key {
+			name = headers[key]
+		} else {
+			name = fmt.Sprintf("%d", key)
+		}
+		newField := arrow.Field{
+			Name:     name,
+			Type:     val,
+			Nullable: true,
+			Metadata: arrow.Metadata{},
+		}
+		fieldsList = append(fieldsList, newField)
+	}
+	schema := arrow.NewSchema(fieldsList, &arrow.Metadata{})
+	return schema, nil
+}
+
+func inferType(s string) string {
+	// Try parsing as date
+	if _, err := tryToParseDate(s); err == nil {
+		return "date"
+	}
+
+	// Try parsing as int
+	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return "int"
+	}
+
+	// Try parsing as float
+	if _, err := strconv.ParseFloat(s, 64); err == nil {
+		return "float"
+	}
+
+	// Try parsing as bool
+	if strings.ToLower(s) == "true" || strings.ToLower(s) == "false" {
+		return "bool"
+	}
+
+	// Default to string
+	return "string"
 }

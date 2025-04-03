@@ -26,23 +26,23 @@ type GBType interface {
 }
 
 type String struct {
-	val string
+	Val string
 }
 
 type Int struct {
-	val int
+	Val int
 }
 
 type Float struct {
-	val float64
+	Val float64
 }
 
 type DateTime struct {
-	val time.Time
+	Val time.Time
 }
 
 type Bool struct {
-	val bool
+	Val bool
 }
 
 type HashSet struct {
