@@ -6,11 +6,16 @@ import (
 
 	"github.com/zoobst/gobi/geojson"
 
-	"github.com/apache/arrow/go/arrow"
-	"github.com/apache/arrow/go/arrow/array"
+	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/array"
 )
 
-type GeometryType struct{ Geometry Geometry }
+type GeometryType struct {
+	arrow.ExtensionBase
+	Geometry Geometry
+}
+
+func (g GeometryType) DataType() arrow.DataType { return g.Deserialize() }
 
 func (g GeometryType) String() string { return g.Geometry.String() }
 
@@ -38,7 +43,7 @@ func (g *GeometryType) Equal(other arrow.DataType) bool {
 
 func (g *GeometryType) Serialize() string { return g.String() }
 
-func (g *GeometryType) Deserialize(s string) arrow.DataType { return &GeometryType{} }
+func (g *GeometryType) Deserialize() arrow.DataType { return g.Geometry.Deserialize() }
 
 func (g *GeometryType) ExtensionName() string { return g.Name() }
 
@@ -77,7 +82,7 @@ func (g *GeometryType) NewArray(data array.Data) array.ExtensionArray {
 
 func (a *GeometryArray) DataType() arrow.DataType { return &GeometryType{} }
 
-func (a *GeometryArray) Data() *array.Data { return a.listArray.Data() }
+func (a *GeometryArray) Data() arrow.ArrayData { return a.listArray.Data() }
 
 func (a *GeometryArray) String() string { return fmt.Sprintf("%v", a.listArray) }
 

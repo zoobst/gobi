@@ -144,11 +144,11 @@ func handleCompression(compression *cmprssn.CompressionType, data *[]byte, compr
 	}
 }
 
-func handleHeader(df *gTypes.DataFrame, row []string, schema map[string]gTypes.GBType) error {
+func handleHeader(df *gTypes.DataFrame, row []string, schema []string) error {
 	if len(schema) > 0 {
 		for idx, val := range row {
 			if t, ok := schema[val]; ok {
-				df.Series[val] = gTypes.Series{
+				df.Table[idx] = gTypes.Series{
 					Type:  t,
 					Index: idx,
 				}
@@ -227,19 +227,23 @@ func inferType(s string) string {
 		return "date"
 	}
 
-	// Try parsing as int
-	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return "int"
-	}
-
 	// Try parsing as float
 	if _, err := strconv.ParseFloat(s, 64); err == nil {
 		return "float"
 	}
 
+	// Try parsing as int
+	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return "int"
+	}
+
 	// Try parsing as bool
 	if strings.ToLower(s) == "true" || strings.ToLower(s) == "false" {
 		return "bool"
+	}
+
+	if gTypes.CheckGeometry(s) {
+
 	}
 
 	// Default to string

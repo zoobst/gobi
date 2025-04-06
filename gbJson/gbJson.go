@@ -8,9 +8,9 @@ import (
 	"github.com/zoobst/gobi/geojson"
 	gTypes "github.com/zoobst/gobi/globalTypes"
 
-	"github.com/apache/arrow/go/arrow"
-	"github.com/apache/arrow/go/arrow/array"
-	"github.com/apache/arrow/go/arrow/memory"
+	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/apache/arrow/go/v18/arrow/memory"
 )
 
 func ReadGeoJSON(path string, options GeoJSONReadOptions) (df *gTypes.DataFrame, err error) {
@@ -73,9 +73,8 @@ func createArrowSchemaFromProperties(properties map[string]any, geometryType str
 	return arrow.NewSchema(fields, nil)
 }
 
-func featureCollectionToDataFrame(fc *geojson.GeoJSONFeatureCollection, schema *arrow.Schema) (df *gTypes.DataFrame, err error) {
-	df = gTypes.NewDataFrame()
-	df.Schema = schema
+func featureCollectionToDataFrame(fc *geojson.GeoJSONFeatureCollection, schema *arrow.Schema) (*gTypes.DataFrame, error) {
+	df := gTypes.NewDataFrame(schema)
 
 	pool := memory.NewGoAllocator()
 	builders := make(map[string]array.Builder)

@@ -13,3 +13,13 @@ var ErrSchemaMismatch error = errors.New("schema provided does not match data")
 var ErrUnsupportedCompressionType error = errors.New("unsupported compression type")
 
 var WarningUnknownPropertyType string = "Warning: Unknown type for property '%s', defaulting to string.\n"
+
+var ErrNumCoords error = errors.New("serialized coords are incorrect length")
+
+var ErrColLengthMismatch error = errors.New("arrow/array: column length mismatch: %d != %d")
+
+var ErrColTypeMismatch error = errors.New("arrow/array: column type mismatch: %v != %v")
+
+var ErrInvalidGeometryType error = errors.New("invalid/unknown geometry type")
+
+var ErrInvalidNumRows error = errors.New("invalid number of rows: %d")

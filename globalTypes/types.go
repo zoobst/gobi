@@ -1,48 +1,32 @@
 package globalTypes
 
 import (
-	"time"
+	"fmt"
 
 	"github.com/zoobst/gobi/geojson"
 
-	"github.com/apache/arrow/go/arrow"
-	"github.com/apache/arrow/go/arrow/array"
+	"github.com/apache/arrow/go/arrow/memory"
+	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/array"
 )
 
 type DataFrame struct {
-	Schema *arrow.Schema
-	Table  []array.Column
-	Series map[string]Series
+	schema   *arrow.Schema
+	Series   []Series
+	refCount int64
+	fmt.Stringer
 }
 
 type Series struct {
-	Col   array.Column
-	Type  GBType
-	Index int
+	Name      string           // Name of the series
+	Values    *arrow.Column    // Apache Arrow array for columnar data
+	Allocator memory.Allocator // Allocator for efficient memory management
 }
 
 type GBType interface {
+	arrow.ExtensionBase
+	fmt.Stringer
 	String() string
-}
-
-type String struct {
-	Val string
-}
-
-type Int struct {
-	Val int
-}
-
-type Float struct {
-	Val float64
-}
-
-type DateTime struct {
-	Val time.Time
-}
-
-type Bool struct {
-	Val bool
 }
 
 type HashSet struct {
@@ -50,6 +34,7 @@ type HashSet struct {
 }
 
 type Geometry interface {
+	fmt.Stringer
 	String() string
 	Type() string
 	WKT() string
@@ -59,7 +44,6 @@ type Geometry interface {
 	MinX() float64
 	MinY() float64
 	GeoJSONGeometry() geojson.GeoJSONGeometry
-	GeoJSONProperties() map[string]any
 	StorageType(arrow.DataType) arrow.DataType
 	ID() arrow.Type
 	Name() string
@@ -73,14 +57,20 @@ type Geometry interface {
 }
 
 type Point struct {
+	fmt.Stringer
+	arrow.ExtensionBase
 	X float64 `json:"lon"`
 	Y float64 `json:"lat"`
 }
 
 type Polygon struct {
+	fmt.Stringer
+	arrow.ExtensionBase
 	Points []Point `json:"Polygon"`
 }
 
 type LineString struct {
+	fmt.Stringer
+	arrow.ExtensionBase
 	Points []Point `json:"LineString"`
 }

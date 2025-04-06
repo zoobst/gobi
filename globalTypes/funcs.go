@@ -2,26 +2,86 @@ package globalTypes
 
 import (
 	"fmt"
+	"strings"
+
+	berrors "github.com/zoobst/gobi/bErrors"
 )
 
-func (s String) String() string {
-	return s.val
+func CheckGeometry(s string) bool {
+	if _, err := ParseWKT(s); err == nil {
+		return true
+	}
+	return false
 }
 
-func (i Int) String() string {
-	return fmt.Sprintf("%d", i.val)
+// ParsePoint parses a WKT Point string
+func ParseWKT(s string) (Geometry, error) {
+	if s[:5] == "POINT" {
+		t, err := ParsePointWKT(s)
+		if err != nil {
+			return nil, err
+		}
+		return t, nil
+	} else if s[:7] == "POLYGON" {
+		t, err := ParsePolygonWKT(s)
+		if err != nil {
+			return nil, err
+		}
+		return t, nil
+	} else if s[:10] == "LINESTRING" {
+		t, err := ParseLineStringWKT(s)
+		if err != nil {
+			return nil, err
+		}
+		return t, nil
+	} else {
+		return nil, berrors.ErrInvalidGeometryType
+	}
 }
 
-func (f Float) String() string {
-	return fmt.Sprintf("%f", f.val)
+// ParsePoint parses a WKT Point string
+func ParsePointWKT(s string) (Point, error) {
+	var coords [2]float64
+	fmt.Scanf("%f %f", coords[0], coords[1])
+	return Point{X: coords[0], Y: coords[1]}, nil
 }
 
-func (t DateTime) String() string {
-	return t.val.String()
+// ParseLineString parses a WKT LineString string
+func ParseLineStringWKT(s string) (LineString, error) {
+	s = strings.TrimPrefix(s, "LINESTRING")
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, ")")
+	coords := strings.Split(s, ",")
+	var points []Point
+	for _, coord := range coords {
+		coord = strings.TrimSpace(coord)
+		p, err := ParsePointWKT(coord)
+		if err != nil {
+			return LineString{}, err
+		}
+		points = append(points, p)
+	}
+	return LineString{Points: points}, nil
 }
 
-func (b Bool) String() string {
-	return fmt.Sprintf("%v", b.val)
+// ParsePolygon parses a WKT Polygon string
+func ParsePolygonWKT(s string) (Polygon, error) {
+	var points []Point
+	s = strings.TrimPrefix(s, "POLYGON((")
+	s = strings.TrimSuffix(s, "))")
+	rings := strings.Split(s, "),(")
+	for _, ring := range rings {
+		coords := strings.Split(ring, ",")
+		for _, coord := range coords {
+			coord = strings.TrimSpace(coord)
+			p, err := ParsePointWKT(coord)
+			if err != nil {
+				return Polygon{}, err
+			}
+			points = append(points, p)
+		}
+	}
+	return Polygon{Points: points}, nil
 }
 
 func maxY[p *[]Point](points *[]Point) (hVal float64) {
@@ -82,22 +142,18 @@ func NewHashSet() *HashSet {
 	}
 }
 
-func (hs *HashSet) Add(value any) {
-	hs.data[value] = struct{}{}
+func (hs *HashSet) Add(Value any) { hs.data[Value] = struct{}{} }
+
+func (hs *HashSet) Remove(Value any) {
+	delete(hs.data, Value)
 }
 
-func (hs *HashSet) Remove(value any) {
-	delete(hs.data, value)
-}
-
-func (hs *HashSet) Contains(value any) bool {
-	_, exists := hs.data[value]
+func (hs *HashSet) Contains(Value any) bool {
+	_, exists := hs.data[Value]
 	return exists
 }
 
-func (hs *HashSet) Len() int {
-	return len(hs.data)
-}
+func (hs *HashSet) Len() int { return len(hs.data) }
 
 func (hs *HashSet) Clear() {
 	hs.data = make(map[any]struct{})

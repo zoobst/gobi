@@ -6,7 +6,8 @@ import (
 
 	"github.com/zoobst/gobi/geojson"
 
-	"github.com/apache/arrow/go/arrow"
+	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/array"
 )
 
 func (p Polygon) String() (strList string) {
@@ -21,21 +22,21 @@ func (p Polygon) String() (strList string) {
 
 func (p Polygon) Type() string { return "Polygon" }
 
-func (p *Polygon) ID() arrow.Type { return arrow.EXTENSION }
+func (p Polygon) ID() arrow.Type { return arrow.EXTENSION }
 
-func (p *Polygon) Name() string { return "Polygon" }
+func (p Polygon) Name() string { return "Polygon" }
 
-func (p *Polygon) StorageType(dt arrow.DataType) arrow.DataType {
+func (p Polygon) StorageType(dt arrow.DataType) arrow.DataType {
 	return arrow.ListOf(arrow.ListOf(arrow.PrimitiveTypes.Float64)) // Storage as list of list of floats (x,y)
 }
 
-func (p *Polygon) Fingerprint() string {
+func (p Polygon) Fingerprint() string {
 	h := fnv.New64a()
 	h.Write([]byte(p.Name())) // Use name as part of the fingerprint.
 	return string(h.Sum(nil))
 }
 
-func (p *Polygon) Equal(other arrow.DataType) bool {
+func (p Polygon) Equal(other arrow.DataType) bool {
 	//Compare the fingerprints.
 	if other, ok := other.(*Polygon); ok {
 		return p.Fingerprint() == other.Fingerprint()
@@ -43,13 +44,13 @@ func (p *Polygon) Equal(other arrow.DataType) bool {
 	return false
 }
 
-func (p *Polygon) Serialize() string { return p.String() }
+func (p Polygon) Serialize() string { return p.String() }
 
-func (p *Polygon) Deserialize(s string) arrow.DataType { return &Polygon{} }
+func (p Polygon) Deserialize() arrow.DataType { return &Polygon{} }
 
-func (p *Polygon) ExtensionName() string { return p.Name() }
+func (p Polygon) ExtensionName() string { return p.Name() }
 
-func (p *Polygon) ExtensionMetadata() string { return "" }
+func (p Polygon) ExtensionMetadata() string { return "" }
 
 func (p Polygon) WKT() (strList string) {
 	strList = "POLYGON ("
@@ -85,3 +86,27 @@ func (p Polygon) GeoJSONGeometry() geojson.GeoJSONGeometry {
 
 func (p Polygon) area(units string) {
 }
+
+type PolygonArray struct {
+	array.ExtensionArray
+	listArray *array.List
+}
+
+func (p Polygon) NewArray(data array.Data) array.ExtensionArray {
+	return &PolygonArray{
+		listArray: array.NewListData(&data),
+	}
+}
+
+func (a PolygonArray) DataType() arrow.DataType { return &Point{} }
+
+func (a PolygonArray) Data() arrow.ArrayData { return a.listArray.Data() }
+
+func (a PolygonArray) String() string { return fmt.Sprintf("%v", a.listArray) }
+
+func (a PolygonArray) Iloc(i int) []float64 {
+	listArray := a.listArray.ListValues()
+	return listArray.(*array.Float64).Float64Values()[a.listArray.Offsets()[i]*2 : a.listArray.Offsets()[i]*2+2]
+}
+
+func (a PolygonArray) ListValues() *array.List { return a.listArray }

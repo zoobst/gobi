@@ -1,8 +1,6 @@
 package gbcsv
 
 import (
-	gTypes "github.com/zoobst/gobi/globalTypes"
-
 	"github.com/zoobst/gobi/cmprssn"
 
 	"github.com/apache/arrow/go/arrow"
@@ -23,7 +21,7 @@ const (
 
 type CsvReadOptions struct {
 	HasHeader       *bool
-	Columns         *map[string]gTypes.GBType
+	Columns         *[]string
 	Separator       *rune
 	CommentPrefix   *rune
 	QuoteChar       *rune
