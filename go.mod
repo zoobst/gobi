@@ -5,6 +5,7 @@ go 1.24.1
 require (
 	github.com/apache/arrow/go/arrow v0.0.0-20211112161151-bc219186db40
 	github.com/apache/arrow/go/v18 v18.0.0-20241007013041-ab95a4d25142
+	github.com/golang/snappy v0.0.4
 )
 
 require (
@@ -12,7 +13,6 @@ require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/apache/thrift v0.20.0 // indirect
 	github.com/goccy/go-json v0.10.3 // indirect
-	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/flatbuffers v24.3.25+incompatible // indirect
 	github.com/klauspost/asmfmt v1.3.2 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect
