@@ -3,8 +3,9 @@ package cmprssn
 import (
 	"bytes"
 	"compress/gzip"
-	"errors"
 	"io"
+
+	"github.com/golang/snappy"
 )
 
 // Compress compresses data using Gzip.
@@ -40,11 +41,16 @@ func (g *GzipCompression) Decompress(data *[]byte) error {
 }
 
 func (s *SnappyCompression) Compress(data *[]byte) error {
-	// Implement Snappy compression logic here
-	return errors.New("not implemented")
+	*data = snappy.Encode(nil, *data) // Compress data with Snappy
+	return nil
 }
 
+// Decompress decompresses data using Snappy.
 func (s *SnappyCompression) Decompress(data *[]byte) error {
-	// Implement Snappy decompression logic here
-	return errors.New("not implemented")
+	decodedData, err := snappy.Decode(nil, *data) // Decompress data with Snappy
+	if err != nil {
+		return err
+	}
+	*data = decodedData
+	return nil
 }

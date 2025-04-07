@@ -4,12 +4,17 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/zoobst/gobi/cmprssn"
 	"github.com/zoobst/gobi/gbParquet"
+	gTypes "github.com/zoobst/gobi/globalTypes"
 )
 
-func main() {
+func ReadParquet(path string, compression cmprssn.CompressionType) (*gTypes.DataFrame, error) {
+	return gbParquet.ReadParquet(path, compression)
+}
 
-	df, err := gbParquet.ReadParquet("testData/titanic_test.parquet")
+func main() {
+	df, err := ReadParquet("testData/titanic_test.gz.parquet", &cmprssn.GzipCompression{})
 	if err != nil {
 		log.Fatal(err)
 	}
