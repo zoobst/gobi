@@ -3,8 +3,10 @@ package gbParquet
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	berrors "github.com/zoobst/gobi/bErrors"
 	"github.com/zoobst/gobi/cmprssn"
@@ -16,7 +18,7 @@ import (
 )
 
 // ReadParquet reads a Parquet file and converts it into a DataFrame structure
-func ReadParquet(filePath string, compression cmprssn.CompressionType) (*gTypes.DataFrame, error) {
+func ReadParquet(filePath string, compression string) (*gTypes.DataFrame, error) {
 	f, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, err
@@ -37,8 +39,13 @@ func ReadParquet(filePath string, compression cmprssn.CompressionType) (*gTypes.
 	return gTypes.NewDataFrameFromTable(table), nil
 }
 
-func handleCompression(compression cmprssn.CompressionType, data *[]byte, compress bool) error {
-	switch c := compression.(type) {
+func handleCompression(compression string, data *[]byte, compress bool) error {
+	cType, err := parseCompressionType(compression)
+	if err != nil {
+		return err
+	}
+
+	switch c := cType.(type) {
 	case *cmprssn.GzipCompression:
 		if compress {
 			c.Compress(data)
@@ -57,4 +64,18 @@ func handleCompression(compression cmprssn.CompressionType, data *[]byte, compre
 		return berrors.ErrUnsupportedCompressionType
 	}
 	return nil
+}
+
+func parseCompressionType(compression string) (cmprssn.CompressionType, error) {
+	c := strings.ToLower(compression)
+	for s, t := range cmprssn.StringMap {
+		if strings.Contains(c, fmt.Sprintf(".%s.", s)) {
+			return t, nil
+		} else if c == s {
+			return t, nil
+		} else {
+			return nil, berrors.ErrUnsupportedCompressionType
+		}
+	}
+	return nil, nil
 }
