@@ -12,6 +12,17 @@ import (
 	berrors "github.com/zoobst/gobi/bErrors"
 )
 
+type Frame interface {
+	arrow.Table
+	Head(int) (DataFrame, error)
+	Tail(int) (DataFrame, error)
+	Shape() (int, int)
+	NumRows() int64
+	NumCols() int64
+	String() string
+	Schema() *arrow.Schema
+}
+
 // NewDataFrame creates a new DataFrame from Arrow Table
 func NewDataFrame(s *arrow.Schema) arrow.Table {
 	return DataFrame{
@@ -23,9 +34,11 @@ func NewDataFrameFromTable(t arrow.Table) *DataFrame {
 	df := DataFrame{
 		schema: t.Schema(),
 	}
+
 	for i := range t.NumCols() {
 		df.Series = append(df.Series, NewSeries(t.Column(int(i)).Name(), t.Column(int(i))))
 	}
+
 	return &df
 }
 

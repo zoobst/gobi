@@ -10,16 +10,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/zoobst/gobi/cmprssn"
-
-	gTypes "github.com/zoobst/gobi/globalTypes"
-
 	berrors "github.com/zoobst/gobi/bErrors"
+	"github.com/zoobst/gobi/cmprssn"
+	gTypes "github.com/zoobst/gobi/globalTypes"
 
 	"github.com/apache/arrow/go/arrow"
 )
 
-func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
+func ReadCsv(path string, options CsvReadOptions) (gTypes.Frame, error) {
 	var (
 		timeFormat string
 		timeCol    int

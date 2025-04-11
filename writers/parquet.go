@@ -8,7 +8,7 @@ import (
 	gTypes "github.com/zoobst/gobi/globalTypes"
 )
 
-func WriteParquetToFile(df *gTypes.DataFrame, path, compression string) error {
+func WriteParquetToFile(df gTypes.Frame, path, compression string) error {
 	outFile, err := os.Create(path)
 	if err != nil {
 		return err
@@ -20,7 +20,7 @@ func WriteParquetToFile(df *gTypes.DataFrame, path, compression string) error {
 		return err
 	}
 
-	err = writer.WriteTable(*df, 8162)
+	err = writer.WriteTable(df, 8162)
 	if err != nil {
 		return err
 	}

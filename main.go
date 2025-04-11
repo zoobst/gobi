@@ -10,19 +10,19 @@ import (
 )
 
 type DataFrame struct {
-	df *gTypes.DataFrame
-}
-
-func (df *DataFrame) ToParquet(outPath, compression string) (err error) {
-	return writers.WriteParquetToFile(df.df, outPath, compression)
+	*gTypes.DataFrame
 }
 
 func ReadParquet(path string, compression string) (*DataFrame, error) {
 	if df, err := gbParquet.ReadParquet(path, compression); err == nil {
-		return &DataFrame{df: df}, err
+		return &DataFrame{df}, err
 	} else {
 		return nil, err
 	}
+}
+
+func (df *DataFrame) ToParquet(outPath, compression string) (err error) {
+	return writers.WriteParquetToFile(df, outPath, compression)
 }
 
 func main() {
@@ -31,12 +31,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	for _, ser := range df.df.Series {
+	for _, ser := range df.Series {
 		log.Println(ser.Name)
 	}
 
-	fmt.Println(df.df.Head(10))
-	fmt.Println(df.df.Tail(10))
+	fmt.Println(df.Head(10))
+	fmt.Println(df.Tail(10))
 
 	err = df.ToParquet("testData/titantic_test_out.gz.parquet", "gz")
 	if err != nil {
