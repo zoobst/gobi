@@ -23,3 +23,7 @@ var ErrColTypeMismatch error = errors.New("arrow/array: column type mismatch: %v
 var ErrInvalidGeometryType error = errors.New("invalid/unknown geometry type")
 
 var ErrInvalidNumRows error = errors.New("invalid number of rows: %d")
+
+var ErrUnsupportedType error = errors.New("unsupported type: %s")
+
+var ErrInvalidType error = errors.New("Invalid Type for type: %v")

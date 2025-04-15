@@ -1,11 +1,13 @@
 package main
 
 import (
-	"fmt"
 	"log"
+	"os"
 
 	"github.com/zoobst/gobi/gbParquet"
 	gTypes "github.com/zoobst/gobi/globalTypes"
+	"github.com/zoobst/gobi/readers"
+	"github.com/zoobst/gobi/tests"
 	"github.com/zoobst/gobi/writers"
 )
 
@@ -25,21 +27,26 @@ func (df *DataFrame) ToParquet(outPath, compression string) (err error) {
 	return writers.WriteParquetToFile(df, outPath, compression)
 }
 
+func ReadCSV(path string, compression string) (string, error) {
+	file, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	testReader := tests.TestCSVTypes{}
+
+	if reader, err := readers.NewGenericCSVReader(testReader, &file); err != nil {
+		return "", err
+	} else {
+		return reader.Schema.String(), nil
+	}
+
+}
+
 func main() {
-	df, err := ReadParquet("testData/titantic_test_out.snappy.parquet", "snappy")
+	df, err := ReadCSV("testData/titanic_test.csv", "")
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	for _, ser := range df.Series {
-		log.Println(ser.Name)
-	}
-
-	fmt.Println(df.Head(10))
-	fmt.Println(df.Tail(10))
-
-	err = df.ToParquet("testData/titantic_test_out.gz.parquet", "gz")
-	if err != nil {
-		log.Fatal(err)
-	}
+	log.Println(df)
 }

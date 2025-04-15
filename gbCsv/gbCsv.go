@@ -14,7 +14,7 @@ import (
 	"github.com/zoobst/gobi/cmprssn"
 	gTypes "github.com/zoobst/gobi/globalTypes"
 
-	"github.com/apache/arrow/go/arrow"
+	"github.com/apache/arrow/go/v18/arrow"
 )
 
 func ReadCsv(path string, options CsvReadOptions) (gTypes.Frame, error) {
