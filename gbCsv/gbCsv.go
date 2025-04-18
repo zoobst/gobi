@@ -2,9 +2,7 @@ package gbcsv
 
 import (
 	"bytes"
-	"encoding/csv"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -13,117 +11,87 @@ import (
 	berrors "github.com/zoobst/gobi/bErrors"
 	"github.com/zoobst/gobi/cmprssn"
 	gTypes "github.com/zoobst/gobi/globalTypes"
+	"github.com/zoobst/gobi/readers"
 
 	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/apache/arrow/go/v18/arrow/memory"
 )
 
+// holds parameters to be passed around
+type csvExplorer struct {
+	timeFormat string
+	timeCol    int
+	headerRow  []string
+	reader     readers.CSVReader
+	df         gTypes.Frame
+	schema     *arrow.Schema
+}
+
 func ReadCsv(path string, options CsvReadOptions) (gTypes.Frame, error) {
-	var (
-		timeFormat string
-		timeCol    int
-		headerRow  []string
-	)
-	df := gTypes.NewDataFrame()
+	exp := csvExplorer{}
+
+	options.setDefaults()
 
 	file, err := os.ReadFile(path)
 	if err != nil {
-		return df, err
+		return nil, err
 	}
 
 	err = handleCompression(options.Compression, &file, false)
 	if err != nil {
-		return df, err
+		return nil, err
 	}
 
-	csvReader := csv.NewReader(bytes.NewReader(file))
-	if options.Separator != nil {
-		csvReader.Comma = *options.Separator
-	}
-
-	if options.CommentPrefix != nil {
-		csvReader.Comment = *options.CommentPrefix
-	}
-
-	if len(*options.Columns) > 0 {
-		csvReader.FieldsPerRecord = len(*options.Columns)
-	}
+	rows := bytes.Split(file, []byte("\n"))
 
 	if *options.HasHeader {
-		headerRow, err = csvReader.Read()
-		if err != nil {
-			return df, err
-		}
-		err = handleHeader(df, headerRow, *options.Columns) // read the first row
-		if err != nil {
-			return df, err
-		}
-	}
-	// Skip initial rows if specified
-	for range *options.SkipRows {
-		_, err := csvReader.Read() // Skip row
-		if err != nil {
-			return df, err
-		}
+		exp.headerRow = strings.Split(string(rows[0]), string(*options.Separator))
+		rows = rows[1:]
 	}
 
-	firstRecord, err := csvReader.Read()
-	if err != nil {
-		return df, err
-	}
+	rows = rows[*options.SkipRows:]
+	rows1 := rows[:options.SkipSlice[0]]
+	rows2 := rows[options.SkipSlice[1]:]
+	rows = append(rows1, rows2...)
 
-	// TODO: Fix all this
+	firstRecord := strings.Split(string(rows[0]), string(*options.Separator))
+
 	if *options.TryToParseDates {
-		for col, r := range firstRecord {
-			timeFormat, err = tryToParseDate(r)
-			if err != nil {
-				return df, err
-			}
-			timeCol = col
+		exp.timeCol, exp.timeFormat, err = tryToParseDate(string(rows[0]), string(*options.Separator))
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	if options.Schema == nil {
-		*options.InferSchema = true
-	} else {
-		if !checkSchema(options.Schema, firstRecord) {
-			return df, berrors.ErrSchemaMismatch
-		}
+	if !checkSchema(options.Schema, firstRecord) {
+		return nil, berrors.ErrSchemaMismatch
 	}
 
 	if *options.InferSchema == true {
-		options.Schema, err = inferSchema(firstRecord, headerRow)
-	}
-
-	var rows [][]string
-	rowCount := 0
-	for {
-		// Read each row
-		record, err := csvReader.Read()
-		if err == io.EOF {
-			break // End of file reached
-		}
+		options.Schema, err = inferSchema(firstRecord, exp.headerRow, string(*options.Separator))
 		if err != nil {
-			if *options.IgnoreErrors {
-				continue // Skip this row on error
-			}
-			return df, err
-		}
-
-		// Apply skipping slice logic if necessary
-		if *options.SkipSlice != [2]int{-1, -1} {
-			start, end := options.SkipSlice[0], options.SkipSlice[1]
-			if start >= 0 && end > start && rowCount >= start && rowCount <= end {
-				continue // Skip this row based on the SkipSlice
-			}
-		}
-
-		rowCount++
-		if *options.NumRows != -1 && rowCount >= *options.NumRows {
-			break // Stop reading if we have reached the desired number of rows
+			return nil, err
 		}
 	}
 
-	return df, nil
+	allocator := memory.NewGoAllocator()
+
+	var builderArray []array.Builder
+
+	// make builders for each col and make coumns
+	// with those
+	for i, r := range options.Schema.Fields() {
+		r.Type
+	}
+
+	// figure out builders
+	recBuilder := array.NewBuilder(memory.DefaultAllocator, options.Schema)
+	defer recBuilder.Release()
+
+	array.NewRecord(options.Schema)
+
+	array.NewTableFromRecords(options.Schema)
 }
 
 func handleCompression(compression *cmprssn.CompressionType, data *[]byte, compress bool) error {
@@ -143,44 +111,29 @@ func handleCompression(compression *cmprssn.CompressionType, data *[]byte, compr
 }
 
 func handleHeader(df *gTypes.DataFrame, row []string, schema []string) error {
-	if len(schema) > 0 {
-		for idx, val := range row {
-			if t, ok := schema[val]; ok {
-				df.Table[idx] = gTypes.Series{
-					Type:  t,
-					Index: idx,
-				}
-			} else {
-				return berrors.ErrSchemaMismatch
-			}
-		}
-	} else {
-		for idx, val := range row {
-			df.Series[val] = gTypes.Series{
-				Index: idx,
-			}
-		}
-	}
 	return nil
 }
 
-func tryToParseDate(s string) (format string, err error) {
-	for _, format := range TimeFormatsList {
-		if _, err = time.Parse(format, s); err == nil {
-			return format, nil
+func tryToParseDate(s string, sep string) (col int, format string, err error) {
+	cols := strings.Split(s, sep)
+	for idx, col := range cols {
+		for _, format := range TimeFormatsList {
+			if _, err = time.Parse(format, col); err == nil {
+				return idx, format, nil
+			}
 		}
 	}
-	return "", err
+	return 0, "", err
 }
 
 func checkSchema(schema *arrow.Schema, record []string) bool {
 
 }
 
-func inferSchema(record []string, headers []string) (*arrow.Schema, error) {
+func inferSchema(record []string, headers []string, sep string) (*arrow.Schema, error) {
 	typeMap := make(map[int]arrow.DataType)
 	for idx, feature := range record {
-		switch inferType(feature) {
+		switch inferType(feature, sep) {
 		case "date":
 			typeMap[idx] = &arrow.Date64Type{}
 		case "float":
@@ -219,9 +172,9 @@ func inferSchema(record []string, headers []string) (*arrow.Schema, error) {
 	return schema, nil
 }
 
-func inferType(s string) string {
+func inferType(s, sep string) string {
 	// Try parsing as date
-	if _, err := tryToParseDate(s); err == nil {
+	if _, _, err := tryToParseDate(s, sep); err == nil {
 		return "date"
 	}
 
@@ -241,7 +194,7 @@ func inferType(s string) string {
 	}
 
 	if gTypes.CheckGeometry(s) {
-
+		return "geometry"
 	}
 
 	// Default to string

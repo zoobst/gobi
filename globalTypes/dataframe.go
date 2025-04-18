@@ -24,7 +24,7 @@ type Frame interface {
 }
 
 // NewDataFrame creates a new DataFrame from Arrow Table
-func NewDataFrame(s *arrow.Schema) arrow.Table {
+func NewDataFrame(s *arrow.Schema) Frame {
 	return DataFrame{
 		schema: s,
 	}
@@ -111,7 +111,7 @@ func (df DataFrame) Release() {
 	}
 }
 
-func (df *DataFrame) Head(nRows int) (DataFrame, error) {
+func (df DataFrame) Head(nRows int) (DataFrame, error) {
 	var n int64
 	if nRows == 0 {
 		n = 5
@@ -141,7 +141,7 @@ func (df *DataFrame) Head(nRows int) (DataFrame, error) {
 	return newDf, nil
 }
 
-func (df *DataFrame) Tail(nRows int) (DataFrame, error) {
+func (df DataFrame) Tail(nRows int) (DataFrame, error) {
 	var n int64
 	if nRows == 0 {
 		n = 6

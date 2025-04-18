@@ -3,10 +3,10 @@ package gbcsv
 import (
 	"github.com/zoobst/gobi/cmprssn"
 
-	"github.com/apache/arrow/go/arrow"
+	"github.com/apache/arrow/go/v18/arrow"
 )
 
-const (
+var (
 	defaultHasHeader       bool = true
 	defaultSeparator       rune = ','
 	defaultCommentPrefix   rune = '#'
@@ -39,4 +39,37 @@ type CsvReadOptions struct {
 	Encoding        *arrow.DataType
 	SampleSize      *int
 	Compression     *cmprssn.CompressionType
+}
+
+func (cro *CsvReadOptions) setDefaults() {
+	if cro.HasHeader == nil {
+		cro.HasHeader = &defaultHasHeader
+	}
+	if cro.Separator == nil {
+		cro.Separator = &defaultSeparator
+	}
+	if cro.CommentPrefix == nil {
+		cro.CommentPrefix = &defaultCommentPrefix
+	}
+	if cro.QuoteChar == nil {
+		cro.QuoteChar = &defaultQuoteChar
+	}
+	if cro.InferSchema == nil {
+		cro.InferSchema = &defaultInferSchema
+	}
+	if cro.IgnoreErrors == nil {
+		cro.IgnoreErrors = &defaultIgnoreErrors
+	}
+	if cro.TryToParseDates == nil {
+		cro.TryToParseDates = &defaultTryToParseDates
+	}
+	if cro.BatchSize == nil {
+		cro.BatchSize = &defaultBatchSize
+	}
+	if cro.NumRows == nil {
+		cro.NumRows = &defaultNumRows
+	}
+	if cro.SampleSize == nil {
+		cro.SampleSize = &defaultSampleSize
+	}
 }

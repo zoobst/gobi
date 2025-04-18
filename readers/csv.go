@@ -1,6 +1,8 @@
 package readers
 
 import (
+	"bytes"
+	"encoding/csv"
 	"fmt"
 	"reflect"
 
@@ -8,10 +10,8 @@ import (
 )
 
 type CSVReader struct {
-	file     Reader
-	read     Reader
-	rowIndex int64
-	Schema   *arrow.Schema
+	csv.Reader
+	Schema *arrow.Schema
 }
 
 type GenericCSVReader[T any] struct {
@@ -19,6 +19,7 @@ type GenericCSVReader[T any] struct {
 }
 
 func NewGenericCSVReader[T any](t T, b *[]byte) (reader GenericCSVReader[T], err error) {
+	reader.CSVReader.Reader = *csv.NewReader(bytes.NewBuffer(*b))
 	reader.Schema, err = CSVStructToArrowSchema(t)
 	if err != nil {
 		return reader, err
@@ -45,7 +46,6 @@ func CSVStructToArrowSchema(s any) (*arrow.Schema, error) {
 			continue // skip if tag is missing
 		}
 
-		// arrowType, err := ArrowTypeFromString(typ.Field(i).Type.Name())
 		arrowType, err := ArrowTypeFromGo(typ.Field(i).Type)
 		if err != nil {
 			return nil, fmt.Errorf("field %s: %w", field.Name, err)
