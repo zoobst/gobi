@@ -43,7 +43,50 @@ func (s Series) String() string {
 		}
 		o.WriteString(chunk.String())
 	}
+	o.WriteString(fmt.Sprintf("\ndtype: %s", s.Values.DataType().String()))
 	return o.String()
+}
+
+func (s Series) Head(nRows int) (Series, error) {
+	var n int64
+	if nRows == 0 {
+		n = 5
+	} else {
+		n = int64(nRows)
+	}
+	if n < 0 {
+		return Series{}, fmt.Errorf(berrors.ErrInvalidNumRows.Error(), nRows)
+	}
+	if s.Values.Len() < int(n) {
+		n = int64(s.Values.Len())
+	}
+	nSer := Series{
+		Name:      s.Name,
+		Values:    array.NewColumnSlice(s.Values, 0, n),
+		Allocator: memory.DefaultAllocator,
+	}
+	return nSer, nil
+}
+
+func (s Series) Tail(nRows int) (Series, error) {
+	var n int64
+	if nRows == 0 {
+		n = 6
+	} else {
+		n = int64(nRows)
+	}
+	if n < 0 {
+		return Series{}, fmt.Errorf(berrors.ErrInvalidNumRows.Error(), nRows)
+	}
+	if s.Values.Len() < int(n) {
+		n = int64(s.Values.Len())
+	}
+	nSer := Series{
+		Name:      s.Name,
+		Values:    array.NewColumnSlice(s.Values, int64(s.Values.Len())-n, int64(s.Values.Len()-1)),
+		Allocator: memory.DefaultAllocator,
+	}
+	return nSer, nil
 }
 
 func (s *Series) Iloc(i int) (Series, error) {

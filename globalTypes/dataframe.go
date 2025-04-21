@@ -124,7 +124,7 @@ func (df DataFrame) String() string {
 			}
 			o.WriteString(chunk.String())
 		}
-		o.WriteString("]\n")
+		o.WriteString(fmt.Sprintf("]\ndtype: %s\n", col.DataType().String()))
 	}
 	return o.String()
 }

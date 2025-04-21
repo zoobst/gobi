@@ -52,4 +52,11 @@ func main() {
 	log.Println(df2.Head(10))
 	log.Println(df2.Iloc(9))
 	log.Println(df2.Series[0].Iloc(9))
+	v, err := df2.Col("Sex")
+	if err != nil {
+		log.Println(err)
+		log.Fatal(err)
+	}
+	log.Println(v.Head(10))
+	log.Println(v.Tail(10))
 }
