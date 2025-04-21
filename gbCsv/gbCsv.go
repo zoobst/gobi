@@ -2,7 +2,9 @@ package gbcsv
 
 import (
 	"bytes"
+	"encoding/csv"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -28,7 +30,101 @@ type csvExplorer struct {
 	schema     *arrow.Schema
 }
 
-func ReadCsv(path string, options CsvReadOptions) (gTypes.Frame, error) {
+func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
+	options.setDefaults()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	genericReader, err := readers.NewGenericCSVReader(t, &b)
+	if err != nil {
+		return nil, err
+	}
+
+	var builderArray []array.Builder
+
+	for _, r := range genericReader.Schema.Fields() {
+		switch r.Type {
+		case arrow.PrimitiveTypes.Float64:
+			builderArray = append(builderArray, array.NewFloat64Builder(memory.DefaultAllocator))
+		case arrow.PrimitiveTypes.Int64:
+			builderArray = append(builderArray, array.NewInt64Builder(memory.DefaultAllocator))
+		case arrow.FixedWidthTypes.Boolean:
+			builderArray = append(builderArray, array.NewBooleanBuilder(memory.DefaultAllocator))
+		case arrow.BinaryTypes.String:
+			builderArray = append(builderArray, array.NewStringBuilder(memory.DefaultAllocator))
+		case arrow.FixedWidthTypes.Date64:
+			builderArray = append(builderArray, array.NewDate64Builder(memory.DefaultAllocator))
+		case arrow.BinaryTypes.Binary:
+			builderArray = append(builderArray, array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary))
+		default:
+			builderArray = append(builderArray, array.NewStringBuilder(memory.DefaultAllocator))
+		}
+	}
+
+	if *options.HasHeader {
+		_, err = genericReader.Read()
+	}
+
+	for {
+		r, err := genericReader.Read()
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				return nil, err
+			}
+		}
+
+		for idx, field := range r {
+			if field == "" {
+				builderArray[idx].AppendNull()
+				continue
+			}
+			switch t := builderArray[idx].(type) {
+			case *array.StringBuilder:
+				t.Append(field)
+			case *array.Float64Builder:
+				f, err := strconv.ParseFloat(field, 64)
+				if err != nil {
+					return nil, err
+				}
+				t.Append(f)
+			case *array.BinaryBuilder:
+				t.Append([]byte(field))
+			case *array.Int64Builder:
+				i, err := strconv.ParseInt(field, 10, 64)
+				if err != nil {
+					return nil, err
+				}
+				t.Append(i)
+			case *array.BooleanBuilder:
+				b, err := strconv.ParseBool(field)
+				if err != nil {
+					return nil, err
+				}
+				t.Append(b)
+			}
+		}
+	}
+
+	columnList := []arrow.Column{}
+
+	for idx, p := range builderArray {
+		arr := p.NewArray()
+		columnList = append(columnList, arrow.NewColumnFromArr(genericReader.Schema.Field(idx), arr))
+	}
+
+	df, err := gTypes.NewDataFrameFromColumns(columnList, genericReader.Schema)
+	if err != nil {
+		return nil, err
+	}
+
+	return df, nil
+}
+
+func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 	exp := csvExplorer{}
 
 	options.setDefaults()
@@ -46,55 +142,91 @@ func ReadCsv(path string, options CsvReadOptions) (gTypes.Frame, error) {
 	rows := bytes.Split(file, []byte("\n"))
 
 	if *options.HasHeader {
-		exp.headerRow = strings.Split(string(rows[0]), string(*options.Separator))
+		csvReader := csv.NewReader(bytes.NewReader(rows[0]))
+		csvReader.Comma = *options.Separator
+		csvReader.Comment = *options.CommentPrefix
+		row, err := csvReader.ReadAll()
+		if err != nil {
+			return nil, err
+		}
+
+		exp.headerRow = row[0]
 		rows = rows[1:]
 	}
 
 	rows = rows[*options.SkipRows:]
-	rows1 := rows[:options.SkipSlice[0]]
-	rows2 := rows[options.SkipSlice[1]:]
-	rows = append(rows1, rows2...)
+	if options.SkipSlice != nil {
+		rows1 := rows[:options.SkipSlice[0]]
+		rows2 := rows[options.SkipSlice[1]:]
+		rows = append(rows1, rows2...)
+	}
 
-	firstRecord := strings.Split(string(rows[0]), string(*options.Separator))
+	data := []byte{}
+
+	for _, r := range rows {
+		data = append(data, r...)
+	}
+
+	csvReader := csv.NewReader(bytes.NewReader(data))
+	csvReader.Comma = *options.Separator
+	csvReader.Comment = *options.CommentPrefix
+
+	firstRecord, err := csvReader.Read()
+	if err != nil {
+		return nil, err
+	}
 
 	if *options.TryToParseDates {
-		exp.timeCol, exp.timeFormat, err = tryToParseDate(string(rows[0]), string(*options.Separator))
+		exp.timeCol, exp.timeFormat, err = tryToParseDate(firstRecord)
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	if !checkSchema(options.Schema, firstRecord) {
-		return nil, berrors.ErrSchemaMismatch
 	}
 
 	if *options.InferSchema == true {
-		options.Schema, err = inferSchema(firstRecord, exp.headerRow, string(*options.Separator))
+		options.Schema, err = inferSchema(firstRecord, exp.headerRow)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	allocator := memory.NewGoAllocator()
-
 	var builderArray []array.Builder
 
-	// make builders for each col and make coumns
-	// with those
-	for i, r := range options.Schema.Fields() {
-		r.Type
+	for _, r := range options.Schema.Fields() {
+		builderArray = append(builderArray, array.NewBuilder(memory.DefaultAllocator, r.Type))
 	}
 
-	// figure out builders
-	recBuilder := array.NewBuilder(memory.DefaultAllocator, options.Schema)
-	defer recBuilder.Release()
+	for {
+		r, err := csvReader.Read()
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				return nil, err
+			}
+		}
 
-	array.NewRecord(options.Schema)
+		for idx, field := range r {
+			if field == "" {
+				builderArray[idx].AppendNull()
+			}
+			builderArray[idx].AppendValueFromString(field)
+		}
+	}
 
-	array.NewTableFromRecords(options.Schema)
+	df := gTypes.NewDataFrame(options.Schema)
+
+	for idx, p := range builderArray {
+		arr := p.NewArray()
+		df.AddColumn(idx, options.Schema.Field(idx), arrow.NewColumnFromArr(options.Schema.Field(idx), arr))
+	}
+	return &df, nil
 }
 
 func handleCompression(compression *cmprssn.CompressionType, data *[]byte, compress bool) error {
+	if compression == nil {
+		return nil
+	}
 	cType := *compression
 	switch c := cType.(type) {
 	case *cmprssn.GzipCompression:
@@ -108,15 +240,15 @@ func handleCompression(compression *cmprssn.CompressionType, data *[]byte, compr
 	default:
 		return berrors.ErrUnsupportedCompressionType
 	}
+	return nil
 }
 
 func handleHeader(df *gTypes.DataFrame, row []string, schema []string) error {
 	return nil
 }
 
-func tryToParseDate(s string, sep string) (col int, format string, err error) {
-	cols := strings.Split(s, sep)
-	for idx, col := range cols {
+func tryToParseDate(s []string) (col int, format string, err error) {
+	for idx, col := range s {
 		for _, format := range TimeFormatsList {
 			if _, err = time.Parse(format, col); err == nil {
 				return idx, format, nil
@@ -127,13 +259,13 @@ func tryToParseDate(s string, sep string) (col int, format string, err error) {
 }
 
 func checkSchema(schema *arrow.Schema, record []string) bool {
-
+	return false
 }
 
-func inferSchema(record []string, headers []string, sep string) (*arrow.Schema, error) {
+func inferSchema(record []string, headers []string) (*arrow.Schema, error) {
 	typeMap := make(map[int]arrow.DataType)
 	for idx, feature := range record {
-		switch inferType(feature, sep) {
+		switch inferType(feature) {
 		case "date":
 			typeMap[idx] = &arrow.Date64Type{}
 		case "float":
@@ -155,7 +287,7 @@ func inferSchema(record []string, headers []string, sep string) (*arrow.Schema, 
 
 	for key, val := range typeMap {
 		var name string
-		if len(headers) >= key {
+		if len(headers)-1 >= key {
 			name = headers[key]
 		} else {
 			name = fmt.Sprintf("%d", key)
@@ -172,9 +304,9 @@ func inferSchema(record []string, headers []string, sep string) (*arrow.Schema, 
 	return schema, nil
 }
 
-func inferType(s, sep string) string {
+func inferType(s string) string {
 	// Try parsing as date
-	if _, _, err := tryToParseDate(s, sep); err == nil {
+	if _, _, err := tryToParseDate([]string{s}); err == nil {
 		return "date"
 	}
 

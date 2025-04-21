@@ -21,10 +21,11 @@ type Frame interface {
 	NumCols() int64
 	String() string
 	Schema() *arrow.Schema
+	AddColumn(int, arrow.Field, arrow.Column) (arrow.Table, error)
 }
 
 // NewDataFrame creates a new DataFrame from Arrow Table
-func NewDataFrame(s *arrow.Schema) Frame {
+func NewDataFrame(s *arrow.Schema) DataFrame {
 	return DataFrame{
 		schema: s,
 	}
@@ -42,15 +43,38 @@ func NewDataFrameFromTable(t arrow.Table) *DataFrame {
 	return &df
 }
 
+func NewDataFrameFromColumns(cols []arrow.Column, schema *arrow.Schema) (*DataFrame, error) {
+	df := DataFrame{
+		schema: schema,
+		Series: NewSeriesFromColumns(cols, schema),
+	}
+
+	return &df, nil
+}
+
 func (df DataFrame) Shape() (int, int) {
 	return int(df.NumCols()), int(df.NumRows())
 }
 
 func (df DataFrame) Schema() *arrow.Schema { return df.schema }
 
-func (df DataFrame) NumRows() int64 { return int64(df.Series[0].Values.Len()) }
+func (df DataFrame) NumRows() int64 {
+	if len(df.Series) > 0 {
+		return int64(df.Series[0].Values.Len())
+	}
+	return int64(0)
+}
 
 func (df DataFrame) NumCols() int64 { return int64(len(df.Series)) }
+
+func (df *DataFrame) Col(q string) (*Series, error) {
+	for _, ser := range df.Series {
+		if ser.Name == q {
+			return &ser, nil
+		}
+	}
+	return nil, fmt.Errorf(berrors.ErrUnknownColumn.Error(), q)
+}
 
 func (df DataFrame) Column(i int) *arrow.Column { return df.Series[i].Values }
 
@@ -65,7 +89,18 @@ func (df DataFrame) AddColumn(pos int, f arrow.Field, c arrow.Column) (arrow.Tab
 	if err != nil {
 		return nil, err
 	}
-	cols := make([]Series, df.NumCols()+1)
+
+	if len(df.Series) == 0 {
+		col := NewSeries(c.Name(), &c)
+		cols := []Series{col}
+
+		newTable := DataFrame{
+			schema: newSchema,
+			Series: cols,
+		}
+		return newTable, nil
+	}
+	cols := make([]Series, df.NumCols()+1, df.NumCols()+1)
 	copy(cols[:pos], df.Series[:pos])
 	cols[pos] = NewSeries(c.Name(), &c)
 	copy(cols[pos+1:], df.Series[pos:])
@@ -159,6 +194,27 @@ func (df DataFrame) Tail(nRows int) (DataFrame, error) {
 		nSer := Series{
 			Name:      ser.Name,
 			Values:    array.NewColumnSlice(ser.Values, int64(ser.Values.Len())-n, int64(ser.Values.Len()-1)),
+			Allocator: memory.DefaultAllocator,
+		}
+		serList = append(serList, nSer)
+
+	}
+	newDf := DataFrame{
+		schema: df.Schema(),
+		Series: serList,
+	}
+	return newDf, nil
+}
+
+func (df DataFrame) Iloc(i int) (DataFrame, error) {
+	var serList []Series
+	for _, ser := range df.Series {
+		if ser.Values.Len() < i {
+			return DataFrame{}, fmt.Errorf(berrors.ErrIndexOutOfRange.Error(), i, ser.Values.Len())
+		}
+		nSer := Series{
+			Name:      ser.Name,
+			Values:    array.NewColumnSlice(ser.Values, int64(i), int64(i+1)),
 			Allocator: memory.DefaultAllocator,
 		}
 		serList = append(serList, nSer)

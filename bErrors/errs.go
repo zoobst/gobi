@@ -27,3 +27,7 @@ var ErrInvalidNumRows error = errors.New("invalid number of rows: %d")
 var ErrUnsupportedType error = errors.New("unsupported type: %s")
 
 var ErrInvalidType error = errors.New("Invalid Type for type: %v")
+
+var ErrIndexOutOfRange error = errors.New("index: %d is out of range of dataframe with len %d")
+
+var ErrUnknownColumn error = errors.New("unrecognized column name: %s")

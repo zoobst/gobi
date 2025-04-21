@@ -7,16 +7,18 @@ import (
 )
 
 var (
-	defaultHasHeader       bool = true
-	defaultSeparator       rune = ','
-	defaultCommentPrefix   rune = '#'
-	defaultQuoteChar       rune = '"'
-	defaultInferSchema     bool = true
-	defaultIgnoreErrors    bool = false
-	defaultTryToParseDates bool = false
-	defaultBatchSize       int  = 8192
-	defaultNumRows         int  = -1
-	defaultSampleSize      int  = 1024
+	defaultHasHeader       bool   = true
+	defaultSeparator       rune   = ','
+	defaultCommentPrefix   rune   = '#'
+	defaultQuoteChar       rune   = '"'
+	defaultInferSchema     bool   = true
+	defaultIgnoreErrors    bool   = false
+	defaultTryToParseDates bool   = false
+	defaultBatchSize       int    = 8192
+	defaultNumRows         int    = -1
+	defaultSampleSize      int    = 1024
+	defaultSkipRows        int    = 0
+	defaultSkipSlice       [2]int = [2]int{-1, -1}
 )
 
 type CsvReadOptions struct {
@@ -42,6 +44,9 @@ type CsvReadOptions struct {
 }
 
 func (cro *CsvReadOptions) setDefaults() {
+	if cro.SkipRows == nil {
+		cro.SkipRows = &defaultSkipRows
+	}
 	if cro.HasHeader == nil {
 		cro.HasHeader = &defaultHasHeader
 	}

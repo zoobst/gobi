@@ -16,19 +16,19 @@ func CheckGeometry(s string) bool {
 
 // ParsePoint parses a WKT Point string
 func ParseWKT(s string) (Geometry, error) {
-	if s[:5] == "POINT" {
+	if (len(s) >= 5) && (s[:5] == "POINT") {
 		t, err := ParsePointWKT(s)
 		if err != nil {
 			return nil, err
 		}
 		return t, nil
-	} else if s[:7] == "POLYGON" {
+	} else if (len(s) >= 7) && (s[:7] == "POLYGON") {
 		t, err := ParsePolygonWKT(s)
 		if err != nil {
 			return nil, err
 		}
 		return t, nil
-	} else if s[:10] == "LINESTRING" {
+	} else if (len(s) >= 10) && (s[:10] == "LINESTRING") {
 		t, err := ParseLineStringWKT(s)
 		if err != nil {
 			return nil, err

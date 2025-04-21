@@ -23,12 +23,6 @@ type Series struct {
 	Allocator memory.Allocator // Allocator for efficient memory management
 }
 
-type GBType interface {
-	arrow.ExtensionBase
-	fmt.Stringer
-	String() string
-}
-
 type HashSet struct {
 	data map[any]struct{}
 }
