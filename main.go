@@ -6,14 +6,13 @@ import (
 	gbcsv "github.com/zoobst/gobi/gbCsv"
 	"github.com/zoobst/gobi/gbParquet"
 	gTypes "github.com/zoobst/gobi/globalTypes"
+	"github.com/zoobst/gobi/tests"
 	"github.com/zoobst/gobi/writers"
 )
 
-type DataFrame map[string]*gTypes.Series
-
-// type DataFrame struct {
-// 	*gTypes.DataFrame
-// }
+type DataFrame struct {
+	*gTypes.DataFrame
+}
 
 func ReadParquet(path string, compression string) (*DataFrame, error) {
 	if df, err := gbParquet.ReadParquet(path, compression); err == nil {
@@ -35,7 +34,7 @@ func ReadCSV(path string, options gbcsv.CsvReadOptions) (*DataFrame, error) {
 	return &DataFrame{df}, nil
 }
 
-func ReadCSVFromType[T struct{}](t T, path string, options gbcsv.CsvReadOptions) (*DataFrame, error) {
+func ReadCSVFromType[T any](t T, path string, options gbcsv.CsvReadOptions) (*DataFrame, error) {
 	df, err := gbcsv.ReadFromGeneric(t, path, gbcsv.CsvReadOptions{})
 	if err != nil {
 		return nil, err
@@ -46,7 +45,7 @@ func ReadCSVFromType[T struct{}](t T, path string, options gbcsv.CsvReadOptions)
 
 func main() {
 	// df2, err := ReadCSV(tests.TestCSVTypes{}, "testData/titanic_test.csv", gbcsv.CsvReadOptions{})
-	df2, err := ReadCSVFromType("testData/titanic_test.csv", gbcsv.CsvReadOptions{})
+	df2, err := ReadCSVFromType(tests.TestCSVTypes{}, "testData/titanic_test.csv", gbcsv.CsvReadOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
