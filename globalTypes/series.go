@@ -33,15 +33,6 @@ func NewSeriesFromColumns(cols []arrow.Column, schema *arrow.Schema) []Series {
 	return sers
 }
 
-func (df *DataFrame) Col(q string) (*Series, error) {
-	for _, ser := range df.Series {
-		if ser.Name == q {
-			return &ser, nil
-		}
-	}
-	return nil, fmt.Errorf(berrors.ErrUnknownColumn.Error(), q)
-}
-
 func (s Series) String() string {
 	o := new(strings.Builder)
 	o.WriteString("\n")
