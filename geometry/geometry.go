@@ -1,18 +1,12 @@
-package globalTypes
+package geometry
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	berrors "github.com/zoobst/gobi/bErrors"
 )
-
-func CheckGeometry(s string) bool {
-	if _, err := ParseWKT(s); err == nil {
-		return true
-	}
-	return false
-}
 
 // ParsePoint parses a WKT Point string
 func ParseWKT(s string) (Geometry, error) {
@@ -136,33 +130,53 @@ func minX[p *[]Point](points *[]Point) (lVal float64) {
 	return lVal
 }
 
-func NewHashSet() *HashSet {
-	return &HashSet{
-		data: make(map[any]struct{}),
+// haversine calculates the great-circle distance between two points on the Earth.
+// The two points must be provided as longitude/latitude pairs (in degrees),
+// and the distance is returned in the unit specified.
+//
+// The unit argument accepts the following values (case-insensitive):
+//   - "km"  : kilometers (default if unknown)
+//   - "mi"  : miles
+//   - "nmi" : nautical miles
+//
+// Coordinates are assumed to be in WGS84 (standard GPS) format.
+//
+// Example usage:
+//
+//	p1 := Point{X: -73.9857, Y: 40.7484} // NYC (lon, lat)
+//	p2 := Point{X: -0.1276, Y: 51.5074}  // London
+//	dist := Haversine(p1, p2, "mi")      // Distance in miles
+//
+// Note: For small distances (<1km), consider Vincenty's formula for better accuracy.
+func haversine(p1, p2 Point, unit string) float64 {
+	// Earth radius by unit
+	var R float64
+	switch strings.ToLower(unit) {
+	case "mi":
+		R = 3958.8 // Miles
+	case "nmi":
+		R = 3440.1 // Nautical miles
+	case "km":
+		fallthrough
+	default:
+		R = 6371.0 // Kilometers (default)
 	}
+
+	lat1 := degreesToRadians(p1.Y)
+	lon1 := degreesToRadians(p1.X)
+	lat2 := degreesToRadians(p2.Y)
+	lon2 := degreesToRadians(p2.X)
+
+	dlat := lat2 - lat1
+	dlon := lon2 - lon1
+
+	a := math.Sin(dlat/2)*math.Sin(dlat/2) +
+		math.Cos(lat1)*math.Cos(lat2)*math.Sin(dlon/2)*math.Sin(dlon/2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+
+	return R * c
 }
 
-func (hs *HashSet) Add(Value any) { hs.data[Value] = struct{}{} }
-
-func (hs *HashSet) Remove(Value any) {
-	delete(hs.data, Value)
-}
-
-func (hs *HashSet) Contains(Value any) bool {
-	_, exists := hs.data[Value]
-	return exists
-}
-
-func (hs *HashSet) Len() int { return len(hs.data) }
-
-func (hs *HashSet) Clear() {
-	hs.data = make(map[any]struct{})
-}
-
-func (hs *HashSet) List() []any {
-	result := make([]any, 0, len(hs.data))
-	for key := range hs.data {
-		result = append(result, key)
-	}
-	return result
+func degreesToRadians(deg float64) float64 {
+	return deg * math.Pi / 180
 }

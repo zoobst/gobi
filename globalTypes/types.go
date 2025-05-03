@@ -18,9 +18,9 @@ type DataFrame struct {
 }
 
 type Series struct {
-	Name      string           // Name of the series
-	Values    *arrow.Column    // Apache Arrow array for columnar data
-	Allocator memory.Allocator // Allocator for efficient memory management
+	Name      string
+	Values    *arrow.Column
+	Allocator memory.Allocator
 }
 
 type HashSet struct {

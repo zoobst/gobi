@@ -1,12 +1,16 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"time"
 
 	gbcsv "github.com/zoobst/gobi/gbCsv"
 	"github.com/zoobst/gobi/gbParquet"
 	gTypes "github.com/zoobst/gobi/globalTypes"
-	"github.com/zoobst/gobi/tests"
 	"github.com/zoobst/gobi/writers"
 )
 
@@ -44,19 +48,40 @@ func ReadCSVFromType[T any](t T, path string, options gbcsv.CsvReadOptions) (*Da
 }
 
 func main() {
-	// df2, err := ReadCSV(tests.TestCSVTypes{}, "testData/titanic_test.csv", gbcsv.CsvReadOptions{})
-	df2, err := ReadCSVFromType(tests.TestCSVTypes{}, "testData/titanic_test.csv", gbcsv.CsvReadOptions{})
+	start := time.Now()
+
+	cpuFile, err := os.Create("cpu.prof")
+	if err != nil {
+		log.Fatal("could not create CPU profile: ", err)
+	}
+	defer cpuFile.Close()
+
+	pprof.StartCPUProfile(cpuFile)
+	defer pprof.StopCPUProfile()
+
+	f, err := os.Create("mem.prof")
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println(df2.Head(10))
-	log.Println(df2.Iloc(9))
-	log.Println(df2.Series[0].Iloc(9))
-	v, err := df2.Col("Sex")
-	if err != nil {
-		log.Println(err)
-		log.Fatal(err)
+	defer f.Close()
+	defer pprof.WriteHeapProfile(f)
+
+	if res := TestReadCSVFromType(); res == false {
+		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestReadCSVFromType"))
 	}
-	log.Println(v.Head(10))
-	log.Println(v.Tail(10))
+
+	if res := TestIloc(); res == false {
+		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestIloc"))
+	}
+
+	if res := TestCol(); res == false {
+		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestCol"))
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("Elapsed time: %s\n", elapsed)
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	fmt.Printf("Total memory allocated: %v MiB\n", m.TotalAlloc/(1024*1024))
 }

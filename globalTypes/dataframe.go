@@ -100,7 +100,7 @@ func (df DataFrame) AddColumn(pos int, f arrow.Field, c arrow.Column) (arrow.Tab
 		}
 		return newTable, nil
 	}
-	cols := make([]Series, df.NumCols()+1, df.NumCols()+1)
+	cols := make([]Series, df.NumCols()+1)
 	copy(cols[:pos], df.Series[:pos])
 	cols[pos] = NewSeries(c.Name(), &c)
 	copy(cols[pos+1:], df.Series[pos:])

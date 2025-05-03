@@ -1,2 +1,4 @@
 testData
 *.py
+.DS_STORE
+mem.prof
