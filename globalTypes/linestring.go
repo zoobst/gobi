@@ -53,30 +53,6 @@ func (p LineString) ExtensionName() string { return p.Name() }
 
 func (p LineString) ExtensionMetadata() string { return "" }
 
-func (l LineString) WKT() (strList string) {
-	strList = "LINESTRING ("
-	for _, LineString := range l.Points {
-		strList += fmt.Sprintf("(%f %f),", LineString.X, LineString.Y)
-	}
-	strList = strList[:len(strList)-1]
-	return strList + ")"
-}
-
-func (l LineString) Coords() (fList [][2]float64) {
-	for _, LineString := range l.Points {
-		fList = append(fList, [2]float64{LineString.X, LineString.Y})
-	}
-	return fList
-}
-
-func (l LineString) MaxX() float64 { return maxX(&l.Points) }
-
-func (l LineString) MaxY() float64 { return maxY(&l.Points) }
-
-func (l LineString) MinX() float64 { return minX(&l.Points) }
-
-func (l LineString) MinY() float64 { return minY(&l.Points) }
-
 // GetGeometry returns the GeoJSON geometry representation of the geometry.
 func (l LineString) GeoJSONGeometry() geojson.GeoJSONGeometry {
 	return geojson.GeoJSONGeometry{
@@ -84,8 +60,6 @@ func (l LineString) GeoJSONGeometry() geojson.GeoJSONGeometry {
 		Coordinates: [][][2]float64{l.Coords()},
 	}
 }
-
-func (l LineString) length(units string) float64 { return 0.0 }
 
 type LineStringArray struct {
 	array.ExtensionArray

@@ -4,30 +4,30 @@ import (
 	"errors"
 )
 
-var ErrEmptyArray error = errors.New("array is empty")
+var (
+	ErrEmptyArray error = errors.New("array is empty")
 
-var ErrEmptyDataFrame error = errors.New("dataframe is empty")
+	ErrEmptyDataFrame error = errors.New("dataframe is empty")
 
-var ErrSchemaMismatch error = errors.New("schema provided does not match data")
+	ErrSchemaMismatch error = errors.New("schema provided does not match data")
 
-var ErrUnsupportedCompressionType error = errors.New("unsupported compression type")
+	ErrUnsupportedCompressionType error = errors.New("unsupported compression type")
 
-var WarningUnknownPropertyType string = "Warning: Unknown type for property '%s', defaulting to string.\n"
+	ErrNumCoords error = errors.New("serialized coords are incorrect length")
 
-var ErrNumCoords error = errors.New("serialized coords are incorrect length")
+	ErrColLengthMismatch error = errors.New("arrow/array: column length mismatch: %d != %d")
 
-var ErrColLengthMismatch error = errors.New("arrow/array: column length mismatch: %d != %d")
+	ErrColTypeMismatch error = errors.New("arrow/array: column type mismatch: %v != %v")
 
-var ErrColTypeMismatch error = errors.New("arrow/array: column type mismatch: %v != %v")
+	ErrInvalidGeometryType error = errors.New("invalid/unknown geometry type")
 
-var ErrInvalidGeometryType error = errors.New("invalid/unknown geometry type")
+	ErrInvalidNumRows error = errors.New("invalid number of rows: %d")
 
-var ErrInvalidNumRows error = errors.New("invalid number of rows: %d")
+	ErrUnsupportedType error = errors.New("unsupported type: %s")
 
-var ErrUnsupportedType error = errors.New("unsupported type: %s")
+	ErrInvalidType error = errors.New("invalid Type for type: %v")
 
-var ErrInvalidType error = errors.New("Invalid Type for type: %v")
+	ErrIndexOutOfRange error = errors.New("index: %d is out of range of dataframe with len %d")
 
-var ErrIndexOutOfRange error = errors.New("index: %d is out of range of dataframe with len %d")
-
-var ErrUnknownColumn error = errors.New("unrecognized column name: %s")
+	ErrUnknownColumn error = errors.New("unrecognized column name: %s")
+)

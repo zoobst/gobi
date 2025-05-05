@@ -1,8 +1,12 @@
 package geometry
 
 import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 )
 
@@ -49,6 +53,90 @@ func (p Polygon) Area(unit string) float64 {
 	return area
 }
 
+// ConvexHull computes the convex hull of the points in the polygon using Graham's scan.
+// Returns a new Polygon containing only the convex hull.
+func (p Polygon) ConvexHull() Polygon {
+	// Find the point with the lowest Y (and leftmost if tie)
+	lowest := p.Points[0]
+	lowestIdx := 0
+	for i, pt := range p.Points {
+		if pt.Y < lowest.Y || (pt.Y == lowest.Y && pt.X < lowest.X) {
+			lowest = pt
+			lowestIdx = i
+		}
+	}
+
+	// Move the lowest point to the first position
+	p.Points[0], p.Points[lowestIdx] = p.Points[lowestIdx], p.Points[0]
+
+	// Sort the rest of the points based on polar angle with respect to lowest point
+	pivot := p.Points[0]
+	sorted := make([]Point, len(p.Points)-1)
+	copy(sorted, p.Points[1:])
+	sort.Slice(sorted, func(i, j int) bool {
+		cp := crossProduct(pivot, sorted[i], sorted[j])
+		if cp == 0 {
+			// Collinear points: closer one comes first
+			return distanceSquared(pivot, sorted[i]) < distanceSquared(pivot, sorted[j])
+		}
+		return cp > 0
+	})
+
+	// Build the convex hull
+	hull := []Point{pivot, sorted[0]}
+	for i := 1; i < len(sorted); i++ {
+		for len(hull) >= 2 && crossProduct(hull[len(hull)-2], hull[len(hull)-1], sorted[i]) <= 0 {
+			hull = hull[:len(hull)-1] // pop
+		}
+		hull = append(hull, sorted[i])
+	}
+
+	return Polygon{Points: hull}
+}
+
+func (p Polygon) Centroid() Point {
+	var (
+		n               = p.Len()
+		cx, cy, areaSum float64
+	)
+
+	for i := range n {
+		j := (i + 1) % n
+		x0, y0 := p.Points[i].X, p.Points[i].Y
+		x1, y1 := p.Points[j].X, p.Points[j].Y
+
+		// Shoelace formula term
+		areaTerm := x0*y1 - x1*y0
+		areaSum += areaTerm
+
+		// Centroid terms
+		cx += (x0 + x1) * areaTerm
+		cy += (y0 + y1) * areaTerm
+	}
+
+	area := areaSum / 2.0
+	if area == 0 {
+		// Degenerate polygon, fallback to average of points
+		var sx, sy float64
+		for _, pt := range p.Points {
+			sx += pt.X
+			sy += pt.Y
+		}
+		return Point{
+			X: sx / float64(n),
+			Y: sy / float64(n),
+		}
+	}
+
+	cx /= (6.0 * area)
+	cy /= (6.0 * area)
+
+	return Point{
+		X: cx,
+		Y: cy,
+	}
+}
+
 func (p Polygon) String() (strList string) {
 	if len(p.Points) == 0 {
 		return
@@ -61,7 +149,9 @@ func (p Polygon) String() (strList string) {
 
 func (p Polygon) Type() string { return "Polygon" }
 
-func (p Polygon) Name() string { return "Polygon" }
+func (p Polygon) Name() string { return p.Type() }
+
+func (p Polygon) CRS() CRS { return p.Points[0].CoordRefSys }
 
 func (p Polygon) WKT() (strList string) {
 	strList = "POLYGON ("
@@ -70,6 +160,60 @@ func (p Polygon) WKT() (strList string) {
 	}
 	strList = strList[:len(strList)-1]
 	return strList + ")"
+}
+
+func (p Polygon) WKB() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Byte order: 1 = little endian
+	if err := binary.Write(buf, binary.LittleEndian, byte(1)); err != nil {
+		return nil, err
+	}
+
+	// Geometry type: Polygon (3)
+	if err := binary.Write(buf, binary.LittleEndian, WKB_POLYGON); err != nil {
+		return nil, err
+	}
+
+	// WKB Polygons consist of one or more "linear rings"
+	// We'll assume this is a single, closed linear ring.
+	ring := p.Points
+
+	// Ensure the ring is closed (first point == last point)
+	if len(ring) > 0 && (ring[0].X != ring[len(ring)-1].X || ring[0].Y != ring[len(ring)-1].Y) {
+		ring = append(ring, ring[0])
+	}
+
+	// Number of rings: 1
+	if err := binary.Write(buf, binary.LittleEndian, uint32(1)); err != nil {
+		return nil, err
+	}
+
+	// Number of points in ring
+	if err := binary.Write(buf, binary.LittleEndian, uint32(len(ring))); err != nil {
+		return nil, err
+	}
+
+	// Write each point (X, Y)
+	for _, pt := range ring {
+		if err := binary.Write(buf, binary.LittleEndian, pt.X); err != nil {
+			return nil, err
+		}
+		if err := binary.Write(buf, binary.LittleEndian, pt.Y); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+// WKBHex returns the WKB encoding of the Polygon as a hex string.
+func (p Polygon) WKBHex() (string, error) {
+	wkb, err := p.WKB()
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(wkb), nil
 }
 
 func (p Polygon) Coords() (fList [][2]float64) {

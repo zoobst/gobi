@@ -180,3 +180,15 @@ func haversine(p1, p2 Point, unit string) float64 {
 func degreesToRadians(deg float64) float64 {
 	return deg * math.Pi / 180
 }
+
+// crossProduct returns the cross product of vectors AB and AC
+func crossProduct(a, b, c Point) float64 {
+	return (b.X-a.X)*(c.Y-a.Y) - (b.Y-a.Y)*(c.X-a.X)
+}
+
+// distanceSquared returns the squared distance between two points
+func distanceSquared(a, b Point) float64 {
+	dx := a.X - b.X
+	dy := a.Y - b.Y
+	return dx*dx + dy*dy
+}

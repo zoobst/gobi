@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/zoobst/gobi/geojson"
+	"github.com/zoobst/gobi/geometry"
 
 	"github.com/apache/arrow/go/arrow/memory"
 	"github.com/apache/arrow/go/v18/arrow"
@@ -29,6 +30,7 @@ type HashSet struct {
 
 type Geometry interface {
 	fmt.Stringer
+	geometry.Geometry
 	String() string
 	Type() string
 	WKT() string
@@ -51,20 +53,16 @@ type Geometry interface {
 }
 
 type Point struct {
-	fmt.Stringer
+	geometry.Point
 	arrow.ExtensionBase
-	X float64 `json:"lon"`
-	Y float64 `json:"lat"`
 }
 
 type Polygon struct {
-	fmt.Stringer
+	geometry.Polygon
 	arrow.ExtensionBase
-	Points []Point `json:"Polygon"`
 }
 
 type LineString struct {
-	fmt.Stringer
+	geometry.LineString
 	arrow.ExtensionBase
-	Points []Point `json:"LineString"`
 }

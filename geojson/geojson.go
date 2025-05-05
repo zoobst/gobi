@@ -6,6 +6,8 @@ import (
 	berrors "github.com/zoobst/gobi/bErrors"
 )
 
+// TODO: Rewrite most of this to be more generic
+
 // NewFeatureCollection creates and returns a new GeoJSONFeatureCollection.
 // It initializes the Type field to "FeatureCollection" and creates an empty Features slice.
 //

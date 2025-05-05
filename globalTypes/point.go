@@ -46,21 +46,6 @@ func (p Point) ExtensionName() string { return p.Name() }
 
 func (p Point) ExtensionMetadata() string { return "" }
 
-func (p Point) WKT() string { return fmt.Sprintf("POINT (%f %f)", p.X, p.Y) }
-
-func (p Point) Coords() (fList [][2]float64) {
-	fList = [][2]float64{{p.X, p.Y}}
-	return fList
-}
-
-func (p Point) MaxX() float64 { return p.X }
-
-func (p Point) MaxY() float64 { return p.Y }
-
-func (p Point) MinX() float64 { return p.X }
-
-func (p Point) MinY() float64 { return p.Y }
-
 // GetGeometry returns the GeoJSON geometry representation of the geometry.
 func (p Point) GeoJSONGeometry() geojson.GeoJSONGeometry {
 	return geojson.GeoJSONGeometry{

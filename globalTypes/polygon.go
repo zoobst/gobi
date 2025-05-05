@@ -52,39 +52,12 @@ func (p Polygon) ExtensionName() string { return p.Name() }
 
 func (p Polygon) ExtensionMetadata() string { return "" }
 
-func (p Polygon) WKT() (strList string) {
-	strList = "POLYGON ("
-	for _, point := range p.Points {
-		strList += fmt.Sprintf("(%f %f),", point.X, point.Y)
-	}
-	strList = strList[:len(strList)-1]
-	return strList + ")"
-}
-
-func (p Polygon) Coords() (fList [][2]float64) {
-	for _, point := range p.Points {
-		fList = append(fList, [2]float64{point.X, point.Y})
-	}
-	return fList
-}
-
-func (p Polygon) MaxX() float64 { return maxX(&p.Points) }
-
-func (p Polygon) MaxY() float64 { return maxY(&p.Points) }
-
-func (p Polygon) MinX() (lVal float64) { return minX(&p.Points) }
-
-func (p Polygon) MinY() float64 { return minY(&p.Points) }
-
 // GetGeometry returns the GeoJSON geometry representation of the geometry.
 func (p Polygon) GeoJSONGeometry() geojson.GeoJSONGeometry {
 	return geojson.GeoJSONGeometry{
 		Type:        "Polygon",
 		Coordinates: [][][2]float64{p.Coords()},
 	}
-}
-
-func (p Polygon) area(units string) {
 }
 
 type PolygonArray struct {
