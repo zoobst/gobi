@@ -14,7 +14,7 @@ type Geometry interface {
 	Type() string
 	Equal(Geometry) bool
 	WKT() string
-	WKB() ([]byte, error)
+	WKB() []byte
 	WKBHex() (string, error)
 	Coords() [][2]float64
 	Bounds() Box

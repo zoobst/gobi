@@ -9,35 +9,41 @@ import (
 	berrors "github.com/zoobst/gobi/bErrors"
 )
 
+func ParseStringGeometry(s string) (geom Geometry, err error) {
+	// Try to parse using WKT
+	if geom, err = ParseWKT(s); err == nil {
+		return
+	}
+	if geom, err = ParseStringCoords(s); err == nil {
+		return
+	}
+	return nil, fmt.Errorf(berrors.ErrUnableToParseStringCoords.Error(), s)
+}
+
 // ParsePoint parses WKT string of Points, LineStrings, and Polygons
-func ParseWKT(s string) (Geometry, error) {
+func ParseWKT(s string) (t Geometry, err error) {
 	if (len(s) > 5) && (s[:5] == "POINT") {
-		t, err := ParsePointWKT(s)
-		if err != nil {
-			return nil, err
+		if t, err = ParsePointWKT(s); err == nil {
+			return
 		}
-		return t, nil
 	} else if (len(s) > 7) && (s[:7] == "POLYGON") {
-		t, err := ParsePolygonWKT(s)
-		if err != nil {
-			return nil, err
+		if t, err = ParsePolygonWKT(s); err == nil {
+			return
 		}
-		return t, nil
 	} else if (len(s) > 10) && (s[:10] == "LINESTRING") {
-		t, err := ParseLineStringWKT(s)
-		if err != nil {
-			return nil, err
+		if t, err = ParseLineStringWKT(s); err == nil {
+			return
 		}
-		return t, nil
 	} else {
 		return nil, berrors.ErrInvalidGeometryType
 	}
+	return nil, err
 }
 
 // ParsePoint parses a WKT Point string
 func ParsePointWKT(s string) (Point, error) {
-	var coords [2]float64
-	_, err := fmt.Scanf("%f %f", coords[0], coords[1])
+	var coords Coord
+	_, err := fmt.Sscanf(s, "%f %f", &coords[0], &coords[1])
 	if err != nil {
 		return Point{}, err
 	}
@@ -65,6 +71,7 @@ func ParseLineStringWKT(s string) (LineString, error) {
 // ParsePolygon parses a WKT Polygon string
 func ParsePolygonWKT(s string) (Polygon, error) {
 	var points []Point
+	s = strings.TrimPrefix(s, "POLYGON ((")
 	s = strings.TrimPrefix(s, "POLYGON((")
 	s = strings.TrimSuffix(s, "))")
 	rings := strings.SplitSeq(s, "),(")
@@ -79,7 +86,29 @@ func ParsePolygonWKT(s string) (Polygon, error) {
 			points = append(points, p)
 		}
 	}
+	log.Println("Points:", points)
 	return Polygon{Points: points}, nil
+}
+
+func ParseStringCoords(s string) (Geometry, error) {
+	var x, y float64
+
+	// Try common coordinate formats
+	formats := []string{
+		"%f,%f",
+		"%f, %f",
+		"(%f,%f)",
+		"(%f, %f)",
+		"%f %f",
+	}
+
+	for _, format := range formats {
+		if _, err := fmt.Sscanf(s, format, &x, &y); err == nil {
+			return Point{X: x, Y: y, CoordRefSys: WGS84}, nil
+		}
+	}
+
+	return nil, fmt.Errorf(berrors.ErrUnableToParseStringCoords.Error(), s)
 }
 
 func maxY[p *[]Point](points *[]Point) (hVal float64) {

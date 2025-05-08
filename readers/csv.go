@@ -4,16 +4,18 @@ import (
 	"bytes"
 	"encoding/csv"
 	"fmt"
+	"log"
 	"reflect"
+	"strings"
 
 	"github.com/apache/arrow/go/v18/arrow"
-	berrors "github.com/zoobst/gobi/bErrors"
 	gTypes "github.com/zoobst/gobi/globalTypes"
 )
 
 type CSVReader struct {
 	csv.Reader
-	Schema *arrow.Schema
+	FirstRecord []byte
+	Schema      *arrow.Schema
 }
 
 type GenericCSVReader[T any] struct {
@@ -22,7 +24,8 @@ type GenericCSVReader[T any] struct {
 
 func NewGenericCSVReader[T any](t T, b *[]byte) (reader GenericCSVReader[T], err error) {
 	reader.CSVReader.Reader = *csv.NewReader(bytes.NewBuffer(*b))
-	reader.Schema, err = CSVStructToArrowSchema(t)
+	reader.FirstRecord = bytes.Split(*b, []byte("\n"))[1]
+	reader.Schema, err = reader.CSVStructToArrowSchema(t)
 	if err != nil {
 		return reader, err
 	}
@@ -30,7 +33,7 @@ func NewGenericCSVReader[T any](t T, b *[]byte) (reader GenericCSVReader[T], err
 	return reader, nil
 }
 
-func CSVStructToArrowSchema(s any) (*arrow.Schema, error) {
+func (self GenericCSVReader[T]) CSVStructToArrowSchema(s any) (schema *arrow.Schema, err error) {
 	val := reflect.ValueOf(s)
 	typ := val.Type()
 	if typ.Kind() != reflect.Struct {
@@ -50,17 +53,18 @@ func CSVStructToArrowSchema(s any) (*arrow.Schema, error) {
 
 		if dTypeTag == "geometry" {
 			var geomType gTypes.Geometry
-			switch typ.Field(i).Name {
-			case "Point":
-				geomType = gTypes.Point{}
-			case "LineString":
-				geomType = gTypes.LineString{}
-			case "Polygon":
-				geomType = gTypes.Polygon{}
-			default:
-				return nil, berrors.ErrInvalidGeometryType
+			gt, err := extractWKTFromCSV(self.FirstRecord)
+			if err != nil {
+				return nil, err
 			}
+			log.Println("gt:", gt)
+			geomType, err = gTypes.ParseStringGeometry(gt)
+			if err != nil {
+				return nil, err
+			}
+			log.Println("geom type:", geomType)
 			fields = append(fields, arrow.Field{Name: csvTag, Type: geomType.StorageType(), Nullable: true})
+			continue
 		}
 
 		arrowType, err := ArrowTypeFromGo(typ.Field(i).Type)
@@ -72,4 +76,27 @@ func CSVStructToArrowSchema(s any) (*arrow.Schema, error) {
 	}
 
 	return arrow.NewSchema(fields, nil), nil
+}
+
+func extractWKTFromCSV(record []byte) (string, error) {
+	reader := csv.NewReader(bytes.NewReader(record))
+	reader.TrimLeadingSpace = true
+	reader.LazyQuotes = true
+
+	fields, err := reader.Read()
+	if err != nil {
+		return "", fmt.Errorf("failed to parse CSV: %w", err)
+	}
+
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		// Match common WKT types
+		if strings.HasPrefix(field, "POINT") ||
+			strings.HasPrefix(field, "LINESTRING") ||
+			strings.HasPrefix(field, "POLYGON") {
+			return field, nil
+		}
+	}
+
+	return "", fmt.Errorf("no WKT geometry found in record: %s", record)
 }

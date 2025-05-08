@@ -7,7 +7,13 @@ import (
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/zoobst/gobi/geometry"
 )
+
+func NewLineStringFromGeometry(g *geometry.LineString) (l LineString) {
+	l = LineString{*g, arrow.ExtensionBase{Storage: l.StorageType()}}
+	return
+}
 
 func (l LineString) String() (strList string) {
 	if len(l.Points) == 0 {
@@ -26,7 +32,7 @@ func (LineString) Type() string { return "Geometry" }
 func (LineString) Name() string { return "LineString" }
 
 func (LineString) StorageType() arrow.DataType {
-	return arrow.ListOf(arrow.ListOf(arrow.PrimitiveTypes.Float64)) // Storage as list of list of floats ((x,y), (x,y))
+	return arrow.BinaryTypes.LargeBinary
 }
 
 func (l LineString) Fingerprint() string {
@@ -65,7 +71,7 @@ func (LineString) Layout() arrow.DataTypeLayout {
 }
 
 func (LineString) ArrayType() reflect.Type {
-	return reflect.TypeOf(LineStringArray{})
+	return reflect.TypeOf(&LineStringArray{}).Elem() // ← This is correct
 }
 
 type LineStringArray struct {

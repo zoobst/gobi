@@ -7,7 +7,13 @@ import (
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/zoobst/gobi/geometry"
 )
+
+func NewPolygonFromGeometry(g *geometry.Polygon) (p Polygon) {
+	p = Polygon{*g, arrow.ExtensionBase{Storage: p.StorageType()}}
+	return
+}
 
 func (p Polygon) String() (strList string) {
 	if len(p.Points) == 0 {
@@ -26,7 +32,8 @@ func (p Polygon) ID() arrow.Type { return arrow.EXTENSION }
 func (p Polygon) Name() string { return "Polygon" }
 
 func (p Polygon) StorageType() arrow.DataType {
-	return arrow.ListOf(arrow.ListOf(arrow.PrimitiveTypes.Float64)) // Storage as list of list of floats ((x,y), (x,y))
+	return arrow.BinaryTypes.LargeBinary
+	// return arrow.ListOf(arrow.ListOf(arrow.PrimitiveTypes.Float64)) // Storage as list of list of floats ((x,y), (x,y))
 }
 
 func (p Polygon) Fingerprint() string {
@@ -64,8 +71,8 @@ func (p Polygon) Layout() arrow.DataTypeLayout {
 	}
 }
 
-func (p Polygon) ArrayType() reflect.Type {
-	return reflect.TypeOf(PolygonArray{})
+func (Polygon) ArrayType() reflect.Type {
+	return reflect.TypeOf(&PolygonArray{}).Elem() // ← This is correct
 }
 
 type PolygonArray struct {

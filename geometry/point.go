@@ -74,36 +74,33 @@ func (p Point) CRS() CRS { return p.CoordRefSys }
 
 func (p Point) WKT() string { return fmt.Sprintf("POINT(%f %f)", p.X, p.Y) }
 
-func (p Point) WKB() ([]byte, error) {
+func (p Point) WKB() []byte {
 	buf := new(bytes.Buffer)
 
 	// Write byte order (1 = little endian)
 	if err := binary.Write(buf, binary.LittleEndian, byte(1)); err != nil {
-		return nil, err
+		return nil
 	}
 
 	// Write geometry type (1 = Point)
 	if err := binary.Write(buf, binary.LittleEndian, WKB_POINT); err != nil {
-		return nil, err
+		return nil
 	}
 
 	// Write coordinates
 	if err := binary.Write(buf, binary.LittleEndian, p.X); err != nil {
-		return nil, err
+		return nil
 	}
 	if err := binary.Write(buf, binary.LittleEndian, p.Y); err != nil {
-		return nil, err
+		return nil
 	}
 
-	return buf.Bytes(), nil
+	return buf.Bytes()
 }
 
 // WKBHex returns the WKB encoding of the Point as a hex string.
 func (p Point) WKBHex() (string, error) {
-	wkb, err := p.WKB()
-	if err != nil {
-		return "", err
-	}
+	wkb := p.WKB()
 	return hex.EncodeToString(wkb), nil
 }
 

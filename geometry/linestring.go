@@ -114,43 +114,40 @@ func (l LineString) Coords() (fList [][2]float64) {
 	return fList
 }
 
-func (l LineString) WKB() ([]byte, error) {
+func (l LineString) WKB() []byte {
 	buf := new(bytes.Buffer)
 
 	// Byte order: 1 = little endian
 	if err := binary.Write(buf, binary.LittleEndian, byte(1)); err != nil {
-		return nil, err
+		return nil
 	}
 
 	// Geometry type: 2 = LineString
 	if err := binary.Write(buf, binary.LittleEndian, WKB_LINESTRING); err != nil {
-		return nil, err
+		return nil
 	}
 
 	numPoints := uint32(l.Len())
 	if err := binary.Write(buf, binary.LittleEndian, numPoints); err != nil {
-		return nil, err
+		return nil
 	}
 
 	// Write all points (X, Y)
 	for _, pt := range l.Points {
 		if err := binary.Write(buf, binary.LittleEndian, pt.X); err != nil {
-			return nil, err
+			return nil
 		}
 		if err := binary.Write(buf, binary.LittleEndian, pt.Y); err != nil {
-			return nil, err
+			return nil
 		}
 	}
 
-	return buf.Bytes(), nil
+	return buf.Bytes()
 }
 
 // WKBHex returns the WKB encoding of the LineString as a hex string.
 func (l LineString) WKBHex() (string, error) {
-	wkb, err := l.WKB()
-	if err != nil {
-		return "", err
-	}
+	wkb := l.WKB()
 	return hex.EncodeToString(wkb), nil
 }
 

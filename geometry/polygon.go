@@ -198,17 +198,17 @@ func (p Polygon) WKT() (strList string) {
 	return strList + ")"
 }
 
-func (p Polygon) WKB() ([]byte, error) {
+func (p Polygon) WKB() []byte {
 	buf := new(bytes.Buffer)
 
 	// Byte order: 1 = little endian
 	if err := binary.Write(buf, binary.LittleEndian, byte(1)); err != nil {
-		return nil, err
+		return nil
 	}
 
 	// Geometry type: Polygon (3)
 	if err := binary.Write(buf, binary.LittleEndian, WKB_POLYGON); err != nil {
-		return nil, err
+		return nil
 	}
 
 	// WKB Polygons consist of one or more "linear rings"
@@ -221,33 +221,30 @@ func (p Polygon) WKB() ([]byte, error) {
 
 	// Number of rings: 1
 	if err := binary.Write(buf, binary.LittleEndian, uint32(1)); err != nil {
-		return nil, err
+		return nil
 	}
 
 	// Number of points in ring
 	if err := binary.Write(buf, binary.LittleEndian, uint32(len(ring))); err != nil {
-		return nil, err
+		return nil
 	}
 
 	// Write each point (X, Y)
 	for _, pt := range ring {
 		if err := binary.Write(buf, binary.LittleEndian, pt.X); err != nil {
-			return nil, err
+			return nil
 		}
 		if err := binary.Write(buf, binary.LittleEndian, pt.Y); err != nil {
-			return nil, err
+			return nil
 		}
 	}
 
-	return buf.Bytes(), nil
+	return buf.Bytes()
 }
 
 // WKBHex returns the WKB encoding of the Polygon as a hex string.
 func (p Polygon) WKBHex() (string, error) {
-	wkb, err := p.WKB()
-	if err != nil {
-		return "", err
-	}
+	wkb := p.WKB()
 	return hex.EncodeToString(wkb), nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -25,9 +26,6 @@ type csvExplorer struct {
 	timeFormat string
 	timeCol    int
 	headerRow  []string
-	reader     readers.CSVReader
-	df         gTypes.Frame
-	schema     *arrow.Schema
 }
 
 func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
@@ -56,16 +54,30 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 			builderArray = append(builderArray, array.NewStringBuilder(memory.DefaultAllocator))
 		case arrow.FixedWidthTypes.Date64:
 			builderArray = append(builderArray, array.NewDate64Builder(memory.DefaultAllocator))
+		case gTypes.Point{}:
+			if err = arrow.RegisterExtensionType(gTypes.Point{}); err != nil {
+				return nil, err
+			}
+			builderArray = append(builderArray, array.NewExtensionBuilder(memory.DefaultAllocator, gTypes.Point{}))
 		case arrow.BinaryTypes.Binary:
 			builderArray = append(builderArray, array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary))
-		case gTypes.GenericPolygon():
-			builderArray = append(builderArray, array.NewExtensionBuilder(memory.DefaultAllocator, gTypes.GenericPolygon()))
-		case gTypes.GenericLineString():
-			builderArray = append(builderArray, array.NewExtensionBuilder(memory.DefaultAllocator, gTypes.GenericLineString()))
-		case gTypes.GenericPoint():
-			builderArray = append(builderArray, array.NewExtensionBuilder(memory.DefaultAllocator, gTypes.GenericPoint()))
 		default:
-			builderArray = append(builderArray, array.NewStringBuilder(memory.DefaultAllocator))
+			if err = arrow.RegisterExtensionType(gTypes.Point{}); err != nil {
+				if !strings.Contains(err.Error(), "already registered") {
+					return nil, err
+				}
+			}
+			if err = arrow.RegisterExtensionType(gTypes.Polygon{}); err != nil {
+				if !strings.Contains(err.Error(), "already registered") {
+					return nil, err
+				}
+			}
+			if err = arrow.RegisterExtensionType(gTypes.LineString{}); err != nil {
+				if !strings.Contains(err.Error(), "already registered") {
+					return nil, err
+				}
+			}
+			builderArray = append(builderArray, array.NewExtensionBuilder(memory.DefaultAllocator, gTypes.Polygon{}))
 		}
 	}
 
@@ -93,6 +105,7 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 			}
 			switch t := builderArray[idx].(type) {
 			case *array.StringBuilder:
+				log.Println("we're here for some reason")
 				t.Append(field)
 			case *array.Float64Builder:
 				f, err := strconv.ParseFloat(field, 64)
@@ -109,11 +122,21 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 				}
 				t.Append(i)
 			case *array.BooleanBuilder:
-				b, err := strconv.ParseBool(field)
+				if b, err := strconv.ParseBool(field); err == nil {
+					t.Append(b)
+				}
+			case *array.ExtensionBuilder:
+				geom, err := gTypes.ParseStringGeometry(field)
 				if err != nil {
 					return nil, err
 				}
-				t.Append(b)
+
+				binaryBuilder, ok := t.StorageBuilder().(*array.BinaryBuilder)
+				if !ok {
+					return nil, fmt.Errorf("expected BinaryBuilder for Point storage")
+				}
+
+				binaryBuilder.Append(geom.WKB())
 			}
 		}
 	}
@@ -122,6 +145,7 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 
 	for idx, p := range builderArray {
 		arr := p.NewArray()
+		log.Println("schema type:", genericReader.Schema.Field(idx))
 		columnList = append(columnList, arrow.NewColumnFromArr(genericReader.Schema.Field(idx), arr))
 	}
 

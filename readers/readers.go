@@ -22,8 +22,12 @@ func ArrowTypeFromString(typeStr string) (arrow.DataType, error) {
 	switch strings.ToLower(typeStr) {
 	case "datetime":
 		return &arrow.Date64Type{}, nil
-	case "geometry":
-		return gTypes.GenericGeometry(), nil
+	case "point":
+		return gTypes.Point{}, nil
+	case "polygon":
+		return gTypes.Polygon{}, nil
+	case "linestring":
+		return gTypes.LineString{}, nil
 	case "int":
 		fallthrough
 	case "int64":
@@ -51,17 +55,11 @@ func ArrowTypeFromGo(inType reflect.Type) (arrow.DataType, error) {
 	case "int":
 		return arrow.PrimitiveTypes.Int64, nil
 	case "string":
-		f := inType.Field(0).Name
-		if strings.ToLower(f) == "geometry" {
-			return gTypes.GenericGeometry(), nil
-		}
 		return arrow.BinaryTypes.String, nil
 	case "float64":
 		return arrow.PrimitiveTypes.Float64, nil
 	case "Time":
 		return &arrow.Date64Type{}, nil
-	case "geometry":
-		return gTypes.GenericGeometry(), nil
 	default:
 		return nil, fmt.Errorf(berrors.ErrInvalidType.Error(), inType.Name())
 	}

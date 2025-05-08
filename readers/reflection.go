@@ -13,4 +13,5 @@ var GoPrimitivesToArrowPrimitivesMap = map[reflect.Kind]arrow.DataType{
 	reflect.Int:       arrow.PrimitiveTypes.Int64,
 	reflect.String:    arrow.BinaryTypes.String,
 	reflect.Interface: arrow.BinaryTypes.String,
+	reflect.Struct:    &arrow.ExtensionBase{},
 }

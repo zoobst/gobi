@@ -19,7 +19,7 @@ var (
 
 	ErrColTypeMismatch error = errors.New("arrow/array: column type mismatch: %v != %v")
 
-	ErrInvalidGeometryType error = errors.New("invalid/unknown geometry type")
+	ErrInvalidGeometryType error = errors.New("invalid/unknown geometry type: %v")
 
 	ErrInvalidNumRows error = errors.New("invalid number of rows: %d")
 
@@ -34,4 +34,6 @@ var (
 	ErrIncompatibleCoordinates error = errors.New("coordinate type %f, %f is incompatible with WGS84 degree coordinate system. Please specify a projected coordinate system to continue")
 
 	ErrInvalidUnit error = errors.New("invalid unit: %s provided")
+
+	ErrUnableToParseStringCoords error = errors.New("unable to parse provided string coordinates: %s")
 )
