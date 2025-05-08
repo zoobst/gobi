@@ -1,4 +1,5 @@
 testData
 *.py
+*.ipynb
 .DS_STORE
-mem.prof
+*.prof

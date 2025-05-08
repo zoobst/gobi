@@ -58,6 +58,12 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 			builderArray = append(builderArray, array.NewDate64Builder(memory.DefaultAllocator))
 		case arrow.BinaryTypes.Binary:
 			builderArray = append(builderArray, array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary))
+		case gTypes.GenericPolygon():
+			builderArray = append(builderArray, array.NewExtensionBuilder(memory.DefaultAllocator, gTypes.GenericPolygon()))
+		case gTypes.GenericLineString():
+			builderArray = append(builderArray, array.NewExtensionBuilder(memory.DefaultAllocator, gTypes.GenericLineString()))
+		case gTypes.GenericPoint():
+			builderArray = append(builderArray, array.NewExtensionBuilder(memory.DefaultAllocator, gTypes.GenericPoint()))
 		default:
 			builderArray = append(builderArray, array.NewStringBuilder(memory.DefaultAllocator))
 		}
@@ -65,6 +71,9 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 
 	if *options.HasHeader {
 		_, err = genericReader.Read()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	for {

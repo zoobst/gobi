@@ -6,6 +6,7 @@ import (
 	"log"
 
 	gbcsv "github.com/zoobst/gobi/gbCsv"
+	gTypes "github.com/zoobst/gobi/globalTypes"
 )
 
 type TestCSVTypes struct {
@@ -23,11 +24,17 @@ type TestCSVTypes struct {
 	Embarked    string  `csv:"Embarked"`
 }
 
+type TestGeometryCSVTypes struct {
+	Geometry  gTypes.Geometry `csv:"geometry" dtype:"geometry"`
+	Placename string          `csv:"placename"`
+}
+
 var (
-	testDir       = "testData"
-	testFileName  = "titanic_test"
-	ErrFailedTest = errors.New("failed test: %s")
-	df            *DataFrame
+	testDir              = "testData"
+	testFileName         = "titanic_test"
+	testGeometryFileName = "israel"
+	ErrFailedTest        = errors.New("failed test: %s")
+	df                   *DataFrame
 )
 
 func TestReadCSVFromType() bool {
@@ -39,6 +46,21 @@ func TestReadCSVFromType() bool {
 	df = idf
 
 	if rows, cols := idf.Shape(); rows > 0 && cols > 0 {
+		return true
+	}
+
+	return false
+}
+
+func TestReadGeometryCSVFromType() bool {
+	idf, err := ReadCSVFromType(TestGeometryCSVTypes{}, fmt.Sprintf("%s/%s.csv", testDir, testGeometryFileName), gbcsv.CsvReadOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	df = idf
+
+	if rows, cols := df.Shape(); rows > 0 && cols > 0 {
 		return true
 	}
 

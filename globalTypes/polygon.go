@@ -3,8 +3,7 @@ package globalTypes
 import (
 	"fmt"
 	"hash/fnv"
-
-	"github.com/zoobst/gobi/geojson"
+	"reflect"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
@@ -26,8 +25,8 @@ func (p Polygon) ID() arrow.Type { return arrow.EXTENSION }
 
 func (p Polygon) Name() string { return "Polygon" }
 
-func (p Polygon) StorageType(dt arrow.DataType) arrow.DataType {
-	return arrow.ListOf(arrow.ListOf(arrow.PrimitiveTypes.Float64)) // Storage as list of list of floats (x,y)
+func (p Polygon) StorageType() arrow.DataType {
+	return arrow.ListOf(arrow.ListOf(arrow.PrimitiveTypes.Float64)) // Storage as list of list of floats ((x,y), (x,y))
 }
 
 func (p Polygon) Fingerprint() string {
@@ -36,28 +35,37 @@ func (p Polygon) Fingerprint() string {
 	return string(h.Sum(nil))
 }
 
-func (p Polygon) Equal(other arrow.DataType) bool {
-	//Compare the fingerprints.
-	if other, ok := other.(*Polygon); ok {
-		return p.Fingerprint() == other.Fingerprint()
-	}
-	return false
-}
-
 func (p Polygon) Serialize() string { return p.String() }
 
-func (p Polygon) Deserialize() arrow.DataType { return &Polygon{} }
+func (p Polygon) Deserialize(arrow.DataType, string) (arrow.ExtensionType, error) {
+	return Polygon{}, nil
+}
 
 func (p Polygon) ExtensionName() string { return p.Name() }
 
 func (p Polygon) ExtensionMetadata() string { return "" }
 
-// GetGeometry returns the GeoJSON geometry representation of the geometry.
-func (p Polygon) GeoJSONGeometry() geojson.GeoJSONGeometry {
-	return geojson.GeoJSONGeometry{
-		Type:        "Polygon",
-		Coordinates: [][][2]float64{p.Coords()},
+func (p Polygon) ExtensionEquals(other arrow.ExtensionType) bool {
+	switch t := other.(type) {
+	case Geometry:
+		return p.Equal(t)
+	default:
+		return false
 	}
+}
+
+func (p Polygon) Layout() arrow.DataTypeLayout {
+	return arrow.DataTypeLayout{
+		Buffers: []arrow.BufferSpec{
+			{Kind: arrow.KindBitmap},   // validity
+			{Kind: arrow.KindVarWidth}, // offsets
+		},
+		HasDict: false,
+	}
+}
+
+func (p Polygon) ArrayType() reflect.Type {
+	return reflect.TypeOf(PolygonArray{})
 }
 
 type PolygonArray struct {

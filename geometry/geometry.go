@@ -2,27 +2,28 @@ package geometry
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"strings"
 
 	berrors "github.com/zoobst/gobi/bErrors"
 )
 
-// ParsePoint parses a WKT Point string
+// ParsePoint parses WKT string of Points, LineStrings, and Polygons
 func ParseWKT(s string) (Geometry, error) {
-	if (len(s) >= 5) && (s[:5] == "POINT") {
+	if (len(s) > 5) && (s[:5] == "POINT") {
 		t, err := ParsePointWKT(s)
 		if err != nil {
 			return nil, err
 		}
 		return t, nil
-	} else if (len(s) >= 7) && (s[:7] == "POLYGON") {
+	} else if (len(s) > 7) && (s[:7] == "POLYGON") {
 		t, err := ParsePolygonWKT(s)
 		if err != nil {
 			return nil, err
 		}
 		return t, nil
-	} else if (len(s) >= 10) && (s[:10] == "LINESTRING") {
+	} else if (len(s) > 10) && (s[:10] == "LINESTRING") {
 		t, err := ParseLineStringWKT(s)
 		if err != nil {
 			return nil, err
@@ -36,7 +37,10 @@ func ParseWKT(s string) (Geometry, error) {
 // ParsePoint parses a WKT Point string
 func ParsePointWKT(s string) (Point, error) {
 	var coords [2]float64
-	fmt.Scanf("%f %f", coords[0], coords[1])
+	_, err := fmt.Scanf("%f %f", coords[0], coords[1])
+	if err != nil {
+		return Point{}, err
+	}
 	return Point{X: coords[0], Y: coords[1]}, nil
 }
 
@@ -130,6 +134,34 @@ func minX[p *[]Point](points *[]Point) (lVal float64) {
 	return lVal
 }
 
+func estimateUTMEPSG(g Geometry) int {
+	if g.CRS().Zone != "" {
+		return g.CRS().EPSG
+	}
+	var p Point
+	switch t := g.(type) {
+	case *Point:
+		p = t.Copy()
+	case *Polygon:
+		p = t.Centroid()
+	case *LineString:
+		p = t.Centroid()
+	default:
+		log.Fatal(berrors.ErrInvalidGeometryType)
+	}
+
+	// Handle Psuedo-Mercator; convert to 4326
+	if g.CRS().Projected {
+		p.X, p.Y = MercatorToLL(p.X, p.Y)
+	}
+
+	zone := int((p.X+180)/6) + 1
+	if p.Y >= 0 {
+		return 32600 + zone // Northern hemisphere
+	}
+	return 32700 + zone // Southern hemisphere
+}
+
 // haversine calculates the great-circle distance between two points on the Earth.
 // The two points must be provided as longitude/latitude pairs (in degrees),
 // and the distance is returned in the unit specified.
@@ -148,7 +180,7 @@ func minX[p *[]Point](points *[]Point) (lVal float64) {
 //	dist := Haversine(p1, p2, "mi")      // Distance in miles
 //
 // Note: For small distances (<1km), consider Vincenty's formula for better accuracy.
-func haversine(p1, p2 Point, unit string) float64 {
+func haversine(p1, p2 *Point, unit string) float64 {
 	// Earth radius by unit
 	var R float64
 	switch strings.ToLower(unit) {
@@ -175,6 +207,33 @@ func haversine(p1, p2 Point, unit string) float64 {
 	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 
 	return R * c
+}
+
+func projectedDistance(p1, p2 *Point, unit string) float64 {
+	dx := p2.X - p1.X
+	dy := p2.Y - p1.Y
+	metersDist := math.Sqrt(dx*dx + dy*dy)
+
+	if unit == "m" {
+		return metersDist
+	}
+	return metersToUnit(metersDist, unit)
+}
+
+func metersToUnit(meters float64, unit string) float64 {
+	switch unit {
+	case "km":
+		return meters / 1000
+	case "mi":
+		return meters / 1609.344
+	case "ft":
+		return meters / 0.3048
+	case "nmi":
+		return meters / 1852
+	default:
+		log.Fatal(fmt.Errorf(berrors.ErrInvalidUnit.Error(), unit))
+	}
+	return 0.0
 }
 
 func degreesToRadians(deg float64) float64 {

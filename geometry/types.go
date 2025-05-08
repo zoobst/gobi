@@ -2,17 +2,22 @@ package geometry
 
 import (
 	"fmt"
+	"log"
 )
 
 type Geometry interface {
 	fmt.Stringer
 	CRS() CRS
+	ToCRS(epsg int) Geometry
+	EstimateUTMCRS() CRS
 	String() string
 	Type() string
+	Equal(Geometry) bool
 	WKT() string
 	WKB() ([]byte, error)
 	WKBHex() (string, error)
 	Coords() [][2]float64
+	Bounds() Box
 	MaxX() float64
 	MaxY() float64
 	MinX() float64
@@ -20,32 +25,46 @@ type Geometry interface {
 }
 
 type CRS struct {
-	CRS  string
+	BoundBox Box
+
+	Name      string
+	AreaOfUse string
+	Zone      string
+
 	EPSG int
+
+	Projected bool
 }
 
+// minx, miny, maxx, maxy
+type Box [4]float64
+
+// x, y (lon, lat)
 type Coord [2]float64
 
 func (c Coord) ToPoint() Point {
-	return Point{X: c[0], Y: c[1]}
+	p, err := NewPoint(c[0], c[1], nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return p
 }
 
+// x, y (lon, lat)
 type Point struct {
 	fmt.Stringer
-	Geometry
 	CoordRefSys CRS
-	X           float64 `json:"lon"`
-	Y           float64 `json:"lat"`
+
+	X float64 `json:"lon"`
+	Y float64 `json:"lat"`
 }
 
 type Polygon struct {
 	fmt.Stringer
-	Geometry
 	Points []Point
 }
 
 type LineString struct {
 	fmt.Stringer
-	Geometry
 	Points []Point
 }

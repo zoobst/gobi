@@ -21,9 +21,9 @@ type Reader interface {
 func ArrowTypeFromString(typeStr string) (arrow.DataType, error) {
 	switch strings.ToLower(typeStr) {
 	case "datetime":
-		return arrow.FixedWidthTypes.Time32ms, nil
+		return &arrow.Date64Type{}, nil
 	case "geometry":
-		return gTypes.GeometryType{}.DataType(), nil
+		return gTypes.GenericGeometry(), nil
 	case "int":
 		fallthrough
 	case "int64":
@@ -49,13 +49,19 @@ func ArrowTypeFromGo(inType reflect.Type) (arrow.DataType, error) {
 	}
 	switch inType.Name() {
 	case "int":
-		return arrow.PrimitiveTypes.Int32, nil
+		return arrow.PrimitiveTypes.Int64, nil
 	case "string":
+		f := inType.Field(0).Name
+		if strings.ToLower(f) == "geometry" {
+			return gTypes.GenericGeometry(), nil
+		}
 		return arrow.BinaryTypes.String, nil
 	case "float64":
 		return arrow.PrimitiveTypes.Float64, nil
 	case "Time":
 		return &arrow.Date64Type{}, nil
+	case "geometry":
+		return gTypes.GenericGeometry(), nil
 	default:
 		return nil, fmt.Errorf(berrors.ErrInvalidType.Error(), inType.Name())
 	}

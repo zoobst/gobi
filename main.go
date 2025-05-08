@@ -66,15 +66,19 @@ func main() {
 	defer f.Close()
 	defer pprof.WriteHeapProfile(f)
 
-	if res := TestReadCSVFromType(); res == false {
+	if res := TestReadCSVFromType(); !res {
 		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestReadCSVFromType"))
 	}
 
-	if res := TestIloc(); res == false {
+	if res := TestReadGeometryCSVFromType(); !res {
+		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestReadGeometryCSVFromType"))
+	}
+
+	if res := TestIloc(); !res {
 		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestIloc"))
 	}
 
-	if res := TestCol(); res == false {
+	if res := TestCol(); !res {
 		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestCol"))
 	}
 

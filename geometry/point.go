@@ -7,19 +7,72 @@ import (
 	"fmt"
 )
 
+func NewPoint(x, y float64, crs *CRS) (Point, error) {
+	p := Point{
+		X: x,
+		Y: y,
+	}
+	if crs == nil {
+		if ok := p.checkDegrees(); !ok {
+			p.CoordRefSys = PSEUDOMERCATOR
+		} else {
+			p.CoordRefSys = WGS84
+		}
+	}
+	return p, nil
+}
+
+func (p Point) Equal(other Geometry) bool {
+	switch t := other.(type) {
+	case *Point:
+		if t.X == p.X && t.Y == p.Y && t.CRS().EPSG == p.CRS().EPSG {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func (p Point) ToCRS(epsg int) Geometry {
+	newP := Point{
+		CoordRefSys: CRSbyEPSG[epsg],
+	}
+	if p.CRS().Projected && newP.CRS().Projected {
+		newP.X, newP.Y = p.X, p.Y
+	} else if p.CRS().Projected && !newP.CRS().Projected {
+		newP.X, newP.Y = MercatorToLL(p.X, p.Y)
+	} else if !p.CRS().Projected && newP.CRS().Projected {
+		newP.X, newP.Y = LLToMercator(p.X, p.Y)
+	}
+	return newP
+}
+
+func (p Point) EstimateUTMCRS() CRS {
+	epsg := estimateUTMEPSG(p)
+	return CRSbyEPSG[epsg]
+}
+
+func (p Point) Bounds() Box {
+	return Box{p.X, p.Y, p.X, p.Y}
+}
+
 func (p Point) Distance(pt2 Point, unit string) float64 {
-	return haversine(p, pt2, unit)
+	if p.CRS().Projected {
+		return projectedDistance(&p, &pt2, unit)
+	}
+	return haversine(&p, &pt2, unit)
 }
 
 func (p Point) String() string { return fmt.Sprintf("%f %f", p.X, p.Y) }
 
-func (p Point) Type() string { return "Point" }
+func (p Point) Type() string { return "Geometry" }
 
-func (p Point) Name() string { return p.Type() }
+func (p Point) Name() string { return "Point" }
 
 func (p Point) CRS() CRS { return p.CoordRefSys }
 
-func (p Point) WKT() string { return fmt.Sprintf("POINT (%f %f)", p.X, p.Y) }
+func (p Point) WKT() string { return fmt.Sprintf("POINT(%f %f)", p.X, p.Y) }
 
 func (p Point) WKB() ([]byte, error) {
 	buf := new(bytes.Buffer)
@@ -59,10 +112,22 @@ func (p Point) Coords() (fList [][2]float64) {
 	return fList
 }
 
+func (p Point) MinX() float64 { return p.X }
+
+func (p Point) MinY() float64 { return p.Y }
+
 func (p Point) MaxX() float64 { return p.X }
 
 func (p Point) MaxY() float64 { return p.Y }
 
-func (p Point) MinX() float64 { return p.X }
+func (p *Point) Copy() Point {
+	copyP := *p
+	return copyP
+}
 
-func (p Point) MinY() float64 { return p.Y }
+func (p Point) checkDegrees() bool {
+	if p.X >= -90.0 && p.X <= 90.0 && p.Y >= -180.0 && p.Y <= 180.0 {
+		return true
+	}
+	return false
+}

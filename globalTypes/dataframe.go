@@ -17,11 +17,6 @@ type Frame interface {
 	Head(int) (DataFrame, error)
 	Tail(int) (DataFrame, error)
 	Shape() (int, int)
-	NumRows() int64
-	NumCols() int64
-	String() string
-	Schema() *arrow.Schema
-	AddColumn(int, arrow.Field, arrow.Column) (arrow.Table, error)
 }
 
 // NewDataFrame creates a new DataFrame from Arrow Table

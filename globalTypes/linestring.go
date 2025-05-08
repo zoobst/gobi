@@ -3,10 +3,10 @@ package globalTypes
 import (
 	"fmt"
 	"hash/fnv"
+	"reflect"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/zoobst/gobi/geojson"
 )
 
 func (l LineString) String() (strList string) {
@@ -19,46 +19,53 @@ func (l LineString) String() (strList string) {
 	return strList[2:]
 }
 
-func (p LineString) ID() arrow.Type { return arrow.EXTENSION }
+func (LineString) ID() arrow.Type { return arrow.EXTENSION }
 
-func (p LineString) Type() string { return "LineString" }
+func (LineString) Type() string { return "Geometry" }
 
-func (p LineString) Name() string { return "LineString" }
+func (LineString) Name() string { return "LineString" }
 
-func (p LineString) StorageType(dt arrow.DataType) arrow.DataType {
-	return arrow.ListOf(arrow.PrimitiveTypes.Float64) // Storage as list of floats (x,y)
+func (LineString) StorageType() arrow.DataType {
+	return arrow.ListOf(arrow.ListOf(arrow.PrimitiveTypes.Float64)) // Storage as list of list of floats ((x,y), (x,y))
 }
 
-func (p LineString) Fingerprint() string {
+func (l LineString) Fingerprint() string {
 	h := fnv.New64a()
-	h.Write([]byte(p.Name())) // Use name as part of the fingerprint.
+	h.Write([]byte(l.Name())) // Use name as part of the fingerprint.
 	return string(h.Sum(nil))
 }
 
-func (p LineString) Equal(other arrow.DataType) bool {
-	//Compare the fingerprints.
-	if other, ok := other.(*LineString); ok {
-		return p.Fingerprint() == other.Fingerprint()
-	}
-	return false
+func (l LineString) Serialize() string { return l.String() }
+
+func (LineString) Deserialize(arrow.DataType, string) (arrow.ExtensionType, error) {
+	return LineString{}, nil
 }
 
-func (p LineString) Serialize() string { return p.String() }
+func (l LineString) ExtensionName() string { return l.Name() }
 
-func (p LineString) Deserialize() arrow.DataType {
-	return &LineString{}
+func (LineString) ExtensionMetadata() string { return "" }
+
+func (l LineString) ExtensionEquals(other arrow.ExtensionType) bool {
+	switch t := other.(type) {
+	case Geometry:
+		return l.Equal(t)
+	default:
+		return false
+	}
 }
 
-func (p LineString) ExtensionName() string { return p.Name() }
-
-func (p LineString) ExtensionMetadata() string { return "" }
-
-// GetGeometry returns the GeoJSON geometry representation of the geometry.
-func (l LineString) GeoJSONGeometry() geojson.GeoJSONGeometry {
-	return geojson.GeoJSONGeometry{
-		Type:        "LineString",
-		Coordinates: [][][2]float64{l.Coords()},
+func (LineString) Layout() arrow.DataTypeLayout {
+	return arrow.DataTypeLayout{
+		Buffers: []arrow.BufferSpec{
+			{Kind: arrow.KindBitmap},   // validity
+			{Kind: arrow.KindVarWidth}, // offsets
+		},
+		HasDict: false,
 	}
+}
+
+func (LineString) ArrayType() reflect.Type {
+	return reflect.TypeOf(LineStringArray{})
 }
 
 type LineStringArray struct {
@@ -66,7 +73,7 @@ type LineStringArray struct {
 	listArray *array.List
 }
 
-func (p LineString) NewArray(data array.Data) array.ExtensionArray {
+func (LineString) NewArray(data array.Data) array.ExtensionArray {
 	return &LineStringArray{
 		listArray: array.NewListData(&data),
 	}

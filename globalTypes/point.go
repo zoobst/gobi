@@ -3,8 +3,7 @@ package globalTypes
 import (
 	"fmt"
 	"hash/fnv"
-
-	"github.com/zoobst/gobi/geojson"
+	"reflect"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
@@ -18,7 +17,7 @@ func (p Point) Type() string { return "Point" }
 
 func (p Point) Name() string { return "Point" }
 
-func (p Point) StorageType(dt arrow.DataType) arrow.DataType {
+func (p Point) StorageType() arrow.DataType {
 	return arrow.ListOf(arrow.PrimitiveTypes.Float64) // Storage as list of floats (x,y)
 }
 
@@ -28,29 +27,38 @@ func (p Point) Fingerprint() string {
 	return string(h.Sum(nil))
 }
 
-func (p Point) Equal(other arrow.DataType) bool {
-	//Compare the fingerprints.
-	if other, ok := other.(*Point); ok {
-		return p.Fingerprint() == other.Fingerprint()
-	}
-	return false
-}
-
 func (p Point) Serialize() string { return p.String() }
 
-func (p Point) Deserialize() arrow.DataType {
-	return &Point{}
+func (p Point) Deserialize(arrow.DataType, string) (arrow.ExtensionType, error) {
+	return Point{}, nil
 }
 
 func (p Point) ExtensionName() string { return p.Name() }
 
 func (p Point) ExtensionMetadata() string { return "" }
 
-// GetGeometry returns the GeoJSON geometry representation of the geometry.
-func (p Point) GeoJSONGeometry() geojson.GeoJSONGeometry {
-	return geojson.GeoJSONGeometry{
-		Type:        "Point",
-		Coordinates: [][][2]float64{p.Coords()},
+func (p Point) ExtensionEquals(other arrow.ExtensionType) bool {
+	switch t := other.(type) {
+	case Geometry:
+		return p.Equal(t)
+	default:
+		return false
+	}
+}
+
+func (p Point) Layout() arrow.DataTypeLayout {
+	return arrow.DataTypeLayout{
+		Buffers: []arrow.BufferSpec{
+			{
+				Kind:      arrow.KindBitmap, // Null bitmap (1 bit per value)
+				ByteWidth: 0,                // Arrow handles bitmaps internally
+			},
+			{
+				Kind:      arrow.KindFixedWidth, // Data buffer
+				ByteWidth: 16,                   // 2 * float64 = 2 * 8 = 16 bytes
+			},
+		},
+		HasDict: false,
 	}
 }
 
@@ -63,6 +71,10 @@ func (p Point) NewArray(data array.Data) array.ExtensionArray {
 	return &PointArray{
 		listArray: array.NewListData(&data),
 	}
+}
+
+func (p Point) ArrayType() reflect.Type {
+	return reflect.TypeOf(PointArray{})
 }
 
 func (a PointArray) DataType() arrow.DataType { return &Point{} }

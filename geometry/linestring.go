@@ -7,6 +7,40 @@ import (
 	"fmt"
 )
 
+func (l LineString) Equal(other Geometry) bool {
+	switch t := other.(type) {
+	case *Polygon:
+		if t.Len() != l.Len() {
+			return false
+		}
+		for i := range l.Len() {
+			if !l.Points[i].Equal(t.Points[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (l LineString) ToCRS(epsg int) Geometry {
+	newL := LineString{}
+	for _, p := range l.Points {
+		newL.Points = append(newL.Points, p.ToCRS(epsg).(Point))
+	}
+	return newL
+}
+
+func (l LineString) EstimateUTMCRS() CRS {
+	epsg := estimateUTMEPSG(l)
+	return CRSbyEPSG[epsg]
+}
+
+func (l LineString) Bounds() Box {
+	return [4]float64{l.MinX(), l.MinY(), l.MaxX(), l.MaxY()}
+}
+
 // Length calculates the distance between two points on the Earth using a haversine
 // calculation. The distance is returned in the unit specified.
 //
@@ -23,9 +57,29 @@ import (
 func (l LineString) Length(unit string) float64 {
 	dist := 0.0
 	for i := range len(l.Points) - 1 {
-		dist += haversine(l.Points[i], l.Points[i+1], unit)
+		if l.CRS().Projected {
+			dist += projectedDistance(&l.Points[i], &l.Points[i+1], unit)
+		} else {
+			dist += haversine(&l.Points[i], &l.Points[i+1], unit)
+		}
 	}
 	return dist
+}
+
+func (l LineString) Centroid() Point {
+	var (
+		n = l.Len()
+	)
+	// average of points
+	var sx, sy float64
+	for _, pt := range l.Points {
+		sx += pt.X
+		sy += pt.Y
+	}
+	return Point{
+		X: sx / float64(n),
+		Y: sy / float64(n),
+	}
 }
 
 func (l LineString) String() (strList string) {
@@ -38,9 +92,9 @@ func (l LineString) String() (strList string) {
 	return strList[2:]
 }
 
-func (l LineString) Type() string { return "LineString" }
+func (l LineString) Type() string { return "Geometry" }
 
-func (l LineString) Name() string { return l.Type() }
+func (l LineString) Name() string { return "LineString" }
 
 func (l LineString) CRS() CRS { return l.Points[0].CoordRefSys }
 
@@ -73,7 +127,6 @@ func (l LineString) WKB() ([]byte, error) {
 		return nil, err
 	}
 
-	// Number of points
 	numPoints := uint32(l.Len())
 	if err := binary.Write(buf, binary.LittleEndian, numPoints); err != nil {
 		return nil, err

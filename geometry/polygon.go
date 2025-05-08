@@ -10,15 +10,47 @@ import (
 	"strings"
 )
 
+func (p Polygon) Equal(other Geometry) bool {
+	switch t := other.(type) {
+	case *Polygon:
+		if t.Len() != p.Len() {
+			return false
+		}
+		for i := range p.Len() {
+			if !p.Points[i].Equal(t.Points[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (p Polygon) ToCRS(epsg int) Geometry {
+	newP := Polygon{}
+	for _, pt := range p.Points {
+		newP.Points = append(newP.Points, pt.ToCRS(epsg).(Point))
+	}
+	return newP
+}
+
+func (p Polygon) EstimateUTMCRS() CRS {
+	epsg := estimateUTMEPSG(p)
+	return CRSbyEPSG[epsg]
+}
+
+func (p Polygon) Bounds() Box {
+	return [4]float64{p.MinX(), p.MinY(), p.MaxX(), p.MaxY()}
+}
+
 // PerimeterLength calculates the distance between all points along the Polygon's
-// perimeter using a haversine calculation. The distance is returned in the unit specified.
+// perimeter. The distance is returned in the unit specified.
 //
 // The unit argument accepts the following values (case-insensitive):
 //   - "km"  : kilometers (default if unknown)
 //   - "mi"  : miles
 //   - "nmi" : nautical miles
-//
-// Coordinates are assumed to be in WGS84 format.
 //
 // Example usage:
 //
@@ -26,7 +58,11 @@ import (
 func (p Polygon) PerimeterLength(unit string) float64 {
 	dist := 0.0
 	for i := range len(p.Points) - 1 {
-		dist += haversine(p.Points[i], p.Points[i+1], unit)
+		if p.CRS().Projected {
+			dist += projectedDistance(&p.Points[i], &p.Points[i+1], unit)
+		} else {
+			dist += haversine(&p.Points[i], &p.Points[i+1], unit)
+		}
 	}
 	return dist
 }
@@ -147,9 +183,9 @@ func (p Polygon) String() (strList string) {
 	return strList[2:]
 }
 
-func (p Polygon) Type() string { return "Polygon" }
+func (p Polygon) Type() string { return "geometry" }
 
-func (p Polygon) Name() string { return p.Type() }
+func (p Polygon) Name() string { return "Polygon" }
 
 func (p Polygon) CRS() CRS { return p.Points[0].CoordRefSys }
 
@@ -176,7 +212,6 @@ func (p Polygon) WKB() ([]byte, error) {
 	}
 
 	// WKB Polygons consist of one or more "linear rings"
-	// We'll assume this is a single, closed linear ring.
 	ring := p.Points
 
 	// Ensure the ring is closed (first point == last point)
@@ -236,7 +271,7 @@ func (p Polygon) Len() int {
 }
 
 func (p *Polygon) checkClosedPolygon() {
-	if p.Points[0] != p.Points[len(p.Points)-1] {
+	if p.Points[0] != p.Points[p.Len()-1] {
 		copyPoint := Coord(p.Points[0].Coords()[0])
 		p.Points = append(p.Points, copyPoint.ToPoint())
 	}

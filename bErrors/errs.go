@@ -30,4 +30,8 @@ var (
 	ErrIndexOutOfRange error = errors.New("index: %d is out of range of dataframe with len %d")
 
 	ErrUnknownColumn error = errors.New("unrecognized column name: %s")
+
+	ErrIncompatibleCoordinates error = errors.New("coordinate type %f, %f is incompatible with WGS84 degree coordinate system. Please specify a projected coordinate system to continue")
+
+	ErrInvalidUnit error = errors.New("invalid unit: %s provided")
 )

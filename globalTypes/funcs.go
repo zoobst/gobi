@@ -9,6 +9,22 @@ func CheckGeometry(s string) bool {
 	return false
 }
 
+func GenericGeometry() Geometry {
+	return Point{}
+}
+
+func GenericPoint() Geometry {
+	return Point{}
+}
+
+func GenericPolygon() Geometry {
+	return Polygon{}
+}
+
+func GenericLineString() Geometry {
+	return LineString{}
+}
+
 func NewHashSet() *HashSet {
 	return &HashSet{
 		data: make(map[any]struct{}),

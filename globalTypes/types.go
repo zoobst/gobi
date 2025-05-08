@@ -3,7 +3,6 @@ package globalTypes
 import (
 	"fmt"
 
-	"github.com/zoobst/gobi/geojson"
 	"github.com/zoobst/gobi/geometry"
 
 	"github.com/apache/arrow/go/arrow/memory"
@@ -30,25 +29,9 @@ type HashSet struct {
 
 type Geometry interface {
 	fmt.Stringer
+	arrow.DataType
+	arrow.ExtensionType
 	geometry.Geometry
-	String() string
-	Type() string
-	WKT() string
-	Coords() [][2]float64
-	MaxX() float64
-	MaxY() float64
-	MinX() float64
-	MinY() float64
-	GeoJSONGeometry() geojson.GeoJSONGeometry
-	StorageType(arrow.DataType) arrow.DataType
-	ID() arrow.Type
-	Name() string
-	Fingerprint() string
-	Equal(arrow.DataType) bool
-	Serialize() string
-	Deserialize() arrow.DataType
-	ExtensionName() string
-	ExtensionMetadata() string
 	NewArray(array.Data) array.ExtensionArray
 }
 
