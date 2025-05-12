@@ -1,6 +1,8 @@
 package geometry
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -8,6 +10,37 @@ import (
 
 	berrors "github.com/zoobst/gobi/bErrors"
 )
+
+func ParseWKB(data []byte) (Geometry, error) {
+	if len(data) < 5 {
+		return nil, errors.New("WKB too short to contain type")
+	}
+
+	byteOrder := data[0]
+	var bo binary.ByteOrder
+	switch byteOrder {
+	case 0:
+		bo = binary.BigEndian
+	case 1:
+		bo = binary.LittleEndian
+	default:
+		return nil, errors.New("invalid byte order in WKB")
+	}
+
+	// Read geometry type (next 4 bytes)
+	geomType := bo.Uint32(data[1:5])
+
+	switch geomType {
+	case WKB_POINT:
+		return Point{}.FromWKB(data)
+	case WKB_LINESTRING:
+		return LineString{}.FromWKB(data)
+	case WKB_POLYGON:
+		return Polygon{}.FromWKB(data)
+	default:
+		return nil, fmt.Errorf("unsupported WKB geometry type: %d", geomType)
+	}
+}
 
 func ParseStringGeometry(s string) (geom Geometry, err error) {
 	// Try to parse using WKT
@@ -35,7 +68,7 @@ func ParseWKT(s string) (t Geometry, err error) {
 			return
 		}
 	} else {
-		return nil, berrors.ErrInvalidGeometryType
+		return nil, fmt.Errorf(berrors.ErrInvalidGeometryType.Error(), t)
 	}
 	return nil, err
 }
@@ -43,6 +76,10 @@ func ParseWKT(s string) (t Geometry, err error) {
 // ParsePoint parses a WKT Point string
 func ParsePointWKT(s string) (Point, error) {
 	var coords Coord
+	s = strings.TrimPrefix(s, "POINT(")
+	s = strings.TrimPrefix(s, "POINT (")
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, ")")
 	_, err := fmt.Sscanf(s, "%f %f", &coords[0], &coords[1])
 	if err != nil {
 		return Point{}, err
@@ -52,7 +89,8 @@ func ParsePointWKT(s string) (Point, error) {
 
 // ParseLineString parses a WKT LineString string
 func ParseLineStringWKT(s string) (LineString, error) {
-	s = strings.TrimPrefix(s, "LINESTRING")
+	s = strings.TrimPrefix(s, "LINESTRING(")
+	s = strings.TrimPrefix(s, "LINESTRING (")
 	s = strings.TrimSpace(s)
 	s = strings.TrimSuffix(s, ")")
 	coords := strings.Split(s, ",")
@@ -176,7 +214,7 @@ func estimateUTMEPSG(g Geometry) int {
 	case *LineString:
 		p = t.Centroid()
 	default:
-		log.Fatal(berrors.ErrInvalidGeometryType)
+		log.Fatal(fmt.Errorf(berrors.ErrInvalidGeometryType.Error(), g))
 	}
 
 	// Handle Psuedo-Mercator; convert to 4326

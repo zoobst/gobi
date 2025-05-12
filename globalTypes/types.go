@@ -29,7 +29,6 @@ type HashSet struct {
 
 type Geometry interface {
 	fmt.Stringer
-	arrow.DataType
 	arrow.ExtensionType
 	geometry.Geometry
 	NewArray(array.Data) array.ExtensionArray

@@ -18,6 +18,7 @@ import (
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
+	arrowcsv "github.com/apache/arrow/go/v18/arrow/csv"
 	"github.com/apache/arrow/go/v18/arrow/memory"
 )
 
@@ -43,42 +44,11 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 	var builderArray []array.Builder
 
 	for _, r := range genericReader.Schema.Fields() {
-		switch r.Type {
-		case arrow.PrimitiveTypes.Float64:
-			builderArray = append(builderArray, array.NewFloat64Builder(memory.DefaultAllocator))
-		case arrow.PrimitiveTypes.Int64:
-			builderArray = append(builderArray, array.NewInt64Builder(memory.DefaultAllocator))
-		case arrow.FixedWidthTypes.Boolean:
-			builderArray = append(builderArray, array.NewBooleanBuilder(memory.DefaultAllocator))
-		case arrow.BinaryTypes.String:
-			builderArray = append(builderArray, array.NewStringBuilder(memory.DefaultAllocator))
-		case arrow.FixedWidthTypes.Date64:
-			builderArray = append(builderArray, array.NewDate64Builder(memory.DefaultAllocator))
-		case gTypes.Point{}:
-			if err = arrow.RegisterExtensionType(gTypes.Point{}); err != nil {
-				return nil, err
-			}
-			builderArray = append(builderArray, array.NewExtensionBuilder(memory.DefaultAllocator, gTypes.Point{}))
-		case arrow.BinaryTypes.Binary:
-			builderArray = append(builderArray, array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary))
-		default:
-			if err = arrow.RegisterExtensionType(gTypes.Point{}); err != nil {
-				if !strings.Contains(err.Error(), "already registered") {
-					return nil, err
-				}
-			}
-			if err = arrow.RegisterExtensionType(gTypes.Polygon{}); err != nil {
-				if !strings.Contains(err.Error(), "already registered") {
-					return nil, err
-				}
-			}
-			if err = arrow.RegisterExtensionType(gTypes.LineString{}); err != nil {
-				if !strings.Contains(err.Error(), "already registered") {
-					return nil, err
-				}
-			}
-			builderArray = append(builderArray, array.NewExtensionBuilder(memory.DefaultAllocator, gTypes.Polygon{}))
+		builder, err := readers.BuildersFromTypes(r.Type)
+		if err != nil {
+			return nil, err
 		}
+		builderArray = append(builderArray, builder)
 	}
 
 	if *options.HasHeader {
@@ -88,7 +58,16 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 		}
 	}
 
-	for {
+	var (
+		i          int
+		sliceSkips [2]int
+	)
+	if options.SkipSlice != nil {
+		sliceSkips = *options.SkipSlice
+	} else {
+		sliceSkips = defaultSkipSlice
+	}
+	for ; ; i++ {
 		r, err := genericReader.Read()
 		if err != nil {
 			if err == io.EOF {
@@ -96,6 +75,9 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 			} else {
 				return nil, err
 			}
+		}
+		if i >= sliceSkips[0] && i < sliceSkips[1] {
+			continue
 		}
 
 		for idx, field := range r {
@@ -105,38 +87,66 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 			}
 			switch t := builderArray[idx].(type) {
 			case *array.StringBuilder:
-				log.Println("we're here for some reason")
 				t.Append(field)
 			case *array.Float64Builder:
-				f, err := strconv.ParseFloat(field, 64)
-				if err != nil {
+				if f, err := strconv.ParseFloat(field, 64); err != nil {
 					return nil, err
+				} else {
+					t.Append(f)
 				}
-				t.Append(f)
 			case *array.BinaryBuilder:
 				t.Append([]byte(field))
 			case *array.Int64Builder:
-				i, err := strconv.ParseInt(field, 10, 64)
-				if err != nil {
+				if i, err := strconv.ParseInt(field, 10, 64); err == nil {
+					t.Append(i)
+				} else {
 					return nil, err
 				}
-				t.Append(i)
 			case *array.BooleanBuilder:
 				if b, err := strconv.ParseBool(field); err == nil {
 					t.Append(b)
-				}
-			case *array.ExtensionBuilder:
-				geom, err := gTypes.ParseStringGeometry(field)
-				if err != nil {
+				} else {
 					return nil, err
 				}
-
-				binaryBuilder, ok := t.StorageBuilder().(*array.BinaryBuilder)
-				if !ok {
-					return nil, fmt.Errorf("expected BinaryBuilder for Point storage")
+			case *array.ExtensionBuilder:
+				parsed, err := gTypes.ParseStringGeometry(field)
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse geometry: %w", err) // field is like: "POLYGON ((...))"
 				}
-
-				binaryBuilder.Append(geom.WKB())
+				log.Println("identifying parsed's type")
+				switch parsed.(type) {
+				case gTypes.Polygon:
+					log.Println("guess its a polygon")
+					// Cast to Polygon type, serialize to WKB
+					polygon, ok := parsed.(gTypes.Polygon)
+					if !ok {
+						log.Println(parsed.Type())
+						log.Println("type:", t.Type())
+						log.Println("name:", t.Type().Name())
+						return nil, fmt.Errorf("not a Polygon type")
+					}
+					t.StorageBuilder().(*array.BinaryBuilder).Append(polygon.WKB()) // This goes into the Binary storage behind the ExtensionBuilder
+				case gTypes.Point:
+					point, ok := parsed.(gTypes.Point)
+					if !ok {
+						return nil, fmt.Errorf("not a Point type")
+					}
+					t.StorageBuilder().(*array.BinaryBuilder).Append(point.WKB()) // This goes into the Binary storage behind the ExtensionBuilder
+				case gTypes.LineString:
+					linestring, ok := parsed.(gTypes.LineString)
+					if !ok {
+						return nil, fmt.Errorf("not a LineString type")
+					}
+					t.StorageBuilder().(*array.BinaryBuilder).Append(linestring.WKB()) // This goes into the Binary storage behind the ExtensionBuilder
+				case *gTypes.GeometryType:
+					log.Println("its a geometrytype")
+					gType, ok := parsed.(*gTypes.GeometryType)
+					if !ok {
+						return nil, fmt.Errorf("not a GeometryType")
+					}
+					t.StorageBuilder().(*array.BinaryBuilder).Append(gType.WKB())
+					log.Println(gType.WKB())
+				}
 			}
 		}
 	}
@@ -144,9 +154,21 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 	columnList := []arrow.Column{}
 
 	for idx, p := range builderArray {
-		arr := p.NewArray()
-		log.Println("schema type:", genericReader.Schema.Field(idx))
-		columnList = append(columnList, arrow.NewColumnFromArr(genericReader.Schema.Field(idx), arr))
+		var arr arrow.Array
+		if p.Type().String() == "extension<Geometry>" {
+			arr = gTypes.GeometryType{}.NewArray(*p.(*array.ExtensionBuilder).NewArray().Data().(*array.Data))
+		} else {
+			arr = p.NewArray()
+		}
+		log.Println(arr)
+		field := genericReader.Schema.Field(idx)
+
+		log.Println(arr.Data())
+		log.Println(arr.DataType())
+
+		log.Println("schema type:", field)
+		log.Println(genericReader.Schema)
+		columnList = append(columnList, arrow.NewColumnFromArr(field, arr))
 	}
 
 	df, err := gTypes.NewDataFrameFromColumns(columnList, genericReader.Schema)
@@ -216,7 +238,7 @@ func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 		}
 	}
 
-	if *options.InferSchema == true {
+	if *options.InferSchema {
 		options.Schema, err = inferSchema(firstRecord, exp.headerRow)
 		if err != nil {
 			return nil, err
@@ -310,7 +332,7 @@ func inferSchema(record []string, headers []string) (*arrow.Schema, error) {
 		case "int":
 			typeMap[idx] = &arrow.Int64Type{}
 		case "geometry":
-			typeMap[idx] = &arrow.ExtensionBase{}
+			typeMap[idx] = gTypes.Point{}
 		default:
 			typeMap[idx] = &arrow.StringType{}
 		}
@@ -364,4 +386,33 @@ func inferType(s string) string {
 
 	// Default to string
 	return "string"
+}
+
+func ReadCSVUsingArrow[T any](t T, path string, options ...arrowcsv.Option) (*gTypes.DataFrame, error) {
+	schema, err := readers.CSVStructToArrowSchema(t)
+	log.Println("t:", t)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	arrowReader := arrowcsv.NewReader(file, schema, options...)
+	defer arrowReader.Release()
+
+	dataRecords := []arrow.Record{}
+
+	for arrowReader.Next() {
+		dataRecords = append(dataRecords, arrowReader.Record())
+		if arrowReader.Err() != nil {
+			return nil, arrowReader.Err()
+		}
+	}
+
+	table := array.NewTableFromRecords(schema, dataRecords)
+	return gTypes.NewDataFrameFromTable(table), nil
 }

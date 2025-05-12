@@ -3,7 +3,9 @@ package globalTypes
 import (
 	"fmt"
 	"hash/fnv"
+	"log"
 	"reflect"
+	"strings"
 
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
@@ -25,15 +27,14 @@ func (p Polygon) String() (strList string) {
 	return strList[2:]
 }
 
-func (p Polygon) Type() string { return "Polygon" }
+func (p Polygon) Type() string { return "Geometry" }
 
 func (p Polygon) ID() arrow.Type { return arrow.EXTENSION }
 
 func (p Polygon) Name() string { return "Polygon" }
 
 func (p Polygon) StorageType() arrow.DataType {
-	return arrow.BinaryTypes.LargeBinary
-	// return arrow.ListOf(arrow.ListOf(arrow.PrimitiveTypes.Float64)) // Storage as list of list of floats ((x,y), (x,y))
+	return arrow.BinaryTypes.Binary
 }
 
 func (p Polygon) Fingerprint() string {
@@ -44,13 +45,16 @@ func (p Polygon) Fingerprint() string {
 
 func (p Polygon) Serialize() string { return p.String() }
 
-func (p Polygon) Deserialize(arrow.DataType, string) (arrow.ExtensionType, error) {
+func (p Polygon) Deserialize(storage arrow.DataType, _ string) (arrow.ExtensionType, error) {
+	if storage.ID() != arrow.BINARY {
+		return nil, fmt.Errorf("invalid storage type for Polygon: %s", storage.Name())
+	}
 	return Polygon{}, nil
 }
 
 func (p Polygon) ExtensionName() string { return p.Name() }
 
-func (p Polygon) ExtensionMetadata() string { return "" }
+func (p Polygon) ExtensionMetadata() string { return "type:geometry" }
 
 func (p Polygon) ExtensionEquals(other arrow.ExtensionType) bool {
 	switch t := other.(type) {
@@ -64,37 +68,132 @@ func (p Polygon) ExtensionEquals(other arrow.ExtensionType) bool {
 func (p Polygon) Layout() arrow.DataTypeLayout {
 	return arrow.DataTypeLayout{
 		Buffers: []arrow.BufferSpec{
-			{Kind: arrow.KindBitmap},   // validity
-			{Kind: arrow.KindVarWidth}, // offsets
+			{Kind: arrow.KindBitmap}, // null bitmap
 		},
 		HasDict: false,
 	}
 }
 
 func (Polygon) ArrayType() reflect.Type {
-	return reflect.TypeOf(&PolygonArray{}).Elem() // ← This is correct
+	return reflect.TypeOf(&GeometryArray{}).Elem()
 }
 
 type PolygonArray struct {
-	array.ExtensionArray
-	listArray *array.List
+	Polygon
+	array.ExtensionArrayBase
 }
 
 func (p Polygon) NewArray(data array.Data) array.ExtensionArray {
-	return &PolygonArray{
-		listArray: array.NewListData(&data),
+	return &GeometryArray{}
+}
+
+func (p *PolygonArray) Len() int {
+	return p.Storage().Len()
+}
+
+func (p *PolygonArray) NullN() int {
+	return p.Storage().NullN()
+}
+
+func (p *PolygonArray) IsNull(i int) bool {
+	return p.Storage().IsNull(i)
+}
+
+func (p *PolygonArray) IsValid(i int) bool {
+	return !p.Storage().IsNull(i)
+}
+
+func (p *PolygonArray) Value(i int) geometry.Polygon {
+	if p.IsNull(i) {
+		return geometry.Polygon{}
 	}
+	poly, err := p.FromWKB(p.Storage().(*array.Binary).Value(i))
+	if err != nil {
+		log.Fatal(err)
+	}
+	return poly
 }
 
-func (a PolygonArray) DataType() arrow.DataType { return &Point{} }
-
-func (a PolygonArray) Data() arrow.ArrayData { return a.listArray.Data() }
-
-func (a PolygonArray) String() string { return fmt.Sprintf("%v", a.listArray) }
-
-func (a PolygonArray) Iloc(i int) []float64 {
-	listArray := a.listArray.ListValues()
-	return listArray.(*array.Float64).Float64Values()[a.listArray.Offsets()[i]*2 : a.listArray.Offsets()[i]*2+2]
+func (p *PolygonArray) ValueStr(i int) string {
+	if p.IsNull(i) {
+		return "null"
+	}
+	poly, err := p.FromWKB(p.Storage().(*array.Binary).Value(i))
+	if err != nil {
+		log.Fatal(err)
+	}
+	return poly.String()
 }
 
-func (a PolygonArray) ListValues() *array.List { return a.listArray }
+func (pa *PolygonArray) String() string {
+	var b strings.Builder
+	b.WriteString("[")
+	for i := range pa.Storage().Len() {
+		if pa.IsNull(i) {
+			b.WriteString("null")
+		} else {
+			b.WriteString(pa.ValueStr(i))
+		}
+		if i != pa.Storage().Len()-1 {
+			b.WriteString(", ")
+		}
+	}
+	b.WriteString("]")
+	return b.String()
+}
+
+func (pa *PolygonArray) GetOneForMarshal(i int) any {
+	return string(pa.Storage().(*array.Binary).Value(i))
+}
+
+func (pa *PolygonArray) MarshalJSON() ([]byte, error) {
+	var b strings.Builder
+	b.WriteString("[")
+	for i := range pa.Storage().Len() {
+		if pa.IsNull(i) {
+			b.WriteString("null")
+		} else {
+			b.WriteString(`"`)
+			if val, ok := pa.GetOneForMarshal(i).(string); ok {
+				b.WriteString(`"` + val + `"`)
+			} else {
+				b.WriteString("null")
+			}
+
+			b.WriteString(`"`)
+		}
+		if i != pa.Storage().Len()-1 {
+			b.WriteString(", ")
+		}
+	}
+	b.WriteString("]")
+	return []byte(b.String()), nil
+}
+
+func (a *PolygonArray) Offset() int {
+	return 0
+}
+
+func (a *PolygonArray) Data() arrow.ArrayData {
+	return a.Storage().Data()
+}
+
+func (a *PolygonArray) DataType() arrow.DataType {
+	return Polygon{}
+}
+
+func (*PolygonArray) ExtensionType() arrow.ExtensionType {
+	return Polygon{}
+}
+
+func (pa *PolygonArray) NullBitmapBytes() []byte {
+	return pa.Storage().NullBitmapBytes()
+}
+
+func (pa *PolygonArray) Release() {
+	pa.Storage().Release()
+}
+
+func (pa *PolygonArray) Retain() {
+	pa.Storage().Retain()
+}

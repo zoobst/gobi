@@ -8,6 +8,7 @@ import (
 	"runtime/pprof"
 	"time"
 
+	"github.com/apache/arrow/go/v18/arrow/csv"
 	gbcsv "github.com/zoobst/gobi/gbCsv"
 	"github.com/zoobst/gobi/gbParquet"
 	gTypes "github.com/zoobst/gobi/globalTypes"
@@ -39,7 +40,16 @@ func ReadCSV(path string, options gbcsv.CsvReadOptions) (*DataFrame, error) {
 }
 
 func ReadCSVFromType[T any](t T, path string, options gbcsv.CsvReadOptions) (*DataFrame, error) {
-	df, err := gbcsv.ReadFromGeneric(t, path, gbcsv.CsvReadOptions{})
+	df, err := gbcsv.ReadFromGeneric[T](t, path, gbcsv.CsvReadOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return &DataFrame{df}, nil
+}
+
+func ReadCSVFromTypeUsingArrow[T any](t T, path string, options ...csv.Option) (*DataFrame, error) {
+	df, err := gbcsv.ReadCSVUsingArrow[T](t, path, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +80,11 @@ func main() {
 		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestReadCSVFromType"))
 	}
 
-	if res := TestReadGeometryCSVFromType(); !res {
+	/* if res := TestReadGeometryCSVFromType(); !res {
+		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestReadGeometryCSVFromType"))
+	} */
+
+	if res := TestReadGeometryCSVFromTypeUsingArrow(); !res {
 		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestReadGeometryCSVFromType"))
 	}
 
@@ -80,6 +94,10 @@ func main() {
 
 	if res := TestCol(); !res {
 		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestCol"))
+	}
+
+	if res := TestArea(0); !res {
+		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestArea"))
 	}
 
 	elapsed := time.Since(start)

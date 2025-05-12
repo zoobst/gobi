@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 )
 
@@ -149,6 +150,62 @@ func (l LineString) WKB() []byte {
 func (l LineString) WKBHex() (string, error) {
 	wkb := l.WKB()
 	return hex.EncodeToString(wkb), nil
+}
+
+func (ls LineString) FromWKB(data []byte) (LineString, error) {
+	crs := ls.Points[0].CoordRefSys
+	buf := bytes.NewReader(data)
+
+	// 1. Byte order
+	var byteOrder byte
+	if err := binary.Read(buf, binary.LittleEndian, &byteOrder); err != nil {
+		return ls, fmt.Errorf("failed to read byte order: %w", err)
+	}
+	var bo binary.ByteOrder
+	switch byteOrder {
+	case 0:
+		bo = binary.BigEndian
+	case 1:
+		bo = binary.LittleEndian
+	default:
+		return ls, errors.New("invalid byte order")
+	}
+
+	// 2. Geometry type
+	var geomType uint32
+	if err := binary.Read(buf, bo, &geomType); err != nil {
+		return ls, fmt.Errorf("failed to read geometry type: %w", err)
+	}
+	if geomType != 2 { // WKB LineString = 2
+		return ls, fmt.Errorf("unexpected geometry type for LineString: %d", geomType)
+	}
+
+	// 3. Number of points
+	var numPoints uint32
+	if err := binary.Read(buf, bo, &numPoints); err != nil {
+		return ls, fmt.Errorf("failed to read number of points: %w", err)
+	}
+
+	// 4. Read each point
+	points := make([]Point, 0, numPoints)
+	for i := range int(numPoints) {
+		var x, y float64
+		if err := binary.Read(buf, bo, &x); err != nil {
+			return ls, fmt.Errorf("failed to read x at point %d: %w", i, err)
+		}
+		if err := binary.Read(buf, bo, &y); err != nil {
+			return ls, fmt.Errorf("failed to read y at point %d: %w", i, err)
+		}
+		points = append(points, Point{X: x, Y: y, CoordRefSys: crs})
+	}
+
+	ls.Points = points
+	for _, pts := range ls.Points {
+		if pts.CoordRefSys.Name == "" {
+			pts.CoordRefSys = WGS84 // Default if not stored in WKB
+		}
+	}
+	return ls, nil
 }
 
 func (l LineString) Len() int {

@@ -105,3 +105,31 @@ func (s *Series) Iloc(i int) (Series, error) {
 
 	return ser, nil
 }
+
+func (s *Series) Area(i int, unit string) (float64, error) {
+	if i < 0 || i >= int(s.Values.Len()) {
+		return 0, fmt.Errorf("index %d out of range for column of length %d", i, s.Values.Len())
+	}
+
+	var offset = 0
+	for _, chunk := range s.Values.Data().Chunks() {
+		if i < offset+chunk.Len() {
+			// Found the right chunk and relative index
+			localIndex := i - offset
+
+			extArr, ok := chunk.(*PolygonArray)
+			if !ok {
+				return 0, fmt.Errorf("expected *PolygonArray, got %T", chunk)
+			}
+
+			if extArr.IsNull(localIndex) {
+				return 0, fmt.Errorf("value at index %d is null", i)
+			}
+
+			return extArr.Value(localIndex).Area(unit), nil
+		}
+		offset += chunk.Len()
+	}
+
+	return 0, fmt.Errorf("index %d not found in chunks", i) // Should never hit
+}

@@ -7,6 +7,7 @@ import (
 
 type Geometry interface {
 	fmt.Stringer
+	Len() int
 	CRS() CRS
 	ToCRS(epsg int) Geometry
 	EstimateUTMCRS() CRS

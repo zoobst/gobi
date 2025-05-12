@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/apache/arrow/go/v18/arrow/csv"
+	"github.com/apache/arrow/go/v18/arrow/memory"
+
 	gbcsv "github.com/zoobst/gobi/gbCsv"
 	gTypes "github.com/zoobst/gobi/globalTypes"
 )
@@ -52,8 +55,23 @@ func TestReadCSVFromType() bool {
 	return false
 }
 
-func TestReadGeometryCSVFromType() bool {
-	idf, err := ReadCSVFromType(TestGeometryCSVTypes{}, fmt.Sprintf("%s/%s.csv", testDir, testGeometryFileName), gbcsv.CsvReadOptions{})
+/* func TestReadGeometryCSVFromType() bool {
+	idf, err := ReadCSVFromType[TestGeometryCSVTypes](TestGeometryCSVTypes{}, fmt.Sprintf("%s/%s.csv", testDir, testGeometryFileName), gbcsv.CsvReadOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	df = idf
+
+	if rows, cols := df.Shape(); rows > 0 && cols > 0 {
+		return true
+	}
+
+	return false
+} */
+
+func TestReadGeometryCSVFromTypeUsingArrow() bool {
+	idf, err := ReadCSVFromTypeUsingArrow[TestGeometryCSVTypes](TestGeometryCSVTypes{}, fmt.Sprintf("%s/%s.csv", testDir, testGeometryFileName), csv.WithAllocator(memory.DefaultAllocator), csv.WithHeader(true))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -68,7 +86,7 @@ func TestReadGeometryCSVFromType() bool {
 }
 
 func TestIloc() bool {
-	if df2, err := df.Iloc(0); err == nil {
+	if df2, err := df.Iloc(1); err == nil {
 		if rows, cols := df2.Shape(); rows > 0 && cols > 0 {
 			log.Println(df2)
 			return true
@@ -80,7 +98,7 @@ func TestIloc() bool {
 }
 
 func TestCol() bool {
-	if v, err := df.Col("Sex"); err == nil {
+	if v, err := df.Col("geometry"); err == nil {
 		if df2, err := v.Head(5); err == nil {
 			log.Println(df2)
 		} else {
@@ -94,4 +112,16 @@ func TestCol() bool {
 		}
 	}
 	return false
+}
+
+func TestArea(i int) bool {
+	if v, err := df.Col("geometry"); err == nil {
+		area, err := v.Area(i, "km")
+		if err != nil {
+			log.Println(err)
+			return false
+		}
+		log.Println(area)
+	}
+	return true
 }

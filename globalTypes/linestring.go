@@ -32,7 +32,7 @@ func (LineString) Type() string { return "Geometry" }
 func (LineString) Name() string { return "LineString" }
 
 func (LineString) StorageType() arrow.DataType {
-	return arrow.BinaryTypes.LargeBinary
+	return arrow.BinaryTypes.Binary
 }
 
 func (l LineString) Fingerprint() string {
@@ -71,7 +71,7 @@ func (LineString) Layout() arrow.DataTypeLayout {
 }
 
 func (LineString) ArrayType() reflect.Type {
-	return reflect.TypeOf(&LineStringArray{}).Elem() // ← This is correct
+	return reflect.TypeOf((*LineStringArray)(nil)) // Correct: pointer to type
 }
 
 type LineStringArray struct {

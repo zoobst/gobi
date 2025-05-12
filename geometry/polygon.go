@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -246,6 +247,77 @@ func (p Polygon) WKB() []byte {
 func (p Polygon) WKBHex() (string, error) {
 	wkb := p.WKB()
 	return hex.EncodeToString(wkb), nil
+}
+
+func (p Polygon) FromWKB(data []byte) (Polygon, error) {
+	var crs CRS
+	if p.Len() > 0 {
+		crs = p.Points[0].CoordRefSys
+	}
+	buf := bytes.NewReader(data)
+
+	// 1. Read byte order
+	var byteOrder byte
+	if err := binary.Read(buf, binary.LittleEndian, &byteOrder); err != nil {
+		return p, fmt.Errorf("failed to read byte order: %w", err)
+	}
+
+	// Determine byte order
+	var bo binary.ByteOrder
+	switch byteOrder {
+	case 0:
+		bo = binary.BigEndian
+	case 1:
+		bo = binary.LittleEndian
+	default:
+		return p, errors.New("invalid byte order")
+	}
+
+	// 2. Read geometry type
+	var geomType uint32
+	if err := binary.Read(buf, bo, &geomType); err != nil {
+		return p, fmt.Errorf("failed to read geometry type: %w", err)
+	}
+	if geomType != WKB_POLYGON {
+		return p, fmt.Errorf("unexpected geometry type: got %d, want %d", geomType, WKB_POLYGON)
+	}
+
+	// 3. Read number of rings (assume 1 ring for now)
+	var numRings uint32
+	if err := binary.Read(buf, bo, &numRings); err != nil {
+		return p, fmt.Errorf("failed to read number of rings: %w", err)
+	}
+	if numRings != 1 {
+		return p, fmt.Errorf("only single-ring polygons supported, got %d", numRings)
+	}
+
+	// 4. Read number of points in the ring
+	var numPoints uint32
+	if err := binary.Read(buf, bo, &numPoints); err != nil {
+		return p, fmt.Errorf("failed to read number of points: %w", err)
+	}
+
+	// 5. Read points
+	points := make([]Point, 0, numPoints)
+	for i := range int(numPoints) {
+		var x, y float64
+		if err := binary.Read(buf, bo, &x); err != nil {
+			return p, fmt.Errorf("failed to read x at point %d: %w", i, err)
+		}
+		if err := binary.Read(buf, bo, &y); err != nil {
+			return p, fmt.Errorf("failed to read y at point %d: %w", i, err)
+		}
+		points = append(points, Point{X: x, Y: y, CoordRefSys: crs})
+	}
+
+	p.Points = points
+	for _, pts := range p.Points {
+		if pts.CoordRefSys.Name == "" {
+			pts.CoordRefSys = WGS84 // Default if not stored in WKB
+		}
+	}
+
+	return p, nil
 }
 
 func (p Polygon) Coords() (fList [][2]float64) {

@@ -13,20 +13,19 @@ func ParseStringGeometry(s string) (geom Geometry, err error) {
 	if err != nil {
 		return nil, err
 	}
+
 	switch t := g.(type) {
 	case geometry.Point:
 		geom = NewPointFromGeometry(&t)
-		return
 	case geometry.LineString:
 		geom = NewLineStringFromGeometry(&t)
-		return
 	case geometry.Polygon:
 		geom = NewPolygonFromGeometry(&t)
-		return
 	default:
 		log.Println(t)
 		return nil, fmt.Errorf(berrors.ErrUnableToParseStringCoords.Error(), s)
 	}
+	return NewGeometryTypeFromGeometry(geom), nil
 }
 
 func CheckGeometry(s string) bool {
@@ -37,7 +36,13 @@ func CheckGeometry(s string) bool {
 }
 
 func GenericGeometry() Geometry {
-	return Point{}
+	return &GeometryType{
+		geometry.GeometryType{
+			T:      geometry.Point{},
+			Points: []geometry.Point{},
+		},
+		defaultExtensionBase,
+	}
 }
 
 func GenericPoint() Geometry {

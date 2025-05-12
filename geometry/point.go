@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 )
 
@@ -20,6 +21,10 @@ func NewPoint(x, y float64, crs *CRS) (Point, error) {
 		}
 	}
 	return p, nil
+}
+
+func (p Point) Len() int {
+	return 1
 }
 
 func (p Point) Equal(other Geometry) bool {
@@ -102,6 +107,53 @@ func (p Point) WKB() []byte {
 func (p Point) WKBHex() (string, error) {
 	wkb := p.WKB()
 	return hex.EncodeToString(wkb), nil
+}
+
+func (pt Point) FromWKB(data []byte) (Point, error) {
+	var crs CRS
+	if pt.CoordRefSys.Name != "" {
+		crs = pt.CoordRefSys
+	}
+	buf := bytes.NewReader(data)
+
+	// 1. Byte order
+	var byteOrder byte
+	if err := binary.Read(buf, binary.LittleEndian, &byteOrder); err != nil {
+		return pt, fmt.Errorf("failed to read byte order: %w", err)
+	}
+	var bo binary.ByteOrder
+	switch byteOrder {
+	case 0:
+		bo = binary.BigEndian
+	case 1:
+		bo = binary.LittleEndian
+	default:
+		return pt, errors.New("invalid byte order")
+	}
+
+	// 2. Geometry type
+	var geomType uint32
+	if err := binary.Read(buf, bo, &geomType); err != nil {
+		return pt, fmt.Errorf("failed to read geometry type: %w", err)
+	}
+	if geomType != 1 { // WKB Point = 1
+		return pt, fmt.Errorf("unexpected geometry type for Point: %d", geomType)
+	}
+
+	// 3. Coordinates
+	if err := binary.Read(buf, bo, &pt.X); err != nil {
+		return pt, fmt.Errorf("failed to read X: %w", err)
+	}
+	if err := binary.Read(buf, bo, &pt.Y); err != nil {
+		return pt, fmt.Errorf("failed to read Y: %w", err)
+	}
+
+	pt.CoordRefSys = crs
+
+	if pt.CoordRefSys.Name == "" {
+		pt.CoordRefSys = WGS84
+	}
+	return pt, nil
 }
 
 func (p Point) Coords() (fList [][2]float64) {

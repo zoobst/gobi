@@ -3,6 +3,7 @@ package globalTypes
 import (
 	"fmt"
 	"hash/fnv"
+	"log"
 	"reflect"
 	"strings"
 
@@ -34,7 +35,7 @@ func (p Point) Field() arrow.Field {
 }
 
 func (p Point) StorageType() arrow.DataType {
-	return arrow.BinaryTypes.LargeBinary
+	return arrow.BinaryTypes.Binary
 }
 
 func (p Point) Fingerprint() string {
@@ -65,14 +66,7 @@ func (p Point) ExtensionEquals(other arrow.ExtensionType) bool {
 func (p Point) Layout() arrow.DataTypeLayout {
 	return arrow.DataTypeLayout{
 		Buffers: []arrow.BufferSpec{
-			{
-				Kind:      arrow.KindBitmap, // Null bitmap (1 bit per value)
-				ByteWidth: 0,                // Arrow handles bitmaps internally
-			},
-			{
-				Kind:      arrow.KindFixedWidth, // Data buffer
-				ByteWidth: 16,                   // 2 * float64 = 2 * 8 = 16 bytes
-			},
+			{Kind: arrow.KindBitmap},
 		},
 		HasDict: false,
 	}
@@ -88,7 +82,7 @@ func (p Point) NewArray(data array.Data) array.ExtensionArray {
 }
 
 func (Point) ArrayType() reflect.Type {
-	return reflect.TypeOf(&PointArray{}).Elem() // ← This is correct
+	return reflect.TypeOf((*PointArray)(nil)) // Correct: pointer to type
 }
 
 func (p *PointArray) Len() int {
@@ -112,7 +106,11 @@ func (p *PointArray) ValueStr(i int) string {
 	if p.IsNull(i) {
 		return "null"
 	}
-	return string(p.Storage().(*array.Binary).Value(i))
+	pt, err := p.FromWKB(p.Storage().(*array.Binary).Value(i))
+	if err != nil {
+		log.Fatal(err)
+	}
+	return pt.String()
 }
 
 func (pa *PointArray) String() string {
