@@ -21,32 +21,10 @@ type Reader interface {
 
 // Helper to map string to arrow.DataType
 func ArrowTypeFromString(typeStr string) (arrow.DataType, error) {
-	switch strings.ToLower(typeStr) {
-	case "datetime":
-		return &arrow.Date64Type{}, nil
-	case "point":
-		return gTypes.Point{}, nil
-	case "polygon":
-		return gTypes.Polygon{}, nil
-	case "linestring":
-		return gTypes.LineString{}, nil
-	case "int":
-		fallthrough
-	case "int64":
-		return arrow.PrimitiveTypes.Int64, nil
-	case "int32":
-		return arrow.PrimitiveTypes.Int32, nil
-	case "float":
-		fallthrough
-	case "float64":
-		return arrow.PrimitiveTypes.Float64, nil
-	case "float32":
-		return arrow.PrimitiveTypes.Float32, nil
-	case "string":
-		return arrow.BinaryTypes.String, nil
-	default:
-		return nil, fmt.Errorf(berrors.ErrUnsupportedType.Error(), typeStr)
+	if val, ok := GoStringToArrowPrimitivesMap[typeStr]; ok {
+		return val, nil
 	}
+	return nil, fmt.Errorf(berrors.ErrUnsupportedType.Error(), typeStr)
 }
 
 func ArrowTypeFromGo(inType reflect.Type) (arrow.DataType, error) {
@@ -96,7 +74,7 @@ func BuildersFromTypes(dtype arrow.DataType) (builder array.Builder, err error) 
 					return nil, err
 				}
 			}
-			return array.NewExtensionBuilder(memory.DefaultAllocator, &gTypes.GeometryType{}), nil
+			return array.NewExtensionBuilder(memory.DefaultAllocator, arrow.GetExtensionType("Geometry")), nil
 		default:
 			return nil, fmt.Errorf(berrors.ErrInvalidType.Error(), dtype.Name())
 		}

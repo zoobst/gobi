@@ -100,12 +100,13 @@ func (g GeometryType) Fingerprint() string {
 func (g GeometryType) ExtensionMetadata() string { return "type:geometry" }
 
 func (g GeometryType) ExtensionEquals(other arrow.ExtensionType) bool {
-	switch t := other.(type) {
-	case Geometry:
-		return g.T.Equal(t)
-	default:
+	if other.StorageType() != arrow.BinaryTypes.Binary {
 		return false
 	}
+	if other.ExtensionName() == g.ExtensionName() {
+		return true
+	}
+	return false
 }
 
 func (g GeometryType) Layout() arrow.DataTypeLayout {
@@ -124,9 +125,11 @@ func (GeometryType) ArrayType() reflect.Type {
 func (g GeometryType) NewArray(arr array.Data) array.ExtensionArray {
 	// Create the storage array from the data
 	storageArray := array.MakeFromData(&arr)
+	storageArray.Retain()
 
 	// Use the correct function to create the extension array
 	extArray := array.NewExtensionArrayWithStorage(arrow.GetExtensionType(g.Type()), storageArray)
+	extArray.Retain()
 
 	// Cast to GeometryArray and return
 	return extArray.(array.ExtensionArray)

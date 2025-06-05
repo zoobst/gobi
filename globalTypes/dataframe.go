@@ -14,12 +14,9 @@ import (
 
 type Frame interface {
 	arrow.Table
-	Head(int) (DataFrame, error)
-	Tail(int) (DataFrame, error)
 	Shape() (int, int)
 }
 
-// NewDataFrame creates a new DataFrame from Arrow Table
 func NewDataFrame(s *arrow.Schema) DataFrame {
 	return DataFrame{
 		schema: s,
@@ -45,6 +42,10 @@ func NewDataFrameFromColumns(cols []arrow.Column, schema *arrow.Schema) (*DataFr
 	}
 
 	return &df, nil
+}
+
+func NewDataFrameFromRecords(schema *arrow.Schema, recArray *[]arrow.Record) (df *DataFrame, err error) {
+	return NewDataFrameFromTable(array.NewTableFromRecords(schema, *recArray)), nil
 }
 
 func (df DataFrame) Shape() (int, int) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -82,7 +83,6 @@ func (p Polygon) Area(unit string) float64 {
 	default:
 		R = 6371.0 // Kilometers (default)
 	}
-	// ensure a closed Polygon
 	p.checkClosedPolygon()
 
 	excess := p.sphericalExcess()
@@ -93,7 +93,6 @@ func (p Polygon) Area(unit string) float64 {
 // ConvexHull computes the convex hull of the points in the polygon using Graham's scan.
 // Returns a new Polygon containing only the convex hull.
 func (p Polygon) ConvexHull() Polygon {
-	// Find the point with the lowest Y (and leftmost if tie)
 	lowest := p.Points[0]
 	lowestIdx := 0
 	for i, pt := range p.Points {
@@ -103,23 +102,19 @@ func (p Polygon) ConvexHull() Polygon {
 		}
 	}
 
-	// Move the lowest point to the first position
 	p.Points[0], p.Points[lowestIdx] = p.Points[lowestIdx], p.Points[0]
 
-	// Sort the rest of the points based on polar angle with respect to lowest point
 	pivot := p.Points[0]
 	sorted := make([]Point, len(p.Points)-1)
 	copy(sorted, p.Points[1:])
 	sort.Slice(sorted, func(i, j int) bool {
 		cp := crossProduct(pivot, sorted[i], sorted[j])
 		if cp == 0 {
-			// Collinear points: closer one comes first
 			return distanceSquared(pivot, sorted[i]) < distanceSquared(pivot, sorted[j])
 		}
 		return cp > 0
 	})
 
-	// Build the convex hull
 	hull := []Point{pivot, sorted[0]}
 	for i := 1; i < len(sorted); i++ {
 		for len(hull) >= 2 && crossProduct(hull[len(hull)-2], hull[len(hull)-1], sorted[i]) <= 0 {
@@ -142,11 +137,9 @@ func (p Polygon) Centroid() Point {
 		x0, y0 := p.Points[i].X, p.Points[i].Y
 		x1, y1 := p.Points[j].X, p.Points[j].Y
 
-		// Shoelace formula term
 		areaTerm := x0*y1 - x1*y0
 		areaSum += areaTerm
 
-		// Centroid terms
 		cx += (x0 + x1) * areaTerm
 		cy += (y0 + y1) * areaTerm
 	}
@@ -171,6 +164,21 @@ func (p Polygon) Centroid() Point {
 	return Point{
 		X: cx,
 		Y: cy,
+	}
+}
+
+func (p Polygon) Intersects(other Geometry) bool {
+	switch g := other.(type) {
+	case Point:
+		return pointInPolygon(g, p)
+	case *Point:
+		return pointInPolygon(*g, p)
+	case Polygon:
+		return polygonsIntersect(p, g)
+	case *Polygon:
+		return polygonsIntersect(p, *g)
+	default:
+		return false
 	}
 }
 
@@ -207,30 +215,24 @@ func (p Polygon) WKB() []byte {
 		return nil
 	}
 
-	// Geometry type: Polygon (3)
 	if err := binary.Write(buf, binary.LittleEndian, WKB_POLYGON); err != nil {
 		return nil
 	}
 
-	// WKB Polygons consist of one or more "linear rings"
 	ring := p.Points
 
-	// Ensure the ring is closed (first point == last point)
 	if len(ring) > 0 && (ring[0].X != ring[len(ring)-1].X || ring[0].Y != ring[len(ring)-1].Y) {
 		ring = append(ring, ring[0])
 	}
 
-	// Number of rings: 1
 	if err := binary.Write(buf, binary.LittleEndian, uint32(1)); err != nil {
 		return nil
 	}
 
-	// Number of points in ring
 	if err := binary.Write(buf, binary.LittleEndian, uint32(len(ring))); err != nil {
 		return nil
 	}
 
-	// Write each point (X, Y)
 	for _, pt := range ring {
 		if err := binary.Write(buf, binary.LittleEndian, pt.X); err != nil {
 			return nil
@@ -256,13 +258,11 @@ func (p Polygon) FromWKB(data []byte) (Polygon, error) {
 	}
 	buf := bytes.NewReader(data)
 
-	// 1. Read byte order
 	var byteOrder byte
 	if err := binary.Read(buf, binary.LittleEndian, &byteOrder); err != nil {
 		return p, fmt.Errorf("failed to read byte order: %w", err)
 	}
 
-	// Determine byte order
 	var bo binary.ByteOrder
 	switch byteOrder {
 	case 0:
@@ -273,7 +273,6 @@ func (p Polygon) FromWKB(data []byte) (Polygon, error) {
 		return p, errors.New("invalid byte order")
 	}
 
-	// 2. Read geometry type
 	var geomType uint32
 	if err := binary.Read(buf, bo, &geomType); err != nil {
 		return p, fmt.Errorf("failed to read geometry type: %w", err)
@@ -282,7 +281,6 @@ func (p Polygon) FromWKB(data []byte) (Polygon, error) {
 		return p, fmt.Errorf("unexpected geometry type: got %d, want %d", geomType, WKB_POLYGON)
 	}
 
-	// 3. Read number of rings (assume 1 ring for now)
 	var numRings uint32
 	if err := binary.Read(buf, bo, &numRings); err != nil {
 		return p, fmt.Errorf("failed to read number of rings: %w", err)
@@ -291,13 +289,11 @@ func (p Polygon) FromWKB(data []byte) (Polygon, error) {
 		return p, fmt.Errorf("only single-ring polygons supported, got %d", numRings)
 	}
 
-	// 4. Read number of points in the ring
 	var numPoints uint32
 	if err := binary.Read(buf, bo, &numPoints); err != nil {
 		return p, fmt.Errorf("failed to read number of points: %w", err)
 	}
 
-	// 5. Read points
 	points := make([]Point, 0, numPoints)
 	for i := range int(numPoints) {
 		var x, y float64
@@ -325,6 +321,35 @@ func (p Polygon) Coords() (fList [][2]float64) {
 		fList = append(fList, [2]float64{point.X, point.Y})
 	}
 	return fList
+}
+
+func (p Polygon) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type        string         `json:"type"`
+		Coordinates [][][2]float64 `json:"coordinates"`
+	}{
+		Type:        p.Name(),
+		Coordinates: [][][2]float64{p.Coords()},
+	})
+}
+
+func (p Polygon) UnmarshalJSON(data []byte) error {
+	temp := struct {
+		Type        string         `json:"type"`
+		Coordinates [][][2]float64 `json:"coordinates"`
+	}{}
+	if err := json.Unmarshal(data, &temp); err != nil {
+		return err
+	}
+	if temp.Type != p.Name() {
+		return errors.New("invalid geometry type for Polygon")
+	}
+
+	for _, pt := range temp.Coordinates[0] {
+		p.Points = append(p.Points, Point{X: pt[0], Y: pt[1]})
+	}
+
+	return nil
 }
 
 func (p Polygon) MaxX() float64 { return maxX(&p.Points) }
@@ -358,4 +383,48 @@ func (p Polygon) sphericalExcess() float64 {
 	}
 
 	return total / 2.0
+}
+
+func pointInPolygon(pt Point, poly Polygon) bool {
+	n := len(poly.Points)
+	inside := false
+	j := n - 1
+	for i := range n {
+		pi := poly.Points[i]
+		pj := poly.Points[j]
+		if ((pi.Y > pt.Y) != (pj.Y > pt.Y)) &&
+			(pt.X < (pj.X-pi.X)*(pt.Y-pi.Y)/(pj.Y-pi.Y)+pi.X) {
+			inside = !inside
+		}
+		j = i
+	}
+	return inside
+}
+
+// polygonsIntersect checks if any edges cross or one contains the other.
+func polygonsIntersect(a, b Polygon) bool {
+	for i := range len(a.Points) - 1 {
+		for j := range len(b.Points) - 1 {
+			if linesIntersect(a.Points[i], a.Points[i+1], b.Points[j], b.Points[j+1]) {
+				return true
+			}
+		}
+	}
+
+	if pointInPolygon(b.Points[0], a) || pointInPolygon(a.Points[0], b) {
+		return true
+	}
+	return false
+}
+
+// linesIntersect returns true if line segments (p1,p2) and (q1,q2) intersect.
+func linesIntersect(p1, p2, q1, q2 Point) bool {
+	orient := func(a, b, c Point) float64 {
+		return (b.X-a.X)*(c.Y-a.Y) - (b.Y-a.Y)*(c.X-a.X)
+	}
+	o1 := orient(p1, p2, q1)
+	o2 := orient(p1, p2, q2)
+	o3 := orient(q1, q2, p1)
+	o4 := orient(q1, q2, p2)
+	return (o1*o2 < 0) && (o3*o4 < 0)
 }

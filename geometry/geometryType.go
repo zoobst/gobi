@@ -15,6 +15,9 @@ type GeometryType struct {
 func (g GeometryType) Type() string { return g.T.Type() }
 
 func (g GeometryType) Len() int {
+	if g.Points == nil {
+		return 0
+	}
 	return len(g.Points)
 }
 
@@ -130,7 +133,6 @@ func (g GeometryType) WKB() []byte {
 	case GeometryType:
 		log.Println("uh oh")
 	default:
-		log.Println("here's your problem: WKB")
 		log.Fatal(fmt.Errorf(berrors.ErrInvalidGeometryType.Error(), t))
 	}
 	return nil
@@ -166,6 +168,14 @@ func (g GeometryType) Coords() (fList [][2]float64) {
 		log.Fatal(berrors.ErrInvalidGeometryType)
 	}
 	return nil
+}
+
+func (gt GeometryType) MarshalJSON() ([]byte, error) {
+	return gt.T.MarshalJSON()
+}
+
+func (gt GeometryType) UnmarshalJSON(data []byte) error {
+	return gt.T.UnmarshalJSON(data)
 }
 
 func (g GeometryType) MinX() float64 { return minX(&g.Points) }

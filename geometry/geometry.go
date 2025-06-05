@@ -149,7 +149,7 @@ func ParseStringCoords(s string) (Geometry, error) {
 	return nil, fmt.Errorf(berrors.ErrUnableToParseStringCoords.Error(), s)
 }
 
-func maxY[p *[]Point](points *[]Point) (hVal float64) {
+func maxY(points *[]Point) (hVal float64) {
 	hVal = -10_000
 	if len(*points) == 0 {
 		return 0.0
@@ -162,7 +162,7 @@ func maxY[p *[]Point](points *[]Point) (hVal float64) {
 	return hVal
 }
 
-func maxX[p *[]Point](points *[]Point) (hVal float64) {
+func maxX(points *[]Point) (hVal float64) {
 	hVal = -10_000
 	if len(*points) == 0 {
 		return 0.0
@@ -175,7 +175,7 @@ func maxX[p *[]Point](points *[]Point) (hVal float64) {
 	return hVal
 }
 
-func minY[p *[]Point](points *[]Point) (lVal float64) {
+func minY(points *[]Point) (lVal float64) {
 	lVal = 10_000
 	if len(*points) == 0 {
 		return 0.0
@@ -188,7 +188,7 @@ func minY[p *[]Point](points *[]Point) (lVal float64) {
 	return lVal
 }
 
-func minX[p *[]Point](points *[]Point) (lVal float64) {
+func minX(points *[]Point) (lVal float64) {
 	lVal = 1_000_000
 	if len(*points) == 0 {
 		return 0.0
@@ -199,6 +199,15 @@ func minX[p *[]Point](points *[]Point) (lVal float64) {
 		}
 	}
 	return lVal
+}
+
+func (b Box) maxBox(b2 Box) (bigBox Box) {
+	return Box{
+		minX(&[]Point{Point{X: b[0], Y: b[1]}, Point{X: b2[0], Y: b2[1]}}),
+		minY(&[]Point{Point{X: b[0], Y: b[1]}, Point{X: b2[0], Y: b2[1]}}),
+		maxX(&[]Point{Point{X: b[2], Y: b[3]}, Point{X: b2[2], Y: b2[3]}}),
+		maxY(&[]Point{Point{X: b[2], Y: b[3]}, Point{X: b2[2], Y: b2[3]}}),
+	}
 }
 
 func estimateUTMEPSG(g Geometry) int {

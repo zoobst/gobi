@@ -32,32 +32,12 @@ func (g *GeometryArray) FromWKB(b []byte) (Geometry, error) {
 	return nil, berrors.ErrInvalidType
 }
 
-func (g *GeometryArray) Len() int {
-	return g.Storage().Len()
-}
-
-func (g *GeometryArray) NullN() int {
-	return g.Storage().NullN()
-}
-
-func (g *GeometryArray) IsNull(i int) bool {
-	return g.Storage().IsNull(i)
-}
-
-func (g *GeometryArray) IsValid(i int) bool {
-	return !g.Storage().IsNull(i)
-}
-
 func (ga *GeometryArray) Value(i int) Geometry {
 	g, err := ga.FromWKB(ga.Storage().(*array.Binary).Value(i))
 	if err != nil {
 		log.Fatal(err)
 	}
 	return g
-}
-
-func (ga *GeometryArray) Storage() arrow.Array {
-	return &array.Binary{}
 }
 
 func (g *GeometryArray) ValueStr(i int) string {
@@ -88,14 +68,6 @@ func (ga *GeometryArray) String() string {
 	return b.String()
 }
 
-func (ga *GeometryArray) GetOneForMarshal(i int) any {
-	if val, err := ga.FromWKB(ga.Storage().(*array.Binary).Value(i)); err == nil {
-		return val.String()
-	} else {
-		return err
-	}
-}
-
 func (ga *GeometryArray) MarshalJSON() ([]byte, error) {
 	var b strings.Builder
 	for i := range ga.Storage().Len() {
@@ -118,28 +90,6 @@ func (ga *GeometryArray) MarshalJSON() ([]byte, error) {
 	return []byte(b.String()), nil
 }
 
-func (*GeometryArray) Offset() int { return 0 }
-
-func (ga *GeometryArray) Data() arrow.ArrayData {
-	return ga.Storage().Data()
-}
-
-func (ga *GeometryArray) DataType() arrow.DataType {
-	return ga.Storage().DataType()
-}
-
 func (ga *GeometryArray) ExtensionType() arrow.ExtensionType {
 	return &GeometryType{}
-}
-
-func (ga *GeometryArray) NullBitmapBytes() []byte {
-	return ga.Storage().NullBitmapBytes()
-}
-
-func (ga *GeometryArray) Release() {
-	ga.Storage().Release()
-}
-
-func (ga *GeometryArray) Retain() {
-	ga.Storage().Retain()
 }

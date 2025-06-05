@@ -4,12 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
-
-	"github.com/apache/arrow/go/v18/arrow/csv"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"testing"
 
 	gbcsv "github.com/zoobst/gobi/gbCsv"
-	gTypes "github.com/zoobst/gobi/globalTypes"
 )
 
 type TestCSVTypes struct {
@@ -28,8 +25,8 @@ type TestCSVTypes struct {
 }
 
 type TestGeometryCSVTypes struct {
-	Geometry  gTypes.Geometry `csv:"geometry" dtype:"geometry"`
-	Placename string          `csv:"placename"`
+	Geometry  Geometry `csv:"geometry" dtype:"geometry"`
+	Placename string   `csv:"placename"`
 }
 
 var (
@@ -40,23 +37,21 @@ var (
 	df                   *DataFrame
 )
 
-func TestReadCSVFromType() bool {
+func TestReadCSVFromType(t *testing.T) {
 	idf, err := ReadCSVFromType(TestCSVTypes{}, fmt.Sprintf("%s/%s.csv", testDir, testFileName), gbcsv.CsvReadOptions{})
 	if err != nil {
-		log.Fatal(err)
+		t.Errorf("reading csv from type failed: %v", err)
 	}
 
 	df = idf
 
 	if rows, cols := idf.Shape(); rows > 0 && cols > 0 {
-		return true
+		t.Errorf("reading csv from type failed")
 	}
-
-	return false
 }
 
 /* func TestReadGeometryCSVFromType() bool {
-	idf, err := ReadCSVFromType[TestGeometryCSVTypes](TestGeometryCSVTypes{}, fmt.Sprintf("%s/%s.csv", testDir, testGeometryFileName), gbcsv.CsvReadOptions{})
+	idf, err := ReadCSVFromType(TestGeometryCSVTypes{}, fmt.Sprintf("%s/%s.csv", testDir, testGeometryFileName), gbcsv.CsvReadOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -70,58 +65,60 @@ func TestReadCSVFromType() bool {
 	return false
 } */
 
-func TestReadGeometryCSVFromTypeUsingArrow() bool {
-	idf, err := ReadCSVFromTypeUsingArrow[TestGeometryCSVTypes](TestGeometryCSVTypes{}, fmt.Sprintf("%s/%s.csv", testDir, testGeometryFileName), csv.WithAllocator(memory.DefaultAllocator), csv.WithHeader(true))
+func TestReadGeometryCSVFromTypeUsingArrow(t *testing.T) {
+	idf, err := ReadCSVFromTypeUsingArrow(
+		TestGeometryCSVTypes{},
+		fmt.Sprintf("%s/%s.csv",
+			testDir,
+			testGeometryFileName,
+		))
 	if err != nil {
-		log.Fatal(err)
+		t.Errorf("reading csv from type failed: %v", err)
 	}
 
 	df = idf
 
 	if rows, cols := df.Shape(); rows > 0 && cols > 0 {
-		return true
+		t.Errorf("reading csv from type failed")
 	}
-
-	return false
 }
 
-func TestIloc() bool {
+func TestIloc(t *testing.T) {
 	if df2, err := df.Iloc(1); err == nil {
 		if rows, cols := df2.Shape(); rows > 0 && cols > 0 {
 			log.Println(df2)
-			return true
+			t.Errorf("test ILoc failed: %v", err)
+		} else {
+			t.Errorf("test ILoc failed: %v", err)
 		}
-		return false
 	} else {
-		return false
+		t.Errorf("test ILoc failed: %v", err)
 	}
 }
 
-func TestCol() bool {
+func TestCol(t *testing.T) {
 	if v, err := df.Col("geometry"); err == nil {
 		if df2, err := v.Head(5); err == nil {
 			log.Println(df2)
 		} else {
-			return false
+			t.Errorf("test Col failed: %v", err)
 		}
 		if df2, err := v.Tail(5); err == nil {
 			log.Println(df2)
-			return true
 		} else {
-			return false
+			t.Errorf("test Col failed: %v", err)
 		}
 	}
-	return false
+	t.Errorf("test Col failed")
 }
 
-func TestArea(i int) bool {
+func TestArea(t *testing.T) {
 	if v, err := df.Col("geometry"); err == nil {
-		area, err := v.Area(i, "km")
+		area, err := v.Area(0, "km")
 		if err != nil {
 			log.Println(err)
-			return false
+			t.Errorf("test Area failed: %v", err)
 		}
 		log.Println(area)
 	}
-	return true
 }

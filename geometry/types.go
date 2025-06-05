@@ -19,6 +19,8 @@ type Geometry interface {
 	WKBHex() (string, error)
 	Coords() [][2]float64
 	Bounds() Box
+	MarshalJSON() ([]byte, error)
+	UnmarshalJSON([]byte) error
 	MaxX() float64
 	MaxY() float64
 	MinX() float64
@@ -68,4 +70,9 @@ type Polygon struct {
 type LineString struct {
 	fmt.Stringer
 	Points []Point
+}
+
+type GeometryCollection struct {
+	fmt.Stringer
+	Geometries []Geometry `json:"geometries"`
 }

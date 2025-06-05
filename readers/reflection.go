@@ -15,3 +15,27 @@ var GoPrimitivesToArrowPrimitivesMap = map[reflect.Kind]arrow.DataType{
 	reflect.Interface: arrow.BinaryTypes.String,
 	reflect.Struct:    &arrow.ExtensionBase{},
 }
+
+var GoStringToArrowPrimitivesMap = map[string]arrow.DataType{
+	"float64": arrow.PrimitiveTypes.Float64,
+	"float32": arrow.PrimitiveTypes.Float32,
+	"float":   arrow.PrimitiveTypes.Float64,
+
+	"point":      arrow.GetExtensionType("Geometry"),
+	"linestring": arrow.GetExtensionType("Geometry"),
+	"polygon":    arrow.GetExtensionType("Geometry"),
+	"geometry":   arrow.GetExtensionType("Geometry"),
+
+	"boolean": arrow.FixedWidthTypes.Boolean,
+
+	"int64": arrow.PrimitiveTypes.Int64,
+	"int":   arrow.PrimitiveTypes.Int64,
+	"int32": arrow.PrimitiveTypes.Int32,
+	"int16": arrow.PrimitiveTypes.Int16,
+
+	"string":    arrow.BinaryTypes.String,
+	"interface": arrow.BinaryTypes.String,
+
+	"datetime": &arrow.Date64Type{},
+	"time":     &arrow.Date32Type{},
+}

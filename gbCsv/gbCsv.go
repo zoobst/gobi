@@ -1,15 +1,11 @@
 package gbcsv
 
 import (
-	"bytes"
-	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strconv"
-	"strings"
-	"time"
 
 	berrors "github.com/zoobst/gobi/bErrors"
 	"github.com/zoobst/gobi/cmprssn"
@@ -19,15 +15,7 @@ import (
 	"github.com/apache/arrow/go/v18/arrow"
 	"github.com/apache/arrow/go/v18/arrow/array"
 	arrowcsv "github.com/apache/arrow/go/v18/arrow/csv"
-	"github.com/apache/arrow/go/v18/arrow/memory"
 )
-
-// holds parameters to be passed around
-type csvExplorer struct {
-	timeFormat string
-	timeCol    int
-	headerRow  []string
-}
 
 func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
 	options.setDefaults()
@@ -41,7 +29,11 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 		return nil, err
 	}
 
-	var builderArray []array.Builder
+	var (
+		builderArray []array.Builder
+		i            int
+		sliceSkips   [2]int
+	)
 
 	for _, r := range genericReader.Schema.Fields() {
 		builder, err := readers.BuildersFromTypes(r.Type)
@@ -58,10 +50,6 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 		}
 	}
 
-	var (
-		i          int
-		sliceSkips [2]int
-	)
 	if options.SkipSlice != nil {
 		sliceSkips = *options.SkipSlice
 	} else {
@@ -179,105 +167,6 @@ func ReadFromGeneric[T any](t T, path string, options CsvReadOptions) (*gTypes.D
 	return df, nil
 }
 
-func ReadCsv(path string, options CsvReadOptions) (*gTypes.DataFrame, error) {
-	exp := csvExplorer{}
-
-	options.setDefaults()
-
-	file, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	err = handleCompression(options.Compression, &file, false)
-	if err != nil {
-		return nil, err
-	}
-
-	rows := bytes.Split(file, []byte("\n"))
-
-	if *options.HasHeader {
-		csvReader := csv.NewReader(bytes.NewReader(rows[0]))
-		csvReader.Comma = *options.Separator
-		csvReader.Comment = *options.CommentPrefix
-		row, err := csvReader.ReadAll()
-		if err != nil {
-			return nil, err
-		}
-
-		exp.headerRow = row[0]
-		rows = rows[1:]
-	}
-
-	rows = rows[*options.SkipRows:]
-	if options.SkipSlice != nil {
-		rows1 := rows[:options.SkipSlice[0]]
-		rows2 := rows[options.SkipSlice[1]:]
-		rows = append(rows1, rows2...)
-	}
-
-	data := []byte{}
-
-	for _, r := range rows {
-		data = append(data, r...)
-	}
-
-	csvReader := csv.NewReader(bytes.NewReader(data))
-	csvReader.Comma = *options.Separator
-	csvReader.Comment = *options.CommentPrefix
-
-	firstRecord, err := csvReader.Read()
-	if err != nil {
-		return nil, err
-	}
-
-	if *options.TryToParseDates {
-		exp.timeCol, exp.timeFormat, err = tryToParseDate(firstRecord)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if *options.InferSchema {
-		options.Schema, err = inferSchema(firstRecord, exp.headerRow)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	var builderArray []array.Builder
-
-	for _, r := range options.Schema.Fields() {
-		builderArray = append(builderArray, array.NewBuilder(memory.DefaultAllocator, r.Type))
-	}
-
-	for {
-		r, err := csvReader.Read()
-		if err != nil {
-			if err == io.EOF {
-				break
-			} else {
-				return nil, err
-			}
-		}
-
-		for idx, field := range r {
-			if field == "" {
-				builderArray[idx].AppendNull()
-			}
-			builderArray[idx].AppendValueFromString(field)
-		}
-	}
-
-	df := gTypes.NewDataFrame(options.Schema)
-
-	for idx, p := range builderArray {
-		arr := p.NewArray()
-		df.AddColumn(idx, options.Schema.Field(idx), arrow.NewColumnFromArr(options.Schema.Field(idx), arr))
-	}
-	return &df, nil
-}
-
 func handleCompression(compression *cmprssn.CompressionType, data *[]byte, compress bool) error {
 	if compression == nil {
 		return nil
@@ -298,96 +187,6 @@ func handleCompression(compression *cmprssn.CompressionType, data *[]byte, compr
 	return nil
 }
 
-func handleHeader(df *gTypes.DataFrame, row []string, schema []string) error {
-	return nil
-}
-
-func tryToParseDate(s []string) (col int, format string, err error) {
-	for idx, col := range s {
-		for _, format := range TimeFormatsList {
-			if _, err = time.Parse(format, col); err == nil {
-				return idx, format, nil
-			}
-		}
-	}
-	return 0, "", err
-}
-
-func checkSchema(schema *arrow.Schema, record []string) bool {
-	return false
-}
-
-func inferSchema(record []string, headers []string) (*arrow.Schema, error) {
-	typeMap := make(map[int]arrow.DataType)
-	for idx, feature := range record {
-		switch inferType(feature) {
-		case "date":
-			typeMap[idx] = &arrow.Date64Type{}
-		case "float":
-			typeMap[idx] = &arrow.Float64Type{}
-		case "string":
-			typeMap[idx] = &arrow.StringType{}
-		case "bool":
-			typeMap[idx] = &arrow.BooleanType{}
-		case "int":
-			typeMap[idx] = &arrow.Int64Type{}
-		case "geometry":
-			typeMap[idx] = gTypes.Point{}
-		default:
-			typeMap[idx] = &arrow.StringType{}
-		}
-	}
-
-	var fieldsList []arrow.Field
-
-	for key, val := range typeMap {
-		var name string
-		if len(headers)-1 >= key {
-			name = headers[key]
-		} else {
-			name = fmt.Sprintf("%d", key)
-		}
-		newField := arrow.Field{
-			Name:     name,
-			Type:     val,
-			Nullable: true,
-			Metadata: arrow.Metadata{},
-		}
-		fieldsList = append(fieldsList, newField)
-	}
-	schema := arrow.NewSchema(fieldsList, &arrow.Metadata{})
-	return schema, nil
-}
-
-func inferType(s string) string {
-	// Try parsing as date
-	if _, _, err := tryToParseDate([]string{s}); err == nil {
-		return "date"
-	}
-
-	// Try parsing as float
-	if _, err := strconv.ParseFloat(s, 64); err == nil {
-		return "float"
-	}
-
-	// Try parsing as int
-	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return "int"
-	}
-
-	// Try parsing as bool
-	if strings.ToLower(s) == "true" || strings.ToLower(s) == "false" {
-		return "bool"
-	}
-
-	if gTypes.CheckGeometry(s) {
-		return "geometry"
-	}
-
-	// Default to string
-	return "string"
-}
-
 func ReadCSVUsingArrow[T any](t T, path string, options ...arrowcsv.Option) (*gTypes.DataFrame, error) {
 	schema, err := readers.CSVStructToArrowSchema(t)
 	log.Println("t:", t)
@@ -401,18 +200,31 @@ func ReadCSVUsingArrow[T any](t T, path string, options ...arrowcsv.Option) (*gT
 	}
 	defer file.Close()
 
+	log.Println("making new arrowcsv Reader...")
 	arrowReader := arrowcsv.NewReader(file, schema, options...)
-	defer arrowReader.Release()
-
+	log.Println("done")
 	dataRecords := []arrow.Record{}
 
+	log.Println("starting next loop...")
+	arrowReader.Retain()
+	defer arrowReader.Release()
+
 	for arrowReader.Next() {
-		dataRecords = append(dataRecords, arrowReader.Record())
-		if arrowReader.Err() != nil {
-			return nil, arrowReader.Err()
+		if err := arrowReader.Err(); err != nil {
+			return nil, err
 		}
+		rec := arrowReader.Record()
+		if rec == nil {
+			log.Println("nil record")
+			continue
+		}
+		log.Printf("record has %d columns, %d rows", rec.NumCols(), rec.NumRows())
+		for i := range int(rec.NumCols()) {
+			arr := rec.Column(i)
+			log.Printf("  column %d (%s): %d values", i, rec.ColumnName(i), arr.Len())
+		}
+		dataRecords = append(dataRecords, rec)
 	}
 
-	table := array.NewTableFromRecords(schema, dataRecords)
-	return gTypes.NewDataFrameFromTable(table), nil
+	return gTypes.NewDataFrameFromRecords(schema, &dataRecords)
 }

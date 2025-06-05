@@ -2,7 +2,18 @@ package geometry
 
 import (
 	"math"
+	"strconv"
+	"strings"
 )
+
+func (c *CRS) ParseCRS(s string) (*CRS, error) {
+	cInt, err := strconv.ParseInt(strings.Split(s, ":")[1], 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	newCRS := CRSbyEPSG[int(cInt)]
+	return &newCRS, nil
+}
 
 func LLToMercator(lng, lat float64) (x, y float64) {
 	x = lng * MERCATOR_TRANSFORM_VAL / 180

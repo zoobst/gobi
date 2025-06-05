@@ -1,36 +1,138 @@
 package geojson
 
-// GeoJSONFeatureCollection represents a collection of GeoJSON features
-type GeoJSONFeatureCollection struct {
-	// Type is always "FeatureCollection" for GeoJSON feature collections.
-	Type     string           `json:"type"`
-	Features []GeoJSONFeature `json:"features"`
+import (
+	"encoding/json"
+	"errors"
+
+	"github.com/zoobst/gobi/geometry"
+)
+
+type GeometryType string
+
+const (
+	PointType              GeometryType = "Point"
+	MultiPointType         GeometryType = "MultiPoint"
+	LineStringType         GeometryType = "LineString"
+	MultiLineStringType    GeometryType = "MultiLineString"
+	PolygonType            GeometryType = "Polygon"
+	MultiPolygonType       GeometryType = "MultiPolygon"
+	GeometryCollectionType GeometryType = "GeometryCollection"
+	FeatureType            GeometryType = "Feature"
+	FeatureCollectionType  GeometryType = "FeatureCollection"
+)
+
+type Geometry interface {
+	geometry.Geometry
 }
 
-// GeoJSONFeature represents a single feature in a GeoJSON structure
-type GeoJSONFeature struct {
-	Type       string          `json:"type"`
-	Geometry   GeoJSONGeometry `json:"geometry"`
-	Properties map[string]any  `json:"properties"`
+type Feature struct {
+	Type       GeometryType   `json:"type"` // always "Feature"
+	Geometry   *Geometry      `json:"geometry"`
+	Properties map[string]any `json:"properties"`
+	BBox       []float64      `json:"bbox,omitempty"`
 }
 
-// GeoJSONGeometry represents the geometry of a GeoJSON feature
-type GeoJSONGeometry struct {
-	Type        string         `json:"type"`
-	Coordinates [][][2]float64 `json:"coordinates"`
+type FeatureCollection struct {
+	Type     GeometryType `json:"type"` // always "FeatureCollection"
+	Features []*Feature   `json:"features"`
+	BBox     []float64    `json:"bbox,omitempty"`
+	CRS      *CRS         `json:"crs,omitempty"`
 }
 
-// GeoJSONMarshaler is an interface for types that can marshal themselves into GeoJSON format.
-type GeoJSONMarshaler interface {
-	// MarshalGeoJSON converts the implementing type into a GeoJSON representation.
-	// and an error if the marshaling process fails.
-	MarshalGeoJSON() ([]byte, error)
+func (f *Feature) MarshalJSON() ([]byte, error) {
+	f.Type = FeatureType
+	return json.Marshal(f)
 }
 
-// GeoJSONGetter is an interface for types that can provide GeoJSON properties and geometry.
-type GeoJSONGetter interface {
-	// GetProperties returns a map of properties for the GeoJSON feature.
-	GeoJSONProperties() map[string]any
-	// GetGeometry returns the geometry of the GeoJSON feature.
-	GeoJSONGeometry() GeoJSONGeometry
+func (f *Feature) UnmarshalJSON(data []byte) error {
+	return json.Unmarshal(data, f)
+}
+
+func (fc *FeatureCollection) MarshalJSON() ([]byte, error) {
+	fc.Type = FeatureCollectionType
+	return json.Marshal(fc)
+}
+
+func (fc *FeatureCollection) UnmarshalJSON(data []byte) error {
+	return json.Unmarshal(data, fc)
+}
+
+type CRS struct {
+	geometry.CRS
+}
+
+func (c *CRS) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type       string            `json:"type"`
+		Properties map[string]string `json:"properties"`
+	}{
+		Type: "name",
+		Properties: map[string]string{
+			"name": c.Name,
+		},
+	})
+}
+
+func (c *CRS) UnmarshalJSON(data []byte) (err error) {
+	temp := struct {
+		Type       string            `json:"type"`
+		Properties map[string]string `json:"properties"`
+	}{}
+	if err := json.Unmarshal(data, &temp); err != nil {
+		return err
+	}
+	newC, err := c.ParseCRS(temp.Properties["name"])
+	if err != nil {
+		return err
+	}
+	c = &CRS{*newC}
+	return nil
+}
+
+type Point struct {
+	geometry.Point
+}
+
+type LineString struct {
+	geometry.LineString
+}
+
+type Polygon struct {
+	geometry.Polygon
+}
+type GeometryCollection struct {
+	geometry.GeometryCollection
+}
+
+// UnmarshalGeometry dispatches to the correct concrete geometry type
+func UnmarshalGeometry(data []byte) (geometry.Geometry, error) {
+	type geomHeader struct {
+		Type GeometryType `json:"type"`
+	}
+	var h geomHeader
+	if err := json.Unmarshal(data, &h); err != nil {
+		return nil, err
+	}
+	switch h.Type {
+	case PointType:
+		var g Point
+		return &g, g.UnmarshalJSON(data)
+	case LineStringType:
+		var g LineString
+		return &g, g.UnmarshalJSON(data)
+	case PolygonType:
+		var g Polygon
+		return &g, g.UnmarshalJSON(data)
+	case GeometryCollectionType:
+		var g GeometryCollection
+		return &g, g.UnmarshalJSON(data)
+	default:
+		return nil, errors.New("unknown geometry type")
+	}
+}
+
+func UnmarshalAs[T Geometry](data []byte) (T, error) {
+	var t T
+	err := t.UnmarshalJSON(data)
+	return t, err
 }

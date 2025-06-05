@@ -6,8 +6,6 @@ import (
 	"github.com/apache/arrow/go/v18/arrow"
 )
 
-type config any
-
 var (
 	defaultHasHeader       bool   = true
 	defaultSeparator       rune   = ','

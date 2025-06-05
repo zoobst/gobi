@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -159,6 +160,32 @@ func (pt Point) FromWKB(data []byte) (Point, error) {
 func (p Point) Coords() (fList [][2]float64) {
 	fList = [][2]float64{{p.X, p.Y}}
 	return fList
+}
+
+func (p Point) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type        string     `json:"type"`
+		Coordinates [2]float64 `json:"coordinates"`
+	}{
+		Type:        p.Name(),
+		Coordinates: p.Coords()[0],
+	})
+}
+
+func (p Point) UnmarshalJSON(data []byte) error {
+	temp := struct {
+		Type        string     `json:"type"`
+		Coordinates [2]float64 `json:"coordinates"`
+	}{}
+	if err := json.Unmarshal(data, &temp); err != nil {
+		return err
+	}
+	if temp.Type != p.Name() {
+		return errors.New("invalid geometry type for Point")
+	}
+	p.X = temp.Coordinates[0]
+	p.Y = temp.Coordinates[1]
+	return nil
 }
 
 func (p Point) MinX() float64 { return p.X }

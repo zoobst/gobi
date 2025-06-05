@@ -19,6 +19,10 @@ type DataFrame struct {
 	*gTypes.DataFrame
 }
 
+type Geometry interface {
+	gTypes.Geometry
+}
+
 func ReadParquet(path string, compression string) (*DataFrame, error) {
 	if df, err := gbParquet.ReadParquet(path, compression); err == nil {
 		return &DataFrame{df}, nil
@@ -31,14 +35,6 @@ func (df *DataFrame) ToParquet(outPath, compression string) (err error) {
 	return writers.WriteParquetToFile(df, outPath, compression)
 }
 
-func ReadCSV(path string, options gbcsv.CsvReadOptions) (*DataFrame, error) {
-	df, err := gbcsv.ReadCsv(path, options)
-	if err != nil {
-		return nil, err
-	}
-	return &DataFrame{df}, nil
-}
-
 func ReadCSVFromType[T any](t T, path string, options gbcsv.CsvReadOptions) (*DataFrame, error) {
 	df, err := gbcsv.ReadFromGeneric[T](t, path, gbcsv.CsvReadOptions{})
 	if err != nil {
@@ -49,7 +45,7 @@ func ReadCSVFromType[T any](t T, path string, options gbcsv.CsvReadOptions) (*Da
 }
 
 func ReadCSVFromTypeUsingArrow[T any](t T, path string, options ...csv.Option) (*DataFrame, error) {
-	df, err := gbcsv.ReadCSVUsingArrow[T](t, path, options...)
+	df, err := gbcsv.ReadCSVUsingArrow(t, path, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -75,30 +71,6 @@ func main() {
 	}
 	defer f.Close()
 	defer pprof.WriteHeapProfile(f)
-
-	if res := TestReadCSVFromType(); !res {
-		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestReadCSVFromType"))
-	}
-
-	/* if res := TestReadGeometryCSVFromType(); !res {
-		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestReadGeometryCSVFromType"))
-	} */
-
-	if res := TestReadGeometryCSVFromTypeUsingArrow(); !res {
-		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestReadGeometryCSVFromType"))
-	}
-
-	if res := TestIloc(); !res {
-		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestIloc"))
-	}
-
-	if res := TestCol(); !res {
-		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestCol"))
-	}
-
-	if res := TestArea(0); !res {
-		log.Fatal(fmt.Errorf(ErrFailedTest.Error(), "TestArea"))
-	}
 
 	elapsed := time.Since(start)
 	fmt.Printf("Elapsed time: %s\n", elapsed)

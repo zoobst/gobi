@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -210,6 +211,35 @@ func (ls LineString) FromWKB(data []byte) (LineString, error) {
 
 func (l LineString) Len() int {
 	return len(l.Points)
+}
+
+func (p LineString) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type        string       `json:"type"`
+		Coordinates [][2]float64 `json:"coordinates"`
+	}{
+		Type:        p.Name(),
+		Coordinates: p.Coords(),
+	})
+}
+
+func (p LineString) UnmarshalJSON(data []byte) error {
+	temp := struct {
+		Type        string       `json:"type"`
+		Coordinates [][2]float64 `json:"coordinates"`
+	}{}
+	if err := json.Unmarshal(data, &temp); err != nil {
+		return err
+	}
+	if temp.Type != p.Name() {
+		return errors.New("invalid geometry type for Polygon")
+	}
+
+	for _, pt := range temp.Coordinates {
+		p.Points = append(p.Points, Point{X: pt[0], Y: pt[1]})
+	}
+
+	return nil
 }
 
 func (l LineString) MaxX() float64 { return maxX(&l.Points) }

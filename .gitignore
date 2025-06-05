@@ -3,3 +3,4 @@ testData
 *.ipynb
 .DS_STORE
 *.prof
+test.txt
