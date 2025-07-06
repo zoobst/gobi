@@ -56,8 +56,8 @@ func (p Point) ExtensionMetadata() string { return "" }
 
 func (p Point) ExtensionEquals(other arrow.ExtensionType) bool {
 	switch t := other.(type) {
-	case Geometry:
-		return p.Equal(t)
+	case Point:
+		return p.Equal(t.Point)
 	default:
 		return false
 	}

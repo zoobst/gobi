@@ -29,12 +29,16 @@ func (p Polygon) Equal(other Geometry) bool {
 	}
 }
 
-func (p Polygon) ToCRS(epsg int) Geometry {
+func (p Polygon) ToCRS(epsg int32) (Polygon, error) {
 	newP := Polygon{}
 	for _, pt := range p.Points {
-		newP.Points = append(newP.Points, pt.ToCRS(epsg).(Point))
+		if point, err := pt.ToCRS(epsg); err == nil {
+			newP.Points = append(newP.Points, point)
+		} else {
+			return p, err
+		}
 	}
-	return newP
+	return newP, nil
 }
 
 func (p Polygon) EstimateUTMCRS() CRS {
@@ -196,7 +200,7 @@ func (p Polygon) Type() string { return "geometry" }
 
 func (p Polygon) Name() string { return "Polygon" }
 
-func (p Polygon) CRS() CRS { return p.Points[0].CoordRefSys }
+func (p Polygon) CRS() *CRS { return &p.Points[0].CoordRefSys }
 
 func (p Polygon) WKT() (strList string) {
 	strList = "POLYGON ("

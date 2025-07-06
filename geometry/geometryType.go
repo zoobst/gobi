@@ -58,7 +58,7 @@ func (g GeometryType) Equal(other Geometry) bool {
 	return true
 }
 
-func (g GeometryType) ToCRS(epsg int) Geometry {
+func (g GeometryType) ToCRS(epsg int32) Geometry {
 	newP := Point{
 		CoordRefSys: CRSbyEPSG[epsg],
 	}
@@ -102,7 +102,7 @@ func (g GeometryType) String() (strList string) {
 	return ""
 }
 
-func (g GeometryType) CRS() CRS { return g.Points[0].CoordRefSys }
+func (g GeometryType) CRS() *CRS { return &g.Points[0].CoordRefSys }
 
 func (g GeometryType) WKT() string {
 	switch g.T.(type) {

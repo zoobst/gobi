@@ -14,20 +14,26 @@ func (gc GeometryCollection) Type() string {
 	return "GeometryCollection"
 }
 
-func (gc GeometryCollection) CRS() CRS {
+func (gc GeometryCollection) CRS() *CRS {
 	return gc.Geometries[0].CRS()
 }
 
 func (gc GeometryCollection) EstimateUTMCRS() CRS {
-	return gc.Geometries[0].EstimateUTMCRS()
+	crs := EstimateUTMCRS(gc.Geometries[0])
+	return CRSbyEPSG[crs]
 }
 
-func (gc GeometryCollection) ToCRS(epsg int) Geometry {
+func (gc *GeometryCollection) ToCRS(epsg int32) error {
 	newGC := GeometryCollection{}
 	for _, geom := range gc.Geometries {
-		newGC.Geometries = append(newGC.Geometries, geom.ToCRS(epsg))
+		err := ToCRS(&geom, epsg)
+		if err != nil {
+			return err
+		}
+		newGC.Geometries = append(newGC.Geometries, geom)
 	}
-	return newGC
+	gc.Geometries = newGC.Geometries
+	return nil
 }
 
 func (gc GeometryCollection) Coords() (coordArray [][2]float64) {
@@ -53,7 +59,7 @@ func (gc GeometryCollection) Equal(other Geometry) bool {
 	switch t := other.(type) {
 	case GeometryCollection:
 		for i, geom := range gc.Geometries {
-			if !geom.Equal(t.Geometries[i]) {
+			if !Equal(geom, t.Geometries[i]) {
 				return false
 			}
 		}

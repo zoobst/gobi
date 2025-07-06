@@ -977,7 +977,7 @@ var (
 	}
 )
 
-var CRSbyEPSG map[int]CRS = map[int]CRS{
+var CRSbyEPSG map[int32]CRS = map[int32]CRS{
 	4326:  WGS84,
 	3857:  PSEUDOMERCATOR,
 	32601: UTMZONE1N,

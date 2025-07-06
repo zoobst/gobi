@@ -36,4 +36,6 @@ var (
 	ErrInvalidUnit error = errors.New("invalid unit: %s provided")
 
 	ErrUnableToParseStringCoords error = errors.New("unable to parse provided string coordinates: %s")
+
+	ErrInvalidCRS error = errors.New("invalid epsg: %d")
 )

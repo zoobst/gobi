@@ -37,6 +37,8 @@ func ParseWKB(data []byte) (Geometry, error) {
 		return LineString{}.FromWKB(data)
 	case WKB_POLYGON:
 		return Polygon{}.FromWKB(data)
+	case WKB_MULTIPOINT:
+		return MultiPoint{}.FromWKB(data)
 	default:
 		return nil, fmt.Errorf("unsupported WKB geometry type: %d", geomType)
 	}
@@ -67,10 +69,29 @@ func ParseWKT(s string) (t Geometry, err error) {
 		if t, err = ParseLineStringWKT(s); err == nil {
 			return
 		}
+	} else if (len(s) > 10) && (s[:10] == "MULTIPOINT") {
+		if t, err = ParseMultiPointWKT(s); err == nil {
+			return
+		}
 	} else {
 		return nil, fmt.Errorf(berrors.ErrInvalidGeometryType.Error(), t)
 	}
 	return nil, err
+}
+
+func EstimateUTMCRS(g Geometry) int32 {
+	return estimateUTMEPSG(g)
+}
+
+func Equal(g1, g2 Geometry) bool {
+	for idx, coord := range g1.Coords() {
+		if g2.Coords()[idx] == coord {
+			continue
+		} else {
+			return false
+		}
+	}
+	return true
 }
 
 // ParsePoint parses a WKT Point string
@@ -84,6 +105,8 @@ func ParsePointWKT(s string) (Point, error) {
 	if err != nil {
 		return Point{}, err
 	}
+
+	log.Println("Points:", coords)
 	return Point{X: coords[0], Y: coords[1]}, nil
 }
 
@@ -103,6 +126,7 @@ func ParseLineStringWKT(s string) (LineString, error) {
 		}
 		points = append(points, p)
 	}
+	log.Println("Points:", points)
 	return LineString{Points: points}, nil
 }
 
@@ -128,6 +152,28 @@ func ParsePolygonWKT(s string) (Polygon, error) {
 	return Polygon{Points: points}, nil
 }
 
+// ParseMultiPointWKT parses a WKT MultiPoint string
+func ParseMultiPointWKT(s string) (mp MultiPoint, err error) {
+	var points []Point
+	s = strings.TrimPrefix(s, "MULTIPOINT ((")
+	s = strings.TrimPrefix(s, "MULTIPOINT((")
+	s = strings.TrimSuffix(s, "))")
+	rings := strings.SplitSeq(s, "),(")
+	for ring := range rings {
+		coords := strings.SplitSeq(ring, ",")
+		for coord := range coords {
+			coord = strings.TrimSpace(coord)
+			p, err := ParsePointWKT(coord)
+			if err != nil {
+				return MultiPoint{}, err
+			}
+			points = append(points, p)
+		}
+	}
+	log.Println("Points:", points)
+	return MultiPoint{PointList: points}, nil
+}
+
 func ParseStringCoords(s string) (Geometry, error) {
 	var x, y float64
 
@@ -147,6 +193,35 @@ func ParseStringCoords(s string) (Geometry, error) {
 	}
 
 	return nil, fmt.Errorf(berrors.ErrUnableToParseStringCoords.Error(), s)
+}
+
+func ToCRS(g *Geometry, epsg int32) error {
+	geo := *g
+	switch t := geo.(type) {
+	case Polygon:
+		t.ToCRS(epsg)
+	case *Polygon:
+		t.ToCRS(epsg)
+	case LineString:
+		t.ToCRS(epsg)
+	case *LineString:
+		t.ToCRS(epsg)
+	case Point:
+		t.ToCRS(epsg)
+	case *Point:
+		t.ToCRS(epsg)
+	case MultiPoint:
+		t.ToCRS(epsg)
+	case *MultiPoint:
+		t.ToCRS(epsg)
+	case GeometryCollection:
+		t.ToCRS(epsg)
+	case *GeometryCollection:
+		t.ToCRS(epsg)
+	default:
+		return berrors.ErrInvalidType
+	}
+	return nil
 }
 
 func maxY(points *[]Point) (hVal float64) {
@@ -210,17 +285,18 @@ func (b Box) maxBox(b2 Box) (bigBox Box) {
 	}
 }
 
-func estimateUTMEPSG(g Geometry) int {
+func estimateUTMEPSG(g Geometry) int32 {
 	if g.CRS().Zone != "" {
-		return g.CRS().EPSG
+		crs := g.CRS()
+		return crs.EPSG
 	}
 	var p Point
 	switch t := g.(type) {
-	case *Point:
+	case Point:
 		p = t.Copy()
-	case *Polygon:
+	case Polygon:
 		p = t.Centroid()
-	case *LineString:
+	case LineString:
 		p = t.Centroid()
 	default:
 		log.Fatal(fmt.Errorf(berrors.ErrInvalidGeometryType.Error(), g))
@@ -231,7 +307,7 @@ func estimateUTMEPSG(g Geometry) int {
 		p.X, p.Y = MercatorToLL(p.X, p.Y)
 	}
 
-	zone := int((p.X+180)/6) + 1
+	zone := int32((p.X+180)/6) + 1
 	if p.Y >= 0 {
 		return 32600 + zone // Northern hemisphere
 	}

@@ -8,12 +8,9 @@ import (
 type Geometry interface {
 	fmt.Stringer
 	Len() int
-	CRS() CRS
-	ToCRS(epsg int) Geometry
-	EstimateUTMCRS() CRS
+	CRS() *CRS
 	String() string
 	Type() string
-	Equal(Geometry) bool
 	WKT() string
 	WKB() []byte
 	WKBHex() (string, error)
@@ -34,7 +31,7 @@ type CRS struct {
 	AreaOfUse string
 	Zone      string
 
-	EPSG int
+	EPSG int32
 
 	Projected bool
 }
@@ -75,4 +72,9 @@ type LineString struct {
 type GeometryCollection struct {
 	fmt.Stringer
 	Geometries []Geometry `json:"geometries"`
+}
+
+type MultiPoint struct {
+	fmt.Stringer
+	PointList []Point
 }

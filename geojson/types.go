@@ -85,7 +85,8 @@ func (c *CRS) UnmarshalJSON(data []byte) (err error) {
 	if err != nil {
 		return err
 	}
-	c = &CRS{*newC}
+	newerC := CRS{*newC}
+	c = &newerC
 	return nil
 }
 

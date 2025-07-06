@@ -11,7 +11,7 @@ func (c *CRS) ParseCRS(s string) (*CRS, error) {
 	if err != nil {
 		return nil, err
 	}
-	newCRS := CRSbyEPSG[int(cInt)]
+	newCRS := CRSbyEPSG[int32(cInt)]
 	return &newCRS, nil
 }
 

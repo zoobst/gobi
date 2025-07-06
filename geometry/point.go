@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	berrors "github.com/zoobst/gobi/bErrors"
 )
 
 func NewPoint(x, y float64, crs *CRS) (Point, error) {
@@ -28,22 +30,22 @@ func (p Point) Len() int {
 	return 1
 }
 
-func (p Point) Equal(other Geometry) bool {
-	switch t := other.(type) {
-	case *Point:
-		if t.X == p.X && t.Y == p.Y && t.CRS().EPSG == p.CRS().EPSG {
-			return true
-		}
-		return false
-	default:
-		return false
+func (p Point) Equal(op Point) bool {
+	if op.X == p.X && op.Y == p.Y && op.CRS().EPSG == p.CRS().EPSG {
+		return true
 	}
+	return false
 }
 
-func (p Point) ToCRS(epsg int) Geometry {
-	newP := Point{
-		CoordRefSys: CRSbyEPSG[epsg],
+func (p Point) ToCRS(epsg int32) (newP Point, err error) {
+	if crs, ok := CRSbyEPSG[epsg]; ok {
+		newP = Point{
+			CoordRefSys: crs,
+		}
+	} else {
+		return newP, fmt.Errorf(berrors.ErrInvalidCRS.Error(), epsg)
 	}
+
 	if p.CRS().Projected && newP.CRS().Projected {
 		newP.X, newP.Y = p.X, p.Y
 	} else if p.CRS().Projected && !newP.CRS().Projected {
@@ -51,7 +53,7 @@ func (p Point) ToCRS(epsg int) Geometry {
 	} else if !p.CRS().Projected && newP.CRS().Projected {
 		newP.X, newP.Y = LLToMercator(p.X, p.Y)
 	}
-	return newP
+	return newP, nil
 }
 
 func (p Point) EstimateUTMCRS() CRS {
@@ -76,7 +78,7 @@ func (p Point) Type() string { return "Geometry" }
 
 func (p Point) Name() string { return "Point" }
 
-func (p Point) CRS() CRS { return p.CoordRefSys }
+func (p Point) CRS() *CRS { return &p.CoordRefSys }
 
 func (p Point) WKT() string { return fmt.Sprintf("POINT(%f %f)", p.X, p.Y) }
 

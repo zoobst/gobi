@@ -26,12 +26,16 @@ func (l LineString) Equal(other Geometry) bool {
 	}
 }
 
-func (l LineString) ToCRS(epsg int) Geometry {
-	newL := LineString{}
+func (l LineString) ToCRS(epsg int32) (newL LineString, err error) {
 	for _, p := range l.Points {
-		newL.Points = append(newL.Points, p.ToCRS(epsg).(Point))
+		p, err = p.ToCRS(epsg)
+		if err != nil {
+			return newL, err
+		}
+
+		newL.Points = append(newL.Points, p)
 	}
-	return newL
+	return newL, nil
 }
 
 func (l LineString) EstimateUTMCRS() CRS {
@@ -98,7 +102,7 @@ func (l LineString) Type() string { return "Geometry" }
 
 func (l LineString) Name() string { return "LineString" }
 
-func (l LineString) CRS() CRS { return l.Points[0].CoordRefSys }
+func (l LineString) CRS() *CRS { return &l.Points[0].CoordRefSys }
 
 func (l LineString) WKT() (strList string) {
 	strList = "LINESTRING ("
