@@ -1,255 +1,160 @@
 package geometry
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"fmt"
+	"math"
+	"strings"
 )
 
-func (l LineString) Equal(other Geometry) bool {
-	switch t := other.(type) {
-	case *Polygon:
-		if t.Len() != l.Len() {
-			return false
-		}
-		for i := range l.Len() {
-			if !l.Points[i].Equal(t.Points[i]) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
+// LineString is an ordered sequence of two or more points. Set HasZ to true
+// to encode Z values in WKB/WKT output.
+type LineString struct {
+	Points   []Point
+	CRSValue CRS
+	HasZ     bool
 }
 
-func (l LineString) ToCRS(epsg int32) (newL LineString, err error) {
+// NewLineString returns a 2D LineString sharing the underlying slice.
+func NewLineString(pts []Point, crs CRS) LineString {
+	return LineString{Points: pts, CRSValue: crs}
+}
+
+// NewLineStringZ returns a 3D LineString.
+func NewLineStringZ(pts []Point, crs CRS) LineString {
+	return LineString{Points: pts, CRSValue: crs, HasZ: true}
+}
+
+func (l LineString) Type() Type { return TypeLineString }
+func (l LineString) CRS() CRS   { return l.CRSValue }
+func (l LineString) Is3D() bool { return l.HasZ }
+
+// Bounds returns the XY bounding box. Z is ignored.
+func (l LineString) Bounds() Bounds {
+	b := EmptyBounds()
 	for _, p := range l.Points {
-		p, err = p.ToCRS(epsg)
-		if err != nil {
-			return newL, err
-		}
-
-		newL.Points = append(newL.Points, p)
+		b = b.Extend(p.X, p.Y)
 	}
-	return newL, nil
+	return b
 }
 
-func (l LineString) EstimateUTMCRS() CRS {
-	epsg := estimateUTMEPSG(l)
-	return CRSbyEPSG[epsg]
-}
-
-func (l LineString) Bounds() Box {
-	return [4]float64{l.MinX(), l.MinY(), l.MaxX(), l.MaxY()}
-}
-
-// Length calculates the distance between two points on the Earth using a haversine
-// calculation. The distance is returned in the unit specified.
-//
-// The unit argument accepts the following values (case-insensitive):
-//   - "km"  : kilometers (default if unknown)
-//   - "mi"  : miles
-//   - "nmi" : nautical miles
-//
-// Coordinates are assumed to be in WGS84 format.
-//
-// Example usage:
-//
-//	stringLength := l.Length("mi")   // Distance in miles
-func (l LineString) Length(unit string) float64 {
-	dist := 0.0
-	for i := range len(l.Points) - 1 {
-		if l.CRS().Projected {
-			dist += projectedDistance(&l.Points[i], &l.Points[i+1], unit)
-		} else {
-			dist += haversine(&l.Points[i], &l.Points[i+1], unit)
-		}
+// EstimateUTMCRS returns the CRS of the UTM zone covering the linestring's
+// bounds midpoint. If the linestring is in a projected CRS, the midpoint is
+// inverse-projected to WGS84 first.
+func (l LineString) EstimateUTMCRS() (CRS, error) {
+	b := l.Bounds()
+	if b.Empty() {
+		return CRS{}, ErrEmptyGeometry
 	}
-	return dist
+	return estimateUTMFromXY((b.MinX+b.MaxX)/2, (b.MinY+b.MaxY)/2, l.CRSValue)
 }
 
+// ToCRS reprojects the linestring into target.
+func (l LineString) ToCRS(target CRS) (LineString, error) {
+	g, err := Project(l, target)
+	if err != nil {
+		return LineString{}, err
+	}
+	return g.(LineString), nil
+}
+
+// Centroid returns the length-weighted midpoint of the linestring in
+// planar XY. Each segment contributes its midpoint weighted by its planar
+// length; the result carries l's CRS.
 func (l LineString) Centroid() Point {
-	var (
-		n = l.Len()
-	)
-	// average of points
-	var sx, sy float64
-	for _, pt := range l.Points {
-		sx += pt.X
-		sy += pt.Y
-	}
-	return Point{
-		X: sx / float64(n),
-		Y: sy / float64(n),
-	}
-}
-
-func (l LineString) String() (strList string) {
 	if len(l.Points) == 0 {
-		return
+		return Point{CRSValue: l.CRSValue}
 	}
-	for _, LineString := range l.Points {
-		strList += ", " + LineString.String()
+	if len(l.Points) == 1 {
+		return Point{X: l.Points[0].X, Y: l.Points[0].Y, CRSValue: l.CRSValue}
 	}
-	return strList[2:]
-}
-
-func (l LineString) Type() string { return "Geometry" }
-
-func (l LineString) Name() string { return "LineString" }
-
-func (l LineString) CRS() *CRS { return &l.Points[0].CoordRefSys }
-
-func (l LineString) WKT() (strList string) {
-	strList = "LINESTRING ("
-	for _, LineString := range l.Points {
-		strList += fmt.Sprintf("(%f %f),", LineString.X, LineString.Y)
-	}
-	strList = strList[:len(strList)-1]
-	return strList + ")"
-}
-
-func (l LineString) Coords() (fList [][2]float64) {
-	for _, LineString := range l.Points {
-		fList = append(fList, [2]float64{LineString.X, LineString.Y})
-	}
-	return fList
-}
-
-func (l LineString) WKB() []byte {
-	buf := new(bytes.Buffer)
-
-	// Byte order: 1 = little endian
-	if err := binary.Write(buf, binary.LittleEndian, byte(1)); err != nil {
-		return nil
-	}
-
-	// Geometry type: 2 = LineString
-	if err := binary.Write(buf, binary.LittleEndian, WKB_LINESTRING); err != nil {
-		return nil
-	}
-
-	numPoints := uint32(l.Len())
-	if err := binary.Write(buf, binary.LittleEndian, numPoints); err != nil {
-		return nil
-	}
-
-	// Write all points (X, Y)
-	for _, pt := range l.Points {
-		if err := binary.Write(buf, binary.LittleEndian, pt.X); err != nil {
-			return nil
+	var cx, cy, total float64
+	for i := 0; i < len(l.Points)-1; i++ {
+		a, b := l.Points[i], l.Points[i+1]
+		dx := b.X - a.X
+		dy := b.Y - a.Y
+		segLen := math.Sqrt(dx*dx + dy*dy)
+		if segLen == 0 {
+			continue
 		}
-		if err := binary.Write(buf, binary.LittleEndian, pt.Y); err != nil {
-			return nil
-		}
+		mx := (a.X + b.X) / 2
+		my := (a.Y + b.Y) / 2
+		cx += mx * segLen
+		cy += my * segLen
+		total += segLen
 	}
-
-	return buf.Bytes()
+	if total == 0 {
+		// All points identical; fall back to first point.
+		return Point{X: l.Points[0].X, Y: l.Points[0].Y, CRSValue: l.CRSValue}
+	}
+	return Point{X: cx / total, Y: cy / total, CRSValue: l.CRSValue}
 }
 
-// WKBHex returns the WKB encoding of the LineString as a hex string.
-func (l LineString) WKBHex() (string, error) {
-	wkb := l.WKB()
-	return hex.EncodeToString(wkb), nil
+// Length returns the total planar (XY) length of the linestring in the
+// requested unit. Z is ignored. Geographic CRSes use haversine; projected
+// CRSes use planar distance.
+func (l LineString) Length(u Unit) (float64, error) {
+	if len(l.Points) < 2 {
+		return 0, nil
+	}
+	total := 0.0
+	for i := 0; i < len(l.Points)-1; i++ {
+		a, b := l.Points[i], l.Points[i+1]
+		var d float64
+		var err error
+		if l.CRSValue.Projected {
+			d, err = Euclidean(a.X, a.Y, b.X, b.Y, u)
+		} else {
+			d, err = Haversine(a.X, a.Y, b.X, b.Y, u)
+		}
+		if err != nil {
+			return 0, err
+		}
+		total += d
+	}
+	return total, nil
 }
 
-func (ls LineString) FromWKB(data []byte) (LineString, error) {
-	crs := ls.Points[0].CoordRefSys
-	buf := bytes.NewReader(data)
-
-	// 1. Byte order
-	var byteOrder byte
-	if err := binary.Read(buf, binary.LittleEndian, &byteOrder); err != nil {
-		return ls, fmt.Errorf("failed to read byte order: %w", err)
-	}
-	var bo binary.ByteOrder
-	switch byteOrder {
-	case 0:
-		bo = binary.BigEndian
-	case 1:
-		bo = binary.LittleEndian
-	default:
-		return ls, errors.New("invalid byte order")
-	}
-
-	// 2. Geometry type
-	var geomType uint32
-	if err := binary.Read(buf, bo, &geomType); err != nil {
-		return ls, fmt.Errorf("failed to read geometry type: %w", err)
-	}
-	if geomType != 2 { // WKB LineString = 2
-		return ls, fmt.Errorf("unexpected geometry type for LineString: %d", geomType)
-	}
-
-	// 3. Number of points
-	var numPoints uint32
-	if err := binary.Read(buf, bo, &numPoints); err != nil {
-		return ls, fmt.Errorf("failed to read number of points: %w", err)
-	}
-
-	// 4. Read each point
-	points := make([]Point, 0, numPoints)
-	for i := range int(numPoints) {
-		var x, y float64
-		if err := binary.Read(buf, bo, &x); err != nil {
-			return ls, fmt.Errorf("failed to read x at point %d: %w", i, err)
+func (l LineString) WKT() string {
+	if len(l.Points) == 0 {
+		if l.HasZ {
+			return "LINESTRING Z EMPTY"
 		}
-		if err := binary.Read(buf, bo, &y); err != nil {
-			return ls, fmt.Errorf("failed to read y at point %d: %w", i, err)
-		}
-		points = append(points, Point{X: x, Y: y, CoordRefSys: crs})
+		return "LINESTRING EMPTY"
 	}
-
-	ls.Points = points
-	for _, pts := range ls.Points {
-		if pts.CoordRefSys.Name == "" {
-			pts.CoordRefSys = WGS84 // Default if not stored in WKB
+	var b strings.Builder
+	if l.HasZ {
+		b.WriteString("LINESTRING Z (")
+	} else {
+		b.WriteString("LINESTRING (")
+	}
+	for i, p := range l.Points {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(formatCoord(p.X))
+		b.WriteByte(' ')
+		b.WriteString(formatCoord(p.Y))
+		if l.HasZ {
+			b.WriteByte(' ')
+			b.WriteString(formatCoord(p.Z))
 		}
 	}
-	return ls, nil
+	b.WriteByte(')')
+	return b.String()
 }
 
-func (l LineString) Len() int {
-	return len(l.Points)
-}
-
-func (p LineString) MarshalJSON() ([]byte, error) {
-	return json.Marshal(struct {
-		Type        string       `json:"type"`
-		Coordinates [][2]float64 `json:"coordinates"`
-	}{
-		Type:        p.Name(),
-		Coordinates: p.Coords(),
-	})
-}
-
-func (p LineString) UnmarshalJSON(data []byte) error {
-	temp := struct {
-		Type        string       `json:"type"`
-		Coordinates [][2]float64 `json:"coordinates"`
-	}{}
-	if err := json.Unmarshal(data, &temp); err != nil {
-		return err
+func (l LineString) AppendWKB(buf []byte) []byte {
+	if l.HasZ {
+		buf = appendWKBHeader(buf, wkbLineStringZ)
+	} else {
+		buf = appendWKBHeader(buf, wkbLineString)
 	}
-	if temp.Type != p.Name() {
-		return errors.New("invalid geometry type for Polygon")
+	buf = appendUint32LE(buf, uint32(len(l.Points)))
+	for _, p := range l.Points {
+		buf = appendFloat64LE(buf, p.X)
+		buf = appendFloat64LE(buf, p.Y)
+		if l.HasZ {
+			buf = appendFloat64LE(buf, p.Z)
+		}
 	}
-
-	for _, pt := range temp.Coordinates {
-		p.Points = append(p.Points, Point{X: pt[0], Y: pt[1]})
-	}
-
-	return nil
+	return buf
 }
-
-func (l LineString) MaxX() float64 { return maxX(&l.Points) }
-
-func (l LineString) MaxY() float64 { return maxY(&l.Points) }
-
-func (l LineString) MinX() float64 { return minX(&l.Points) }
-
-func (l LineString) MinY() float64 { return minY(&l.Points) }

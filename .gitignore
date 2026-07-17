@@ -1,6 +1,25 @@
-testData
-*.py
-*.ipynb
-.DS_STORE
+# Binaries
+/gobi
+/gobi-demo
+/bin/
+
+# Profiling
 *.prof
-test.txt
+*.pprof
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Test artifacts
+coverage.out
+coverage.html
+
+test.ipynb
+
+# Benchmark harnesses + fixtures (local performance experiments only)
+/benchmarks/

@@ -1,434 +1,339 @@
 package geometry
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"fmt"
 	"math"
 	"sort"
 	"strings"
 )
 
-func (p Polygon) Equal(other Geometry) bool {
-	switch t := other.(type) {
-	case *Polygon:
-		if t.Len() != p.Len() {
+// Polygon is a planar surface defined by one exterior linear ring and zero or
+// more interior rings (holes). Rings are lists of points; the first and last
+// point of each ring must coincide (Polygon operations close rings implicitly
+// if they don't).
+type Polygon struct {
+	Rings    [][]Point
+	CRSValue CRS
+	HasZ     bool
+}
+
+// NewPolygon returns a 2D Polygon with the given rings. The first ring is the
+// exterior boundary; any subsequent rings are holes.
+func NewPolygon(rings [][]Point, crs CRS) Polygon {
+	return Polygon{Rings: rings, CRSValue: crs}
+}
+
+// NewPolygonZ returns a 3D Polygon.
+func NewPolygonZ(rings [][]Point, crs CRS) Polygon {
+	return Polygon{Rings: rings, CRSValue: crs, HasZ: true}
+}
+
+// SimplePolygon returns a Polygon with a single exterior ring.
+func SimplePolygon(exterior []Point, crs CRS) Polygon {
+	return Polygon{Rings: [][]Point{exterior}, CRSValue: crs}
+}
+
+func (p Polygon) Type() Type { return TypePolygon }
+func (p Polygon) CRS() CRS   { return p.CRSValue }
+func (p Polygon) Is3D() bool { return p.HasZ }
+
+func (p Polygon) Bounds() Bounds {
+	b := EmptyBounds()
+	if len(p.Rings) == 0 {
+		return b
+	}
+	for _, pt := range p.Rings[0] {
+		b = b.Extend(pt.X, pt.Y)
+	}
+	return b
+}
+
+// Exterior returns the exterior ring, or nil if the polygon has no rings.
+func (p Polygon) Exterior() []Point {
+	if len(p.Rings) == 0 {
+		return nil
+	}
+	return p.Rings[0]
+}
+
+// EstimateUTMCRS returns the CRS of the UTM zone covering the polygon's
+// centroid. If the polygon is in a projected CRS, the centroid is
+// inverse-projected to WGS84 first.
+func (p Polygon) EstimateUTMCRS() (CRS, error) {
+	if len(p.Rings) == 0 || len(p.Rings[0]) == 0 {
+		return CRS{}, ErrEmptyGeometry
+	}
+	c := p.Centroid()
+	return estimateUTMFromXY(c.X, c.Y, p.CRSValue)
+}
+
+// ToCRS reprojects the polygon into target.
+func (p Polygon) ToCRS(target CRS) (Polygon, error) {
+	g, err := Project(p, target)
+	if err != nil {
+		return Polygon{}, err
+	}
+	return g.(Polygon), nil
+}
+
+// Area returns the polygon area. For geographic CRSes the area is computed on
+// a sphere of Earth radius and returned in u² (u ∈ km/mi/nmi/m/ft). For
+// projected CRSes the area is planar (signed absolute value) in the CRS's
+// linear unit², converted to u².
+func (p Polygon) Area(u Unit) (float64, error) {
+	if len(p.Rings) == 0 || len(p.Rings[0]) < 3 {
+		return 0, nil
+	}
+	if p.CRSValue.Projected {
+		a := planarRingArea(p.Rings[0])
+		for _, hole := range p.Rings[1:] {
+			a -= planarRingArea(hole)
+		}
+		perM, err := metersPerUnit(u)
+		if err != nil {
+			return 0, err
+		}
+		return a / (perM * perM), nil
+	}
+	// geographic — spherical excess
+	perM, err := metersPerUnit(u)
+	if err != nil {
+		return 0, err
+	}
+	rMeters := EarthRadiusKM * 1000
+	a := sphericalRingArea(p.Rings[0], rMeters)
+	for _, hole := range p.Rings[1:] {
+		a -= sphericalRingArea(hole, rMeters)
+	}
+	return math.Abs(a) / (perM * perM), nil
+}
+
+// Perimeter returns the length of the polygon's exterior ring in u.
+func (p Polygon) Perimeter(u Unit) (float64, error) {
+	if len(p.Rings) == 0 {
+		return 0, nil
+	}
+	ring := closedRing(p.Rings[0])
+	l := LineString{Points: ring, CRSValue: p.CRSValue}
+	return l.Length(u)
+}
+
+// Centroid returns the area-weighted centroid of the exterior ring, using the
+// planar (shoelace) formula. For small geographic polygons the result is a
+// close approximation.
+func (p Polygon) Centroid() Point {
+	ring := p.Exterior()
+	if len(ring) == 0 {
+		return Point{CRSValue: p.CRSValue}
+	}
+	ring = closedRing(ring)
+	var (
+		cx, cy  float64
+		areaTwo float64
+		n               = len(ring) - 1
+		sx, sy  float64 = 0, 0
+	)
+	for i := range n {
+		x0, y0 := ring[i].X, ring[i].Y
+		x1, y1 := ring[i+1].X, ring[i+1].Y
+		cross := x0*y1 - x1*y0
+		areaTwo += cross
+		cx += (x0 + x1) * cross
+		cy += (y0 + y1) * cross
+		sx += x0
+		sy += y0
+	}
+	if areaTwo == 0 {
+		return Point{X: sx / float64(n), Y: sy / float64(n), CRSValue: p.CRSValue}
+	}
+	return Point{
+		X:        cx / (3 * areaTwo),
+		Y:        cy / (3 * areaTwo),
+		CRSValue: p.CRSValue,
+	}
+}
+
+// Contains reports whether pt lies inside p (exterior ring, minus any holes).
+// The check uses the winding-parity (crossing) rule. Points on the boundary
+// have undefined containment.
+func (p Polygon) Contains(pt Point) bool {
+	if len(p.Rings) == 0 || !p.Bounds().Contains(pt.X, pt.Y) {
+		return false
+	}
+	if !pointInRing(pt, p.Rings[0]) {
+		return false
+	}
+	for _, hole := range p.Rings[1:] {
+		if pointInRing(pt, hole) {
 			return false
 		}
-		for i := range p.Len() {
-			if !p.Points[i].Equal(t.Points[i]) {
-				return false
+	}
+	return true
+}
+
+func (p Polygon) WKT() string {
+	if len(p.Rings) == 0 {
+		if p.HasZ {
+			return "POLYGON Z EMPTY"
+		}
+		return "POLYGON EMPTY"
+	}
+	var b strings.Builder
+	if p.HasZ {
+		b.WriteString("POLYGON Z (")
+	} else {
+		b.WriteString("POLYGON (")
+	}
+	for i, ring := range p.Rings {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteByte('(')
+		for j, pt := range ring {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(formatCoord(pt.X))
+			b.WriteByte(' ')
+			b.WriteString(formatCoord(pt.Y))
+			if p.HasZ {
+				b.WriteByte(' ')
+				b.WriteString(formatCoord(pt.Z))
 			}
 		}
-		return true
-	default:
-		return false
+		b.WriteByte(')')
 	}
+	b.WriteByte(')')
+	return b.String()
 }
 
-func (p Polygon) ToCRS(epsg int32) (Polygon, error) {
-	newP := Polygon{}
-	for _, pt := range p.Points {
-		if point, err := pt.ToCRS(epsg); err == nil {
-			newP.Points = append(newP.Points, point)
-		} else {
-			return p, err
+func (p Polygon) AppendWKB(buf []byte) []byte {
+	if p.HasZ {
+		buf = appendWKBHeader(buf, wkbPolygonZ)
+	} else {
+		buf = appendWKBHeader(buf, wkbPolygon)
+	}
+	buf = appendUint32LE(buf, uint32(len(p.Rings)))
+	for _, ring := range p.Rings {
+		ring = closedRing(ring)
+		buf = appendUint32LE(buf, uint32(len(ring)))
+		for _, pt := range ring {
+			buf = appendFloat64LE(buf, pt.X)
+			buf = appendFloat64LE(buf, pt.Y)
+			if p.HasZ {
+				buf = appendFloat64LE(buf, pt.Z)
+			}
 		}
 	}
-	return newP, nil
+	return buf
 }
 
-func (p Polygon) EstimateUTMCRS() CRS {
-	epsg := estimateUTMEPSG(p)
-	return CRSbyEPSG[epsg]
-}
-
-func (p Polygon) Bounds() Box {
-	return [4]float64{p.MinX(), p.MinY(), p.MaxX(), p.MaxY()}
-}
-
-// PerimeterLength calculates the distance between all points along the Polygon's
-// perimeter. The distance is returned in the unit specified.
-//
-// The unit argument accepts the following values (case-insensitive):
-//   - "km"  : kilometers (default if unknown)
-//   - "mi"  : miles
-//   - "nmi" : nautical miles
-//
-// Example usage:
-//
-//	polyPerimeterLength := poly.PerimeterLength("mi")   // Distance in miles
-func (p Polygon) PerimeterLength(unit string) float64 {
-	dist := 0.0
-	for i := range len(p.Points) - 1 {
-		if p.CRS().Projected {
-			dist += projectedDistance(&p.Points[i], &p.Points[i+1], unit)
-		} else {
-			dist += haversine(&p.Points[i], &p.Points[i+1], unit)
-		}
-	}
-	return dist
-}
-
-// Area calculates the area (in square kilometers) of a polygon
-// on the Earth's surface assuming the coordinates are (lon, lat) in degrees.
-func (p Polygon) Area(unit string) float64 {
-	var R float64
-	switch strings.ToLower(unit) {
-	case "mi":
-		R = 3958.8 // Miles
-	case "nmi":
-		R = 3440.1 // Nautical miles
-	case "km":
-		fallthrough
-	default:
-		R = 6371.0 // Kilometers (default)
-	}
-	p.checkClosedPolygon()
-
-	excess := p.sphericalExcess()
-	area := math.Abs(excess) * R * R
-	return area
-}
-
-// ConvexHull computes the convex hull of the points in the polygon using Graham's scan.
-// Returns a new Polygon containing only the convex hull.
+// ConvexHull returns the convex hull of the polygon's exterior points using
+// the Graham scan. Points on collinear edges are dropped.
 func (p Polygon) ConvexHull() Polygon {
-	lowest := p.Points[0]
-	lowestIdx := 0
-	for i, pt := range p.Points {
-		if pt.Y < lowest.Y || (pt.Y == lowest.Y && pt.X < lowest.X) {
-			lowest = pt
-			lowestIdx = i
+	src := p.Exterior()
+	if len(src) < 3 {
+		return Polygon{Rings: [][]Point{append([]Point(nil), src...)}, CRSValue: p.CRSValue}
+	}
+	pts := append([]Point(nil), src...)
+
+	lowIdx := 0
+	for i, pt := range pts {
+		if pt.Y < pts[lowIdx].Y || (pt.Y == pts[lowIdx].Y && pt.X < pts[lowIdx].X) {
+			lowIdx = i
 		}
 	}
+	pts[0], pts[lowIdx] = pts[lowIdx], pts[0]
+	pivot := pts[0]
 
-	p.Points[0], p.Points[lowestIdx] = p.Points[lowestIdx], p.Points[0]
-
-	pivot := p.Points[0]
-	sorted := make([]Point, len(p.Points)-1)
-	copy(sorted, p.Points[1:])
-	sort.Slice(sorted, func(i, j int) bool {
-		cp := crossProduct(pivot, sorted[i], sorted[j])
-		if cp == 0 {
-			return distanceSquared(pivot, sorted[i]) < distanceSquared(pivot, sorted[j])
+	rest := pts[1:]
+	sort.Slice(rest, func(i, j int) bool {
+		c := cross(pivot, rest[i], rest[j])
+		if c == 0 {
+			return distSq(pivot, rest[i]) < distSq(pivot, rest[j])
 		}
-		return cp > 0
+		return c > 0
 	})
 
-	hull := []Point{pivot, sorted[0]}
-	for i := 1; i < len(sorted); i++ {
-		for len(hull) >= 2 && crossProduct(hull[len(hull)-2], hull[len(hull)-1], sorted[i]) <= 0 {
-			hull = hull[:len(hull)-1] // pop
+	hull := make([]Point, 0, len(pts))
+	hull = append(hull, pivot)
+	for _, pt := range rest {
+		for len(hull) >= 2 && cross(hull[len(hull)-2], hull[len(hull)-1], pt) <= 0 {
+			hull = hull[:len(hull)-1]
 		}
-		hull = append(hull, sorted[i])
+		hull = append(hull, pt)
 	}
-
-	return Polygon{Points: hull}
+	return Polygon{Rings: [][]Point{closedRing(hull)}, CRSValue: p.CRSValue}
 }
 
-func (p Polygon) Centroid() Point {
-	var (
-		n               = p.Len()
-		cx, cy, areaSum float64
-	)
-
-	for i := range n {
-		j := (i + 1) % n
-		x0, y0 := p.Points[i].X, p.Points[i].Y
-		x1, y1 := p.Points[j].X, p.Points[j].Y
-
-		areaTerm := x0*y1 - x1*y0
-		areaSum += areaTerm
-
-		cx += (x0 + x1) * areaTerm
-		cy += (y0 + y1) * areaTerm
+// closedRing returns r if it is already closed, otherwise a copy with the
+// first point appended.
+func closedRing(r []Point) []Point {
+	if len(r) < 2 {
+		return r
 	}
-
-	area := areaSum / 2.0
-	if area == 0 {
-		// Degenerate polygon, fallback to average of points
-		var sx, sy float64
-		for _, pt := range p.Points {
-			sx += pt.X
-			sy += pt.Y
-		}
-		return Point{
-			X: sx / float64(n),
-			Y: sy / float64(n),
-		}
+	first, last := r[0], r[len(r)-1]
+	if first.X == last.X && first.Y == last.Y {
+		return r
 	}
-
-	cx /= (6.0 * area)
-	cy /= (6.0 * area)
-
-	return Point{
-		X: cx,
-		Y: cy,
-	}
+	out := make([]Point, len(r)+1)
+	copy(out, r)
+	out[len(r)] = first
+	return out
 }
 
-func (p Polygon) Intersects(other Geometry) bool {
-	switch g := other.(type) {
-	case Point:
-		return pointInPolygon(g, p)
-	case *Point:
-		return pointInPolygon(*g, p)
-	case Polygon:
-		return polygonsIntersect(p, g)
-	case *Polygon:
-		return polygonsIntersect(p, *g)
-	default:
+func planarRingArea(ring []Point) float64 {
+	if len(ring) < 3 {
+		return 0
+	}
+	ring = closedRing(ring)
+	var a float64
+	for i := 0; i < len(ring)-1; i++ {
+		a += ring[i].X*ring[i+1].Y - ring[i+1].X*ring[i].Y
+	}
+	return math.Abs(a) / 2
+}
+
+func sphericalRingArea(ring []Point, radiusM float64) float64 {
+	if len(ring) < 3 {
+		return 0
+	}
+	ring = closedRing(ring)
+	var total float64
+	for i := 0; i < len(ring)-1; i++ {
+		λ1 := degToRad(ring[i].X)
+		λ2 := degToRad(ring[i+1].X)
+		φ1 := degToRad(ring[i].Y)
+		φ2 := degToRad(ring[i+1].Y)
+		total += (λ2 - λ1) * (math.Sin(φ1) + math.Sin(φ2))
+	}
+	return math.Abs(total*radiusM*radiusM) / 2
+}
+
+func pointInRing(pt Point, ring []Point) bool {
+	if len(ring) < 3 {
 		return false
 	}
-}
-
-func (p Polygon) String() (strList string) {
-	if len(p.Points) == 0 {
-		return
-	}
-	for _, point := range p.Points {
-		strList += ", " + point.String()
-	}
-	return strList[2:]
-}
-
-func (p Polygon) Type() string { return "geometry" }
-
-func (p Polygon) Name() string { return "Polygon" }
-
-func (p Polygon) CRS() *CRS { return &p.Points[0].CoordRefSys }
-
-func (p Polygon) WKT() (strList string) {
-	strList = "POLYGON ("
-	for _, point := range p.Points {
-		strList += fmt.Sprintf("(%f %f),", point.X, point.Y)
-	}
-	strList = strList[:len(strList)-1]
-	return strList + ")"
-}
-
-func (p Polygon) WKB() []byte {
-	buf := new(bytes.Buffer)
-
-	// Byte order: 1 = little endian
-	if err := binary.Write(buf, binary.LittleEndian, byte(1)); err != nil {
-		return nil
-	}
-
-	if err := binary.Write(buf, binary.LittleEndian, WKB_POLYGON); err != nil {
-		return nil
-	}
-
-	ring := p.Points
-
-	if len(ring) > 0 && (ring[0].X != ring[len(ring)-1].X || ring[0].Y != ring[len(ring)-1].Y) {
-		ring = append(ring, ring[0])
-	}
-
-	if err := binary.Write(buf, binary.LittleEndian, uint32(1)); err != nil {
-		return nil
-	}
-
-	if err := binary.Write(buf, binary.LittleEndian, uint32(len(ring))); err != nil {
-		return nil
-	}
-
-	for _, pt := range ring {
-		if err := binary.Write(buf, binary.LittleEndian, pt.X); err != nil {
-			return nil
-		}
-		if err := binary.Write(buf, binary.LittleEndian, pt.Y); err != nil {
-			return nil
-		}
-	}
-
-	return buf.Bytes()
-}
-
-// WKBHex returns the WKB encoding of the Polygon as a hex string.
-func (p Polygon) WKBHex() (string, error) {
-	wkb := p.WKB()
-	return hex.EncodeToString(wkb), nil
-}
-
-func (p Polygon) FromWKB(data []byte) (Polygon, error) {
-	var crs CRS
-	if p.Len() > 0 {
-		crs = p.Points[0].CoordRefSys
-	}
-	buf := bytes.NewReader(data)
-
-	var byteOrder byte
-	if err := binary.Read(buf, binary.LittleEndian, &byteOrder); err != nil {
-		return p, fmt.Errorf("failed to read byte order: %w", err)
-	}
-
-	var bo binary.ByteOrder
-	switch byteOrder {
-	case 0:
-		bo = binary.BigEndian
-	case 1:
-		bo = binary.LittleEndian
-	default:
-		return p, errors.New("invalid byte order")
-	}
-
-	var geomType uint32
-	if err := binary.Read(buf, bo, &geomType); err != nil {
-		return p, fmt.Errorf("failed to read geometry type: %w", err)
-	}
-	if geomType != WKB_POLYGON {
-		return p, fmt.Errorf("unexpected geometry type: got %d, want %d", geomType, WKB_POLYGON)
-	}
-
-	var numRings uint32
-	if err := binary.Read(buf, bo, &numRings); err != nil {
-		return p, fmt.Errorf("failed to read number of rings: %w", err)
-	}
-	if numRings != 1 {
-		return p, fmt.Errorf("only single-ring polygons supported, got %d", numRings)
-	}
-
-	var numPoints uint32
-	if err := binary.Read(buf, bo, &numPoints); err != nil {
-		return p, fmt.Errorf("failed to read number of points: %w", err)
-	}
-
-	points := make([]Point, 0, numPoints)
-	for i := range int(numPoints) {
-		var x, y float64
-		if err := binary.Read(buf, bo, &x); err != nil {
-			return p, fmt.Errorf("failed to read x at point %d: %w", i, err)
-		}
-		if err := binary.Read(buf, bo, &y); err != nil {
-			return p, fmt.Errorf("failed to read y at point %d: %w", i, err)
-		}
-		points = append(points, Point{X: x, Y: y, CoordRefSys: crs})
-	}
-
-	p.Points = points
-	for _, pts := range p.Points {
-		if pts.CoordRefSys.Name == "" {
-			pts.CoordRefSys = WGS84 // Default if not stored in WKB
-		}
-	}
-
-	return p, nil
-}
-
-func (p Polygon) Coords() (fList [][2]float64) {
-	for _, point := range p.Points {
-		fList = append(fList, [2]float64{point.X, point.Y})
-	}
-	return fList
-}
-
-func (p Polygon) MarshalJSON() ([]byte, error) {
-	return json.Marshal(struct {
-		Type        string         `json:"type"`
-		Coordinates [][][2]float64 `json:"coordinates"`
-	}{
-		Type:        p.Name(),
-		Coordinates: [][][2]float64{p.Coords()},
-	})
-}
-
-func (p Polygon) UnmarshalJSON(data []byte) error {
-	temp := struct {
-		Type        string         `json:"type"`
-		Coordinates [][][2]float64 `json:"coordinates"`
-	}{}
-	if err := json.Unmarshal(data, &temp); err != nil {
-		return err
-	}
-	if temp.Type != p.Name() {
-		return errors.New("invalid geometry type for Polygon")
-	}
-
-	for _, pt := range temp.Coordinates[0] {
-		p.Points = append(p.Points, Point{X: pt[0], Y: pt[1]})
-	}
-
-	return nil
-}
-
-func (p Polygon) MaxX() float64 { return maxX(&p.Points) }
-
-func (p Polygon) MaxY() float64 { return maxY(&p.Points) }
-
-func (p Polygon) MinX() (lVal float64) { return minX(&p.Points) }
-
-func (p Polygon) MinY() float64 { return minY(&p.Points) }
-
-func (p Polygon) Len() int {
-	return len(p.Points)
-}
-
-func (p *Polygon) checkClosedPolygon() {
-	if p.Points[0] != p.Points[p.Len()-1] {
-		copyPoint := Coord(p.Points[0].Coords()[0])
-		p.Points = append(p.Points, copyPoint.ToPoint())
-	}
-}
-
-func (p Polygon) sphericalExcess() float64 {
-	total := 0.0
-	for i := range p.Len() - 1 {
-		lon1 := degreesToRadians(p.Points[i].X)
-		lat1 := degreesToRadians(p.Points[i].Y)
-		lon2 := degreesToRadians(p.Points[i+1].X)
-		lat2 := degreesToRadians(p.Points[i+1].Y)
-
-		total += (lon2 - lon1) * (math.Sin(lat1) + math.Sin(lat2))
-	}
-
-	return total / 2.0
-}
-
-func pointInPolygon(pt Point, poly Polygon) bool {
-	n := len(poly.Points)
+	ring = closedRing(ring)
 	inside := false
-	j := n - 1
-	for i := range n {
-		pi := poly.Points[i]
-		pj := poly.Points[j]
-		if ((pi.Y > pt.Y) != (pj.Y > pt.Y)) &&
-			(pt.X < (pj.X-pi.X)*(pt.Y-pi.Y)/(pj.Y-pi.Y)+pi.X) {
-			inside = !inside
+	for i := 0; i < len(ring)-1; i++ {
+		xi, yi := ring[i].X, ring[i].Y
+		xj, yj := ring[i+1].X, ring[i+1].Y
+		if (yi > pt.Y) != (yj > pt.Y) {
+			xIntersect := (xj-xi)*(pt.Y-yi)/(yj-yi) + xi
+			if pt.X < xIntersect {
+				inside = !inside
+			}
 		}
-		j = i
 	}
 	return inside
 }
 
-// polygonsIntersect checks if any edges cross or one contains the other.
-func polygonsIntersect(a, b Polygon) bool {
-	for i := range len(a.Points) - 1 {
-		for j := range len(b.Points) - 1 {
-			if linesIntersect(a.Points[i], a.Points[i+1], b.Points[j], b.Points[j+1]) {
-				return true
-			}
-		}
-	}
-
-	if pointInPolygon(b.Points[0], a) || pointInPolygon(a.Points[0], b) {
-		return true
-	}
-	return false
+func cross(a, b, c Point) float64 {
+	return (b.X-a.X)*(c.Y-a.Y) - (b.Y-a.Y)*(c.X-a.X)
 }
 
-// linesIntersect returns true if line segments (p1,p2) and (q1,q2) intersect.
-func linesIntersect(p1, p2, q1, q2 Point) bool {
-	orient := func(a, b, c Point) float64 {
-		return (b.X-a.X)*(c.Y-a.Y) - (b.Y-a.Y)*(c.X-a.X)
-	}
-	o1 := orient(p1, p2, q1)
-	o2 := orient(p1, p2, q2)
-	o3 := orient(q1, q2, p1)
-	o4 := orient(q1, q2, p2)
-	return (o1*o2 < 0) && (o3*o4 < 0)
+func distSq(a, b Point) float64 {
+	dx := a.X - b.X
+	dy := a.Y - b.Y
+	return dx*dx + dy*dy
 }

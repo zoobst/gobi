@@ -1,30 +1,49 @@
 package geometry
 
-import (
-	"math"
-	"strconv"
-	"strings"
+import "fmt"
+
+// CRS identifies a coordinate reference system. Only EPSG code is authoritative
+// for equality — Name is a human-readable label.
+type CRS struct {
+	EPSG      int32
+	Name      string
+	Projected bool
+}
+
+// Known CRSes. The set is intentionally small; add as needed.
+var (
+	WGS84          = CRS{EPSG: 4326, Name: "WGS 84", Projected: false}
+	PseudoMercator = CRS{EPSG: 3857, Name: "WGS 84 / Pseudo-Mercator", Projected: true}
 )
 
-func (c *CRS) ParseCRS(s string) (*CRS, error) {
-	cInt, err := strconv.ParseInt(strings.Split(s, ":")[1], 10, 64)
-	if err != nil {
-		return nil, err
+var registry = map[int32]CRS{
+	WGS84.EPSG:          WGS84,
+	PseudoMercator.EPSG: PseudoMercator,
+}
+
+// LookupCRS returns the CRS for the given EPSG code, or ErrUnknownCRS.
+func LookupCRS(epsg int32) (CRS, error) {
+	if c, ok := registry[epsg]; ok {
+		return c, nil
 	}
-	newCRS := CRSbyEPSG[int32(cInt)]
-	return &newCRS, nil
+	return CRS{}, fmt.Errorf("%w: EPSG:%d", ErrUnknownCRS, epsg)
 }
 
-func LLToMercator(lng, lat float64) (x, y float64) {
-	x = lng * MERCATOR_TRANSFORM_VAL / 180
-	y = math.Log(math.Tan((90+lat)*math.Pi/360)) / (math.Pi / 180)
-	y = y * MERCATOR_TRANSFORM_VAL / 180
-	return x, y
+// RegisterCRS adds a CRS to the runtime registry. Overwrites any prior entry
+// for the same EPSG code.
+func RegisterCRS(c CRS) {
+	registry[c.EPSG] = c
 }
 
-func MercatorToLL(x, y float64) (lng, lat float64) {
-	lng = x / MERCATOR_TRANSFORM_VAL * 180
-	lat = y / MERCATOR_TRANSFORM_VAL * 180
-	lat = 180 / math.Pi * (2*math.Atan(math.Exp(lat*math.Pi/180)) - math.Pi/2)
-	return lng, lat
+// Equal reports whether two CRSes refer to the same system.
+func (c CRS) Equal(o CRS) bool { return c.EPSG == o.EPSG }
+
+// Zero reports whether the CRS is the zero value.
+func (c CRS) Zero() bool { return c == CRS{} }
+
+func (c CRS) String() string {
+	if c.Zero() {
+		return "CRS:unset"
+	}
+	return fmt.Sprintf("EPSG:%d", c.EPSG)
 }
