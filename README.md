@@ -175,7 +175,7 @@ df.SJoin(..., gobi.Workers(1))            // force sequential
 
 ## Performance
 
-Single-threaded, 1M-row Parquet fixture, Apple M3 Pro:
+Single-threaded, 1M-row Parquet fixture:
 
 | Op                          | gobi     | Polars 1T | gap    |
 |-----------------------------|---------:|----------:|-------:|
@@ -189,12 +189,7 @@ Single-threaded, 1M-row Parquet fixture, Apple M3 Pro:
 `simd` and `simd/archsimd` packages gain arm64 NEON support in **Go 1.27
 (August 2026)**, at which point the existing `//go:build goexperiment.simd`
 kernel gets rewritten against the portable package and closes most of the
-Sum gap on this hardware — see `TODO(1.27-simd)` in `series_ops_simd_*.go`.
-
-Harnesses live under `benchmarks/` (gitignored). Regenerate the fixture
-with `go run benchmarks/generate_fixture.go`, then run either
-`go run benchmarks/gobi_bench.go` or
-`conda run -n py313 python benchmarks/polars_bench.py`.
+Sum gap — see `TODO(1.27-simd)` in `series_ops_simd_*.go`.
 
 ## Development
 
