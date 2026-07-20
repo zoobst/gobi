@@ -5,6 +5,11 @@ import (
 	"sync/atomic"
 )
 
+// globalMaxParallelism carries the package-level default worker count. A
+// value of 0 means "defer to GOMAXPROCS at call time." Access is atomic so
+// concurrent gobi operations see a consistent value without a lock.
+var globalMaxParallelism atomic.Int64
+
 // Option configures a parallel gobi operation. Values are applied to an
 // internal options struct in the order the caller supplies them, so later
 // options override earlier ones.
@@ -38,11 +43,6 @@ func (o workersOpt) apply(s *options) { s.workers = o.n }
 func Workers(n int) Option { return workersOpt{n: n} }
 
 // -- Global default -----------------------------------------------------
-
-// globalMaxParallelism carries the package-level default worker count. A
-// value of 0 means "defer to GOMAXPROCS at call time." Access is atomic so
-// concurrent gobi operations see a consistent value without a lock.
-var globalMaxParallelism atomic.Int64
 
 // SetMaxParallelism sets the default max worker count for every parallel
 // gobi operation across the process. Pass 0 (the default) to defer to

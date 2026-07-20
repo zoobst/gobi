@@ -4,10 +4,20 @@ import (
 	"slices"
 	"sort"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
+
+// numericView is a lightweight snapshot of a single-chunk numeric column,
+// carrying the underlying slice + the array (for null checks). See
+// series_ops.go for the equivalent single-column fast-path helpers.
+type numericView struct {
+	f64  []float64
+	i64  []int64
+	arr  arrow.Array
+	kind uint8 // 0=empty, 1=f64, 2=i64
+}
 
 // aggFast is a specialization of Agg for the common shape: exactly one key
 // column, single-chunk, of a directly-hashable primitive type. It avoids
@@ -19,6 +29,13 @@ import (
 func (g *GroupBy) aggFast(aggs []Aggregation) (*Frame, bool, error) {
 	if len(g.keys) != 1 {
 		return nil, false, nil
+	}
+	// Custom aggregators are user-defined and produce arbitrary output
+	// types — they can't share the numeric fast path.
+	for _, a := range aggs {
+		if a.Fn != nil {
+			return nil, false, nil
+		}
 	}
 	chunks := g.keys[0].col.Data().Chunks()
 	if len(chunks) != 1 {
@@ -100,7 +117,7 @@ func (g *GroupBy) aggFastString(keyArr *array.String, aggs []Aggregation, aggVie
 		}
 	}
 
-	return finishAggFrame(g.keys[0].field, keyB.NewArray(), aggFields, aggBuilders, pool)
+	return finishAggFrame(g.keys[0].field, keyB.NewArray(), aggFields, aggBuilders)
 }
 
 // aggFastInt64 handles the int64-key fast path.
@@ -145,7 +162,7 @@ func (g *GroupBy) aggFastInt64(keyArr *array.Int64, aggs []Aggregation, aggViews
 		}
 	}
 
-	return finishAggFrame(g.keys[0].field, keyB.NewArray(), aggFields, aggBuilders, pool)
+	return finishAggFrame(g.keys[0].field, keyB.NewArray(), aggFields, aggBuilders)
 }
 
 // aggFastFloat64 handles the float64-key fast path. Float64 keys with NaNs
@@ -192,17 +209,7 @@ func (g *GroupBy) aggFastFloat64(keyArr *array.Float64, aggs []Aggregation, aggV
 		}
 	}
 
-	return finishAggFrame(g.keys[0].field, keyB.NewArray(), aggFields, aggBuilders, pool)
-}
-
-// numericView is a lightweight snapshot of a single-chunk numeric column,
-// carrying the underlying slice + the array (for null checks). See
-// series_ops.go for the equivalent single-column fast-path helpers.
-type numericView struct {
-	f64  []float64
-	i64  []int64
-	arr  arrow.Array
-	kind uint8 // 0=empty, 1=f64, 2=i64
+	return finishAggFrame(g.keys[0].field, keyB.NewArray(), aggFields, aggBuilders)
 }
 
 // viewNumeric returns a numericView plus ok=true when s is a single-chunk
@@ -314,7 +321,7 @@ func appendFastAgg(b array.Builder, a Aggregation, v numericView, rows []int) {
 
 // finishAggFrame stitches the key column + agg columns into a Frame with
 // the requested schema. keyField provides the name/type for the key column.
-func finishAggFrame(keyField arrow.Field, keyArr arrow.Array, aggFields []arrow.Field, aggBs []array.Builder, pool memory.Allocator) (*Frame, bool, error) {
+func finishAggFrame(keyField arrow.Field, keyArr arrow.Array, aggFields []arrow.Field, aggBs []array.Builder) (*Frame, bool, error) {
 	fields := make([]arrow.Field, 0, 1+len(aggFields))
 	fields = append(fields, arrow.Field{Name: keyField.Name, Type: keyField.Type, Nullable: false})
 	fields = append(fields, aggFields...)

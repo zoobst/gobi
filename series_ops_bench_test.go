@@ -3,8 +3,8 @@ package gobi
 import (
 	"testing"
 
-	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // sink prevents the compiler from eliminating benchmark bodies.
@@ -40,9 +40,9 @@ func benchInt64Series(name string, n int) Series {
 func BenchmarkSeries_Add_Float64_1M(b *testing.B) {
 	a := benchFloatSeries("a", benchN)
 	c := benchFloatSeries("c", benchN)
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		out, err := a.Add(c)
 		if err != nil {
 			b.Fatal(err)
@@ -54,9 +54,9 @@ func BenchmarkSeries_Add_Float64_1M(b *testing.B) {
 func BenchmarkSeries_Add_Int64_1M(b *testing.B) {
 	a := benchInt64Series("a", benchN)
 	c := benchInt64Series("c", benchN)
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		out, err := a.Add(c)
 		if err != nil {
 			b.Fatal(err)
@@ -68,9 +68,9 @@ func BenchmarkSeries_Add_Int64_1M(b *testing.B) {
 func BenchmarkSeries_Mul_Float64_1M(b *testing.B) {
 	a := benchFloatSeries("a", benchN)
 	c := benchFloatSeries("c", benchN)
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		out, err := a.Mul(c)
 		if err != nil {
 			b.Fatal(err)
@@ -81,9 +81,9 @@ func BenchmarkSeries_Mul_Float64_1M(b *testing.B) {
 
 func BenchmarkSeries_Sum_Float64_1M(b *testing.B) {
 	a := benchFloatSeries("a", benchN)
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		v, err := a.Sum()
 		if err != nil {
 			b.Fatal(err)
@@ -94,9 +94,9 @@ func BenchmarkSeries_Sum_Float64_1M(b *testing.B) {
 
 func BenchmarkSeries_GtScalar_Float64_1M(b *testing.B) {
 	a := benchFloatSeries("a", benchN)
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		out, err := a.GtScalar(1000)
 		if err != nil {
 			b.Fatal(err)

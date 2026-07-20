@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 )
 
 // Frame is a columnar dataset: an Arrow schema plus a set of named Series.
@@ -188,4 +188,115 @@ func (f *Frame) Table() arrow.Table {
 		cols[i] = *s.col
 	}
 	return array.NewTable(f.schema, cols, int64(f.NumRows()))
+}
+
+// WithColumn returns a new Frame with s appended (or replaced, if a column
+// already exists with that name). The returned Frame independently
+// ref-counts every column, so the caller can Release either Frame without
+// affecting the other's buffers.
+//
+// s.Len() must equal f.NumRows() unless f has zero columns.
+//
+// The Series' arrow.Field is carried over — its Nullable flag, geometry
+// metadata, and any other field-level attributes — with only the Name
+// replaced by name. This preserves geometry-column identification when
+// swapping in a WKB Binary column derived from a user function.
+func (f *Frame) WithColumn(name string, s Series) (*Frame, error) {
+	if s.col == nil {
+		return nil, fmt.Errorf("%w: nil series", ErrColumnLenMismatch)
+	}
+	if len(f.series) > 0 && s.Len() != f.NumRows() {
+		return nil, fmt.Errorf("%w: series %q has %d rows, frame has %d",
+			ErrColumnLenMismatch, name, s.Len(), f.NumRows())
+	}
+
+	newField := s.field
+	newField.Name = name
+	newCol := arrow.NewColumn(newField, s.col.Data())
+
+	// Locate an existing column with the same name.
+	replaceIdx := -1
+	for i, existing := range f.series {
+		if existing.name == name {
+			replaceIdx = i
+			break
+		}
+	}
+
+	oldFields := f.schema.Fields()
+	newFieldCount := len(oldFields)
+	if replaceIdx < 0 {
+		newFieldCount++
+	}
+	newFields := make([]arrow.Field, 0, newFieldCount)
+	newSeries := make([]Series, 0, newFieldCount)
+
+	if replaceIdx >= 0 {
+		for i, existing := range f.series {
+			if i == replaceIdx {
+				newFields = append(newFields, newField)
+				newSeries = append(newSeries, NewSeries(newCol))
+				continue
+			}
+			newFields = append(newFields, oldFields[i])
+			newSeries = append(newSeries, carryColumn(existing))
+		}
+	} else {
+		for i, existing := range f.series {
+			newFields = append(newFields, oldFields[i])
+			newSeries = append(newSeries, carryColumn(existing))
+		}
+		newFields = append(newFields, newField)
+		newSeries = append(newSeries, NewSeries(newCol))
+	}
+
+	var md *arrow.Metadata
+	if f.schema.HasMetadata() {
+		m := f.schema.Metadata()
+		md = &m
+	}
+	return &Frame{schema: arrow.NewSchema(newFields, md), series: newSeries}, nil
+}
+
+// DropColumn returns a new Frame with the named column removed. Returns
+// ErrColumnNotFound if no column matches. Every retained column is
+// independently ref-counted so the caller can Release either Frame
+// without affecting the other's buffers.
+func (f *Frame) DropColumn(name string) (*Frame, error) {
+	dropIdx := -1
+	for i, s := range f.series {
+		if s.name == name {
+			dropIdx = i
+			break
+		}
+	}
+	if dropIdx < 0 {
+		return nil, fmt.Errorf("%w: %q", ErrColumnNotFound, name)
+	}
+
+	oldFields := f.schema.Fields()
+	newFields := make([]arrow.Field, 0, len(oldFields)-1)
+	newSeries := make([]Series, 0, len(f.series)-1)
+	for i, existing := range f.series {
+		if i == dropIdx {
+			continue
+		}
+		newFields = append(newFields, oldFields[i])
+		newSeries = append(newSeries, carryColumn(existing))
+	}
+
+	var md *arrow.Metadata
+	if f.schema.HasMetadata() {
+		m := f.schema.Metadata()
+		md = &m
+	}
+	return &Frame{schema: arrow.NewSchema(newFields, md), series: newSeries}, nil
+}
+
+// carryColumn produces a Series over a fresh *arrow.Column that shares
+// buffers with existing but owns an independent chunked-array reference.
+// Used by WithColumn / DropColumn so returned Frames can be Released
+// without affecting the source Frame.
+func carryColumn(existing Series) Series {
+	return NewSeries(arrow.NewColumn(existing.col.Field(), existing.col.Data()))
 }

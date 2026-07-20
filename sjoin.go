@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/zoobst/gobi/geometry"
 )
@@ -16,9 +16,6 @@ import (
 // scheduling overhead swamping the useful work.
 const SJoinMinParallelRows = 1024
 
-// SpatialPredicate names a binary spatial predicate for SJoin.
-type SpatialPredicate uint8
-
 const (
 	// SPIntersects matches when the left and right geometries share any point.
 	SPIntersects SpatialPredicate = iota
@@ -27,6 +24,9 @@ const (
 	// SPWithin matches when the left geometry lies fully within the right.
 	SPWithin
 )
+
+// SpatialPredicate names a binary spatial predicate for SJoin.
+type SpatialPredicate uint8
 
 func (p SpatialPredicate) String() string {
 	switch p {
@@ -124,9 +124,7 @@ func sjoinScan(
 		return sjoinScanRange(leftGeoms, rightGeoms, tree, geomPred, 0, n, nil)
 	}
 
-	if workers > n {
-		workers = n
-	}
+	workers = min(workers, n)
 	chunk := (n + workers - 1) / workers
 
 	type shard struct {
@@ -135,20 +133,19 @@ func sjoinScan(
 	shards := make([]shard, workers)
 
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		start := w * chunk
 		end := min(start+chunk, n)
 		if start >= end {
 			continue
 		}
-		wg.Add(1)
-		go func(idx, s, e int) {
-			defer wg.Done()
+		idx, s, e := w, start, end
+		wg.Go(func() {
 			// Each worker owns its scratch buffer for R-tree candidates.
 			var scratch []int32
 			l, r := sjoinScanRange(leftGeoms, rightGeoms, tree, geomPred, s, e, scratch)
 			shards[idx] = shard{l: l, r: r}
-		}(w, start, end)
+		})
 	}
 	wg.Wait()
 

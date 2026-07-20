@@ -3,7 +3,7 @@ package gobi
 import (
 	"strconv"
 
-	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow"
 )
 
 // Schema metadata keys used by gobi to tag geometry columns. This follows the

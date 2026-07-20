@@ -8,17 +8,17 @@ import (
 	"github.com/zoobst/gobi/geometry"
 )
 
-type city struct {
-	Name       string `csv:"name"`
-	Population int64  `csv:"population"`
-	Geom       string `csv:"geometry" geom:"true"`
-}
-
 const citiesCSV = `name,population,geometry
 New York,8804190,POINT (-74.0060 40.7128)
 Los Angeles,3898747,POINT (-118.2437 34.0522)
 Chicago,2746388,POINT (-87.6298 41.8781)
 `
+
+type city struct {
+	Name       string `csv:"name"`
+	Population int64  `csv:"population"`
+	Geom       string `csv:"geometry" geom:"true"`
+}
 
 func TestRead_Cities(t *testing.T) {
 	df, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.Options{CRSHint: 4326})

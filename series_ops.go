@@ -4,14 +4,38 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+)
+
+const (
+	opAdd arithOp = iota
+	opSub
+	opMul
+	opDiv
+)
+
+const (
+	cmpEq cmpOp = iota
+	cmpNe
+	cmpLt
+	cmpLe
+	cmpGt
+	cmpGe
 )
 
 // ErrNotNumeric is returned when arithmetic is attempted on a non-numeric
 // Series. Only int64/int32/float64/float32 are currently supported.
 var ErrNotNumeric = fmt.Errorf("gobi: series is not numeric")
+
+// arithOp identifies the elementwise binary operation. Kept as a small enum
+// so kernels can dispatch to native operators (which the compiler inlines)
+// rather than a function pointer per element.
+type arithOp uint8
+
+// cmpOp identifies an elementwise comparison operator.
+type cmpOp uint8
 
 // numericAt returns the value at row i as float64 plus a validity flag.
 // It walks chunks and does a type-switched value lookup — significantly
@@ -125,18 +149,6 @@ func (s Series) Div(o Series) (Series, error) {
 	return s.arith(o, opDiv, true)
 }
 
-// arithOp identifies the elementwise binary operation. Kept as a small enum
-// so kernels can dispatch to native operators (which the compiler inlines)
-// rather than a function pointer per element.
-type arithOp uint8
-
-const (
-	opAdd arithOp = iota
-	opSub
-	opMul
-	opDiv
-)
-
 func (s Series) arith(o Series, op arithOp, wantFloat bool) (Series, error) {
 	if !s.isNumeric() || !o.isNumeric() {
 		return Series{}, fmt.Errorf("%w", ErrNotNumeric)
@@ -212,22 +224,22 @@ func arithI64I64(a, b []int64, aArr, bArr *array.Int64, op arithOp, name string)
 	if !aNulls && !bNulls {
 		switch op {
 		case opAdd:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] + b[i]
 			}
 		case opSub:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] - b[i]
 			}
 		case opMul:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] * b[i]
 			}
 		}
 		return buildInt64Series(name, out, nil)
 	}
 	validity := make([]bool, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if aArr.IsNull(i) || bArr.IsNull(i) {
 			continue
 		}
@@ -252,7 +264,7 @@ func (s Series) arithSlow(o Series, op arithOp, wantFloat bool) (Series, error) 
 	if wantFloat || !bothInt(s, o) {
 		b := array.NewFloat64Builder(pool)
 		defer b.Release()
-		for i := 0; i < n; i++ {
+		for i := range n {
 			av, aok, err := s.numericAt(i)
 			if err != nil {
 				return Series{}, err
@@ -271,7 +283,7 @@ func (s Series) arithSlow(o Series, op arithOp, wantFloat bool) (Series, error) 
 	}
 	b := array.NewInt64Builder(pool)
 	defer b.Release()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		av, aok, err := s.numericAt(i)
 		if err != nil {
 			return Series{}, err
@@ -330,7 +342,7 @@ func (s Series) scalar(v float64, op arithOp) (Series, error) {
 	b := array.NewFloat64Builder(pool)
 	defer b.Release()
 	n := s.Len()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		av, aok, err := s.numericAt(i)
 		if err != nil {
 			return Series{}, err
@@ -363,7 +375,7 @@ func scalarF64(a []float64, arr *array.Float64, v float64, op arithOp, name stri
 		return buildFloat64Series(name, out, nil)
 	}
 	validity := make([]bool, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if arr.IsNull(i) {
 			continue
 		}
@@ -530,7 +542,7 @@ func (s Series) Min() (float64, error) {
 	}
 	m := math.Inf(1)
 	any := false
-	for i := 0; i < s.Len(); i++ {
+	for i := range s.Len() {
 		v, ok, err := s.numericAt(i)
 		if err != nil {
 			return 0, err
@@ -563,7 +575,7 @@ func (s Series) Max() (float64, error) {
 	}
 	m := math.Inf(-1)
 	any := false
-	for i := 0; i < s.Len(); i++ {
+	for i := range s.Len() {
 		v, ok, err := s.numericAt(i)
 		if err != nil {
 			return 0, err
@@ -687,18 +699,6 @@ func (s Series) Count() int {
 
 // ---------- comparisons ----------
 
-// cmpOp identifies an elementwise comparison operator.
-type cmpOp uint8
-
-const (
-	cmpEq cmpOp = iota
-	cmpNe
-	cmpLt
-	cmpLe
-	cmpGt
-	cmpGe
-)
-
 // Eq returns a boolean Series that is true where s[i] == o[i].
 func (s Series) Eq(o Series) (Series, error) { return s.cmp(o, cmpEq) }
 
@@ -749,34 +749,34 @@ func cmpF64F64(a, b []float64, aArr, bArr *array.Float64, op cmpOp, name string)
 	if !aNulls && !bNulls {
 		switch op {
 		case cmpEq:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] == b[i]
 			}
 		case cmpNe:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] != b[i]
 			}
 		case cmpLt:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] < b[i]
 			}
 		case cmpLe:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] <= b[i]
 			}
 		case cmpGt:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] > b[i]
 			}
 		case cmpGe:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] >= b[i]
 			}
 		}
 		return buildBoolSeries(name, out, nil)
 	}
 	validity := make([]bool, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if aArr.IsNull(i) || bArr.IsNull(i) {
 			continue
 		}
@@ -829,7 +829,7 @@ func (s Series) cmpScalar(v float64, op cmpOp) (Series, error) {
 	}
 	b := array.NewBooleanBuilder(memory.DefaultAllocator)
 	defer b.Release()
-	for i := 0; i < s.Len(); i++ {
+	for i := range s.Len() {
 		av, aok, err := s.numericAt(i)
 		if err != nil {
 			return Series{}, err
@@ -849,34 +849,34 @@ func cmpScalarF64(a []float64, arr *array.Float64, v float64, op cmpOp, name str
 	if arr.NullN() == 0 {
 		switch op {
 		case cmpEq:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] == v
 			}
 		case cmpNe:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] != v
 			}
 		case cmpLt:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] < v
 			}
 		case cmpLe:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] <= v
 			}
 		case cmpGt:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] > v
 			}
 		case cmpGe:
-			for i := 0; i < n; i++ {
+			for i := range n {
 				out[i] = a[i] >= v
 			}
 		}
 		return buildBoolSeries(name, out, nil)
 	}
 	validity := make([]bool, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if arr.IsNull(i) {
 			continue
 		}

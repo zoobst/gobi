@@ -132,7 +132,7 @@ func decodeLineStringWKBSized(data []byte, bo binary.ByteOrder, hasZ bool) (Line
 		return LineString{}, 0, ErrShortWKB
 	}
 	pts := make([]Point, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		off := 4 + i*cs
 		p := Point{
 			X:    math.Float64frombits(bo.Uint64(data[off : off+8])),
@@ -155,7 +155,7 @@ func decodePolygonWKBSized(data []byte, bo binary.ByteOrder, hasZ bool) (Polygon
 	off := 4
 	cs := coordSize(hasZ)
 	rings := make([][]Point, 0, numRings)
-	for r := 0; r < numRings; r++ {
+	for range numRings {
 		if len(data) < off+4 {
 			return Polygon{}, 0, ErrShortWKB
 		}
@@ -165,7 +165,7 @@ func decodePolygonWKBSized(data []byte, bo binary.ByteOrder, hasZ bool) (Polygon
 			return Polygon{}, 0, ErrShortWKB
 		}
 		pts := make([]Point, nPts)
-		for i := 0; i < nPts; i++ {
+		for i := range nPts {
 			base := off + i*cs
 			p := Point{
 				X:    math.Float64frombits(bo.Uint64(data[base : base+8])),
@@ -195,7 +195,7 @@ func decodeMultiPointWKBSized(data []byte, bo binary.ByteOrder, hasZ bool) (Mult
 		innerType = wkbPointZ
 	}
 	elemSize := 5 + coordSize(hasZ)
-	for i := 0; i < n; i++ {
+	for range n {
 		if len(data) < off+elemSize {
 			return MultiPoint{}, 0, ErrShortWKB
 		}
@@ -227,7 +227,7 @@ func decodeMultiLineStringWKBSized(data []byte, bo binary.ByteOrder, hasZ bool) 
 	if hasZ {
 		innerType = wkbLineStringZ
 	}
-	for i := 0; i < n; i++ {
+	for range n {
 		if len(data) < off+5 {
 			return MultiLineString{}, 0, ErrShortWKB
 		}
@@ -259,7 +259,7 @@ func decodeMultiPolygonWKBSized(data []byte, bo binary.ByteOrder, hasZ bool) (Mu
 	if hasZ {
 		innerType = wkbPolygonZ
 	}
-	for i := 0; i < n; i++ {
+	for range n {
 		if len(data) < off+5 {
 			return MultiPolygon{}, 0, ErrShortWKB
 		}
@@ -287,7 +287,7 @@ func decodeGeometryCollectionWKBSized(data []byte, bo binary.ByteOrder, hasZ boo
 	n := int(bo.Uint32(data[0:4]))
 	off := 4
 	gs := make([]Geometry, 0, n)
-	for i := 0; i < n; i++ {
+	for range n {
 		g, used, err := decodeInnerGeometryWKB(data[off:])
 		if err != nil {
 			return GeometryCollection{}, 0, err

@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // AggKind identifies an aggregation operation.
@@ -19,15 +19,6 @@ const (
 	AggMin
 	AggMax
 )
-
-// Aggregation names a column to aggregate and how to aggregate it. The
-// resulting column in the aggregated frame is named Alias (or, if empty,
-// "<column>_<kind>").
-type Aggregation struct {
-	Column string
-	Kind   AggKind
-	Alias  string
-}
 
 func (k AggKind) String() string {
 	switch k {
@@ -44,6 +35,52 @@ func (k AggKind) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+// Aggregation names a column to aggregate and how to aggregate it. The
+// resulting column in the aggregated frame is named Alias (or, if empty,
+// "<column>_<kind>" for built-in kinds, "<column>_<Fn.Name()>" for
+// custom aggregators).
+//
+// When Fn is non-nil, it takes precedence over Kind: the aggregation is
+// user-defined and Fn is called once per group. Otherwise Kind selects
+// a built-in aggregation.
+type Aggregation struct {
+	Column string
+	Kind   AggKind
+	Alias  string
+	Fn     Aggregator
+}
+
+// Aggregator is a user-defined aggregation function called once per
+// group during GroupBy.Agg. Implementations reduce the rows of a Series
+// to a single scalar value.
+//
+// Typical implementations:
+//
+//	weighted mean, mode, percentile / quantile, log-sum-exp, first / last,
+//	geospatial reductions (H3 cell of the centroid, dominant hex),
+//	string aggregations (concat, longest common prefix).
+//
+// Return nil from Aggregate to emit an Arrow null for the group. The
+// declared Type must match the concrete Go type Aggregate returns:
+//
+//	Float64 → float64        Uint64  → uint64      String    → string
+//	Float32 → float32        Uint32  → uint32      Binary    → []byte
+//	Int64   → int64          Boolean → bool        Timestamp → arrow.Timestamp
+//	Int32   → int32
+//
+// If the returned dynamic type doesn't match Type, Agg reports an error
+// naming the offending Aggregation.
+//
+// Aggregate is called sequentially per group; the same Aggregator
+// instance is reused across groups. Implementations that need per-group
+// scratch space should allocate it inside Aggregate rather than as
+// receiver fields.
+type Aggregator interface {
+	Aggregate(s Series, rows []int) (any, error)
+	Type() arrow.DataType
+	Name() string
 }
 
 // GroupBy partitions a Frame by the values in one or more key columns. The
@@ -120,6 +157,21 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 	aggBuilders := make([]array.Builder, len(aggs))
 	aggFields := make([]arrow.Field, len(aggs))
 	for i, a := range aggs {
+		if a.Fn != nil {
+			if _, err := g.frame.Column(a.Column); err != nil {
+				return nil, err
+			}
+			b, err := builderForType(pool, a.Fn.Type())
+			if err != nil {
+				return nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
+					i, aggName(a), err)
+			}
+			aggBuilders[i] = b
+			aggFields[i] = arrow.Field{
+				Name: aggName(a), Type: a.Fn.Type(), Nullable: true,
+			}
+			continue
+		}
 		if a.Kind == AggCount {
 			aggBuilders[i] = array.NewInt64Builder(pool)
 			aggFields[i] = arrow.Field{
@@ -183,10 +235,119 @@ func aggName(a Aggregation) string {
 	if a.Alias != "" {
 		return a.Alias
 	}
+	if a.Fn != nil {
+		return fmt.Sprintf("%s_%s", a.Column, a.Fn.Name())
+	}
 	if a.Kind == AggCount && a.Column == "" {
 		return "count"
 	}
 	return fmt.Sprintf("%s_%s", a.Column, a.Kind)
+}
+
+// builderForType returns an empty Arrow builder matching t. Types not
+// listed here are rejected by custom aggregators — callers should widen
+// Aggregator.Type() to one of the supported outputs.
+func builderForType(pool memory.Allocator, t arrow.DataType) (array.Builder, error) {
+	switch t.ID() {
+	case arrow.FLOAT64:
+		return array.NewFloat64Builder(pool), nil
+	case arrow.FLOAT32:
+		return array.NewFloat32Builder(pool), nil
+	case arrow.INT64:
+		return array.NewInt64Builder(pool), nil
+	case arrow.INT32:
+		return array.NewInt32Builder(pool), nil
+	case arrow.UINT64:
+		return array.NewUint64Builder(pool), nil
+	case arrow.UINT32:
+		return array.NewUint32Builder(pool), nil
+	case arrow.BOOL:
+		return array.NewBooleanBuilder(pool), nil
+	case arrow.STRING:
+		return array.NewStringBuilder(pool), nil
+	case arrow.BINARY:
+		return array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary), nil
+	case arrow.TIMESTAMP:
+		return array.NewTimestampBuilder(pool, t.(*arrow.TimestampType)), nil
+	default:
+		return nil, fmt.Errorf("unsupported Aggregator output type %s", t)
+	}
+}
+
+// appendCustomValue appends v to b, matching v's dynamic Go type against
+// b's arrow builder type. Returns an error naming the mismatch if the
+// types don't align — this is how misdeclared Aggregator.Type() surfaces
+// at aggregation time rather than as a silent panic.
+func appendCustomValue(b array.Builder, v any) error {
+	if v == nil {
+		b.AppendNull()
+		return nil
+	}
+	switch tb := b.(type) {
+	case *array.Float64Builder:
+		x, ok := v.(float64)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Float64", v)
+		}
+		tb.Append(x)
+	case *array.Float32Builder:
+		x, ok := v.(float32)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Float32", v)
+		}
+		tb.Append(x)
+	case *array.Int64Builder:
+		x, ok := v.(int64)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Int64", v)
+		}
+		tb.Append(x)
+	case *array.Int32Builder:
+		x, ok := v.(int32)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Int32", v)
+		}
+		tb.Append(x)
+	case *array.Uint64Builder:
+		x, ok := v.(uint64)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Uint64", v)
+		}
+		tb.Append(x)
+	case *array.Uint32Builder:
+		x, ok := v.(uint32)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Uint32", v)
+		}
+		tb.Append(x)
+	case *array.BooleanBuilder:
+		x, ok := v.(bool)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Boolean", v)
+		}
+		tb.Append(x)
+	case *array.StringBuilder:
+		x, ok := v.(string)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared String", v)
+		}
+		tb.Append(x)
+	case *array.BinaryBuilder:
+		x, ok := v.([]byte)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Binary", v)
+		}
+		tb.Append(x)
+	case *array.TimestampBuilder:
+		x, ok := v.(arrow.Timestamp)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Timestamp", v)
+		}
+		tb.Append(x)
+	default:
+		return fmt.Errorf("unhandled builder type %T", b)
+	}
+	return nil
 }
 
 func (g *GroupBy) rowKey(row int) (string, error) {
@@ -226,6 +387,12 @@ func keyOf(s Series, row int) ([]byte, error) {
 				return []byte{0x04, 0x00}, nil
 			case *array.Float64:
 				return append([]byte{0x05}, i64Bytes(int64(a.Value(local)*1e9))...), nil
+			case *array.Uint64:
+				return append([]byte{0x06}, i64Bytes(int64(a.Value(local)))...), nil
+			case *array.Uint32:
+				return append([]byte{0x07}, i64Bytes(int64(a.Value(local)))...), nil
+			case *array.Timestamp:
+				return append([]byte{0x08}, i64Bytes(int64(a.Value(local)))...), nil
 			default:
 				return nil, fmt.Errorf("gobi: key type %T not hashable", chunk)
 			}
@@ -244,7 +411,8 @@ func i64Bytes(v int64) []byte {
 
 func isHashable(t arrow.DataType) bool {
 	switch t.ID() {
-	case arrow.STRING, arrow.INT64, arrow.INT32, arrow.BOOL, arrow.FLOAT64:
+	case arrow.STRING, arrow.INT64, arrow.INT32, arrow.BOOL, arrow.FLOAT64,
+		arrow.UINT64, arrow.UINT32, arrow.TIMESTAMP:
 		return true
 	default:
 		return false
@@ -254,7 +422,7 @@ func isHashable(t arrow.DataType) bool {
 func makeKeyBuilders(pool memory.Allocator, keys []Series) ([]array.Builder, error) {
 	out := make([]array.Builder, len(keys))
 	for i, k := range keys {
-		switch k.DataType().ID() {
+		switch dt := k.DataType(); dt.ID() {
 		case arrow.STRING:
 			out[i] = array.NewStringBuilder(pool)
 		case arrow.INT64:
@@ -265,8 +433,14 @@ func makeKeyBuilders(pool memory.Allocator, keys []Series) ([]array.Builder, err
 			out[i] = array.NewBooleanBuilder(pool)
 		case arrow.FLOAT64:
 			out[i] = array.NewFloat64Builder(pool)
+		case arrow.UINT64:
+			out[i] = array.NewUint64Builder(pool)
+		case arrow.UINT32:
+			out[i] = array.NewUint32Builder(pool)
+		case arrow.TIMESTAMP:
+			out[i] = array.NewTimestampBuilder(pool, dt.(*arrow.TimestampType))
 		default:
-			return nil, fmt.Errorf("gobi: unsupported key type %s", k.DataType())
+			return nil, fmt.Errorf("gobi: unsupported key type %s", dt)
 		}
 	}
 	return out, nil
@@ -288,6 +462,20 @@ func appendKeyRow(builders []array.Builder, keys []Series, row int) error {
 }
 
 func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error {
+	if agg.Fn != nil {
+		s, err := g.frame.Column(agg.Column)
+		if err != nil {
+			return err
+		}
+		v, err := agg.Fn.Aggregate(s, rows)
+		if err != nil {
+			return fmt.Errorf("gobi: aggregation %s: %w", aggName(agg), err)
+		}
+		if err := appendCustomValue(b, v); err != nil {
+			return fmt.Errorf("gobi: aggregation %s: %w", aggName(agg), err)
+		}
+		return nil
+	}
 	if agg.Kind == AggCount {
 		if agg.Column == "" {
 			b.(*array.Int64Builder).Append(int64(len(rows)))

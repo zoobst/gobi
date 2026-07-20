@@ -23,3 +23,5 @@ test.ipynb
 
 # Benchmark harnesses + fixtures (local performance experiments only)
 /benchmarks/
+parquetio.test
+csvio.test

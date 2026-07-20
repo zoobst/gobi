@@ -3,9 +3,9 @@ package gobi
 import (
 	"fmt"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/zoobst/gobi/geometry"
 )
@@ -62,7 +62,7 @@ func (s Series) GeomCentroid() (Series, error) {
 
 	for _, chunk := range s.col.Data().Chunks() {
 		bin := chunk.(*array.Binary)
-		for i := 0; i < bin.Len(); i++ {
+		for i := range bin.Len() {
 			if bin.IsNull(i) {
 				b.AppendNull()
 				continue
@@ -99,7 +99,7 @@ func (s Series) GeomBounds() (*Frame, error) {
 
 	for _, chunk := range s.col.Data().Chunks() {
 		bin := chunk.(*array.Binary)
-		for i := 0; i < bin.Len(); i++ {
+		for i := range bin.Len() {
 			if bin.IsNull(i) {
 				minX.AppendNull()
 				minY.AppendNull()
@@ -151,7 +151,7 @@ func geomFloat64Op(s Series, outName string, fn func(geometry.Geometry) (float64
 			return Series{}, fmt.Errorf("%w: geometry column not Binary (%T)",
 				ErrColumnTypeMismatch, chunk)
 		}
-		for i := 0; i < bin.Len(); i++ {
+		for i := range bin.Len() {
 			if bin.IsNull(i) {
 				b.AppendNull()
 				continue

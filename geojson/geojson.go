@@ -18,6 +18,14 @@ import (
 // unsupported geometry type.
 var ErrInvalidGeoJSON = errors.New("geojson: invalid input")
 
+// Feature is a GeoJSON Feature wrapper.
+type Feature struct {
+	Type       string          `json:"type"`
+	Geometry   json.RawMessage `json:"geometry"`
+	Properties map[string]any  `json:"properties,omitempty"`
+	ID         any             `json:"id,omitempty"`
+}
+
 // Marshal encodes a Geometry to its GeoJSON representation.
 func Marshal(g geometry.Geometry) ([]byte, error) {
 	obj, err := toGeoJSON(g)
@@ -38,14 +46,6 @@ func Unmarshal(data []byte) (geometry.Geometry, error) {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidGeoJSON, err)
 	}
 	return decodeType(raw.Type, raw.Coordinates)
-}
-
-// Feature is a GeoJSON Feature wrapper.
-type Feature struct {
-	Type       string            `json:"type"`
-	Geometry   json.RawMessage   `json:"geometry"`
-	Properties map[string]any    `json:"properties,omitempty"`
-	ID         any               `json:"id,omitempty"`
 }
 
 // UnmarshalFeature decodes a GeoJSON Feature into its geometry and property

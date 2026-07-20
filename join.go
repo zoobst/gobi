@@ -3,9 +3,9 @@ package gobi
 import (
 	"fmt"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // JoinType selects the join behavior.
@@ -47,7 +47,7 @@ func (f *Frame) Join(right *Frame, leftKey, rightKey string, kind JoinType) (*Fr
 
 	// Build a hash of key → []rowIdx on the right frame.
 	rightIndex := map[string][]int{}
-	for row := 0; row < right.NumRows(); row++ {
+	for row := range right.NumRows() {
 		k, err := keyOf(rKey, row)
 		if err != nil {
 			return nil, err
@@ -64,7 +64,7 @@ func (f *Frame) Join(right *Frame, leftKey, rightKey string, kind JoinType) (*Fr
 		leftIdxs  []int
 		rightIdxs []int // -1 means "no match" (used only for left join)
 	)
-	for lRow := 0; lRow < f.NumRows(); lRow++ {
+	for lRow := range f.NumRows() {
 		k, err := keyOf(lKey, lRow)
 		if err != nil {
 			return nil, err

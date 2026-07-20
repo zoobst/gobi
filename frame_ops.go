@@ -3,9 +3,9 @@ package gobi
 import (
 	"fmt"
 
-	"github.com/apache/arrow/go/v18/arrow"
-	"github.com/apache/arrow/go/v18/arrow/array"
-	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // ErrMaskNotBoolean is returned when Filter receives a non-boolean Series.
@@ -317,6 +317,10 @@ func appendPrimitiveAt(s Series, idx int, b array.Builder) error {
 				b.(*array.Int64Builder).Append(a.Value(local))
 			case *array.Int32:
 				b.(*array.Int32Builder).Append(a.Value(local))
+			case *array.Uint64:
+				b.(*array.Uint64Builder).Append(a.Value(local))
+			case *array.Uint32:
+				b.(*array.Uint32Builder).Append(a.Value(local))
 			case *array.Float64:
 				b.(*array.Float64Builder).Append(a.Value(local))
 			case *array.Float32:
@@ -327,6 +331,8 @@ func appendPrimitiveAt(s Series, idx int, b array.Builder) error {
 				b.(*array.StringBuilder).Append(a.Value(local))
 			case *array.Binary:
 				b.(*array.BinaryBuilder).Append(a.Value(local))
+			case *array.Timestamp:
+				b.(*array.TimestampBuilder).Append(a.Value(local))
 			default:
 				return fmt.Errorf("%w: unsupported chunk type %T",
 					ErrColumnTypeMismatch, chunk)

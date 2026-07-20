@@ -70,7 +70,7 @@ func TestWriteRead_PreservesGeoParquetMetadata(t *testing.T) {
 	if err := parquetio.WriteFile(df, path, parquetio.CodecSnappy); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	loaded, err := parquetio.ReadFile(path)
+	loaded, err := parquetio.ReadFile(path, nil)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -102,7 +102,7 @@ func testRoundTrip(t *testing.T, codec parquetio.Codec) {
 		t.Fatalf("write: %v", err)
 	}
 
-	loaded, err := parquetio.ReadFile(path)
+	loaded, err := parquetio.ReadFile(path, nil)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
