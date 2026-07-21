@@ -67,7 +67,7 @@ func TestWriteRead_PreservesGeoParquetMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "cities.parquet")
-	if err := parquetio.WriteFile(df, path, parquetio.CodecSnappy); err != nil {
+	if err := parquetio.WriteFile(df, path, &parquetio.WriteOptions{Codec: parquetio.CodecSnappy}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	loaded, err := parquetio.ReadFile(path, nil)
@@ -98,7 +98,7 @@ func testRoundTrip(t *testing.T, codec parquetio.Codec) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "cities.parquet")
-	if err := parquetio.WriteFile(df, path, codec); err != nil {
+	if err := parquetio.WriteFile(df, path, &parquetio.WriteOptions{Codec: codec}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 

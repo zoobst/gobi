@@ -61,7 +61,7 @@ func makeSyntheticFrame(t *testing.T, n int) *gobi.Frame {
 func writeFixture(t *testing.T, df *gobi.Frame, name string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
-	if err := parquetio.WriteFile(df, path, parquetio.CodecSnappy); err != nil {
+	if err := parquetio.WriteFile(df, path, &parquetio.WriteOptions{Codec: parquetio.CodecSnappy}); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
 	return path

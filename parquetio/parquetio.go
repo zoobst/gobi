@@ -88,6 +88,48 @@ type Options struct {
 	Allocator memory.Allocator
 }
 
+// WriteOptions controls parquet write behavior. A nil pointer is
+// treated as the zero value (CodecSnappy + parquet-arrow's default
+// row-group sizing).
+type WriteOptions struct {
+	// Codec selects the Parquet page compression codec. Empty string
+	// defaults to CodecSnappy — matches parquet-arrow's own default
+	// and is the common choice for good balance between size and
+	// decode speed.
+	Codec Codec
+
+	// RowGroupRows caps the maximum number of rows per row group. 0
+	// uses parquet-arrow's default (~1M rows).
+	//
+	// Smaller row groups → more granular predicate pushdown (readers
+	// can skip whole groups via rowgroup statistics) and lower peak
+	// memory when streaming one group at a time. Larger row groups →
+	// better compression ratios and less per-group metadata overhead.
+	// 64k–256k is a reasonable range for analytical workloads that
+	// filter on min/max stats; leave at 0 for archive/bulk-load files
+	// where read patterns are full-scan.
+	RowGroupRows int64
+
+	// BloomFilterColumns names columns that should have a bloom
+	// filter attached to each row group. High-cardinality equality-
+	// filtered columns (user IDs, hashes, categorical keys) benefit
+	// most; skew-free min/max distributions do not — parquet's row-
+	// group statistics already handle those.
+	//
+	// gobi's own reader does not yet consume bloom filters for row-
+	// group skipping (that lands with the query optimizer). Files
+	// produced here are still consumed correctly by DuckDB, Spark,
+	// Polars, and pyarrow, which do use bloom filters for predicate
+	// pushdown on equality filters.
+	BloomFilterColumns []string
+
+	// BloomFilterFPP is the target false-positive probability for
+	// the bloom filters written above. 0 uses arrow-go's default
+	// (0.05). Lower FPP → larger filter on disk; reasonable range
+	// 0.01–0.1. Ignored when BloomFilterColumns is empty.
+	BloomFilterFPP float64
+}
+
 // ParseCodec resolves a codec by name (case-insensitive). Empty and "none"
 // map to CodecUncompressed.
 func ParseCodec(s string) (Codec, error) {
@@ -189,10 +231,27 @@ func ReadFileChunksFunc(path string, opts *Options, fn func(*gobi.Frame) error) 
 	return nil
 }
 
-// WriteFile writes f to path with the requested codec. If f contains any
-// geometry columns, the output includes a GeoParquet 1.1 metadata blob
-// under the file-level "geo" key.
-func WriteFile(f *gobi.Frame, path string, codec Codec) error {
+// WriteFile writes f to path. A nil opts uses defaults:
+// CodecSnappy compression and parquet-arrow's default row-group
+// sizing (~1M rows).
+//
+// If f contains any geometry columns, the output includes a
+// GeoParquet 1.1 metadata blob under the file-level "geo" key.
+//
+// Tuning row-group size matters for readers that use rowgroup
+// statistics for predicate pushdown or that stream one rowgroup at a
+// time. Smaller groups → more granular filter skipping and lower
+// per-batch memory; larger groups → better compression ratios and
+// less per-group overhead. The parquet default is a reasonable
+// starting point for most workloads.
+func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
+	if opts == nil {
+		opts = &WriteOptions{}
+	}
+	codec := opts.Codec
+	if codec == "" {
+		codec = CodecSnappy
+	}
 	compression, err := codec.toArrow()
 	if err != nil {
 		return err
@@ -208,10 +267,23 @@ func WriteFile(f *gobi.Frame, path string, codec Codec) error {
 	}
 	defer out.Close()
 
+	writerProps := []parquet.WriterProperty{parquet.WithCompression(compression)}
+	if opts.RowGroupRows > 0 {
+		writerProps = append(writerProps, parquet.WithMaxRowGroupLength(opts.RowGroupRows))
+	}
+	if len(opts.BloomFilterColumns) > 0 {
+		if opts.BloomFilterFPP > 0 {
+			writerProps = append(writerProps, parquet.WithBloomFilterFPP(opts.BloomFilterFPP))
+		}
+		for _, col := range opts.BloomFilterColumns {
+			writerProps = append(writerProps, parquet.WithBloomFilterEnabledFor(col, true))
+		}
+	}
+
 	writer, err := pqarrow.NewFileWriter(
 		f.Schema(),
 		out,
-		parquet.NewWriterProperties(parquet.WithCompression(compression)),
+		parquet.NewWriterProperties(writerProps...),
 		pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()),
 	)
 	if err != nil {

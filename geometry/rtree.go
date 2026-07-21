@@ -90,7 +90,7 @@ func (t *RTree) SearchInto(buf []int32, q Bounds) []int32 {
 			continue
 		}
 		if n.isLeaf {
-			for i := int32(0); i < n.count; i++ {
+			for i := range n.count {
 				id := t.itemIDs[n.first+i]
 				if t.itemBounds[id].Intersects(q) {
 					out = append(out, id)
@@ -98,7 +98,7 @@ func (t *RTree) SearchInto(buf []int32, q Bounds) []int32 {
 			}
 			continue
 		}
-		for i := int32(0); i < n.count; i++ {
+		for i := range n.count {
 			stack = append(stack, t.childRefs[n.first+i])
 		}
 	}
@@ -125,12 +125,12 @@ func (t *RTree) Nearest(x, y float64, k int) []int32 {
 		}
 		n := t.nodes[top.node]
 		if n.isLeaf {
-			for i := int32(0); i < n.count; i++ {
+			for i := range n.count {
 				id := t.itemIDs[n.first+i]
 				heap.Push(pq, rtreeQueue{isItem: true, item: id, dist: bboxDist(t.itemBounds[id], x, y)})
 			}
 		} else {
-			for i := int32(0); i < n.count; i++ {
+			for i := range n.count {
 				child := t.childRefs[n.first+i]
 				heap.Push(pq, rtreeQueue{node: child, dist: bboxDist(t.nodes[child].bounds, x, y)})
 			}

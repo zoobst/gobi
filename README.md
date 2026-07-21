@@ -6,8 +6,8 @@ API with Polars-shaped internals: columnar, chunk-slice fast paths, and
 built around a strongly-typed schema.
 
 > **Status:** early. The API is settled enough to build a small pipeline on;
-> semver stability begins with the first tagged release. GeoParquet 1.1
-> output has been verified against GeoPandas and QGIS.
+> semver stability begins with the first tagged release. GeoParquet v1.1
+> output has been verified against GeoPandas v1.1.1 and QGIS v4.0.2.
 
 ## Highlights
 
@@ -20,6 +20,12 @@ built around a strongly-typed schema.
 - **Real spatial operations.** Area, length, centroid (every geometry
   type), convex hull, containment, `Simplify` (Douglas-Peucker), `Buffer`
   with rounded joins and caps, `EstimateUTMCRS` on every type.
+- **Geometry constructors from columns.** `PointsFromXY(x, y, crs)`
+  and `PointsFromXYZ(x, y, z, crs)` build a WKB geometry Series
+  directly from numeric coordinate columns — modeled on
+  `geopandas.points_from_xy`. Mixed numeric types (Float64, Float32,
+  Int64, Int32) auto-promote; nulls in either input yield a null
+  geometry.
 - **Reprojection engine.** WGS84 ↔ Web Mercator ↔ all 120 UTM zones,
   using the ellipsoidal Redfearn/Snyder formulas. Sub-cm round-trip
   accuracy verified against reference cities worldwide.
@@ -27,15 +33,22 @@ built around a strongly-typed schema.
   bounding-box and k-nearest queries. `Frame.SJoin(right, ..., pred)`
   with `SPIntersects` / `SPContains` / `SPWithin` predicates,
   multi-threaded across left rows, tunable via `Workers(n)`.
-- **DataFrame ops.** `Filter`, `Take`, `Head`, `Tail`, `WithColumn`,
-  `DropColumn`, `GroupBy(...).Agg(count/sum/mean/min/max)`, `Join`
-  (inner / left), `Explode`. Series arithmetic (Add/Sub/Mul/Div +
-  scalar), comparisons, aggregations — all with single-chunk bulk fast
-  paths.
+- **DataFrame ops.** `Filter`, `Take`, `Head`, `Tail`, `SortBy`
+  (multi-key stable, nulls-last), `WithColumn`, `DropColumn`,
+  `GroupBy(...).Agg(count/sum/mean/min/max)`, `Join`
+  (inner / left / right / full / semi / anti with coalesced keys),
+  `Explode`. Series arithmetic (Add/Sub/Mul/Div + scalar), comparisons,
+  aggregations — all with single-chunk bulk fast paths.
 - **User-defined aggregations.** `type Aggregator interface { ... }`
   plugs directly into `GroupBy.Agg` alongside the built-ins — mode,
   percentile, weighted mean, H3-of-centroid, whatever you need,
   without forking the package.
+- **Expression IR.** `gobi.Col("price").Mul(gobi.Lit(1.08)).Gt(gobi.Lit(100))`
+  builds a data tree, not a chain of already-executed calls.
+  `Frame.FilterExpr` and `Frame.WithColumnExpr` evaluate it; a
+  `Custom(node ExprNode)` escape hatch lets sibling packages (H3,
+  hashes, ML inference) plug in their own expression types alongside
+  the built-ins. Seed for future lazy planning + optimizer.
 - **Datetime + timezone-aware ops.** `Timestamp[ns]` columns with
   optional IANA tz label. Component extractors, `AddDuration` /
   `DiffDuration`, comparisons, sub-day + calendar truncation.
@@ -54,6 +67,12 @@ built around a strongly-typed schema.
 - **Column projection.** `parquetio.Options{Columns: ...}` skips fetch,
   decompress, and arrow materialization for the columns you don't
   need. Composes with streaming.
+- **Parquet write tuning.** `parquetio.WriteOptions` exposes
+  `RowGroupRows` (predicate-pushdown-friendly small groups vs.
+  compression-friendly large ones), `BloomFilterColumns` +
+  `BloomFilterFPP` (equality-filter skipping in DuckDB / Spark /
+  Polars / pyarrow readers today; gobi's own reader when the query
+  optimizer lands).
 - **Parallelism controls.** Package-level `SetMaxParallelism(n)` or
   per-op `Workers(n)`.
 - **Pure Go, no cgo.** No GDAL, no GEOS, no libproj. Cross-compiles
@@ -93,9 +112,24 @@ func main() {
     defer df.Release()
 
     // The output file carries a spec-compliant GeoParquet 1.1 metadata
-    // blob and reads cleanly in GeoPandas / QGIS.
-    _ = parquetio.WriteFile(df, "cities.parquet", parquetio.CodecSnappy)
+    // blob and reads cleanly in GeoPandas / QGIS. nil = Snappy + arrow's
+    // default row-group sizing.
+    _ = parquetio.WriteFile(df, "cities.parquet", nil)
 }
+```
+
+### Build a geometry column from lat/lng
+
+```go
+// Turn two numeric columns into a WKB geometry column. Argument
+// order is x, y — i.e. longitude, latitude — matching WKB / GeoJSON /
+// geopandas.points_from_xy. Nulls on either side yield a null point.
+lng, _   := df.Column("lng")
+lat, _   := df.Column("lat")
+points, _ := gobi.PointsFromXY(lng, lat, 4326)
+df, _     = df.WithColumn("geometry", points)
+// df["geometry"] is now a proper WKB column, ready for SJoin,
+// GeoParquet write, etc.
 ```
 
 ### Spatial join
@@ -121,6 +155,31 @@ totals, _ := gb.Agg(
 )
 ```
 
+### Sort
+
+```go
+// Multi-key, stable, nulls-last. Earlier keys have priority;
+// later keys break ties.
+sorted, _ := df.SortBy(
+    gobi.SortKey{Column: "date"},                        // ascending
+    gobi.SortKey{Column: "revenue", Descending: true},
+)
+```
+
+### Tuned parquet write
+
+```go
+// Small row groups + bloom filters on high-cardinality equality columns.
+// DuckDB / Spark / Polars / pyarrow readers all use the bloom filters
+// for predicate pushdown on equality filters.
+err := parquetio.WriteFile(df, "events.parquet", &parquetio.WriteOptions{
+    Codec:              parquetio.CodecZstd,
+    RowGroupRows:       128_000,                     // 0 = arrow default (~1M)
+    BloomFilterColumns: []string{"user_id", "session_id"},
+    BloomFilterFPP:     0.01,                        // 0 = arrow default (0.05)
+})
+```
+
 ### Streaming ETL
 
 ```go
@@ -141,18 +200,32 @@ CSV has the same shape: `csvio.ReadFileChunksFunc[Row](path, opts, fn)`.
 
 ### Derived columns
 
+Two shapes. `WithColumn` accepts any Series the caller built by hand:
+
 ```go
 // A user-space helper produces the derived Series any way it likes
 // (external library call, vectorized loop, whatever). WithColumn wires
 // it back into the Frame — appending, or replacing an existing column
 // of the same name.
-lat, _ := df.Column("lat")
-lng, _ := df.Column("lng")
+lat, _   := df.Column("lat")
+lng, _   := df.Column("lng")
 cells, _ := h3x.Encode(lat, lng, 9)
-df, _ = df.WithColumn("h3", cells)
+df, _     = df.WithColumn("h3", cells)
 
-// And DropColumn for the inverse.
 df, _ = df.DropColumn("raw_geometry")
+```
+
+`WithColumnExpr` accepts an expression tree, so pipelines composed from
+built-in ops read left-to-right:
+
+```go
+// Same shape via the expression IR — no intermediate Series to name.
+df, _ = df.WithColumnExpr("usd_price",
+    gobi.Col("eur_price").Mul(gobi.Lit(1.08)),
+)
+df, _ = df.WithColumnExpr("margin",
+    gobi.Col("revenue").Sub(gobi.Col("cost")),
+)
 ```
 
 ### User-defined aggregation
@@ -184,10 +257,21 @@ out, _ := gb.Agg(
 
 ### Filter
 
+Two shapes. `Filter` takes an already-computed Boolean Series (mask):
+
 ```go
 pops, _ := df.Column("population")
 mask, _ := pops.GtScalar(1_000_000)
 big,  _ := df.Filter(mask)
+```
+
+`FilterExpr` takes an expression tree — no intermediate Series to name:
+
+```go
+big, _ := df.FilterExpr(
+    gobi.Col("population").Gt(gobi.Lit(1_000_000)).
+        And(gobi.Col("country").Eq(gobi.Lit("US"))),
+)
 ```
 
 ### Reproject
@@ -273,7 +357,7 @@ _ = shpio.WriteFile(counties, "counties_out")       // writes all four files
 | `github.com/zoobst/gobi`  | `Frame`, `Series`, `GroupBy`, `Join`, `SJoin`, `Explode`, datetime + rolling + resample, options |
 | `.../gobi/geometry`       | 2D + XYZ primitives, WKB / WKT, CRS + reprojection, predicates, R-tree, Buffer / Simplify / Centroid |
 | `.../gobi/csvio`          | Typed CSV read + streaming (`ReadFileChunksFunc`), gzip / zstd / bzip2 auto-detect              |
-| `.../gobi/parquetio`      | Parquet read/write + streaming + column projection; snappy/gzip/brotli/zstd/lz4 + GeoParquet 1.1 |
+| `.../gobi/parquetio`      | Parquet read/write + streaming + column projection + row-group + bloom-filter tuning; snappy/gzip/brotli/zstd/lz4 + GeoParquet 1.1 |
 | `.../gobi/geojson`        | Marshal / unmarshal GeoJSON geometries and Features                                             |
 | `.../gobi/gpkg`           | Read features from an OGC GeoPackage (SQLite)                                                   |
 | `.../gobi/kmlio`          | Read / write KML (OGC 12-007r2) with Placemarks + ExtendedData                                  |
@@ -299,7 +383,7 @@ Use `gobi.GeometryField(name, epsg)` to construct a tagged field manually.
 
 ## Extending gobi
 
-Two extension points cover most add-on work today, without forking:
+Three extension points cover most add-on work today, without forking:
 
 **1. Derived columns via a helper package + `Frame.WithColumn`.**
 Write a sibling package (e.g. `h3x`, `hashcol`) whose functions take one or
@@ -337,6 +421,40 @@ returned dynamic type doesn't match the declared `Type()`, `Agg`
 returns an error naming the offending aggregation rather than
 panicking.
 
+**3. Custom expression nodes via the `ExprNode` interface.**
+
+```go
+type ExprNode interface {
+    // Evaluate against a Frame. Return a Series with input.NumRows() rows.
+    Eval(input *Frame) (Series, error)
+    // Declared output arrow type given the input schema. Used by
+    // FilterExpr / WithColumnExpr for validation.
+    Type(schema *arrow.Schema) (arrow.DataType, error)
+    // Sub-expressions, for tree walkers.
+    Children() []Expr
+    // Pretty-printer for logs and debug output.
+    String() string
+}
+```
+
+Wrap your node with `gobi.Custom(node)` and it composes with the
+built-in `Col`, `Lit`, and operator methods:
+
+```go
+// h3x.Encode returns a gobi.Expr backed by a custom node.
+cellExpr := h3x.Encode(gobi.Col("lat"), gobi.Col("lng"), 9)
+
+df, _ = df.WithColumnExpr("h3", cellExpr)
+df, _ = df.FilterExpr(cellExpr.Eq(gobi.Lit(uint64(0xdead))))
+```
+
+Because expressions are data, not function calls, the tree can be
+inspected before evaluation (`e.String()`, `e.Node().Children()`),
+type-checked without touching the buffers (`e.Node().Type(schema)`),
+and — in a future release — rewritten by an optimizer that pushes
+predicates into scans and prunes unused columns. Extension points
+that implement `ExprNode` will benefit from those passes automatically.
+
 **Group-by key types.** Hashable key columns: `String`, `Bool`,
 `Int32`, `Int64`, `Uint32`, `Uint64`, `Float64`, `Timestamp`.
 `Uint64` is what makes H3-cell grouping ergonomic.
@@ -367,21 +485,65 @@ df.SJoin(..., gobi.Workers(1))            // force sequential
 
 ## Performance
 
-Single-threaded, 1M-row Parquet fixture:
+All numbers Apple M3 Pro, warm cache, 10–20 iterations per op. Fixtures
+and scripts live under [`benchmarks/`](benchmarks/) — regenerate with
+`go run generate_fixture.go`, `go run generate_csv_fixture.go`, and
+`go run generate_spatial_fixture.go`.
 
-| Op                          | gobi     | Polars 1T | gap    |
-|-----------------------------|---------:|----------:|-------:|
-| `Sum(value_a)`              |  0.81 ms |   0.08 ms | 10.1×  |
-| `value_a + value_b`         |  1.26 ms |   0.66 ms |  1.9×  |
-| `Filter(value_a > 500k)`    | 15.1 ms  |   1.61 ms |  9.4×  |
-| `GroupBy(key).Agg(Sum,Mean)`| 37.1 ms  |   7.62 ms |  4.9×  |
+### Compute ops (1M-row Parquet, non-spatial)
+
+| Op                            | gobi     | pandas 2.3 | Polars 1T | Polars all |
+|-------------------------------|---------:|-----------:|----------:|-----------:|
+| `Sum(value_a)`                |  0.81 ms |    0.29 ms |   0.08 ms |          — |
+| `value_a + value_b`           |  1.26 ms |    0.66 ms |   0.66 ms |          — |
+| `Filter(value_a > 500k)`      | 15.1 ms  |    4.73 ms |   1.61 ms |          — |
+| `GroupBy(key).Agg(Sum,Mean)`  | 37.1 ms  |   18.25 ms |   7.62 ms |          — |
+
+pandas sits between gobi and single-threaded Polars on every op — numpy's
+SIMD reductions and C-implemented groupby carry it past pure-Go for now.
+See the SIMD note below.
+
+### CSV read (38.6 MB / 1M rows)
+
+| Reader                          |  per-read | notes                                              |
+|---------------------------------|----------:|----------------------------------------------------|
+| Polars 1.42, all threads        |  12.0 ms  | multi-threaded Rust tokenizer + SIMD               |
+| Polars 1.42, 1 thread           |  56.2 ms  | SIMD numeric parse, single core                    |
+| pandas 2.3, `engine="pyarrow"`  |  25.8 ms  | pyarrow C++ tokenizer                              |
+| pandas 2.3, default (C engine)  | 128.5 ms  | pandas' native C tokenizer                         |
+| **gobi `csvio.Read`**           | **212.5 ms** | arrow-go's CSV wraps stdlib `encoding/csv`      |
+
+The gap is entirely in stdlib `encoding/csv` allocating a `[]string` per
+row + per-cell `strconv` — 99.5% of gobi's CSV allocations show up
+there in a pprof run. Closing it means replacing that layer with a
+byte-level tokenizer that writes straight into Arrow buffers; not on
+the roadmap yet. Maybe the arrow-go folks will pick that up.
+
+### Spatial ops (100k points × 100 polygons)
+
+| Op                              |     gobi | geopandas 1.1 |     result |
+|---------------------------------|---------:|--------------:|-----------:|
+| Read points.parquet (100k)      |  3.94 ms |      32.5 ms  | **8.3× faster** |
+| Read polygons.parquet (100)     |  0.41 ms |       0.82 ms | **2× faster**   |
+| `Area(polygons)`                |  0.02 ms |       0.12 ms | **6× faster**   |
+| `Centroid(polygons)`            |  0.03 ms |       0.15 ms | **5× faster**   |
+| `SJoin(100k pts, 100 polys)`    |  3.54 ms |       2.57 ms | 1.4× slower     |
+
+Gobi wins on read and per-row bulk ops because it doesn't have to
+construct Shapely Python objects per row on load. The one gap is
+`sjoin`: geopandas uses Shapely 2's GEOS-backed STRtree in C++; gobi's
+Sort-Tile-Recursive R-tree is pure Go. Landing within 40% of a
+GEOS-C++ index while staying cgo-free is the intended trade.
+
+### Why the compute-op gap will shrink
 
 `Sum` / `Add` are already memory-bandwidth-bound. The remaining gap on
-`Sum` is SIMD reduction (Polars uses parallel-lane accumulators). The Go
-`simd` and `simd/archsimd` packages gain arm64 NEON support in **Go 1.27
-(August 2026)**, at which point the existing `//go:build goexperiment.simd`
-kernel gets rewritten against the portable package and closes most of the
-Sum gap — see `TODO(1.27-simd)` in `series_ops_simd_*.go`.
+`Sum` is SIMD reduction (Polars and numpy both use parallel-lane
+accumulators). The Go `simd` and `simd/archsimd` packages gain arm64
+NEON support in **Go 1.27 (August 2026)**, at which point the existing
+`//go:build goexperiment.simd` kernel gets rewritten against the
+portable package and closes most of the Sum gap — see
+`TODO(1.27-simd)` in `series_ops_simd_*.go`.
 
 ## Development
 

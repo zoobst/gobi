@@ -224,6 +224,57 @@ func takeArrayFast(pool memory.Allocator, chunk arrow.Array, indexes []int) (arr
 			b.Append(a.Value(idx))
 		}
 		return b.NewArray(), nil
+	case *array.Uint64:
+		b := array.NewUint64Builder(pool)
+		defer b.Release()
+		if a.NullN() == 0 {
+			for _, idx := range indexes {
+				b.Append(a.Value(idx))
+			}
+			return b.NewArray(), nil
+		}
+		for _, idx := range indexes {
+			if a.IsNull(idx) {
+				b.AppendNull()
+				continue
+			}
+			b.Append(a.Value(idx))
+		}
+		return b.NewArray(), nil
+	case *array.Uint32:
+		b := array.NewUint32Builder(pool)
+		defer b.Release()
+		if a.NullN() == 0 {
+			for _, idx := range indexes {
+				b.Append(a.Value(idx))
+			}
+			return b.NewArray(), nil
+		}
+		for _, idx := range indexes {
+			if a.IsNull(idx) {
+				b.AppendNull()
+				continue
+			}
+			b.Append(a.Value(idx))
+		}
+		return b.NewArray(), nil
+	case *array.Timestamp:
+		b := array.NewTimestampBuilder(pool, a.DataType().(*arrow.TimestampType))
+		defer b.Release()
+		if a.NullN() == 0 {
+			for _, idx := range indexes {
+				b.Append(a.Value(idx))
+			}
+			return b.NewArray(), nil
+		}
+		for _, idx := range indexes {
+			if a.IsNull(idx) {
+				b.AppendNull()
+				continue
+			}
+			b.Append(a.Value(idx))
+		}
+		return b.NewArray(), nil
 	}
 	return nil, fmt.Errorf("%w: take not implemented for %T", ErrColumnTypeMismatch, chunk)
 }

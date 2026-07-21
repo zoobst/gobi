@@ -66,7 +66,7 @@ func main() {
 	if out == "" {
 		out = strings.TrimSuffix(*inputPath, filepath.Ext(*inputPath)) + ".parquet"
 	}
-	if err := parquetio.WriteFile(df, out, codec); err != nil {
+	if err := parquetio.WriteFile(df, out, &parquetio.WriteOptions{Codec: codec}); err != nil {
 		log.Fatalf("write parquet: %v", err)
 	}
 	fmt.Printf("Wrote %s (%s)\n", out, codec)

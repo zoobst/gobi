@@ -25,3 +25,4 @@ test.ipynb
 /benchmarks/
 parquetio.test
 csvio.test
+/experiments/
