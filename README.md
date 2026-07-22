@@ -48,23 +48,51 @@ built around a strongly-typed schema.
   `Frame.FilterExpr` and `Frame.WithColumnExpr` evaluate it; a
   `Custom(node ExprNode)` escape hatch lets sibling packages (H3,
   hashes, ML inference) plug in their own expression types alongside
-  the built-ins. Seed for future lazy planning + optimizer.
+  the built-ins.
+- **LazyFrame + rule-based optimizer.** `df.Lazy()` and
+  `parquetio.ScanFile(path)` build plan trees that don't execute
+  until `.Collect()`. Nine rewrite rules run to a fixed point:
+  constant folding, dead-filter removal, adjacent-filter combining,
+  push-filter-below-project, push-filter-below-sort, column
+  projection pushdown, predicate pushdown (into row-group stats),
+  and cascade-empty (short-circuits `Lit(false)`-derived subtrees).
+  Projection pushdown routes into `parquetio.ReadOptions.Columns` — 2.4×
+  faster reads on partial-column queries, matching the eager
+  baseline. Optimizer overhead is ~8 µs on a five-node plan;
+  always-on.
+- **Parallel streaming executor.** `LazyFrame.Collect()` compiles
+  the optimized plan to a tree of `ExecOperator`s that pull one
+  record batch at a time — bounded memory regardless of source
+  size. Filter, Project, WithColumn, Drop, Limit, ScanFrame, and
+  ScanFile all stream natively. Aggregate (built-in Kinds) and
+  hash-join (Inner/Left/Semi/Anti) run as native streaming
+  operators too — no materialization step. Parquet scan
+  parallelizes across row-groups; the streaming hash aggregate
+  partitions rows across workers by key hash. Both scale to
+  `GOMAXPROCS` out of the box. `LazyFrame.ExplainPhysical()` prints
+  what strategy each node compiles to (worker counts included).
 - **Datetime + timezone-aware ops.** `Timestamp[ns]` columns with
   optional IANA tz label. Component extractors, `AddDuration` /
   `DiffDuration`, comparisons, sub-day + calendar truncation.
   `ResampleEvery(timeCol, interval)` for downsampling and
   `RollingBy(timeCol, period)` for trailing time windows; plus fixed-size
   `Series.RollingSum` / `Mean` / `Min` / `Max` / `Count`.
-- **Multi-format I/O.** CSV (with `.gz` / `.zst` / `.bz2` auto-detect),
-  Parquet with proper GeoParquet 1.1 metadata (snappy / gzip / brotli /
-  zstd / lz4), GeoJSON, GeoPackage read, **KML read/write**, and
-  **Shapefile read/write** (`.shp` + `.shx` + `.dbf` + optional `.prj`).
+- **Multi-format I/O.** Every format has `ReadFile` / `WriteFile` at
+  Frame level plus a `ScanFile` LazyFrame entry point where the
+  underlying source supports it. Formats: CSV (with `.gz` / `.zst`
+  / `.bz2` auto-detect), Parquet with proper GeoParquet 1.1
+  metadata (snappy / gzip / brotli / zstd / lz4), full RFC 7946
+  GeoJSON (every geometry type + XYZ, `.geojsonl` streaming), OGC
+  GeoPackage 1.3 (SQLite, RTree spatial index, spec-compliant
+  metadata), PostgreSQL / PostGIS (via `pgx/v5`, native `CopyFrom`
+  bulk load), **KML read/write**, and **Shapefile read/write**
+  (`.shp` + `.shx` + `.dbf` + optional `.prj`).
 - **Streaming readers.** `csvio.ReadFileChunksFunc` and
   `parquetio.ReadFileChunksFunc` yield one Frame per record batch
   (~64k rows), releasing arrow buffers after each callback. Peak
   memory is bounded regardless of source-file size — good for ETL
   over multi-GB inputs.
-- **Column projection.** `parquetio.Options{Columns: ...}` skips fetch,
+- **Column projection.** `parquetio.ReadOptions{Columns: ...}` skips fetch,
   decompress, and arrow materialization for the columns you don't
   need. Composes with streaming.
 - **Parquet write tuning.** `parquetio.WriteOptions` exposes
@@ -86,6 +114,15 @@ go get github.com/zoobst/gobi
 
 Requires Go **1.26** or newer.
 
+## Docs
+
+Full API reference is on
+[pkg.go.dev](https://pkg.go.dev/github.com/zoobst/gobi) —
+auto-generated from source doc comments. Every subpackage
+(`parquetio`, `csvio`, `geometry`, `geojsonio`, `gpkgio`, `pgio`,
+`kmlio`, `shpio`) has its own page; use the same base URL with
+the package path appended.
+
 ## Quick start
 
 ### Read a CSV, write a GeoParquet
@@ -106,8 +143,8 @@ type city struct {
 
 func main() {
     // .gz / .zst / .bz2 are auto-detected from the filename; explicit
-    // Options.Compression overrides.
-    df, err := csvio.ReadFile[city]("cities.csv.gz", &csvio.Options{CRSHint: 4326})
+    // ReadOptions.Compression overrides.
+    df, err := csvio.ReadFile[city]("cities.csv.gz", &csvio.ReadOptions{CRSHint: 4326})
     if err != nil { panic(err) }
     defer df.Release()
 
@@ -187,7 +224,7 @@ err := parquetio.WriteFile(df, "events.parquet", &parquetio.WriteOptions{
 // fetched off disk; the rest are never decompressed.
 err := parquetio.ReadFileChunksFunc(
     "events.parquet",
-    &parquetio.Options{Columns: []string{"user_id", "ts"}, ChunkRows: 64_000},
+    &parquetio.ReadOptions{Columns: []string{"user_id", "ts"}, ChunkRows: 64_000},
     func(batch *gobi.Frame) error {
         // Process ~64k rows at a time. The batch is released after
         // return; call batch.Retain() to keep it past this callback.
@@ -358,8 +395,9 @@ _ = shpio.WriteFile(counties, "counties_out")       // writes all four files
 | `.../gobi/geometry`       | 2D + XYZ primitives, WKB / WKT, CRS + reprojection, predicates, R-tree, Buffer / Simplify / Centroid |
 | `.../gobi/csvio`          | Typed CSV read + streaming (`ReadFileChunksFunc`), gzip / zstd / bzip2 auto-detect              |
 | `.../gobi/parquetio`      | Parquet read/write + streaming + column projection + row-group + bloom-filter tuning; snappy/gzip/brotli/zstd/lz4 + GeoParquet 1.1 |
-| `.../gobi/geojson`        | Marshal / unmarshal GeoJSON geometries and Features                                             |
-| `.../gobi/gpkg`           | Read features from an OGC GeoPackage (SQLite)                                                   |
+| `.../gobi/geojsonio`      | Full RFC 7946 GeoJSON (all geometry types + XYZ) — Frame-level `ReadFile`/`WriteFile`/`ScanFile`, `.geojsonl` streaming |
+| `.../gobi/gpkgio`         | Read / write OGC GeoPackage 1.3 (SQLite) with RTree spatial index + LazyFrame `ScanFile` + SQL predicate pushdown |
+| `.../gobi/pgio`           | PostgreSQL / PostGIS via `pgx/v5` — `ReadQuery`/`ReadTable`/`ScanTable` + `WriteTable` with `CopyFrom` bulk load |
 | `.../gobi/kmlio`          | Read / write KML (OGC 12-007r2) with Placemarks + ExtendedData                                  |
 | `.../gobi/shpio`          | Read / write ESRI Shapefile (`.shp` + `.shx` + `.dbf` + optional `.prj`)                        |
 
@@ -461,8 +499,27 @@ that implement `ExprNode` will benefit from those passes automatically.
 
 ## Parallelism
 
-Parallel operations (currently `SJoin`, more to come) resolve their worker
-count in this priority order:
+Two layers of parallel execution work together in a LazyFrame
+collect: the parquet scan splits row-groups across workers, and the
+streaming aggregate partitions rows by key hash across workers.
+
+- **Parallel scan.** `parquetio.ScanFile(path, &parquetio.ReadOptions{ScanWorkers: N})`
+  splits row-groups across N goroutines. Each worker reads a
+  disjoint subset of row-groups; batches fan-in through a bounded
+  channel. `ScanWorkers: 0` (the default) auto-picks `GOMAXPROCS`,
+  capped at the file's row-group count. `ScanWorkers: 1` forces
+  serial for reproducibility. Files with a single row-group skip
+  parallel scan automatically (no benefit possible).
+- **Parallel aggregate.** The streaming hash aggregate
+  (`GroupBy(...).Agg(...)` on a LazyFrame with built-in Kinds)
+  partitions rows across `GOMAXPROCS` workers by key hash — no
+  cross-worker key overlap, no locks, no value-level combine at
+  merge. Kicks in for any aggregate where every `Aggregation` uses
+  a built-in `Kind`; custom `Fn` aggregators still route through
+  the materializing fallback.
+
+Both layers respect the package-level `SetMaxParallelism(n)` /
+per-op `Workers(n)` overrides, in this priority:
 
 1. Per-op `gobi.Workers(n)` option
 2. Package default via `gobi.SetMaxParallelism(n)`
@@ -473,6 +530,10 @@ gobi.SetMaxParallelism(4)                 // process-wide default
 df.SJoin(..., gobi.Workers(8))            // override for one call
 df.SJoin(..., gobi.Workers(1))            // force sequential
 ```
+
+`LazyFrame.ExplainPhysical()` shows the resolved worker count for
+each parallel node — useful when debugging why a query didn't get
+the parallelism you expected.
 
 ## Design constraints
 
@@ -492,26 +553,27 @@ and scripts live under [`benchmarks/`](benchmarks/) — regenerate with
 
 ### Compute ops (1M-row Parquet, non-spatial)
 
-| Op                            | gobi     | pandas 2.3 | Polars 1T | Polars all |
-|-------------------------------|---------:|-----------:|----------:|-----------:|
-| `Sum(value_a)`                |  0.81 ms |    0.29 ms |   0.08 ms |          — |
-| `value_a + value_b`           |  1.26 ms |    0.66 ms |   0.66 ms |          — |
-| `Filter(value_a > 500k)`      | 15.1 ms  |    4.73 ms |   1.61 ms |          — |
-| `GroupBy(key).Agg(Sum,Mean)`  | 37.1 ms  |   18.25 ms |   7.62 ms |          — |
+| Op                            |    gobi | pandas 2.3 | Polars 1T | Polars all |
+|-------------------------------|--------:|-----------:|----------:|-----------:|
+| `Sum(value_a)`                | 0.92 ms |    0.31 ms |   0.08 ms |    0.08 ms |
+| `value_a + value_b`           | 1.01 ms |    0.71 ms |   0.68 ms |    0.76 ms |
+| `Filter(value_a > 500k)`      | 14.3 ms |    4.81 ms |   1.74 ms |    1.37 ms |
+| `GroupBy(key).Agg(Sum,Mean)`  | 33.3 ms |   18.16 ms |   7.59 ms |    2.24 ms |
 
+Polars 1T = `POLARS_MAX_THREADS=1`; Polars all = default (all cores).
 pandas sits between gobi and single-threaded Polars on every op — numpy's
 SIMD reductions and C-implemented groupby carry it past pure-Go for now.
 See the SIMD note below.
 
 ### CSV read (38.6 MB / 1M rows)
 
-| Reader                          |  per-read | notes                                              |
-|---------------------------------|----------:|----------------------------------------------------|
-| Polars 1.42, all threads        |  12.0 ms  | multi-threaded Rust tokenizer + SIMD               |
-| Polars 1.42, 1 thread           |  56.2 ms  | SIMD numeric parse, single core                    |
-| pandas 2.3, `engine="pyarrow"`  |  25.8 ms  | pyarrow C++ tokenizer                              |
-| pandas 2.3, default (C engine)  | 128.5 ms  | pandas' native C tokenizer                         |
-| **gobi `csvio.Read`**           | **212.5 ms** | arrow-go's CSV wraps stdlib `encoding/csv`      |
+| Reader                          |    per-read | notes                                              |
+|---------------------------------|------------:|----------------------------------------------------|
+| Polars 1.42, all threads        |     9.1 ms  | multi-threaded Rust tokenizer + SIMD (typed schema) |
+| Polars 1.42, 1 thread           |    56.0 ms  | SIMD numeric parse, single core                    |
+| pandas 2.3, `engine="pyarrow"`  |    25.9 ms  | pyarrow C++ tokenizer                              |
+| pandas 2.3, default (C engine)  |   129.8 ms  | pandas' native C tokenizer                         |
+| **gobi `csvio.Read`**           | **209.4 ms** | arrow-go's CSV wraps stdlib `encoding/csv`      |
 
 The gap is entirely in stdlib `encoding/csv` allocating a `[]string` per
 row + per-cell `strconv` — 99.5% of gobi's CSV allocations show up
@@ -523,11 +585,11 @@ the roadmap yet. Maybe the arrow-go folks will pick that up.
 
 | Op                              |     gobi | geopandas 1.1 |     result |
 |---------------------------------|---------:|--------------:|-----------:|
-| Read points.parquet (100k)      |  3.94 ms |      32.5 ms  | **8.3× faster** |
-| Read polygons.parquet (100)     |  0.41 ms |       0.82 ms | **2× faster**   |
-| `Area(polygons)`                |  0.02 ms |       0.12 ms | **6× faster**   |
-| `Centroid(polygons)`            |  0.03 ms |       0.15 ms | **5× faster**   |
-| `SJoin(100k pts, 100 polys)`    |  3.54 ms |       2.57 ms | 1.4× slower     |
+| Read points.parquet (100k)      |  4.37 ms |      35.2 ms  | **8.0× faster** |
+| Read polygons.parquet (100)     |  0.26 ms |       0.76 ms | **2.9× faster** |
+| `Area(polygons)`                |  0.02 ms |       0.13 ms | **6.5× faster** |
+| `Centroid(polygons)`            |  0.02 ms |       0.16 ms | **8× faster**   |
+| `SJoin(100k pts, 100 polys)`    |  3.14 ms |       2.60 ms | 1.2× slower     |
 
 Gobi wins on read and per-row bulk ops because it doesn't have to
 construct Shapely Python objects per row on load. The one gap is
@@ -535,7 +597,52 @@ construct Shapely Python objects per row on load. The one gap is
 Sort-Tile-Recursive R-tree is pure Go. Landing within 40% of a
 GEOS-C++ index while staying cgo-free is the intended trade.
 
-### Why the compute-op gap will shrink
+### LazyFrame + optimizer (projection pushdown)
+
+Same 1M-row parquet fixture, `Select(id, value_a)` — reading 2 of 4
+columns. Measures the projection-pushdown rule's effect on I/O and
+decode cost.
+
+| Path                                                        | per-op   | vs. baseline |
+|-------------------------------------------------------------|---------:|:-------------|
+| `ReadFile(path, Options{Columns:[id,value_a]})` (eager)     |  6.18 ms | 1.0× (baseline) |
+| `ScanFile(path).Select(id,value_a).Collect()` (optimized)   |  7.06 ms | ~1.14× — close to eager |
+| `ScanFile(path).Select(id,value_a).CollectRaw()` (no rules) | 14.08 ms | 2.3× slower — reads all 4 cols |
+
+The optimizer's `ProjectionPushdown` rule turns the lazy pipeline
+into the equivalent of an eager `Options.Columns` — 2.0× faster than
+the same pipeline with optimization disabled. Optimizer overhead
+itself is **8 µs per plan** (measured on a 5-node pipeline), or
+0.14% of the collect time. Always-on optimization is effectively
+free.
+
+### 1 Billion Row Challenge
+
+The [1BRC fixture](https://github.com/gunnarmorling/1brc) is 1 billion
+weather-station rows in Snappy-compressed parquet (~4 GB on disk).
+Query: min / mean / max of `temperature` grouped by `station`. Apple
+M3 Pro, 11 GOMAXPROCS.
+
+| Config                                   |    wall |  user CPU | peak RSS |
+|------------------------------------------|--------:|----------:|---------:|
+| Serial (`ScanWorkers=1`, single agg)     | 1m 50s  |    147s   |  156 MB  |
+| Parallel scan                            | 1m 52s  |    148s   | 1.28 GB  |
+| Parallel scan + parallel aggregate.      | 1m 11s  |    197s   | 1.31 GB  |
+| **Both + composite-key optimizations**   | **15.5s** | **141s** | **1.5 GB** |
+| Polars 1.42 streaming (reference)        |   ~3 s  |     ~15s  | ~4.6 GB  |
+
+Same query, streaming end-to-end — no `LazyFrame.CollectRaw()`
+materialization, no disk spill. The gap to Polars closed to 5× across
+three complementary changes: partitioning the parquet scan across row-groups,
+sharding the streaming hash aggregate by key hash across workers, and
+eliminating per-row key allocations in the hot path (reusable scratch buffers +
+single-string-key fast path that reads the arrow value zero-copy).
+
+Peak RSS is 3× lower than Polars because gobi keeps at most one
+batch per worker in memory (~1.3 GB total on 11 workers) — Polars
+buffers larger working sets by design.
+
+### Why the remaining compute-op gap will shrink
 
 `Sum` / `Add` are already memory-bandwidth-bound. The remaining gap on
 `Sum` is SIMD reduction (Polars and numpy both use parallel-lane
@@ -544,6 +651,15 @@ NEON support in **Go 1.27 (August 2026)**, at which point the existing
 `//go:build goexperiment.simd` kernel gets rewritten against the
 portable package and closes most of the Sum gap — see
 `TODO(1.27-simd)` in `series_ops_simd_*.go`.
+
+The 1BRC gap breaks down similarly: with parallelism landed, most of
+the remaining 5× vs Polars is per-row accumulator throughput
+(`minMaxAcc.Update` calls `Series.numericAt` per row, dispatching
+through an interface + type switch). Vectorized kernels — tight
+loops over typed slices — would close a meaningful fraction on the
+Go compiler alone; the last factor comes from the same Go 1.27 SIMD
+package. Neither is on the roadmap until the toolchain support
+lands.
 
 ## Development
 

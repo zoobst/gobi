@@ -16,7 +16,7 @@
 //     is bounded regardless of source file size. Good for ETL / bounded-
 //     memory pipelines.
 //
-// Both entry points accept an Options.Columns list to project the read
+// Both entry points accept an ReadOptions.Columns list to project the read
 // to a subset of columns. Projected-away columns are neither fetched
 // from disk nor decompressed nor materialized into arrow arrays.
 package parquetio
@@ -51,8 +51,8 @@ const (
 )
 
 // DefaultChunkRows is the arrow record-batch size used by
-// ReadFileChunksFunc when Options.ChunkRows is 0.
-const DefaultChunkRows int64 = 64 * 1024
+// ReadFileChunksFunc when ReadOptions.ChunkRows is 0.
+const DefaultChunkRows = 64 * 1024
 
 // Errors.
 var (
@@ -61,9 +61,9 @@ var (
 	ErrChunksAborted  = errors.New("parquetio: chunk callback returned error")
 )
 
-// Options controls parquet read behavior. A nil pointer is treated as
+// ReadOptions controls parquet read behavior. A nil pointer is treated as
 // the zero value.
-type Options struct {
+type ReadOptions struct {
 	// Columns projects the file to a subset of top-level columns by
 	// name. nil or empty = read all columns.
 	//
@@ -82,10 +82,48 @@ type Options struct {
 	// Sub-partitioning a row group into fixed-size batches is what
 	// bounds streaming memory to ~one batch at a time regardless of
 	// the file's row-group sizes.
-	ChunkRows int64
+	ChunkRows int
 
 	// Allocator overrides the Arrow allocator. nil = memory.DefaultAllocator.
 	Allocator memory.Allocator
+
+	// Predicate is a hint from the optimizer for row-group skipping.
+	// When set, ReadFile / ReadFileChunksFunc walk each row-group's
+	// footer statistics and skip whole groups whose (min, max) bounds
+	// prove no row could satisfy the predicate. The Filter operation
+	// above the read still runs — this is a coarse fast-path that
+	// avoids fetching irrelevant row-groups off disk.
+	//
+	// Predicates only prune when they reference columns present in
+	// the file's schema. Unrecognized columns silently prevent
+	// pruning (conservative — a "maybe" survives). Uses the same
+	// Expr type as Frame.FilterExpr.
+	Predicate gobi.Expr
+
+	// RowGroups optionally restricts the read to a specific set of
+	// row-group indices. When set, ReadFile / ReadFileChunksFunc /
+	// ScanFile process only those row-groups; when nil or empty,
+	// all row-groups are read.
+	//
+	// Primarily used internally to partition scans across parallel
+	// workers (see ScanWorkers) — each worker gets a disjoint
+	// RowGroups slice. Callers can set it directly for very
+	// targeted reads (e.g. "just the last row-group of this file"),
+	// though the more common way to restrict is via Columns or
+	// Predicate.
+	RowGroups []int
+
+	// ScanWorkers controls row-group-level parallelism for ScanFile.
+	// 0 (default) = runtime.GOMAXPROCS(0), capped at NumRowGroups.
+	// 1 = single-threaded (the previous behavior). n > 1 = n
+	// workers, capped at NumRowGroups.
+	//
+	// Ignored by ReadFile (always single-threaded — reads one whole
+	// file) and by ReadFileChunksFunc (also single-threaded — the
+	// callback API is fundamentally serial). Applies only when the
+	// scan flows through the Layer 6 executor via ScanFile +
+	// LazyFrame.Collect.
+	ScanWorkers int
 }
 
 // WriteOptions controls parquet write behavior. A nil pointer is
@@ -170,11 +208,172 @@ func (c Codec) toArrow() (compress.Compression, error) {
 	}
 }
 
+// ReadSchema opens path, reads just the parquet footer, and returns
+// the arrow schema of the file — projected through opts.Columns and
+// stamped with the GeoParquet "geo" metadata if present.
+//
+// Reads no column data. Used by ScanFile to populate a lazy plan
+// node's output schema without materializing any rows.
+func ReadSchema(path string, opts *ReadOptions) (*arrow.Schema, error) {
+	rc, err := openReader(path, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.close()
+
+	arrowSchema, err := rc.reader.Schema()
+	if err != nil {
+		return nil, err
+	}
+
+	// If Columns was set, project the schema to just those fields.
+	if len(opts.readColumns()) > 0 {
+		nameToIdx := make(map[string]int, len(arrowSchema.Fields()))
+		for i, f := range arrowSchema.Fields() {
+			nameToIdx[f.Name] = i
+		}
+		projected := make([]arrow.Field, 0, len(opts.readColumns()))
+		for _, name := range opts.readColumns() {
+			if i, ok := nameToIdx[name]; ok {
+				projected = append(projected, arrowSchema.Field(i))
+			}
+		}
+		arrowSchema = arrow.NewSchema(projected, schemaMetadataPtr(arrowSchema))
+	}
+
+	// Attach the "geo" key if the file carried one.
+	if rc.geoRaw != "" {
+		return attachGeoKey(arrowSchema, rc.geoRaw)
+	}
+	return arrowSchema, nil
+}
+
+// ScanFile returns a LazyFrame anchored at a parquet scan. No data
+// is read until Collect() is called; the schema is read eagerly from
+// the parquet footer so downstream nodes can propagate types.
+//
+// If the file can't be opened at construction (missing file, bad
+// footer, unknown codec), the returned LazyFrame still builds — the
+// error surfaces at Collect. This matches DuckDB's / Polars'
+// `scan_parquet` semantics: cheap to compose, errors bubble at
+// materialization.
+//
+// Composes with the LazyFrame chain: Filter, Select, WithColumn,
+// SortBy, GroupBy.Agg, Join, Limit, Head, Tail, DropColumn.
+//
+// A future optimizer will push Filter and Select nodes above the
+// scan back INTO the parquet reader (predicate + projection
+// pushdown, bloom-filter-driven rowgroup skipping). Today ScanFile is
+// pure API shape — it reads the whole file at Collect regardless of
+// what's above it.
+func ScanFile(path string, opts *ReadOptions) *gobi.LazyFrame {
+	// Try to read the schema eagerly. If that fails, the read
+	// closure below will surface the same error at Collect time.
+	sch, schemaErr := ReadSchema(path, opts)
+
+	label := buildScanLabel(path, opts)
+
+	node := gobi.NewScanNode(label, sch, func() (*gobi.Frame, error) {
+		if schemaErr != nil {
+			return nil, schemaErr
+		}
+		return ReadFile(path, opts)
+	}, gobi.WithColumnProjection(func(cols []string) gobi.LogicalPlan {
+		// Called by the optimizer's projection-pushdown rule. If
+		// the caller already restricted columns explicitly, keep
+		// their choice — the optimizer's set is derived from what
+		// the plan actually uses, but user intent wins.
+		//
+		// If no user projection is set, produce a new ScanFile
+		// with ReadOptions.Columns = cols. The recursive ScanFile
+		// terminates because the new node has cols set, so the
+		// next optimizer pass won't project it again.
+		if len(opts.readColumns()) > 0 {
+			return nil // treated as "no change" by ProjectColumns caller
+		}
+		var newOpts ReadOptions
+		if opts != nil {
+			newOpts = *opts
+		}
+		newOpts.Columns = cols
+		return ScanFile(path, &newOpts).Plan()
+	}), gobi.WithStreamRead(func(cb func(*gobi.Frame) error) error {
+		if schemaErr != nil {
+			return schemaErr
+		}
+		return ReadFileChunksFunc(path, opts, cb)
+	}), gobi.WithParallelStreamReads(func() []func(cb func(*gobi.Frame) error) error {
+		// Only produce a parallel plan if we actually have >1
+		// worker's worth of work to do. otherwise nil signals
+		// fallback to the serial WithStreamRead callback.
+		if schemaErr != nil {
+			return nil
+		}
+		return partitionRowGroups(path, opts)
+	}), gobi.WithPredicatePushdown(func(pred gobi.Expr) gobi.LogicalPlan {
+		// Called by the optimizer's PushPredicateToScan rule.
+		// Layered atop any existing predicate via AND — a caller-
+		// supplied Predicate stays applied, and the optimizer's
+		// contribution is added on top.
+		var newOpts ReadOptions
+		if opts != nil {
+			newOpts = *opts
+		}
+		if newOpts.Predicate.Node() == nil {
+			newOpts.Predicate = pred
+		} else {
+			newOpts.Predicate = newOpts.Predicate.And(pred)
+		}
+		return ScanFile(path, &newOpts).Plan()
+	}))
+	return gobi.NewLazyFrame(node)
+}
+
+// buildScanLabel produces the human-readable Scan[parquet](...) label
+// used in Explain output. Includes column projection and predicate
+// pushdown state so it's obvious from Explain what the scan sees.
+func buildScanLabel(path string, opts *ReadOptions) string {
+	label := fmt.Sprintf("Scan[parquet](%q)", path)
+	if opts == nil {
+		return label
+	}
+	if len(opts.Columns) > 0 && opts.Predicate.Node() != nil {
+		return fmt.Sprintf("Scan[parquet](%q, cols=%v, pred=%s)",
+			path, opts.Columns, opts.Predicate)
+	}
+	if len(opts.Columns) > 0 {
+		return fmt.Sprintf("Scan[parquet](%q, cols=%v)", path, opts.Columns)
+	}
+	if opts.Predicate.Node() != nil {
+		return fmt.Sprintf("Scan[parquet](%q, pred=%s)", path, opts.Predicate)
+	}
+	return label
+}
+
+// readColumns returns opts.Columns, treating a nil *ReadOptions as empty.
+// Used by ReadSchema and ScanFile without repeated nil checks.
+func (o *ReadOptions) readColumns() []string {
+	if o == nil {
+		return nil
+	}
+	return o.Columns
+}
+
+// schemaMetadataPtr mirrors the helper of the same name in gobi/plan.go,
+// re-declared here to avoid pulling in the whole package for one line.
+func schemaMetadataPtr(s *arrow.Schema) *arrow.Metadata {
+	if s == nil || !s.HasMetadata() {
+		return nil
+	}
+	m := s.Metadata()
+	return &m
+}
+
 // ReadFile reads path into a single Frame. If opts.Columns is non-empty,
 // only those columns are fetched + decoded. If the file has a GeoParquet
 // "geo" key, it is re-attached to the Frame's Arrow schema so downstream
 // code can detect geometry columns.
-func ReadFile(path string, opts *Options) (*gobi.Frame, error) {
+func ReadFile(path string, opts *ReadOptions) (*gobi.Frame, error) {
 	rc, err := openReader(path, opts)
 	if err != nil {
 		return nil, err
@@ -190,7 +389,7 @@ func ReadFile(path string, opts *Options) (*gobi.Frame, error) {
 
 // ReadFileChunksFunc streams path as record-batch-sized Frames. fn is
 // invoked once per batch (~DefaultChunkRows rows by default; override
-// via Options.ChunkRows). Only the current batch's arrow buffers are
+// via ReadOptions.ChunkRows). Only the current batch's arrow buffers are
 // in memory, so peak footprint is bounded to roughly one batch.
 //
 // The Frame handed to fn is Released after fn returns. To retain a Frame
@@ -200,7 +399,7 @@ func ReadFile(path string, opts *Options) (*gobi.Frame, error) {
 // If fn returns an error, iteration stops and the error is wrapped in
 // ErrChunksAborted so callers can errors.Is / errors.As it. Underlying
 // parquet read errors are returned directly.
-func ReadFileChunksFunc(path string, opts *Options, fn func(*gobi.Frame) error) error {
+func ReadFileChunksFunc(path string, opts *ReadOptions, fn func(*gobi.Frame) error) error {
 	rc, err := openReader(path, opts)
 	if err != nil {
 		return err
@@ -340,9 +539,9 @@ func (rc *readerContext) close() {
 // openReader opens path, builds a pqarrow.FileReader with a batch size
 // suitable for streaming, extracts geo metadata, and resolves
 // opts.Columns to arrow-schema indices.
-func openReader(path string, opts *Options) (*readerContext, error) {
+func openReader(path string, opts *ReadOptions) (*readerContext, error) {
 	if opts == nil {
-		opts = &Options{}
+		opts = &ReadOptions{}
 	}
 	pool := opts.Allocator
 	if pool == nil {
@@ -384,10 +583,31 @@ func openReader(path string, opts *Options) (*readerContext, error) {
 		return nil, err
 	}
 
-	rowGroups := make([]int, pf.NumRowGroups())
-	for i := range rowGroups {
-		rowGroups[i] = i
+	// Row-group selection: honor ReadOptions.RowGroups when set,
+	// otherwise all groups. Then narrow further by predicate stats.
+	var rowGroups []int
+	if len(opts.RowGroups) > 0 {
+		total := pf.NumRowGroups()
+		rowGroups = make([]int, 0, len(opts.RowGroups))
+		for _, rg := range opts.RowGroups {
+			if rg < 0 || rg >= total {
+				_ = pf.Close()
+				_ = f.Close()
+				return nil, fmt.Errorf("parquetio: row-group index %d out of range [0,%d)", rg, total)
+			}
+			rowGroups = append(rowGroups, rg)
+		}
+	} else {
+		rowGroups = make([]int, pf.NumRowGroups())
+		for i := range rowGroups {
+			rowGroups[i] = i
+		}
 	}
+	// Predicate pushdown: filter row-groups by footer stats. Never
+	// causes correctness issues — a false positive (row-group kept
+	// that could have been skipped) just costs a bit of extra I/O.
+	// filterRowGroupsByPredicate handles a nil Predicate as a no-op.
+	rowGroups = filterRowGroupsByPredicate(pf, opts.Predicate, rowGroups)
 
 	return &readerContext{
 		file:        f,
@@ -436,9 +656,9 @@ func resolveColumns(pf *file.Reader, fr *pqarrow.FileReader, names []string) ([]
 	return out, nil
 }
 
-func chunkRows(opts *Options) int64 {
+func chunkRows(opts *ReadOptions) int64 {
 	if opts != nil && opts.ChunkRows > 0 {
-		return opts.ChunkRows
+		return int64(opts.ChunkRows)
 	}
 	return DefaultChunkRows
 }

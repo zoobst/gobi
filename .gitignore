@@ -18,6 +18,7 @@
 # Test artifacts
 coverage.out
 coverage.html
+scratch.txt
 
 test.ipynb
 

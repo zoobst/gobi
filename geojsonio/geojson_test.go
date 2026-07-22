@@ -1,21 +1,21 @@
-package geojson_test
+package geojsonio_test
 
 import (
 	"encoding/json"
 	"errors"
 	"testing"
 
-	"github.com/zoobst/gobi/geojson"
+	"github.com/zoobst/gobi/geojsonio"
 	"github.com/zoobst/gobi/geometry"
 )
 
 func TestPointRoundTrip(t *testing.T) {
 	p := geometry.Point{X: 10, Y: 20, CRSValue: geometry.WGS84}
-	buf, err := geojson.Marshal(p)
+	buf, err := geojsonio.Marshal(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	back, err := geojson.Unmarshal(buf)
+	back, err := geojsonio.Unmarshal(buf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,11 +32,11 @@ func TestPolygonRoundTrip(t *testing.T) {
 		},
 		CRSValue: geometry.WGS84,
 	}
-	buf, err := geojson.Marshal(poly)
+	buf, err := geojsonio.Marshal(poly)
 	if err != nil {
 		t.Fatal(err)
 	}
-	back, err := geojson.Unmarshal(buf)
+	back, err := geojsonio.Unmarshal(buf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestUnmarshalFeature(t *testing.T) {
 		"geometry": {"type": "Point", "coordinates": [-73.9857, 40.7484]},
 		"properties": {"name": "Empire State"}
 	}`)
-	g, props, err := geojson.UnmarshalFeature(src)
+	g, props, err := geojsonio.UnmarshalFeature(src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,15 +65,20 @@ func TestUnmarshalFeature(t *testing.T) {
 }
 
 func TestUnmarshalInvalid(t *testing.T) {
-	_, err := geojson.Unmarshal([]byte(`{"type":"MultiPolygon","coordinates":[]}`))
-	if !errors.Is(err, geojson.ErrInvalidGeoJSON) {
+	// GeometryTriangle isn't a GeoJSON type, so the dispatcher
+	// rejects the input. MultiPolygon USED to be the canonical
+	// "unsupported type" example — as of the geojsonio expansion
+	// it's a first-class type, so this test picks a genuinely
+	// invalid name instead.
+	_, err := geojsonio.Unmarshal([]byte(`{"type":"GeometryTriangle","coordinates":[]}`))
+	if !errors.Is(err, geojsonio.ErrInvalidGeoJSON) {
 		t.Fatalf("expected ErrInvalidGeoJSON, got %v", err)
 	}
 }
 
 func TestMarshalJSON_Structure(t *testing.T) {
 	p := geometry.Point{X: 1, Y: 2}
-	buf, _ := geojson.Marshal(p)
+	buf, _ := geojsonio.Marshal(p)
 	var out map[string]any
 	if err := json.Unmarshal(buf, &out); err != nil {
 		t.Fatal(err)

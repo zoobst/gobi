@@ -65,7 +65,7 @@ func TestWriteRead_PointRoundTrip(t *testing.T) {
 	df := buildPointFrame(t)
 	dir := t.TempDir()
 	base := filepath.Join(dir, "cities")
-	if err := shpio.WriteFile(df, base); err != nil {
+	if err := shpio.WriteFile(df, base, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	// Confirm the four sidecars all landed.
@@ -75,7 +75,7 @@ func TestWriteRead_PointRoundTrip(t *testing.T) {
 		}
 	}
 
-	back, err := shpio.ReadFile(base)
+	back, err := shpio.ReadFile(base, nil)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -158,10 +158,10 @@ func TestWriteRead_PolygonRoundTrip(t *testing.T) {
 
 	dir := t.TempDir()
 	base := filepath.Join(dir, "poly")
-	if err := shpio.WriteFile(df, base); err != nil {
+	if err := shpio.WriteFile(df, base, nil); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	back, err := shpio.ReadFile(base)
+	back, err := shpio.ReadFile(base, nil)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -213,10 +213,10 @@ func TestWriteRead_LineStringRoundTrip(t *testing.T) {
 
 	dir := t.TempDir()
 	base := filepath.Join(dir, "line")
-	if err := shpio.WriteFile(df, base); err != nil {
+	if err := shpio.WriteFile(df, base, nil); err != nil {
 		t.Fatal(err)
 	}
-	back, err := shpio.ReadFile(base)
+	back, err := shpio.ReadFile(base, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestWriteRead_LineStringRoundTrip(t *testing.T) {
 }
 
 func TestReadFile_MissingSHPErrors(t *testing.T) {
-	_, err := shpio.ReadFile(filepath.Join(t.TempDir(), "nope"))
+	_, err := shpio.ReadFile(filepath.Join(t.TempDir(), "nope"), nil)
 	if err == nil {
 		t.Fatal("expected error for missing .shp")
 	}

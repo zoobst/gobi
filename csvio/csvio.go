@@ -50,13 +50,13 @@ var DefaultTimeLayouts = []string{
 }
 
 // DefaultChunkRows is the row batch size Arrow's CSV reader emits when
-// Options.ChunkRows is zero. Larger batches amortize per-batch overhead;
+// ReadOptions.ChunkRows is zero. Larger batches amortize per-batch overhead;
 // smaller batches bound peak memory. 64k rows is a reasonable middle
 // ground for typical wide tables.
 const DefaultChunkRows = 64 * 1024
 
-// Options controls CSV parsing.
-type Options struct {
+// ReadOptions controls CSV parsing.
+type ReadOptions struct {
 	// HasHeader indicates whether the first row is a header. Defaults to true.
 	HasHeader *bool
 	// Delimiter overrides the default comma. Any rune is accepted, e.g.
@@ -95,7 +95,7 @@ type Options struct {
 	ChunkRows int
 }
 
-func (o *Options) hasHeader() bool {
+func (o *ReadOptions) hasHeader() bool {
 	if o == nil || o.HasHeader == nil {
 		return true
 	}
@@ -105,7 +105,7 @@ func (o *Options) hasHeader() bool {
 // ReadFile reads path into a Frame, inferring the schema from T. If
 // opts.Compression is CodecAuto (the default), the codec is inferred from
 // the filename's extension (`.gz`, `.zst`, `.bz2`).
-func ReadFile[T any](path string, opts *Options) (*gobi.Frame, error) {
+func ReadFile[T any](path string, opts *ReadOptions) (*gobi.Frame, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -115,7 +115,7 @@ func ReadFile[T any](path string, opts *Options) (*gobi.Frame, error) {
 	// Auto-detect the codec from the filename unless the caller has
 	// explicitly set one.
 	if opts == nil {
-		opts = &Options{}
+		opts = &ReadOptions{}
 	}
 	if opts.Compression == CodecAuto {
 		local := *opts
@@ -128,9 +128,9 @@ func ReadFile[T any](path string, opts *Options) (*gobi.Frame, error) {
 // Read reads r into a Frame, inferring the schema from T. Streams reaching
 // this function are treated as uncompressed unless opts.Compression is set
 // explicitly (Read has no filename to inspect).
-func Read[T any](r io.Reader, opts *Options) (*gobi.Frame, error) {
+func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 	if opts == nil {
-		opts = &Options{}
+		opts = &ReadOptions{}
 	}
 	if opts.Compression != CodecAuto && opts.Compression != CodecNone {
 		dec, release, err := wrapCodec(r, opts.Compression)
@@ -284,7 +284,7 @@ func Read[T any](r io.Reader, opts *Options) (*gobi.Frame, error) {
 }
 
 // chunkRows resolves the effective row batch size.
-func chunkRows(opts *Options) int {
+func chunkRows(opts *ReadOptions) int {
 	if opts != nil && opts.ChunkRows > 0 {
 		return opts.ChunkRows
 	}
@@ -312,7 +312,7 @@ var ErrChunksAborted = errors.New("csvio: chunk callback returned error")
 // ReadFileChunksFunc is the file variant of ReadChunksFunc: opens path,
 // auto-detects compression from the filename (unless opts.Compression is
 // explicitly set), and streams record-batch-sized Frames to fn.
-func ReadFileChunksFunc[T any](path string, opts *Options, fn func(*gobi.Frame) error) error {
+func ReadFileChunksFunc[T any](path string, opts *ReadOptions, fn func(*gobi.Frame) error) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -320,7 +320,7 @@ func ReadFileChunksFunc[T any](path string, opts *Options, fn func(*gobi.Frame) 
 	defer f.Close()
 
 	if opts == nil {
-		opts = &Options{}
+		opts = &ReadOptions{}
 	}
 	if opts.Compression == CodecAuto {
 		local := *opts
@@ -331,7 +331,7 @@ func ReadFileChunksFunc[T any](path string, opts *Options, fn func(*gobi.Frame) 
 }
 
 // ReadChunksFunc reads r and invokes fn once per record batch (~64k rows
-// by default; override via Options.ChunkRows). The Frame passed to fn has
+// by default; override via ReadOptions.ChunkRows). The Frame passed to fn has
 // single-chunk columns matching the final output schema — tagged
 // geometry/time columns have already been post-transformed. Peak memory
 // is bounded to roughly one batch plus a working buffer for transforms.
@@ -343,7 +343,7 @@ func ReadFileChunksFunc[T any](path string, opts *Options, fn func(*gobi.Frame) 
 // If fn returns an error, iteration stops and the error is wrapped in
 // ErrChunksAborted. If reading fails, the underlying Arrow error is
 // returned directly.
-func ReadChunksFunc[T any](r io.Reader, opts *Options, fn func(*gobi.Frame) error) error {
+func ReadChunksFunc[T any](r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) error) error {
 	sc, err := setupReader[T](r, opts)
 	if err != nil {
 		return err
@@ -394,9 +394,9 @@ func (s *setupContext) close() {
 // setupReader builds the arrowcsv.Reader + column plan + output schema
 // shared by Read and the streaming API. On success, the caller must
 // invoke setupContext.close() when done.
-func setupReader[T any](r io.Reader, opts *Options) (*setupContext, error) {
+func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 	if opts == nil {
-		opts = &Options{}
+		opts = &ReadOptions{}
 	}
 	sc := &setupContext{release: func() {}}
 	if opts.Compression != CodecAuto && opts.Compression != CodecNone {

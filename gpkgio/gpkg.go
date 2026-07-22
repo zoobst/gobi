@@ -1,10 +1,41 @@
-// Package gpkg reads geometry features from an OGC GeoPackage (SQLite).
+// Package gpkgio reads and writes gobi Frames as OGC GeoPackage
+// (SQLite) files.
 //
-// GeoPackage stores each geometry as a small header followed by a standard
-// WKB payload. This package focuses on that geometry decoding plus a light
-// discovery API — feature tables are exposed as an iterator that yields
-// (attributes, geometry) tuples.
-package gpkg
+// GeoPackage 1.3 (application_id 0x47504B47, user_version 10300) is
+// the target — every WriteFile emits a file that QGIS, GDAL /
+// ogr2ogr, and other GeoPackage-aware tools recognize as a
+// compliant feature GeoPackage. Each geometry is stored as the
+// standard GPB blob (magic + version + flags + SRS ID + optional
+// envelope + WKB payload) per spec §2.1.3.1.
+//
+// The package offers three entry points:
+//
+//   - ReadFile materializes a single layer as a Frame. Peak memory
+//     scales with the layer size; good for small/medium layers.
+//
+//   - ReadFileChunksFunc streams a layer as record-batch-sized
+//     Frames, releasing arrow buffers after each callback. Peak
+//     memory is bounded regardless of layer size.
+//
+//   - ScanFile returns a gobi.LazyFrame — participates in the
+//     optimizer's projection pushdown (SELECT column list is
+//     narrowed to what the plan actually uses) and streams under
+//     the hood. Predicate-pushdown-to-SQL is not implemented yet;
+//     callers who need SQL-side filtering can use ReadOptions.Where
+//     directly.
+//
+// Write is transactional and prepared-statement-based: rows batch
+// into transactions of WriteOptions.BatchSize (default 1000). The
+// standard GeoPackage RTree spatial index (rtree_<layer>_<geomcol>)
+// is created and populated inline during the insert loop; gobi
+// maintains it from Go rather than via SpatiaLite triggers, since
+// pure-Go modernc.org/sqlite doesn't ship ST_MinX/ST_MaxX/ST_IsEmpty.
+//
+// Multi-layer GeoPackages are supported: each WriteFile appends its
+// layer to the target file, leaving other layers untouched. Use
+// WriteOptions.Replace to overwrite an existing layer of the same
+// name.
+package gpkgio
 
 import (
 	"database/sql"
@@ -26,7 +57,7 @@ var ErrInvalidHeader = errors.New("gpkg: invalid geometry header")
 type FeatureTable struct {
 	Name     string
 	GeomCol  string
-	SRSID    int32
+	SRID    int32
 	GeomType string
 }
 
@@ -64,7 +95,7 @@ func (g *GeoPackage) FeatureTables() ([]FeatureTable, error) {
 	var out []FeatureTable
 	for rows.Next() {
 		var ft FeatureTable
-		if err := rows.Scan(&ft.Name, &ft.GeomCol, &ft.SRSID, &ft.GeomType); err != nil {
+		if err := rows.Scan(&ft.Name, &ft.GeomCol, &ft.SRID, &ft.GeomType); err != nil {
 			return nil, err
 		}
 		out = append(out, ft)

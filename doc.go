@@ -22,9 +22,11 @@
 //
 // See the subpackages for more:
 //
-//   - geometry: 2D primitives, WKB/WKT, CRS, area/distance/hull
-//   - csvio:    typed CSV read/write
-//   - parquetio: Parquet read/write with compression
-//   - geojson:  GeoJSON encoding/decoding for individual features
-//   - gpkg:     read features from a GeoPackage
+//   - geometry:  2D primitives, WKB/WKT, CRS, area/distance/hull
+//   - csvio:     typed CSV read/write
+//   - parquetio: Parquet + GeoParquet read/write, LazyFrame scan
+//   - geojsonio: GeoJSON encoding/decoding for individual features
+//   - gpkgio:    OGC GeoPackage read/write with RTree spatial index
+//   - kmlio:     KML read/write with ExtendedData attributes
+//   - shpio:     ESRI Shapefile read/write
 package gobi

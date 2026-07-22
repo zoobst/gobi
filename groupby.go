@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -18,6 +19,20 @@ const (
 	AggMean
 	AggMin
 	AggMax
+	// AggFirst / AggLast: first (or last) non-null value in the
+	// group, in the group's row order. Output type matches the source
+	// column (preserved via the Frame's schema).
+	AggFirst
+	AggLast
+	// AggStd / AggVar: sample standard deviation / variance
+	// (Bessel-corrected, n-1 denominator). Streaming path uses
+	// Welford's online algorithm. Empty or single-row groups emit
+	// null.
+	AggStd
+	AggVar
+	// AggNUnique: count of distinct non-null values per group. Output
+	// is Int64, always non-null (empty group counts as 0).
+	AggNUnique
 )
 
 func (k AggKind) String() string {
@@ -32,6 +47,16 @@ func (k AggKind) String() string {
 		return "min"
 	case AggMax:
 		return "max"
+	case AggFirst:
+		return "first"
+	case AggLast:
+		return "last"
+	case AggStd:
+		return "std"
+	case AggVar:
+		return "var"
+	case AggNUnique:
+		return "n_unique"
 	default:
 		return "unknown"
 	}
@@ -172,10 +197,30 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 			}
 			continue
 		}
-		if a.Kind == AggCount {
+		if a.Kind == AggCount || a.Kind == AggNUnique {
 			aggBuilders[i] = array.NewInt64Builder(pool)
 			aggFields[i] = arrow.Field{
-				Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: false,
+				Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: a.Kind != AggCount && a.Kind != AggNUnique,
+			}
+			continue
+		}
+		// First / Last preserve the source column's arrow type. We
+		// stand up a builder matching that type and let appendAgg
+		// route through the type-generic value writer.
+		if a.Kind == AggFirst || a.Kind == AggLast {
+			src, err := g.frame.Column(a.Column)
+			if err != nil {
+				return nil, err
+			}
+			srcType := src.DataType()
+			b, err := builderForType(pool, srcType)
+			if err != nil {
+				return nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
+					i, aggName(a), err)
+			}
+			aggBuilders[i] = b
+			aggFields[i] = arrow.Field{
+				Name: aggName(a), Type: srcType, Nullable: true,
 			}
 			continue
 		}
@@ -265,6 +310,8 @@ func builderForType(pool memory.Allocator, t arrow.DataType) (array.Builder, err
 		return array.NewBooleanBuilder(pool), nil
 	case arrow.STRING:
 		return array.NewStringBuilder(pool), nil
+	case arrow.LARGE_STRING:
+		return array.NewLargeStringBuilder(pool), nil
 	case arrow.BINARY:
 		return array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary), nil
 	case arrow.TIMESTAMP:
@@ -332,6 +379,12 @@ func appendCustomValue(b array.Builder, v any) error {
 			return fmt.Errorf("value %T does not match declared String", v)
 		}
 		tb.Append(x)
+	case *array.LargeStringBuilder:
+		x, ok := v.(string)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared LargeString", v)
+		}
+		tb.Append(x)
 	case *array.BinaryBuilder:
 		x, ok := v.([]byte)
 		if !ok {
@@ -366,33 +419,60 @@ func (g *GroupBy) rowKey(row int) (string, error) {
 }
 
 func keyOf(s Series, row int) ([]byte, error) {
+	return keyOfAppend(nil, s, row)
+}
+
+// keyOfAppend is the alloc-free variant of keyOf: appends the
+// tag-prefixed byte encoding for s[row] into dst and returns the
+// resulting slice. Callers reuse dst across many rows so the
+// streaming aggregate can avoid a per-row []byte allocation.
+//
+// The encoding is identical to keyOf's: same tag bytes, same value
+// bytes, same null convention. keyOf(s,row) == keyOfAppend(nil,s,row)
+// for every hashable Series type.
+func keyOfAppend(dst []byte, s Series, row int) ([]byte, error) {
 	offset := 0
 	for _, chunk := range s.col.Data().Chunks() {
 		if row < offset+chunk.Len() {
 			local := row - offset
 			if chunk.IsNull(local) {
-				return []byte{0x00}, nil
+				return append(dst, 0x00), nil
 			}
 			switch a := chunk.(type) {
 			case *array.String:
-				return append([]byte{0x01}, []byte(a.Value(local))...), nil
+				dst = append(dst, 0x01)
+				return append(dst, a.Value(local)...), nil
+			case *array.LargeString:
+				// Same encoding as String — the tag byte reflects
+				// the *value type* being a string, not the arrow
+				// offset width. Ensures a LargeString and String
+				// column with equal contents produce equal keys.
+				dst = append(dst, 0x01)
+				return append(dst, a.Value(local)...), nil
 			case *array.Int64:
-				return append([]byte{0x02}, i64Bytes(a.Value(local))...), nil
+				dst = append(dst, 0x02)
+				return appendI64BE(dst, a.Value(local)), nil
 			case *array.Int32:
-				return append([]byte{0x03}, i64Bytes(int64(a.Value(local)))...), nil
+				dst = append(dst, 0x03)
+				return appendI64BE(dst, int64(a.Value(local))), nil
 			case *array.Boolean:
+				dst = append(dst, 0x04)
 				if a.Value(local) {
-					return []byte{0x04, 0x01}, nil
+					return append(dst, 0x01), nil
 				}
-				return []byte{0x04, 0x00}, nil
+				return append(dst, 0x00), nil
 			case *array.Float64:
-				return append([]byte{0x05}, i64Bytes(int64(a.Value(local)*1e9))...), nil
+				dst = append(dst, 0x05)
+				return appendI64BE(dst, int64(a.Value(local)*1e9)), nil
 			case *array.Uint64:
-				return append([]byte{0x06}, i64Bytes(int64(a.Value(local)))...), nil
+				dst = append(dst, 0x06)
+				return appendI64BE(dst, int64(a.Value(local))), nil
 			case *array.Uint32:
-				return append([]byte{0x07}, i64Bytes(int64(a.Value(local)))...), nil
+				dst = append(dst, 0x07)
+				return appendI64BE(dst, int64(a.Value(local))), nil
 			case *array.Timestamp:
-				return append([]byte{0x08}, i64Bytes(int64(a.Value(local)))...), nil
+				dst = append(dst, 0x08)
+				return appendI64BE(dst, int64(a.Value(local))), nil
 			default:
 				return nil, fmt.Errorf("gobi: key type %T not hashable", chunk)
 			}
@@ -402,17 +482,24 @@ func keyOf(s Series, row int) ([]byte, error) {
 	return nil, fmt.Errorf("%w: %d", ErrRowOutOfRange, row)
 }
 
+// appendI64BE writes v as big-endian 8 bytes into dst. Big-endian
+// gives lexicographic byte order == numeric order for non-negative
+// values — matters for sorted-key output emission.
+func appendI64BE(dst []byte, v int64) []byte {
+	return append(dst,
+		byte(v>>56), byte(v>>48), byte(v>>40), byte(v>>32),
+		byte(v>>24), byte(v>>16), byte(v>>8), byte(v),
+	)
+}
+
 func i64Bytes(v int64) []byte {
-	return []byte{
-		byte(v >> 56), byte(v >> 48), byte(v >> 40), byte(v >> 32),
-		byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v),
-	}
+	return appendI64BE(nil, v)
 }
 
 func isHashable(t arrow.DataType) bool {
 	switch t.ID() {
-	case arrow.STRING, arrow.INT64, arrow.INT32, arrow.BOOL, arrow.FLOAT64,
-		arrow.UINT64, arrow.UINT32, arrow.TIMESTAMP:
+	case arrow.STRING, arrow.LARGE_STRING, arrow.INT64, arrow.INT32, arrow.BOOL,
+		arrow.FLOAT64, arrow.UINT64, arrow.UINT32, arrow.TIMESTAMP:
 		return true
 	default:
 		return false
@@ -425,6 +512,8 @@ func makeKeyBuilders(pool memory.Allocator, keys []Series) ([]array.Builder, err
 		switch dt := k.DataType(); dt.ID() {
 		case arrow.STRING:
 			out[i] = array.NewStringBuilder(pool)
+		case arrow.LARGE_STRING:
+			out[i] = array.NewLargeStringBuilder(pool)
 		case arrow.INT64:
 			out[i] = array.NewInt64Builder(pool)
 		case arrow.INT32:
@@ -498,6 +587,71 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 		b.(*array.Int64Builder).Append(n)
 		return nil
 	}
+	// First / Last: emit the first (or last) non-null value in the
+	// group in row order. Output type matches the source column, so
+	// we route through appendCustomValue with the value read via
+	// readScalarAt (defined in exec_aggregate.go).
+	if agg.Kind == AggFirst || agg.Kind == AggLast {
+		s, err := g.frame.Column(agg.Column)
+		if err != nil {
+			return err
+		}
+		startIdx, endIdx, step := 0, len(rows), 1
+		if agg.Kind == AggLast {
+			startIdx, endIdx, step = len(rows)-1, -1, -1
+		}
+		for i := startIdx; i != endIdx; i += step {
+			row := rows[i]
+			null, err := isNullAtSeries(s, row)
+			if err != nil {
+				return err
+			}
+			if null {
+				continue
+			}
+			v, err := readScalarAt(s, row)
+			if err != nil {
+				return err
+			}
+			return appendCustomValue(b, v)
+		}
+		// All rows null: emit null.
+		b.AppendNull()
+		return nil
+	}
+	// NUnique: count distinct non-null values in the group. Uses the
+	// same keyOfAppend byte encoding as GroupBy itself, so numeric
+	// bit-equal values collapse identically. Cheap because groups
+	// are typically small.
+	if agg.Kind == AggNUnique {
+		s, err := g.frame.Column(agg.Column)
+		if err != nil {
+			return err
+		}
+		seen := make(map[string]struct{})
+		var scratch []byte
+		for _, row := range rows {
+			null, err := isNullAtSeries(s, row)
+			if err != nil {
+				return err
+			}
+			if null {
+				continue
+			}
+			buf, err := keyOfAppend(scratch[:0], s, row)
+			if err != nil {
+				return err
+			}
+			scratch = buf
+			// map[string(bytes)] READ optimization: compiler skips
+			// the string alloc on probe; only distinct inserts pay.
+			if _, ok := seen[string(buf)]; !ok {
+				seen[string(buf)] = struct{}{}
+			}
+		}
+		b.(*array.Int64Builder).Append(int64(len(seen)))
+		return nil
+	}
 	s, err := g.frame.Column(agg.Column)
 	if err != nil {
 		return err
@@ -505,8 +659,14 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 	if !s.isNumeric() {
 		return fmt.Errorf("%w: %s", ErrNotNumeric, agg.Column)
 	}
+	// One pass, one traversal. Welford's algorithm gives numerically
+	// stable running mean + M2 (sum of squared deviations from mean)
+	// so we can compute Std/Var without a second pass. Cheap enough
+	// that we do it unconditionally — the Std/Var branch just reads
+	// the accumulator, non-Std/Var branches ignore it.
 	var (
 		sum, minV, maxV float64
+		mean, m2        float64
 		n               int
 	)
 	for _, row := range rows {
@@ -529,6 +689,9 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 		}
 		sum += v
 		n++
+		delta := v - mean
+		mean += delta / float64(n)
+		m2 += delta * (v - mean)
 	}
 	fb := b.(*array.Float64Builder)
 	if n == 0 {
@@ -544,6 +707,20 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 		fb.Append(minV)
 	case AggMax:
 		fb.Append(maxV)
+	case AggVar:
+		// Sample variance (Bessel-corrected). Undefined for n==1;
+		// emit null to match pandas / polars.
+		if n < 2 {
+			fb.AppendNull()
+			return nil
+		}
+		fb.Append(m2 / float64(n-1))
+	case AggStd:
+		if n < 2 {
+			fb.AppendNull()
+			return nil
+		}
+		fb.Append(math.Sqrt(m2 / float64(n-1)))
 	default:
 		return fmt.Errorf("gobi: unknown aggregation kind %d", agg.Kind)
 	}

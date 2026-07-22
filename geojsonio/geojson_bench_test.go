@@ -1,4 +1,4 @@
-package geojson_test
+package geojsonio_test
 
 import (
 	"encoding/json"
@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/zoobst/gobi/geojson"
+	"github.com/zoobst/gobi/geojsonio"
 	"github.com/zoobst/gobi/geometry"
 )
 
@@ -66,7 +66,7 @@ func BenchmarkGeoJSON_UnmarshalFeature_Single(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(singleFeature)))
 	for b.Loop() {
-		g, props, err := geojson.UnmarshalFeature(singleFeature)
+		g, props, err := geojsonio.UnmarshalFeature(singleFeature)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -80,10 +80,10 @@ func BenchmarkGeoJSON_UnmarshalFeature_Single(b *testing.B) {
 // walks the resulting features and decodes each geometry. This is the
 // user-facing pattern for "load a whole GeoJSON file and iterate":
 //
-//	var fc struct { Features []geojson.Feature `json:"features"` }
+//	var fc struct { Features []geojsonio.Feature `json:"features"` }
 //	json.Unmarshal(data, &fc)
 //	for _, f := range fc.Features {
-//	    g, _ := geojson.Unmarshal(f.Geometry)
+//	    g, _ := geojsonio.Unmarshal(f.Geometry)
 //	    ...
 //	}
 //
@@ -97,13 +97,13 @@ func BenchmarkGeoJSON_FeatureCollection_1M(b *testing.B) {
 	for b.Loop() {
 		var fc struct {
 			Type     string             `json:"type"`
-			Features []geojson.Feature  `json:"features"`
+			Features []geojsonio.Feature  `json:"features"`
 		}
 		if err := json.Unmarshal(data, &fc); err != nil {
 			b.Fatal(err)
 		}
 		for i := range fc.Features {
-			g, err := geojson.Unmarshal(fc.Features[i].Geometry)
+			g, err := geojsonio.Unmarshal(fc.Features[i].Geometry)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -113,7 +113,7 @@ func BenchmarkGeoJSON_FeatureCollection_1M(b *testing.B) {
 }
 
 // BenchmarkGeoJSON_FeatureCollection_1M_OuterOnly decodes only the
-// outer FeatureCollection into []geojson.Feature — it does NOT walk
+// outer FeatureCollection into []geojsonio.Feature — it does NOT walk
 // each feature's Geometry field. This isolates the encoding/json cost
 // of parsing the ~105 MB blob from the downstream geometry decoding
 // work, so we can attribute the total time to (outer decode) +
@@ -126,7 +126,7 @@ func BenchmarkGeoJSON_FeatureCollection_1M_OuterOnly(b *testing.B) {
 	for b.Loop() {
 		var fc struct {
 			Type     string             `json:"type"`
-			Features []geojson.Feature  `json:"features"`
+			Features []geojsonio.Feature  `json:"features"`
 		}
 		if err := json.Unmarshal(data, &fc); err != nil {
 			b.Fatal(err)

@@ -45,7 +45,7 @@ const citiesKML = `<?xml version="1.0" encoding="UTF-8"?>
 </kml>`
 
 func TestRead_Cities(t *testing.T) {
-	df, err := kmlio.Read(strings.NewReader(citiesKML))
+	df, err := kmlio.Read(strings.NewReader(citiesKML), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestRead_MultiGeometry(t *testing.T) {
     </MultiGeometry>
   </Placemark>
 </kml>`
-	df, err := kmlio.Read(strings.NewReader(src))
+	df, err := kmlio.Read(strings.NewReader(src), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestWrite_RoundTripPreservesGeometry(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := kmlio.Write(df, &buf); err != nil {
+	if err := kmlio.Write(df, &buf, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(buf.String(), "<Placemark>") {
@@ -190,7 +190,7 @@ func TestWrite_RoundTripPreservesGeometry(t *testing.T) {
 	}
 
 	// Round-trip: read what we wrote and confirm geometries survive.
-	back, err := kmlio.Read(&buf)
+	back, err := kmlio.Read(&buf, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,11 +209,11 @@ func TestWrite_RoundTripPreservesGeometry(t *testing.T) {
 
 func TestRead_MalformedErrors(t *testing.T) {
 	// Non-<kml> root should return a clear error, not silently succeed.
-	if _, err := kmlio.Read(strings.NewReader(`<not-kml/>`)); err == nil {
+	if _, err := kmlio.Read(strings.NewReader(`<not-kml/>`), nil); err == nil {
 		t.Fatal("expected error for non-KML root, got nil")
 	}
 	// Broken XML should also error.
-	if _, err := kmlio.Read(strings.NewReader(`<kml><Placemark>`)); err == nil {
+	if _, err := kmlio.Read(strings.NewReader(`<kml><Placemark>`), nil); err == nil {
 		t.Fatal("expected error for unterminated XML, got nil")
 	}
 }

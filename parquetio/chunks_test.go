@@ -71,7 +71,7 @@ func TestReadFile_ColumnProjection(t *testing.T) {
 	df := makeSyntheticFrame(t, 500)
 	path := writeFixture(t, df, "projection.parquet")
 
-	loaded, err := parquetio.ReadFile(path, &parquetio.Options{
+	loaded, err := parquetio.ReadFile(path, &parquetio.ReadOptions{
 		Columns: []string{"id", "key"},
 	})
 	if err != nil {
@@ -97,7 +97,7 @@ func TestReadFile_ColumnProjection_UnknownColumn(t *testing.T) {
 	df := makeSyntheticFrame(t, 10)
 	path := writeFixture(t, df, "unknown_col.parquet")
 
-	_, err := parquetio.ReadFile(path, &parquetio.Options{
+	_, err := parquetio.ReadFile(path, &parquetio.ReadOptions{
 		Columns: []string{"id", "does_not_exist"},
 	})
 	if err == nil {
@@ -118,7 +118,7 @@ func TestReadFileChunksFunc_MultipleChunks(t *testing.T) {
 	path := writeFixture(t, df, "chunks.parquet")
 
 	var chunkCount, totalRows int
-	err := parquetio.ReadFileChunksFunc(path, &parquetio.Options{ChunkRows: 1000},
+	err := parquetio.ReadFileChunksFunc(path, &parquetio.ReadOptions{ChunkRows: 1000},
 		func(f *gobi.Frame) error {
 			chunkCount++
 			totalRows += f.NumRows()
@@ -142,7 +142,7 @@ func TestReadFileChunksFunc_CallbackErrorAborts(t *testing.T) {
 
 	sentinel := errors.New("stop")
 	var invocations int
-	err := parquetio.ReadFileChunksFunc(path, &parquetio.Options{ChunkRows: 500},
+	err := parquetio.ReadFileChunksFunc(path, &parquetio.ReadOptions{ChunkRows: 500},
 		func(f *gobi.Frame) error {
 			invocations++
 			if invocations == 2 {
@@ -172,7 +172,7 @@ func TestReadFileChunksFunc_DataIntegrity(t *testing.T) {
 	path := writeFixture(t, df, "integrity.parquet")
 
 	var rowIdx int64
-	err := parquetio.ReadFileChunksFunc(path, &parquetio.Options{ChunkRows: 400},
+	err := parquetio.ReadFileChunksFunc(path, &parquetio.ReadOptions{ChunkRows: 400},
 		func(f *gobi.Frame) error {
 			idCol, _ := f.Column("id")
 			arr := idCol.Column().Data().Chunks()[0].(*array.Int64)
@@ -198,7 +198,7 @@ func TestReadFileChunksFunc_RetainAcrossCallback(t *testing.T) {
 	path := writeFixture(t, df, "retain.parquet")
 
 	var kept []*gobi.Frame
-	err := parquetio.ReadFileChunksFunc(path, &parquetio.Options{ChunkRows: 400},
+	err := parquetio.ReadFileChunksFunc(path, &parquetio.ReadOptions{ChunkRows: 400},
 		func(f *gobi.Frame) error {
 			f.Retain()
 			kept = append(kept, f)
@@ -232,7 +232,7 @@ func TestReadFileChunksFunc_ProjectionApplies(t *testing.T) {
 
 	var seenCols []string
 	err := parquetio.ReadFileChunksFunc(path,
-		&parquetio.Options{Columns: []string{"key"}, ChunkRows: 500},
+		&parquetio.ReadOptions{Columns: []string{"key"}, ChunkRows: 500},
 		func(f *gobi.Frame) error {
 			if seenCols == nil {
 				seenCols = f.ColumnNames()
@@ -254,7 +254,7 @@ func TestReadFileChunksFunc_ProjectionApplies(t *testing.T) {
 func TestReadFileChunksFunc_GeoMetadataPropagates(t *testing.T) {
 	// Streaming a file with geometry columns should attach the "geo"
 	// file-level metadata to each yielded frame's schema.
-	src, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.Options{CRSHint: 4326})
+	src, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.ReadOptions{CRSHint: 4326})
 	if err != nil {
 		t.Fatal(err)
 	}

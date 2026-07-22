@@ -48,6 +48,20 @@ import (
 // a construct this package doesn't support.
 var ErrInvalidKML = errors.New("kmlio: invalid input")
 
+// ReadOptions reserves a slot for future read-time configuration
+// (e.g., skip-Style, geometry-column-name override, folder-name
+// prefixing). Currently empty — pass nil.
+//
+// The struct exists so future options can be added without breaking
+// the ReadFile / Read signatures. Matches the naming pattern used
+// by parquetio, csvio, gpkgio, geojsonio, and pgio.
+type ReadOptions struct{}
+
+// WriteOptions reserves a slot for future write-time configuration
+// (e.g., document-name / description, KMZ compression, style
+// injection). Currently empty — pass nil.
+type WriteOptions struct{}
+
 // -----------------------------------------------------------------------------
 // XML structs (subset of KML 2.3 we actually decode)
 // -----------------------------------------------------------------------------
@@ -138,18 +152,20 @@ func collectFromContainer(c kmlContainer) []kmlPlacemark {
 // -----------------------------------------------------------------------------
 
 // ReadFile parses path and returns a Frame. See package doc for the
-// column shape.
-func ReadFile(path string) (*gobi.Frame, error) {
+// column shape. Pass nil opts for defaults.
+func ReadFile(path string, opts *ReadOptions) (*gobi.Frame, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return Read(f)
+	return Read(f, opts)
 }
 
-// Read parses a KML document from r into a Frame.
-func Read(r io.Reader) (*gobi.Frame, error) {
+// Read parses a KML document from r into a Frame. Pass nil opts
+// for defaults.
+func Read(r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
+	_ = opts // reserved
 	var root kmlRoot
 	dec := xml.NewDecoder(r)
 	if err := dec.Decode(&root); err != nil {

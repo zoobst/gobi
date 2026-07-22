@@ -23,7 +23,9 @@ import (
 // The geometry column is picked automatically (the first tagged geometry
 // column, or "geometry" if present). All rows must share a compatible
 // shape type — mixed Point / LineString / Polygon rows are rejected.
-func WriteFile(f *gobi.Frame, base string) error {
+// Pass nil opts for defaults.
+func WriteFile(f *gobi.Frame, base string, opts *WriteOptions) error {
+	_ = opts // reserved
 	base = strings.TrimSuffix(base, ".shp")
 
 	geomCol, geomName, err := findGeometryColumn(f)

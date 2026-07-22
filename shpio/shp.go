@@ -60,14 +60,29 @@ const shpFileCode = 9994
 // input.
 var ErrInvalidShapefile = errors.New("shpio: invalid shapefile")
 
+// ReadOptions reserves a slot for future read-time configuration
+// (e.g., .prj override, dbf encoding hint, M-variant handling).
+// Currently empty — pass nil.
+//
+// The struct exists so future options can be added without breaking
+// the ReadFile signature. Matches the naming pattern used by
+// parquetio, csvio, gpkgio, geojsonio, kmlio, and pgio.
+type ReadOptions struct{}
+
+// WriteOptions reserves a slot for future write-time configuration
+// (e.g., forced geometry-type override, .prj injection, custom
+// .dbf field spec). Currently empty — pass nil.
+type WriteOptions struct{}
+
 // -----------------------------------------------------------------------------
 // Reader
 // -----------------------------------------------------------------------------
 
 // ReadFile reads the shapefile whose base name is `base` (no `.shp`
 // suffix) and returns a Frame with attribute columns from the .dbf plus
-// a geometry column.
-func ReadFile(base string) (*gobi.Frame, error) {
+// a geometry column. Pass nil opts for defaults.
+func ReadFile(base string, opts *ReadOptions) (*gobi.Frame, error) {
+	_ = opts // reserved
 	base = strings.TrimSuffix(base, ".shp")
 
 	shpBytes, err := os.ReadFile(base + ".shp")

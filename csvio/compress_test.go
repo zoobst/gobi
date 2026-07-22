@@ -85,7 +85,7 @@ func TestReadFile_GzipAutoDetect(t *testing.T) {
 	if err := os.WriteFile(path, gzipBytes(t, compressCSV), 0644); err != nil {
 		t.Fatal(err)
 	}
-	df, err := csvio.ReadFile[city](path, &csvio.Options{CRSHint: 4326})
+	df, err := csvio.ReadFile[city](path, &csvio.ReadOptions{CRSHint: 4326})
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestReadFile_ZstdAutoDetect(t *testing.T) {
 	if err := os.WriteFile(path, zstdBytes(t, compressCSV), 0644); err != nil {
 		t.Fatal(err)
 	}
-	df, err := csvio.ReadFile[city](path, &csvio.Options{CRSHint: 4326})
+	df, err := csvio.ReadFile[city](path, &csvio.ReadOptions{CRSHint: 4326})
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestReadFile_ZstdAutoDetect(t *testing.T) {
 
 func TestRead_ExplicitGzipCodec(t *testing.T) {
 	buf := gzipBytes(t, compressCSV)
-	df, err := csvio.Read[city](bytes.NewReader(buf), &csvio.Options{
+	df, err := csvio.Read[city](bytes.NewReader(buf), &csvio.ReadOptions{
 		CRSHint:     4326,
 		Compression: csvio.CodecGzip,
 	})
@@ -125,7 +125,7 @@ func TestRead_ExplicitGzipCodec(t *testing.T) {
 
 func TestRead_ExplicitZstdCodec(t *testing.T) {
 	buf := zstdBytes(t, compressCSV)
-	df, err := csvio.Read[city](bytes.NewReader(buf), &csvio.Options{
+	df, err := csvio.Read[city](bytes.NewReader(buf), &csvio.ReadOptions{
 		CRSHint:     4326,
 		Compression: csvio.CodecZstd,
 	})
@@ -157,7 +157,7 @@ func TestReadFile_CodecNoneOverridesExtension(t *testing.T) {
 	if err := os.WriteFile(path, []byte(compressCSV), 0644); err != nil {
 		t.Fatal(err)
 	}
-	df, err := csvio.ReadFile[city](path, &csvio.Options{
+	df, err := csvio.ReadFile[city](path, &csvio.ReadOptions{
 		CRSHint:     4326,
 		Compression: csvio.CodecNone,
 	})
@@ -170,7 +170,7 @@ func TestReadFile_CodecNoneOverridesExtension(t *testing.T) {
 }
 
 func TestRead_UnknownCodecErrors(t *testing.T) {
-	_, err := csvio.Read[city](strings.NewReader(compressCSV), &csvio.Options{
+	_, err := csvio.Read[city](strings.NewReader(compressCSV), &csvio.ReadOptions{
 		Compression: csvio.Codec("bogus"),
 	})
 	if !errors.Is(err, csvio.ErrUnknownCodec) {

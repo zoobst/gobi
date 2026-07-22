@@ -16,18 +16,20 @@ import (
 )
 
 // WriteFile writes f to path as KML. See package doc for the column
-// conventions the writer looks for.
-func WriteFile(f *gobi.Frame, path string) error {
+// conventions the writer looks for. Pass nil opts for defaults.
+func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 	out, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-	return Write(f, out)
+	return Write(f, out, opts)
 }
 
-// Write encodes f to w as a KML document (namespace 2.2).
-func Write(f *gobi.Frame, w io.Writer) error {
+// Write encodes f to w as a KML document (namespace 2.2). Pass nil
+// opts for defaults.
+func Write(f *gobi.Frame, w io.Writer, opts *WriteOptions) error {
+	_ = opts // reserved
 	geomCol, geomName, err := findGeometryColumn(f)
 	if err != nil {
 		return err

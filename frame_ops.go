@@ -380,6 +380,8 @@ func appendPrimitiveAt(s Series, idx int, b array.Builder) error {
 				b.(*array.BooleanBuilder).Append(a.Value(local))
 			case *array.String:
 				b.(*array.StringBuilder).Append(a.Value(local))
+			case *array.LargeString:
+				b.(*array.LargeStringBuilder).Append(a.Value(local))
 			case *array.Binary:
 				b.(*array.BinaryBuilder).Append(a.Value(local))
 			case *array.Timestamp:

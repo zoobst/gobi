@@ -62,7 +62,7 @@ func TestWriteRead_RoundTrip_Uncompressed(t *testing.T) {
 }
 
 func TestWriteRead_PreservesGeoParquetMetadata(t *testing.T) {
-	df, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.Options{CRSHint: 4326})
+	df, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.ReadOptions{CRSHint: 4326})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestWriteRead_PreservesGeoParquetMetadata(t *testing.T) {
 
 func testRoundTrip(t *testing.T, codec parquetio.Codec) {
 	t.Helper()
-	df, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.Options{CRSHint: 4326})
+	df, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.ReadOptions{CRSHint: 4326})
 	if err != nil {
 		t.Fatal(err)
 	}

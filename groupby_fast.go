@@ -1,6 +1,7 @@
 package gobi
 
 import (
+	"math"
 	"slices"
 	"sort"
 
@@ -31,9 +32,17 @@ func (g *GroupBy) aggFast(aggs []Aggregation) (*Frame, bool, error) {
 		return nil, false, nil
 	}
 	// Custom aggregators are user-defined and produce arbitrary output
-	// types — they can't share the numeric fast path.
+	// types — they can't share the numeric fast path. First / Last /
+	// NUnique also fall through: First/Last need to preserve the source
+	// column type (may be non-numeric), and NUnique's byte encoding
+	// path is easier to keep in the generic path than to inline here.
+	// Std / Var stay in the fast path — cheap Welford add.
 	for _, a := range aggs {
 		if a.Fn != nil {
+			return nil, false, nil
+		}
+		switch a.Kind {
+		case AggFirst, AggLast, AggNUnique:
 			return nil, false, nil
 		}
 	}
@@ -244,12 +253,14 @@ func (v numericView) at(i int) (float64, bool) {
 }
 
 // makeAggBuilders returns one output-array builder + field per aggregation.
-// AggCount produces an Int64 column; every other kind produces Float64.
+// Count / NUnique produce Int64; every other Kind supported in this
+// fast path produces Float64. First / Last / custom Fn kinds never
+// reach here — the caller (aggFast) bails out for those.
 func makeAggBuilders(pool memory.Allocator, aggs []Aggregation) ([]array.Builder, []arrow.Field) {
 	bs := make([]array.Builder, len(aggs))
 	fs := make([]arrow.Field, len(aggs))
 	for i, a := range aggs {
-		if a.Kind == AggCount {
+		if a.Kind == AggCount || a.Kind == AggNUnique {
 			bs[i] = array.NewInt64Builder(pool)
 			fs[i] = arrow.Field{Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: false}
 			continue
@@ -279,8 +290,12 @@ func appendFastAgg(b array.Builder, a Aggregation, v numericView, rows []int) {
 		return
 	}
 	fb := b.(*array.Float64Builder)
+	// Welford's running mean + M2 alongside the existing sum/min/max
+	// tracking. Cheap enough to do unconditionally — the Std/Var
+	// branches read m2/mean, others ignore.
 	var (
 		sum, minV, maxV float64
+		mean, m2        float64
 		n               int
 	)
 	for _, row := range rows {
@@ -300,6 +315,9 @@ func appendFastAgg(b array.Builder, a Aggregation, v numericView, rows []int) {
 		}
 		sum += x
 		n++
+		delta := x - mean
+		mean += delta / float64(n)
+		m2 += delta * (x - mean)
 	}
 	if n == 0 {
 		fb.AppendNull()
@@ -314,6 +332,18 @@ func appendFastAgg(b array.Builder, a Aggregation, v numericView, rows []int) {
 		fb.Append(minV)
 	case AggMax:
 		fb.Append(maxV)
+	case AggVar:
+		if n < 2 {
+			fb.AppendNull()
+			return
+		}
+		fb.Append(m2 / float64(n-1))
+	case AggStd:
+		if n < 2 {
+			fb.AppendNull()
+			return
+		}
+		fb.Append(math.Sqrt(m2 / float64(n-1)))
 	default:
 		fb.AppendNull()
 	}

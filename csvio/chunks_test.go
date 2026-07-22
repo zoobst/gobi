@@ -40,7 +40,7 @@ func TestReadChunksFunc_ChunkSize(t *testing.T) {
 	var chunkCount int
 	var totalRows int
 	err := csvio.ReadChunksFunc[basicRow](strings.NewReader(src),
-		&csvio.Options{ChunkRows: 10_000},
+		&csvio.ReadOptions{ChunkRows: 10_000},
 		func(f *gobi.Frame) error {
 			chunkCount++
 			totalRows += f.NumRows()
@@ -63,7 +63,7 @@ func TestReadChunksFunc_CallbackErrorAborts(t *testing.T) {
 	sentinel := errors.New("boom")
 	var invocations int
 	err := csvio.ReadChunksFunc[basicRow](strings.NewReader(src),
-		&csvio.Options{ChunkRows: 1_000},
+		&csvio.ReadOptions{ChunkRows: 1_000},
 		func(f *gobi.Frame) error {
 			invocations++
 			if invocations == 2 {
@@ -92,7 +92,7 @@ func TestReadChunksFunc_DataIntegrityAcrossChunks(t *testing.T) {
 	src := makeSyntheticCSV(n)
 	var rowIdx int64
 	err := csvio.ReadChunksFunc[basicRow](strings.NewReader(src),
-		&csvio.Options{ChunkRows: 500},
+		&csvio.ReadOptions{ChunkRows: 500},
 		func(f *gobi.Frame) error {
 			iCol, _ := f.Column("i")
 			arr := iCol.Column().Data().Chunks()[0].(*array.Int64)
@@ -120,7 +120,7 @@ func TestReadChunksFunc_RetainAcrossCallback(t *testing.T) {
 	src := makeSyntheticCSV(2_000)
 	var kept []*gobi.Frame
 	err := csvio.ReadChunksFunc[basicRow](strings.NewReader(src),
-		&csvio.Options{ChunkRows: 500},
+		&csvio.ReadOptions{ChunkRows: 500},
 		func(f *gobi.Frame) error {
 			f.Retain()
 			kept = append(kept, f)
@@ -164,7 +164,7 @@ Chicago,2746388,POINT (-87.6298 41.8781)
 	}
 
 	var totalRows int
-	err := csvio.ReadFileChunksFunc[city](path, &csvio.Options{CRSHint: 4326},
+	err := csvio.ReadFileChunksFunc[city](path, &csvio.ReadOptions{CRSHint: 4326},
 		func(f *gobi.Frame) error {
 			totalRows += f.NumRows()
 			// Sanity: geometry column is decoded.
@@ -212,7 +212,7 @@ func TestReadChunksFunc_BoundedMemoryLarge(t *testing.T) {
 	src := makeSyntheticCSV(200_000)
 	var total int
 	err := csvio.ReadChunksFunc[basicRow](strings.NewReader(src),
-		&csvio.Options{ChunkRows: 8_192},
+		&csvio.ReadOptions{ChunkRows: 8_192},
 		func(f *gobi.Frame) error {
 			total += f.NumRows()
 			return nil

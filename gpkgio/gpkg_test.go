@@ -1,4 +1,4 @@
-package gpkg
+package gpkgio
 
 import (
 	"encoding/binary"

@@ -19,7 +19,7 @@ func TestOption_CustomDelimiter_TSV(t *testing.T) {
 	src := "name\tn\tf\n" +
 		"alpha\t1\t1.5\n" +
 		"bravo\t2\t2.5\n"
-	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.Options{
+	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.ReadOptions{
 		Delimiter: '\t',
 	})
 	if err != nil {
@@ -38,7 +38,7 @@ func TestOption_CustomDelimiter_TSV(t *testing.T) {
 func TestOption_CustomDelimiter_Semicolon(t *testing.T) {
 	src := "name;n;f\n" +
 		"alpha;1;1.5\n"
-	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.Options{
+	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.ReadOptions{
 		Delimiter: ';',
 	})
 	if err != nil {
@@ -54,7 +54,7 @@ func TestOption_NullTokens(t *testing.T) {
 		"alpha,1,1.5\n" +
 		"bravo,NA,NULL\n" +
 		"charlie,,\n"
-	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.Options{
+	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.ReadOptions{
 		NullTokens: []string{"NA", "NULL"},
 	})
 	if err != nil {
@@ -84,7 +84,7 @@ func TestOption_Comment(t *testing.T) {
 		"alpha,1,1.5\n" +
 		"# another comment\n" +
 		"bravo,2,2.5\n"
-	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.Options{
+	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.ReadOptions{
 		Comment: '#',
 	})
 	if err != nil {
@@ -102,7 +102,7 @@ func TestOption_SkipRows(t *testing.T) {
 		"name,n,f\n" +
 		"alpha,1,1.5\n" +
 		"bravo,2,2.5\n"
-	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.Options{
+	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.ReadOptions{
 		SkipRows: 2,
 	})
 	if err != nil {
@@ -123,7 +123,7 @@ al"pha,1,1.5
 		t.Fatal("expected strict-quote error without LazyQuotes")
 	}
 	// With LazyQuotes, the row parses.
-	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.Options{
+	df, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.ReadOptions{
 		LazyQuotes: true,
 	})
 	if err != nil {
@@ -144,7 +144,7 @@ func TestOption_ChunkRows_SmallBatchProducesSameOutput(t *testing.T) {
 		"c,3,3.5\n" +
 		"d,4,4.5\n" +
 		"e,5,5.5\n"
-	small, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.Options{ChunkRows: 1})
+	small, err := csvio.Read[numericRow](strings.NewReader(src), &csvio.ReadOptions{ChunkRows: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

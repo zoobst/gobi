@@ -21,7 +21,7 @@ type city struct {
 }
 
 func TestRead_Cities(t *testing.T) {
-	df, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.Options{CRSHint: 4326})
+	df, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.ReadOptions{CRSHint: 4326})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestRead_Cities(t *testing.T) {
 }
 
 func TestReadFile_Cities(t *testing.T) {
-	df, err := csvio.ReadFile[city]("../testdata/cities.csv", &csvio.Options{CRSHint: 4326})
+	df, err := csvio.ReadFile[city]("../testdata/cities.csv", &csvio.ReadOptions{CRSHint: 4326})
 	if err != nil {
 		t.Fatal(err)
 	}
