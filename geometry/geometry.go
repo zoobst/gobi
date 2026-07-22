@@ -48,6 +48,10 @@ type Geometry interface {
 	// Is3D reports whether the geometry carries Z (XYZ). Bounds and 2D
 	// operations ignore Z whether or not the geometry is 3D.
 	Is3D() bool
+	// Centroid returns the geometry's centroid using its type-specific
+	// definition. For Point this is the identity; for lines, polygons,
+	// and collections see the concrete implementations.
+	Centroid() Point
 	// WKT returns the Well-Known Text representation.
 	WKT() string
 	// AppendWKB appends the little-endian WKB encoding to buf and returns

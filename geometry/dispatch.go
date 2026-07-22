@@ -3,25 +3,14 @@ package geometry
 import "fmt"
 
 // Centroid returns the centroid of g using each concrete type's own
-// definition. Unrecognized geometry types return an empty Point.
+// definition. Kept as a package-level helper for API symmetry with
+// Area and Length; internally this is just interface dispatch on
+// g.Centroid().
 func Centroid(g Geometry) Point {
-	switch t := g.(type) {
-	case Point:
-		return t
-	case LineString:
-		return t.Centroid()
-	case Polygon:
-		return t.Centroid()
-	case MultiPoint:
-		return t.Centroid()
-	case MultiLineString:
-		return t.Centroid()
-	case MultiPolygon:
-		return t.Centroid()
-	case GeometryCollection:
-		return t.Centroid()
+	if g == nil {
+		return Point{}
 	}
-	return Point{}
+	return g.Centroid()
 }
 
 // Area returns the planar (XY) area of g in u². Non-polygonal geometries

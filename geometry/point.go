@@ -29,6 +29,11 @@ func (p Point) Type() Type { return TypePoint }
 func (p Point) CRS() CRS   { return p.CRSValue }
 func (p Point) Is3D() bool { return p.HasZ }
 
+// Centroid returns p itself — a Point is its own centroid. Present so
+// Point satisfies the Geometry interface's Centroid method and the
+// top-level geometry.Centroid dispatch collapses to interface dispatch.
+func (p Point) Centroid() Point { return p }
+
 // Bounds returns the XY bounding box. Z, if present, is ignored (the Bounds
 // type is deliberately 2D).
 func (p Point) Bounds() Bounds {
