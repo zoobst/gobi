@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/apache/arrow-go/v18 v18.6.0
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/klauspost/compress v1.18.5
 	modernc.org/sqlite v1.49.1
 )
@@ -18,7 +19,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jackc/pgx/v5 v5.10.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
