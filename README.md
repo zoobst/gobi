@@ -397,7 +397,7 @@ _ = shpio.WriteFile(counties, "counties_out")       // writes all four files
 | `.../gobi/parquetio`      | Parquet read/write + streaming + column projection + row-group + bloom-filter tuning; snappy/gzip/brotli/zstd/lz4 + GeoParquet 1.1 |
 | `.../gobi/geojsonio`      | Full RFC 7946 GeoJSON (all geometry types + XYZ) — Frame-level `ReadFile`/`WriteFile`/`ScanFile`, `.geojsonl` streaming |
 | `.../gobi/gpkgio`         | Read / write OGC GeoPackage 1.3 (SQLite) with RTree spatial index + LazyFrame `ScanFile` + SQL predicate pushdown |
-| `.../gobi/pgio`           | PostgreSQL / PostGIS via `pgx/v5` — `ReadQuery`/`ReadTable`/`ScanTable` + `WriteTable` with `CopyFrom` bulk load |
+| `.../gobi/pgio`           | **Beta.** PostgreSQL / PostGIS via `pgx/v5` — `ReadQuery`/`ReadTable`/`ScanTable` + `WriteTable` with `CopyFrom` bulk load. Integration tests are `//go:build integration`-gated; set `PGIO_TEST_DSN` and run against a live PostGIS to exercise them. |
 | `.../gobi/kmlio`          | Read / write KML (OGC 12-007r2) with Placemarks + ExtendedData                                  |
 | `.../gobi/shpio`          | Read / write ESRI Shapefile (`.shp` + `.shx` + `.dbf` + optional `.prj`)                        |
 
