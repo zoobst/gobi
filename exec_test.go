@@ -262,7 +262,7 @@ func TestExec_StreamingAggregate_FallbackForCustomFn(t *testing.T) {
 	// because Aggregator.Aggregate(Series, []int) takes all rows.
 	df := lazyFrame(t)
 	lf := df.Lazy().GroupBy("region").Agg(
-		Aggregation{Column: "price", Fn: countDistinctAggregator{}},
+		Aggregation{Column: "price", Fn: &countDistinctAggregator{}},
 	)
 	op, err := Compile(Optimize(lf.Plan()))
 	if err != nil {

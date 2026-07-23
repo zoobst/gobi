@@ -102,8 +102,29 @@ type Aggregation struct {
 // instance is reused across groups. Implementations that need per-group
 // scratch space should allocate it inside Aggregate rather than as
 // receiver fields.
+//
+// Merge combines the state of a peer Aggregator (one that has been fed
+// a disjoint subset of the same group's rows via Aggregate) into the
+// receiver. It exists so future parallel modes — rolling windows,
+// pipeline-parallel executors, task parallelism — can partition a
+// group's rows across workers and still assemble a correct result.
+// gobi's v0.2 hash-partitioned executor never splits a group across
+// workers, so Merge is not called on the current parallel path; it is
+// still required so users don't have to guess whether they'll need it
+// later. Implementations that don't carry state across Aggregate calls
+// (e.g. stateless "return first non-null") can implement Merge as a
+// no-op returning nil.
+//
+// State lifecycle: the eager engine reuses a single Aggregator
+// instance across every group, so implementations must reset internal
+// state at the start of Aggregate — the receiver is fresh-per-group
+// from the caller's perspective. Merge is called by parallel/window
+// executors that deliberately hand the receiver a peer instance whose
+// state should be combined; the framework never mixes state across
+// groups.
 type Aggregator interface {
 	Aggregate(s Series, rows []int) (any, error)
+	Merge(other Aggregator) error
 	Type() arrow.DataType
 	Name() string
 }
@@ -316,6 +337,28 @@ func builderForType(pool memory.Allocator, t arrow.DataType) (array.Builder, err
 		return array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary), nil
 	case arrow.TIMESTAMP:
 		return array.NewTimestampBuilder(pool, t.(*arrow.TimestampType)), nil
+	case arrow.INT8:
+		return array.NewInt8Builder(pool), nil
+	case arrow.INT16:
+		return array.NewInt16Builder(pool), nil
+	case arrow.UINT8:
+		return array.NewUint8Builder(pool), nil
+	case arrow.UINT16:
+		return array.NewUint16Builder(pool), nil
+	case arrow.LIST:
+		// arrow's List builder needs the element type at
+		// construction; the outer NewListBuilder wires it via the
+		// element field on the ListType. Passing a *arrow.StructType
+		// as the element gives a valid List<Struct<...>> builder for
+		// nested-struct aggregator outputs.
+		lt := t.(*arrow.ListType)
+		return array.NewListBuilder(pool, lt.Elem()), nil
+	case arrow.STRUCT:
+		// StructBuilder needs the concrete *arrow.StructType so it
+		// can stand up per-field builders internally. Users drive
+		// each field builder directly via FieldBuilder(i).
+		st := t.(*arrow.StructType)
+		return array.NewStructBuilder(pool, st), nil
 	default:
 		return nil, fmt.Errorf("unsupported Aggregator output type %s", t)
 	}

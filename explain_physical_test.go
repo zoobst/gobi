@@ -49,7 +49,7 @@ func TestExplainPhysical_AggregateCustomFnMaterializes(t *testing.T) {
 	df := lazyFrame(t)
 	got := df.Lazy().
 		GroupBy("region").
-		Agg(Aggregation{Column: "region", Fn: countDistinctAggregator{}}).
+		Agg(Aggregation{Column: "region", Fn: &countDistinctAggregator{}}).
 		ExplainPhysical()
 	if !strings.Contains(got, "MaterializeAggregate(") {
 		t.Fatalf("custom Fn agg should be MaterializeAggregate:\n%s", got)

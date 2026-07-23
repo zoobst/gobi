@@ -7,6 +7,50 @@ introduce breaking changes; check this file when upgrading.
 
 ## [Unreleased]
 
+### Added
+
+- **List<T> column support (Level 3).** `arrow.ListType` columns are
+  now first-class. `FromStructs` / `ToStructs` round-trip slice fields
+  (`[]T` for non-nullable elements, `[]*T` for nullable) as List
+  columns; `Frame.Explode` accepts any List column in addition to
+  geometry columns; new expression ops `Expr.ListLen()`, `.ListGet(i)`,
+  `.ListSlice(start, stop)`, `.ListContains(elem)`, `.ListSum()`,
+  `.ListMean()`, `.ListMin()`, `.ListMax()`, `.ListFirst()`,
+  `.ListLast()`. `builderForType` covers LIST + Int8/16 + Uint8/16.
+  Nested slices and `*[]T` fields are rejected with a clear error.
+- **`Expr.Over(partitionCols...)` window functions.** Polars-style
+  windowed aggregations that compute a group aggregate and broadcast
+  it back to every input row. Chains with the new scalar aggregate
+  methods `Expr.Sum()`, `.Mean()`, `.MinAgg()`, `.MaxAgg()`, `.Count()`
+  — e.g. `Col("v").Sum().Over("group")` broadcasts each group's sum
+  back to its rows. Row order preserved (unlike GroupBy which
+  collapses). Multi-key partitions supported. Composes with arithmetic
+  for mean-centering, z-score, and similar per-group transforms.
+- **Struct-typed columns.** `builderForType` handles `arrow.STRUCT`,
+  so Custom ExprNodes can construct and return `Struct<...>` columns
+  end-to-end (see [struct_column_test.go](struct_column_test.go) for
+  a `Struct<List<Uint64>, Bool>` UDF pattern matching road-snap-shaped
+  outputs). `List<Struct<...>>` also carries through Frame
+  construction and `ListLen`/other list ops. FromStructs/ToStructs
+  don't yet round-trip nested struct fields — a Custom ExprNode is
+  the current path for producing Struct columns.
+- **Verified: Custom ExprNodes returning List columns.** The Expr
+  framework's `Eval(input) (Series, error)` contract accommodates any
+  Arrow type on the output side — including variable-length List
+  columns produced by user UDFs (H3 GridPath / KRing / PolyfillCells
+  patterns). Added a reference test so this stays wired.
+
+### Changed
+
+- **BREAKING: `gobi.Aggregator` interface gained a `Merge(other
+  Aggregator) error` method.** Every custom aggregator must now
+  implement Merge, which combines a peer instance's state into the
+  receiver (used by future parallel/window paths — v0.2 hash-partition
+  aggregate never splits a group across workers, so the current
+  executor never invokes Merge). Aggregator implementations must also
+  reset internal state at the start of Aggregate; the eager engine
+  reuses a single instance across every group.
+
 ## [0.1.1] — 2026-07-23
 
 ### Added

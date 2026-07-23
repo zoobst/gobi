@@ -27,3 +27,6 @@ test.ipynb
 parquetio.test
 csvio.test
 /experiments/
+
+# In-progress subpackages (athenaio design work — not yet ready to publish)
+/contrib/

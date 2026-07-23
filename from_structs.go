@@ -218,6 +218,15 @@ func planStructFields(tp reflect.Type) ([]structFieldPlan, error) {
 			ft = ft.Elem()
 		}
 
+		// Reject *[]T (pointer to non-byte slice). Slices are
+		// already nullable via nil, so the pointer wrapping is
+		// ambiguous — the empty-list vs. missing-list distinction
+		// would need a separate flag to survive round-trip.
+		if isPtr && ft.Kind() == reflect.Slice && ft.Elem().Kind() != reflect.Uint8 {
+			return nil, fmt.Errorf("%w: field %q is *[]T; use []T (slices already convey nullability via nil)",
+				ErrUnsupportedStructField, name)
+		}
+
 		// geom:"true" — geometry column.
 		if sf.Tag.Get("geom") == "true" {
 			if ft.Kind() != reflect.String && !(ft.Kind() == reflect.Slice && ft.Elem().Kind() == reflect.Uint8) {
@@ -277,6 +286,12 @@ func planStructFields(tp reflect.Type) ([]structFieldPlan, error) {
 // Go type. Broader coverage than csvio's arrowTypeFor because
 // FromStructs isn't parsing strings — it can accept every integer
 // width + []byte directly.
+//
+// Slice fields (other than []byte) map to arrow ListType with an
+// element type derived from the slice element. Pointer-typed
+// elements (e.g. []*int64) preserve nullability of each element.
+// Nested slices ([][]T) are not supported — flatten manually before
+// calling FromStructs.
 func arrowTypeForField(t reflect.Type) (arrow.DataType, error) {
 	switch t.Kind() {
 	case reflect.String:
@@ -307,8 +322,29 @@ func arrowTypeForField(t reflect.Type) (arrow.DataType, error) {
 		if t.Elem().Kind() == reflect.Uint8 {
 			return arrow.BinaryTypes.Binary, nil
 		}
+		return arrowListType(t.Elem())
 	}
 	return nil, fmt.Errorf("%w: %s", ErrUnsupportedStructField, t.Kind())
+}
+
+// arrowListType builds arrow.ListOf(elem) for a Go slice element
+// type. Element pointers (for nullable elements) unwrap to their
+// pointee; time.Time elements map to Timestamp[ns].
+func arrowListType(elem reflect.Type) (arrow.DataType, error) {
+	if elem.Kind() == reflect.Pointer {
+		elem = elem.Elem()
+	}
+	if elem == reflect.TypeFor[time.Time]() {
+		return arrow.ListOf(&arrow.TimestampType{Unit: arrow.Nanosecond}), nil
+	}
+	if elem.Kind() == reflect.Slice && elem.Elem().Kind() != reflect.Uint8 {
+		return nil, fmt.Errorf("%w: nested slice not supported (flatten manually)", ErrUnsupportedStructField)
+	}
+	et, err := arrowTypeForField(elem)
+	if err != nil {
+		return nil, fmt.Errorf("list element: %w", err)
+	}
+	return arrow.ListOf(et), nil
 }
 
 // appendFieldValue writes one row's value for one field into the
@@ -330,6 +366,9 @@ func appendFieldValue(b array.Builder, fv reflect.Value, p structFieldPlan) erro
 	}
 	if p.isTimeTag {
 		return appendTimeField(b, fv, p)
+	}
+	if p.arrowType.ID() == arrow.LIST {
+		return appendListField(b, fv)
 	}
 
 	// Scalar fields — extract as Go-typed value + append via
@@ -460,6 +499,9 @@ func readFieldValue(fv reflect.Value, s Series, row int, p structFieldPlan) erro
 	}
 	if p.isTimeTag {
 		return readTimeField(fv, s, row, p)
+	}
+	if p.arrowType.ID() == arrow.LIST {
+		return readListField(fv, s, row)
 	}
 
 	v, err := readScalarAt(s, row)
@@ -602,6 +644,172 @@ func geometryToWKT(g geometry.Geometry) (string, error) {
 		return t.WKT(), nil
 	}
 	return "", fmt.Errorf("%w: geometry type %T has no WKT encoder", ErrUnsupportedStructField, g)
+}
+
+// appendListField writes one row of a slice field into a
+// ListBuilder. A nil slice becomes a null list; an empty non-nil
+// slice becomes a zero-length list. Pointer-typed elements
+// (e.g. []*int64) preserve per-element nullability.
+func appendListField(b array.Builder, fv reflect.Value) error {
+	lb, ok := b.(*array.ListBuilder)
+	if !ok {
+		return fmt.Errorf("list builder isn't ListBuilder: %T", b)
+	}
+	if fv.Kind() != reflect.Slice {
+		return fmt.Errorf("list field isn't a slice: %s", fv.Kind())
+	}
+	if fv.IsNil() {
+		lb.AppendNull()
+		return nil
+	}
+	lb.Append(true)
+	inner := lb.ValueBuilder()
+	elemIsPtr := fv.Type().Elem().Kind() == reflect.Pointer
+	n := fv.Len()
+	for i := range n {
+		elem := fv.Index(i)
+		if elemIsPtr {
+			if elem.IsNil() {
+				inner.AppendNull()
+				continue
+			}
+			elem = elem.Elem()
+		}
+		if err := appendListElement(inner, elem); err != nil {
+			return fmt.Errorf("elem %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// appendListElement writes one slice element into the inner
+// builder of a ListBuilder. Mirrors appendFieldValue's scalar
+// switch, plus a time.Time branch.
+func appendListElement(b array.Builder, elem reflect.Value) error {
+	switch b := b.(type) {
+	case *array.StringBuilder:
+		b.Append(elem.String())
+	case *array.BooleanBuilder:
+		b.Append(elem.Bool())
+	case *array.Int64Builder:
+		b.Append(elem.Int())
+	case *array.Int32Builder:
+		b.Append(int32(elem.Int()))
+	case *array.Int16Builder:
+		b.Append(int16(elem.Int()))
+	case *array.Int8Builder:
+		b.Append(int8(elem.Int()))
+	case *array.Uint64Builder:
+		b.Append(elem.Uint())
+	case *array.Uint32Builder:
+		b.Append(uint32(elem.Uint()))
+	case *array.Uint16Builder:
+		b.Append(uint16(elem.Uint()))
+	case *array.Uint8Builder:
+		b.Append(uint8(elem.Uint()))
+	case *array.Float64Builder:
+		b.Append(elem.Float())
+	case *array.Float32Builder:
+		b.Append(float32(elem.Float()))
+	case *array.BinaryBuilder:
+		b.Append(elem.Bytes())
+	case *array.TimestampBuilder:
+		t, ok := elem.Interface().(time.Time)
+		if !ok {
+			return fmt.Errorf("timestamp element got %T", elem.Interface())
+		}
+		b.Append(arrow.Timestamp(t.UnixNano()))
+	default:
+		return fmt.Errorf("%w: unsupported list element builder %T", ErrUnsupportedStructField, b)
+	}
+	return nil
+}
+
+// readListField reads a List cell into a Go slice field. Nil-list
+// rows already returned via the null-check in readFieldValue, so
+// this only handles non-null rows.
+func readListField(fv reflect.Value, s Series, row int) error {
+	offset := 0
+	for _, chunk := range s.col.Data().Chunks() {
+		if row < offset+chunk.Len() {
+			local := row - offset
+			la, ok := chunk.(*array.List)
+			if !ok {
+				return fmt.Errorf("list column not List, got %T", chunk)
+			}
+			start, end := la.ValueOffsets(local)
+			values := la.ListValues()
+			n := int(end - start)
+
+			sliceType := fv.Type()
+			elemType := sliceType.Elem()
+			elemIsPtr := elemType.Kind() == reflect.Pointer
+			sliceVal := reflect.MakeSlice(sliceType, n, n)
+			for i := range n {
+				idx := int(start) + i
+				target := sliceVal.Index(i)
+				if values.IsNull(idx) {
+					// Non-pointer elements stay at zero value; pointer
+					// elements stay nil (MakeSlice's default).
+					continue
+				}
+				if elemIsPtr {
+					nv := reflect.New(elemType.Elem())
+					if err := assignListElement(nv.Elem(), values, idx); err != nil {
+						return fmt.Errorf("elem %d: %w", i, err)
+					}
+					target.Set(nv)
+					continue
+				}
+				if err := assignListElement(target, values, idx); err != nil {
+					return fmt.Errorf("elem %d: %w", i, err)
+				}
+			}
+			fv.Set(sliceVal)
+			return nil
+		}
+		offset += chunk.Len()
+	}
+	return fmt.Errorf("row %d out of range", row)
+}
+
+// assignListElement reads one element from a list's inner Array
+// into fv, dispatching on the array's concrete type.
+func assignListElement(fv reflect.Value, arr arrow.Array, idx int) error {
+	switch a := arr.(type) {
+	case *array.String:
+		fv.SetString(a.Value(idx))
+	case *array.Boolean:
+		fv.SetBool(a.Value(idx))
+	case *array.Int64:
+		fv.SetInt(a.Value(idx))
+	case *array.Int32:
+		fv.SetInt(int64(a.Value(idx)))
+	case *array.Int16:
+		fv.SetInt(int64(a.Value(idx)))
+	case *array.Int8:
+		fv.SetInt(int64(a.Value(idx)))
+	case *array.Uint64:
+		fv.SetUint(a.Value(idx))
+	case *array.Uint32:
+		fv.SetUint(uint64(a.Value(idx)))
+	case *array.Uint16:
+		fv.SetUint(uint64(a.Value(idx)))
+	case *array.Uint8:
+		fv.SetUint(uint64(a.Value(idx)))
+	case *array.Float64:
+		fv.SetFloat(a.Value(idx))
+	case *array.Float32:
+		fv.SetFloat(float64(a.Value(idx)))
+	case *array.Binary:
+		fv.SetBytes(a.Value(idx))
+	case *array.Timestamp:
+		t := time.Unix(0, int64(a.Value(idx))).UTC()
+		fv.Set(reflect.ValueOf(t))
+	default:
+		return fmt.Errorf("%w: unsupported list element array %T", ErrUnsupportedStructField, arr)
+	}
+	return nil
 }
 
 // binaryAt reads a Binary cell's raw bytes at row from a Series.

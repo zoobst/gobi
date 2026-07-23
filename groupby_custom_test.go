@@ -12,58 +12,109 @@ import (
 
 // modeAggregator returns the most frequently occurring Int64 value in a
 // group. Ties broken by first-seen. Emits nulls when the group is empty.
-type modeAggregator struct{}
+//
+// Pointer receiver + state fields so Merge can combine partial counts
+// from a peer that saw disjoint rows for the same group.
+type modeAggregator struct {
+	counts map[int64]int
+	order  []int64
+}
 
-func (modeAggregator) Aggregate(s Series, rows []int) (any, error) {
+func (m *modeAggregator) Aggregate(s Series, rows []int) (any, error) {
+	// Reset — the same instance is reused across groups by the eager
+	// engine, so per-group state must not leak.
+	m.counts = make(map[int64]int, len(rows))
+	m.order = m.order[:0]
 	chunk := s.col.Data().Chunks()[0].(*array.Int64)
-	counts := make(map[int64]int, len(rows))
-	var order []int64
 	for _, r := range rows {
 		if chunk.IsNull(r) {
 			continue
 		}
 		v := chunk.Value(r)
-		if _, seen := counts[v]; !seen {
-			order = append(order, v)
+		if _, seen := m.counts[v]; !seen {
+			m.order = append(m.order, v)
 		}
-		counts[v]++
+		m.counts[v]++
 	}
-	if len(order) == 0 {
-		return nil, nil
-	}
-	bestVal, bestCount := order[0], counts[order[0]]
-	for _, v := range order[1:] {
-		if counts[v] > bestCount {
-			bestVal, bestCount = v, counts[v]
-		}
-	}
-	return bestVal, nil
+	return m.currentValue(), nil
 }
-func (modeAggregator) Type() arrow.DataType { return arrow.PrimitiveTypes.Int64 }
-func (modeAggregator) Name() string         { return "mode" }
+
+// currentValue returns the mode implied by m.counts, or nil for an
+// empty aggregator. Separated so Merge can compute a merged value
+// without repeating the tie-break logic.
+func (m *modeAggregator) currentValue() any {
+	if len(m.order) == 0 {
+		return nil
+	}
+	bestVal, bestCount := m.order[0], m.counts[m.order[0]]
+	for _, v := range m.order[1:] {
+		if m.counts[v] > bestCount {
+			bestVal, bestCount = v, m.counts[v]
+		}
+	}
+	return bestVal
+}
+
+// Merge folds other's per-value counts into m, preserving first-seen
+// order for tie-breaking.
+func (m *modeAggregator) Merge(other Aggregator) error {
+	o, ok := other.(*modeAggregator)
+	if !ok {
+		return fmt.Errorf("modeAggregator.Merge: peer is %T", other)
+	}
+	if m.counts == nil {
+		m.counts = make(map[int64]int, len(o.counts))
+	}
+	for _, v := range o.order {
+		if _, seen := m.counts[v]; !seen {
+			m.order = append(m.order, v)
+		}
+		m.counts[v] += o.counts[v]
+	}
+	return nil
+}
+func (m *modeAggregator) Type() arrow.DataType { return arrow.PrimitiveTypes.Int64 }
+func (m *modeAggregator) Name() string         { return "mode" }
 
 // countDistinctAggregator returns the number of distinct non-null values.
-type countDistinctAggregator struct{}
+type countDistinctAggregator struct {
+	seen map[string]struct{}
+}
 
-func (countDistinctAggregator) Aggregate(s Series, rows []int) (any, error) {
+func (c *countDistinctAggregator) Aggregate(s Series, rows []int) (any, error) {
+	// Reset per group (see Aggregator docs).
+	c.seen = make(map[string]struct{}, len(rows))
 	chunk := s.col.Data().Chunks()[0].(*array.String)
-	set := make(map[string]struct{}, len(rows))
 	for _, r := range rows {
 		if chunk.IsNull(r) {
 			continue
 		}
-		set[chunk.Value(r)] = struct{}{}
+		c.seen[chunk.Value(r)] = struct{}{}
 	}
-	return int64(len(set)), nil
+	return int64(len(c.seen)), nil
 }
-func (countDistinctAggregator) Type() arrow.DataType { return arrow.PrimitiveTypes.Int64 }
-func (countDistinctAggregator) Name() string         { return "ndv" }
+func (c *countDistinctAggregator) Merge(other Aggregator) error {
+	o, ok := other.(*countDistinctAggregator)
+	if !ok {
+		return fmt.Errorf("countDistinctAggregator.Merge: peer is %T", other)
+	}
+	if c.seen == nil {
+		c.seen = make(map[string]struct{}, len(o.seen))
+	}
+	for k := range o.seen {
+		c.seen[k] = struct{}{}
+	}
+	return nil
+}
+func (c *countDistinctAggregator) Type() arrow.DataType { return arrow.PrimitiveTypes.Int64 }
+func (c *countDistinctAggregator) Name() string         { return "ndv" }
 
 // badTypeAggregator declares Uint64 but returns int64 — used to verify
 // that Agg surfaces a helpful mismatch error.
 type badTypeAggregator struct{}
 
 func (badTypeAggregator) Aggregate(Series, []int) (any, error) { return int64(1), nil }
+func (badTypeAggregator) Merge(Aggregator) error               { return nil }
 func (badTypeAggregator) Type() arrow.DataType                 { return arrow.PrimitiveTypes.Uint64 }
 func (badTypeAggregator) Name() string                         { return "bad" }
 
@@ -122,7 +173,7 @@ func TestGroupBy_AggCustom_Mode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := g.Agg(Aggregation{Column: "v", Fn: modeAggregator{}})
+	out, err := g.Agg(Aggregation{Column: "v", Fn: &modeAggregator{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +198,7 @@ func TestGroupBy_AggCustom_MixedWithBuiltIn(t *testing.T) {
 	g, _ := f.GroupBy("g")
 	out, err := g.Agg(
 		Aggregation{Column: "v", Kind: AggSum},
-		Aggregation{Column: "tag", Fn: countDistinctAggregator{}},
+		Aggregation{Column: "tag", Fn: &countDistinctAggregator{}},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +225,7 @@ func TestGroupBy_AggCustom_Alias(t *testing.T) {
 	f := buildGroupFrame(t)
 	g, _ := f.GroupBy("g")
 	out, err := g.Agg(Aggregation{
-		Column: "v", Fn: modeAggregator{}, Alias: "typical",
+		Column: "v", Fn: &modeAggregator{}, Alias: "typical",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -294,6 +345,40 @@ func TestGroupBy_KeysTimestamp(t *testing.T) {
 	keyCol, _ := out.Column("when")
 	if keyCol.DataType().ID() != arrow.TIMESTAMP {
 		t.Fatalf("timestamp key type dropped: %s", keyCol.DataType())
+	}
+}
+
+// TestAggregatorMerge_ModeCombines exercises Aggregator.Merge directly.
+// Two peer modeAggregators fed disjoint row subsets of the same group
+// must combine (via Merge) into the same result as a single aggregator
+// fed the union of rows. After Merge, currentValue() reveals the
+// combined value — Aggregate would reset state (per interface docs)
+// so peers use their internal accessor.
+func TestAggregatorMerge_ModeCombines(t *testing.T) {
+	f := buildGroupFrame(t)
+	valS, _ := f.Column("v")
+
+	// Serial baseline: rows 3-6 = group B's {7, 7, 8, 8}.
+	serial := &modeAggregator{}
+	serialResult, err := serial.Aggregate(valS, []int{3, 4, 5, 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Parallel: two peers, each sees half of group B, then merge.
+	left := &modeAggregator{}
+	if _, err := left.Aggregate(valS, []int{3, 4}); err != nil { // {7, 7}
+		t.Fatal(err)
+	}
+	right := &modeAggregator{}
+	if _, err := right.Aggregate(valS, []int{5, 6}); err != nil { // {8, 8}
+		t.Fatal(err)
+	}
+	if err := left.Merge(right); err != nil {
+		t.Fatal(err)
+	}
+	if merged := left.currentValue(); merged != serialResult {
+		t.Fatalf("merge divergence: serial=%v merged=%v", serialResult, merged)
 	}
 }
 
