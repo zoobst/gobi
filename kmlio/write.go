@@ -15,20 +15,36 @@ import (
 	"github.com/zoobst/gobi/geometry"
 )
 
-// WriteFile writes f to path as KML. See package doc for the column
-// conventions the writer looks for. Pass nil opts for defaults.
+// WriteFile writes f to path as KML or KMZ. See package doc for the
+// column conventions the writer looks for. Pass nil opts for defaults.
+// File extension picks between KML and KMZ (.kmz → KMZ) when
+// opts.Format is FormatAuto.
 func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
+	if resolveWriteFormat(path, opts) == FormatKMZ {
+		return writeKMZFile(f, path, opts)
+	}
 	out, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-	return Write(f, out, opts)
+	return writeXML(f, out, opts)
 }
 
-// Write encodes f to w as a KML document (namespace 2.2). Pass nil
-// opts for defaults.
+// Write encodes f to w as a KML or KMZ document. Pass nil opts for
+// KML defaults. Set opts.Format = FormatKMZ to emit a zip archive
+// (single "doc.kml" entry) — needed for Writer-based flows where
+// there's no filename to auto-detect from.
 func Write(f *gobi.Frame, w io.Writer, opts *WriteOptions) error {
+	if opts != nil && opts.Format == FormatKMZ {
+		return writeKMZ(f, w, opts)
+	}
+	return writeXML(f, w, opts)
+}
+
+// writeXML is the raw-KML XML encoder — shared between the KML
+// path and (via writeKMZ) the KMZ path.
+func writeXML(f *gobi.Frame, w io.Writer, opts *WriteOptions) error {
 	_ = opts // reserved
 	geomCol, geomName, err := findGeometryColumn(f)
 	if err != nil {

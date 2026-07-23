@@ -85,8 +85,9 @@ built around a strongly-typed schema.
   GeoJSON (every geometry type + XYZ, `.geojsonl` streaming), OGC
   GeoPackage 1.3 (SQLite, RTree spatial index, spec-compliant
   metadata), PostgreSQL / PostGIS (via `pgx/v5`, native `CopyFrom`
-  bulk load), **KML read/write**, and **Shapefile read/write**
-  (`.shp` + `.shx` + `.dbf` + optional `.prj`).
+  bulk load), **KML + KMZ read/write** (zipped KML auto-detected
+  by `.kmz` extension), and **Shapefile read/write** (`.shp` +
+  `.shx` + `.dbf` + optional `.prj`).
 - **Streaming readers.** `csvio.ReadFileChunksFunc` and
   `parquetio.ReadFileChunksFunc` yield one Frame per record batch
   (~64k rows), releasing arrow buffers after each callback. Peak
@@ -375,16 +376,20 @@ val, _ := df.Column("value")
 m7, _ := val.RollingMean(7) // 7-row moving average
 ```
 
-### KML / Shapefile
+### KML / KMZ / Shapefile
 
 ```go
 // KML → Frame (auto-parses ExtendedData into columns)
-places, _ := kmlio.ReadFile("places.kml")
-_ = kmlio.WriteFile(places, "out.kml")
+places, _ := kmlio.ReadFile("places.kml", nil)
+_ = kmlio.WriteFile(places, "out.kml", nil)
+
+// KMZ works the same way — extension picks the format automatically.
+// Set kmlio.WriteOptions{Format: FormatKMZ} explicitly for Writer flows.
+_ = kmlio.WriteFile(places, "out.kmz", nil)         // writes zip with doc.kml
 
 // Shapefile → Frame (reads .shp + .shx + .dbf + optional .prj)
-counties, _ := shpio.ReadFile("counties")           // no .shp suffix needed
-_ = shpio.WriteFile(counties, "counties_out")       // writes all four files
+counties, _ := shpio.ReadFile("counties", nil)      // no .shp suffix needed
+_ = shpio.WriteFile(counties, "counties_out", nil)  // writes all four files
 ```
 
 ## Packages
@@ -398,7 +403,7 @@ _ = shpio.WriteFile(counties, "counties_out")       // writes all four files
 | `.../gobi/geojsonio`      | Full RFC 7946 GeoJSON (all geometry types + XYZ) — Frame-level `ReadFile`/`WriteFile`/`ScanFile`, `.geojsonl` streaming |
 | `.../gobi/gpkgio`         | Read / write OGC GeoPackage 1.3 (SQLite) with RTree spatial index + LazyFrame `ScanFile` + SQL predicate pushdown |
 | `.../gobi/pgio`           | **Beta.** PostgreSQL / PostGIS via `pgx/v5` — `ReadQuery`/`ReadTable`/`ScanTable` + `WriteTable` with `CopyFrom` bulk load. Integration tests are `//go:build integration`-gated; set `PGIO_TEST_DSN` and run against a live PostGIS to exercise them. |
-| `.../gobi/kmlio`          | Read / write KML (OGC 12-007r2) with Placemarks + ExtendedData                                  |
+| `.../gobi/kmlio`          | Read / write KML (OGC 12-007r2) + KMZ (zipped KML). Placemarks + ExtendedData. `.kmz` extension auto-detected. |
 | `.../gobi/shpio`          | Read / write ESRI Shapefile (`.shp` + `.shx` + `.dbf` + optional `.prj`)                        |
 
 ## Geometry columns

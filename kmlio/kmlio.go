@@ -1,11 +1,12 @@
-// Package kmlio reads and writes KML (Keyhole Markup Language, OGC 12-007r2)
-// as gobi Frames.
+// Package kmlio reads and writes KML (Keyhole Markup Language,
+// OGC 12-007r2) and KMZ (zipped KML) as gobi Frames.
 //
-// KML always stores coordinates in WGS 84 (lon, lat[, alt]) per the OGC spec,
-// so output frames have their geometry column tagged with EPSG:4326.
+// KML always stores coordinates in WGS 84 (lon, lat[, alt]) per the
+// OGC spec, so output frames have their geometry column tagged with
+// EPSG:4326.
 //
-// The reader flattens every <Placemark> in the document. Each placemark
-// contributes one row with columns:
+// The reader flattens every <Placemark> in the document. Each
+// placemark contributes one row with columns:
 //
 //   - name         (string, from <name>)
 //   - description  (string, from <description>)
@@ -13,16 +14,25 @@
 //   - <ext-key>    one string column per distinct <ExtendedData><Data>
 //     name= attribute seen in the document
 //
-// The writer emits one <Placemark> per row. String / numeric columns other
-// than "name", "description", and the geometry column become <ExtendedData>
-// entries.
+// The writer emits one <Placemark> per row. String / numeric columns
+// other than "name", "description", and the geometry column become
+// <ExtendedData> entries.
 //
-// Not implemented (out of scope for a small first cut):
+// KMZ support. KMZ is a zip archive containing one primary .kml
+// file (by convention "doc.kml") plus optional resources. ReadFile
+// and WriteFile auto-detect the format from the file extension
+// (.kmz → KMZ). For Reader/Writer flows without a filename hint,
+// set ReadOptions.Format / WriteOptions.Format to FormatKMZ. The
+// reader prefers "doc.kml" but falls back to the first .kml entry
+// in the archive so KMZ files produced by other tools (with names
+// like "layer.kml") still parse.
+//
+// Not implemented (out of scope):
 //
 //   - <Style>, <StyleMap>, <NetworkLink>, <Document> nesting semantics
 //   - Time / TimeSpan primitives
-//   - KMZ (zipped KML) — deliberately deferred; use gzip/zstd via csvio as
-//     a stopgap or unzip first
+//   - KMZ resource files (icons, images) — only the primary .kml
+//     entry is read; other entries in the archive are ignored
 //   - Non-primitive KML geometries (Model, gx:Track)
 package kmlio
 
@@ -48,19 +58,41 @@ import (
 // a construct this package doesn't support.
 var ErrInvalidKML = errors.New("kmlio: invalid input")
 
-// ReadOptions reserves a slot for future read-time configuration
-// (e.g., skip-Style, geometry-column-name override, folder-name
-// prefixing). Currently empty — pass nil.
-//
-// The struct exists so future options can be added without breaking
-// the ReadFile / Read signatures. Matches the naming pattern used
-// by parquetio, csvio, gpkgio, geojsonio, and pgio.
-type ReadOptions struct{}
+// ReadOptions controls the KML/KMZ reader.
+type ReadOptions struct {
+	// Format selects the on-disk shape. FormatAuto (the default)
+	// picks by file extension (.kmz → KMZ, otherwise KML) in
+	// ReadFile. For Read (io.Reader-based), FormatAuto behaves as
+	// FormatKML — a raw Reader has no filename hint. Set Format
+	// explicitly when reading KMZ from a Reader.
+	Format Format
+}
 
-// WriteOptions reserves a slot for future write-time configuration
-// (e.g., document-name / description, KMZ compression, style
-// injection). Currently empty — pass nil.
-type WriteOptions struct{}
+// WriteOptions controls the KML/KMZ writer.
+type WriteOptions struct {
+	// Format selects the on-disk shape. Same auto-detect rules as
+	// ReadOptions.Format — .kmz extension → KMZ, otherwise KML.
+	Format Format
+}
+
+// Format identifies the KML container flavor: raw XML or a
+// zip-packaged .kmz. KMZ is a zip archive containing a single
+// primary .kml file (by convention "doc.kml") plus optional
+// resources (icons, images). Gobi's writer emits just the
+// "doc.kml" entry; the reader accepts any archive containing at
+// least one .kml file.
+type Format uint8
+
+const (
+	// FormatAuto picks by file extension (.kmz → KMZ, otherwise
+	// KML). Only meaningful for ReadFile / WriteFile; io.Reader /
+	// io.Writer paths treat it as FormatKML.
+	FormatAuto Format = iota
+	// FormatKML is uncompressed XML — the canonical KML document.
+	FormatKML
+	// FormatKMZ is a zip archive containing a doc.kml entry.
+	FormatKMZ
+)
 
 // -----------------------------------------------------------------------------
 // XML structs (subset of KML 2.3 we actually decode)
@@ -152,19 +184,39 @@ func collectFromContainer(c kmlContainer) []kmlPlacemark {
 // -----------------------------------------------------------------------------
 
 // ReadFile parses path and returns a Frame. See package doc for the
-// column shape. Pass nil opts for defaults.
+// column shape. Pass nil opts for defaults. File extension picks
+// between KML and KMZ (.kmz → KMZ) when opts.Format is FormatAuto.
 func ReadFile(path string, opts *ReadOptions) (*gobi.Frame, error) {
+	format := resolveReadFormat(path, opts)
+	if format == FormatKMZ {
+		return readKMZFile(path, opts)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return Read(f, opts)
+	return readXML(f, opts)
 }
 
 // Read parses a KML document from r into a Frame. Pass nil opts
 // for defaults.
+//
+// For a KMZ archive from a Reader, set opts.Format = FormatKMZ.
+// The reader will buffer the input to a bytes.Buffer (archive/zip
+// needs io.ReaderAt with a known size) and locate the primary
+// .kml entry inside the archive. FormatAuto on a Reader defaults
+// to FormatKML — a raw Reader carries no filename hint.
 func Read(r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
+	if opts != nil && opts.Format == FormatKMZ {
+		return readKMZReader(r, opts)
+	}
+	return readXML(r, opts)
+}
+
+// readXML is the raw-KML XML decoder — shared by the KML path and
+// (after unzipping) the KMZ path.
+func readXML(r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 	_ = opts // reserved
 	var root kmlRoot
 	dec := xml.NewDecoder(r)

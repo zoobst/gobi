@@ -7,6 +7,28 @@ introduce breaking changes; check this file when upgrading.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-23
+
+### Added
+
+- **`kmlio` KMZ (zipped KML) support.** `ReadFile` / `WriteFile`
+  auto-detect the format from the file extension (`.kmz` → zip
+  archive with `doc.kml`); `Read` / `Write` accept
+  `Format: FormatKMZ` for io.Reader / io.Writer flows. The reader
+  prefers `doc.kml` but falls back to the first `.kml` entry so
+  KMZs produced by other tools still parse.
+- **`gobi.FromStructs[T]` / `gobi.ToStructs[T]`.** Round-trip
+  between a slice of Go structs and a Frame using the same
+  struct-tag conventions as csvio (`csv:"col"`, `geom:"true"`,
+  `time:"layout"`). Supports every arrow-mappable Go type plus
+  pointer-wrapped nullability.
+
+### Changed
+
+- `kmlio.ReadOptions` / `kmlio.WriteOptions` gained a `Format`
+  field (`FormatAuto` / `FormatKML` / `FormatKMZ`). Previously
+  empty stubs.
+
 ## [0.1.0] — 2026-07-22
 
 First tagged release. Everything below is what a caller sees when
@@ -130,5 +152,6 @@ entry points. Options field naming is documented in CLAUDE.md.
   future work in CLAUDE.md; would drop 1BRC peak RSS from ~1.3 GB
   toward ~400 MB.
 
-[Unreleased]: https://github.com/zoobst/gobi/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/zoobst/gobi/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/zoobst/gobi/releases/tag/v0.1.1
 [0.1.0]: https://github.com/zoobst/gobi/releases/tag/v0.1.0
