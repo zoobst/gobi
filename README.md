@@ -560,10 +560,10 @@ and scripts live under [`benchmarks/`](benchmarks/) — regenerate with
 
 | Op                            |    gobi | pandas 2.3 | Polars 1T | Polars all |
 |-------------------------------|--------:|-----------:|----------:|-----------:|
-| `Sum(value_a)`                | 0.92 ms |    0.31 ms |   0.08 ms |    0.08 ms |
-| `value_a + value_b`           | 1.01 ms |    0.71 ms |   0.68 ms |    0.76 ms |
-| `Filter(value_a > 500k)`      | 14.3 ms |    4.81 ms |   1.74 ms |    1.37 ms |
-| `GroupBy(key).Agg(Sum,Mean)`  | 33.3 ms |   18.16 ms |   7.59 ms |    2.24 ms |
+| `Sum(value_a)`                | 0.94 ms |    0.31 ms |   0.10 ms |    0.09 ms |
+| `value_a + value_b`           | 1.00 ms |    1.03 ms |   0.82 ms |    0.90 ms |
+| `Filter(value_a > 500k)`      | 15.1 ms |    6.83 ms |   1.96 ms |    1.60 ms |
+| `GroupBy(key).Agg(Sum,Mean)`  | 48.2 ms |   19.73 ms |   9.89 ms |    2.42 ms |
 
 Polars 1T = `POLARS_MAX_THREADS=1`; Polars all = default (all cores).
 pandas sits between gobi and single-threaded Polars on every op — numpy's
@@ -574,11 +574,11 @@ See the SIMD note below.
 
 | Reader                          |    per-read | notes                                              |
 |---------------------------------|------------:|----------------------------------------------------|
-| Polars 1.42, all threads        |     9.1 ms  | multi-threaded Rust tokenizer + SIMD (typed schema) |
-| Polars 1.42, 1 thread           |    56.0 ms  | SIMD numeric parse, single core                    |
-| pandas 2.3, `engine="pyarrow"`  |    25.9 ms  | pyarrow C++ tokenizer                              |
-| pandas 2.3, default (C engine)  |   129.8 ms  | pandas' native C tokenizer                         |
-| **gobi `csvio.Read`**           | **209.4 ms** | arrow-go's CSV wraps stdlib `encoding/csv`      |
+| Polars 1.42, all threads        |    11.5 ms  | multi-threaded Rust tokenizer + SIMD (typed schema) |
+| Polars 1.42, 1 thread           |    13.5 ms  | SIMD numeric parse, single core                    |
+| pandas 2.3, `engine="pyarrow"`  |    43.2 ms  | pyarrow C++ tokenizer                              |
+| pandas 2.3, default (C engine)  |   149.4 ms  | pandas' native C tokenizer                         |
+| **gobi `csvio.Read`**           | **224.3 ms** | arrow-go's CSV wraps stdlib `encoding/csv`      |
 
 The gap is entirely in stdlib `encoding/csv` allocating a `[]string` per
 row + per-cell `strconv` — 99.5% of gobi's CSV allocations show up
@@ -590,11 +590,11 @@ the roadmap yet. Maybe the arrow-go folks will pick that up.
 
 | Op                              |     gobi | geopandas 1.1 |     result |
 |---------------------------------|---------:|--------------:|-----------:|
-| Read points.parquet (100k)      |  4.37 ms |      35.2 ms  | **8.0× faster** |
-| Read polygons.parquet (100)     |  0.26 ms |       0.76 ms | **2.9× faster** |
-| `Area(polygons)`                |  0.02 ms |       0.13 ms | **6.5× faster** |
-| `Centroid(polygons)`            |  0.02 ms |       0.16 ms | **8× faster**   |
-| `SJoin(100k pts, 100 polys)`    |  3.14 ms |       2.60 ms | 1.2× slower     |
+| Read points.parquet (100k)      |  4.04 ms |     37.74 ms  | **9.3× faster** |
+| Read polygons.parquet (100)     |  0.26 ms |      0.83 ms  | **3.2× faster** |
+| `Area(polygons)`                |  0.02 ms |      0.13 ms  | **6.5× faster** |
+| `Centroid(polygons)`            |  0.02 ms |      0.16 ms  | **8× faster**   |
+| `SJoin(100k pts, 100 polys)`    |  3.49 ms |      2.62 ms  | 1.3× slower     |
 
 Gobi wins on read and per-row bulk ops because it doesn't have to
 construct Shapely Python objects per row on load. The one gap is
@@ -610,9 +610,9 @@ decode cost.
 
 | Path                                                        | per-op   | vs. baseline |
 |-------------------------------------------------------------|---------:|:-------------|
-| `ReadFile(path, Options{Columns:[id,value_a]})` (eager)     |  6.18 ms | 1.0× (baseline) |
-| `ScanFile(path).Select(id,value_a).Collect()` (optimized)   |  7.06 ms | ~1.14× — close to eager |
-| `ScanFile(path).Select(id,value_a).CollectRaw()` (no rules) | 14.08 ms | 2.3× slower — reads all 4 cols |
+| `ReadFile(path, Options{Columns:[id,value_a]})` (eager)     |  6.21 ms | 1.0× (baseline) |
+| `ScanFile(path).Select(id,value_a).Collect()` (optimized)   |  8.12 ms | ~1.31× — close to eager |
+| `ScanFile(path).Select(id,value_a).CollectRaw()` (no rules) | 14.58 ms | 2.3× slower — reads all 4 cols |
 
 The optimizer's `ProjectionPushdown` rule turns the lazy pipeline
 into the equivalent of an eager `Options.Columns` — 2.0× faster than
@@ -628,24 +628,51 @@ weather-station rows in Snappy-compressed parquet (~4 GB on disk).
 Query: min / mean / max of `temperature` grouped by `station`. Apple
 M3 Pro, 11 GOMAXPROCS.
 
-| Config                                   |    wall |  user CPU | peak RSS |
+| Engine                                   |    wall |  user CPU | peak RSS |
 |------------------------------------------|--------:|----------:|---------:|
-| Serial (`ScanWorkers=1`, single agg)     | 1m 50s  |    147s   |  156 MB  |
-| Parallel scan                            | 1m 52s  |    148s   | 1.28 GB  |
-| Parallel scan + parallel aggregate.      | 1m 11s  |    197s   | 1.31 GB  |
-| **Both + composite-key optimizations**   | **15.5s** | **141s** | **1.5 GB** |
-| Polars 1.42 streaming (reference)        |   ~3 s  |     ~15s  | ~4.6 GB  |
+| **gobi streaming** (parallel scan + agg) | **18.1s** | **~140s** | **1.27 GB** |
+| Polars 1.42 streaming (reference)        |   3.0 s |      ~15s |  4.42 GB |
+| Polars 1.42 eager (reference)            |  12.0 s |     ~120s | 20.96 GB |
 
-Same query, streaming end-to-end — no `LazyFrame.CollectRaw()`
-materialization, no disk spill. The gap to Polars closed to 5× across
-three complementary changes: partitioning the parquet scan across row-groups,
-sharding the streaming hash aggregate by key hash across workers, and
-eliminating per-row key allocations in the hot path (reusable scratch buffers +
+Streaming end-to-end — no `LazyFrame.CollectRaw()` materialization,
+no disk spill. Getting here took three complementary changes:
+partitioning the parquet scan across row-groups, sharding the
+streaming hash aggregate by key hash across workers, and eliminating
+per-row key allocations in the hot path (reusable scratch buffers +
 single-string-key fast path that reads the arrow value zero-copy).
 
-Peak RSS is 3× lower than Polars because gobi keeps at most one
-batch per worker in memory (~1.3 GB total on 11 workers) — Polars
-buffers larger working sets by design.
+Peak RSS is 3.5× lower than Polars streaming and 16× lower than
+Polars eager because gobi keeps at most one batch per worker in
+memory (~1.3 GB total on 11 workers) — Polars buffers larger working
+sets by design.
+
+### v0.2.0 alignment fast paths (1M rows, 1000 groups)
+
+When the caller can prove input partitioning + sort order via
+`WithPartitionMeta(...)`, `Over` and `GroupBy` skip the general
+hash-map path and linear-scan group boundaries directly. Same
+`bench_alignment.parquet` fixture (1M rows, 10 regions × 100 ids,
+pre-sorted by `(region, id)`) across all three rows; Polars doesn't
+expose alignment metadata, so it picks its own path.
+
+| Op                              |     gobi (unaligned) | gobi (aligned) |    Polars all |
+|---------------------------------|---------------------:|---------------:|--------------:|
+| `Over(region, id).Sum(v)`       |             54.03 ms |    **37.85 ms** (30% faster) |       7.11 ms |
+| `GroupBy(region, id).Sum(v)`    |            107.87 ms |    **32.36 ms** (70% faster) |       4.65 ms |
+
+Sort-merge Inner join (also alignment-gated) is measured in-tree
+rather than in this fixture bench — a fixture-scale self-join is
+dominated by 100M-row cross-product construction rather than the
+join algorithm itself. `BenchmarkJoin_MergeAligned` on 10k×10k Int64
+keys shows the aligned sort-merge path is 31% faster than the hash
+join it replaces, and `BenchmarkJoin_HashMultiProbeBatch` shows the
+streaming-hash-join build-side cache fix that landed with the
+alignment work is 49% faster on multi-batch Inner joins.
+
+Polars still wins in absolute terms — the aligned fast paths close a
+2× gap on Over and a 3× gap on GroupBy while leaving the vectorized-
+reduction gap untouched (see the SIMD note below). If the workload
+can carry alignment metadata, taking it is nearly free.
 
 ### Why the remaining compute-op gap will shrink
 
@@ -658,7 +685,7 @@ portable package and closes most of the Sum gap — see
 `TODO(1.27-simd)` in `series_ops_simd_*.go`.
 
 The 1BRC gap breaks down similarly: with parallelism landed, most of
-the remaining 5× vs Polars is per-row accumulator throughput
+the remaining 6× vs Polars streaming is per-row accumulator throughput
 (`minMaxAcc.Update` calls `Series.numericAt` per row, dispatching
 through an interface + type switch). Vectorized kernels — tight
 loops over typed slices — would close a meaningful fraction on the
