@@ -6,7 +6,7 @@ API with Polars-shaped internals: columnar, chunk-slice fast paths, and
 built around a strongly-typed schema.
 
 > **Status:** early. The API is settled enough to build a small pipeline on;
-> semver stability begins with the first tagged release. GeoParquet v1.1
+> semver stability begins with v1.0. GeoParquet v1.1
 > output has been verified against GeoPandas v1.1.1 and QGIS v4.0.2.
 
 ## Highlights
@@ -100,8 +100,7 @@ built around a strongly-typed schema.
   `RowGroupRows` (predicate-pushdown-friendly small groups vs.
   compression-friendly large ones), `BloomFilterColumns` +
   `BloomFilterFPP` (equality-filter skipping in DuckDB / Spark /
-  Polars / pyarrow readers today; gobi's own reader when the query
-  optimizer lands).
+  Polars / pyarrow / gobi readers today).
 - **Parallelism controls.** Package-level `SetMaxParallelism(n)` or
   per-op `Workers(n)`.
 - **Pure Go, no cgo.** No GDAL, no GEOS, no libproj. Cross-compiles
