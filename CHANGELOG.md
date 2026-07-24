@@ -5,7 +5,7 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
-## [Unreleased]
+## [v0.2.0]
 
 ### Added
 
@@ -39,6 +39,29 @@ introduce breaking changes; check this file when upgrading.
   Arrow type on the output side — including variable-length List
   columns produced by user UDFs (H3 GridPath / KRing / PolyfillCells
   patterns). Added a reference test so this stays wired.
+- **Partition-aware `LazyFrame` infrastructure.** New
+  `gobi.PartitionMetadata{Columns, HashFn, SortedBy, SortEnforced}`
+  type attached to scan nodes + propagated through every plan
+  operator (`Filter`, `Project`, `WithColumn`, `Drop`, `Limit`,
+  `Tail`, `Sort`, `Aggregate`, `Join` — full propagation rule table
+  covered by 16 unit-tested subtests). Two alignment predicates:
+  `Aligned(meta, cols)` for single-source shuffle-skip checks (Over,
+  aligned GroupBy) and `AlignedWith(l, r)` for two-source checks
+  (partition-wise Join). `HashFn` uses versioned, source-namespaced
+  string tags (`"gobi/xxhash64/v1"` etc.); cross-tag comparisons
+  always fail so different sources can't be accidentally assumed
+  hash-compatible.
+- **`LazyFrame.WithPartitionAssertion(meta)`** escape hatch for
+  opaque sources (custom UDFs, hand-crafted parquet scans, external
+  ETL). Narrowing-only rule — refuses to widen an existing claim.
+  User owns correctness (gobi never verifies against actual data).
+- **`parquetio.ReadReader` / `ReadReaderChunksFunc`** — new public
+  entry points that accept `io.ReaderAt + int64` size alongside the
+  existing path-based API. Enables non-file sources (S3, HTTP,
+  in-memory `bytes.Reader`) to feed parquetio without disk
+  round-trips. Same options/geo-metadata/predicate-pushdown surface
+  as the path-based API. Internal refactor: `openReader` split into
+  path-based + reader-based paths that share `openReaderFromRS`.
 
 ### Changed
 
@@ -50,6 +73,53 @@ introduce breaking changes; check this file when upgrading.
   executor never invokes Merge). Aggregator implementations must also
   reset internal state at the start of Aggregate; the eager engine
   reuses a single instance across every group.
+
+### Performance
+
+Four alignment-based fast paths land on top of the new
+`PartitionMetadata` infrastructure. All fire only when the input
+carries a matching partition claim (via a scan source's
+`WithPartitionMetadata` or a user's `WithPartitionAssertion`) —
+un-annotated inputs run the existing paths unchanged.
+
+Hardware for measurements: Apple M3 Pro (11 cores), Go 1.26,
+`go test -bench -benchtime=3s -count=3`. Median across 3 runs.
+
+- **`.Over(K)` aligned linear-scan fast path — 34% faster.**
+  `overFastPathApplicable` (aligned + `SortedBy` starts with
+  partition cols + `SortEnforced=true`) triggers a single-pass
+  linear-scan reducer in place of the row→group-id hash-map path.
+  3.73ms → 2.47ms on 100k-row / 100-group `Sum().Over("group")`.
+  Composes end-to-end through the streaming executor —
+  `withColumnExecOp` propagates the input plan node's
+  `PartitionMetadata` to per-batch Frames.
+- **Sort-merge Inner join fast path — 31% faster.**
+  `canMergeJoin` (both sides `AlignedWith` + `SortedBy` starts with
+  join key + `SortEnforced=true`) selects `sortMergeJoinExec` in
+  place of `streamingJoinExec`. Two-pointer merge over encoded keys
+  eliminates the hash-index build. 1.98ms → 1.36ms on 10k×10k
+  Int64-keyed Inner join. Inner-only for v1; Left/Semi/Anti stay on
+  the hash path.
+- **Aligned `GroupBy.Agg` linear-scan fast path — 74% faster.**
+  `groupByFastPathApplicable` triggers a linear-scan aggregate that
+  detects group boundaries via composite-key comparison of
+  consecutive rows — skips the `rowKeys []string` alloc, the
+  `map[string][]int` group buffer, and the terminal `sort.Strings`
+  order pass. 12.4ms → 3.25ms on 100k-row / 1k-group two-column-key
+  `AggSum`. Sits after the existing `aggFast` single-primitive-key
+  hot path (single-string-key 1BRC workloads keep their tuned
+  performance); the new fast path lights up on shapes `aggFast`
+  bails on (multi-column keys, First/Last, custom Fn).
+- **Streaming hash-join build-side index cache — 49% faster.**
+  `streamingJoinExec.buildIfNeeded` now builds the right-side hash
+  index once alongside materializing the right Frame; `Next` reuses
+  it per probe batch via the new `Frame.joinHashRightWithIndex`
+  helper. Previously the exec called `Frame.Join` per batch, which
+  rebuilt the full hash index each time (a real bug on any
+  workload where the probe side spans multiple `defaultBatchRows`-
+  sized batches). 48.1ms → 24.6ms on 200k probe × 100k build
+  (4-probe-batch workload). Fires for every Inner/Left/Semi/Anti
+  hash join — no alignment claim required.
 
 ## [0.1.1] — 2026-07-23
 

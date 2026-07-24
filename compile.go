@@ -54,7 +54,14 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 			return nil, err
 		}
 		return &withColumnExecOp{
-			input: child, name: n.name, expr: n.expr, outSchema: n.outSchema,
+			input:     child,
+			name:      n.name,
+			expr:      n.expr,
+			outSchema: n.outSchema,
+			// Capture the input's partition claim at Compile time so
+			// per-batch expression Eval (Over in particular) can see
+			// the alignment context via frame.PartitionMetadata().
+			inputMeta: n.input.PartitionMetadata(),
 		}, nil
 
 	case *dropNode:
@@ -134,6 +141,23 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Alignment-aware Inner fast path: when both sides carry
+		// PartitionMetadata proving same-key rows are colocated AND
+		// each side is sorted on the join key with SortEnforced=true,
+		// swap in the sort-merge executor. Eliminates the hash-index
+		// build entirely — see exec_join_merge.go for the mechanics.
+		//
+		// Inner-only for step 7. Left/Semi/Anti stay on the streaming
+		// hash path even when the inputs would otherwise qualify.
+		if n.kind == JoinInner && canMergeJoin(n) {
+			return &sortMergeJoinExec{
+				left:      left,
+				right:     right,
+				leftKey:   n.leftKey,
+				rightKey:  n.rightKey,
+				outSchema: n.outSchema,
+			}, nil
+		}
 		// Left-driven kinds (Inner, Left, Semi, Anti) stream the
 		// probe side against a materialized build. Right and Full
 		// need a second-phase pass to emit unmatched right rows,
@@ -181,6 +205,13 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 				return f.Tail(nRows), nil
 			},
 		}, nil
+
+	case *partitionAssertionNode:
+		// Assertion is a metadata-only wrapper — compile the input
+		// directly, no executor node needed. The metadata claim is
+		// consumed at plan time (by alignment predicates), not at
+		// runtime.
+		return Compile(n.input)
 	}
 	return nil, fmt.Errorf("gobi: Compile: unknown plan node %T", p)
 }

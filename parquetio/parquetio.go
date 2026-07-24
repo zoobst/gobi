@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -430,6 +431,122 @@ func ReadFileChunksFunc(path string, opts *ReadOptions, fn func(*gobi.Frame) err
 	return nil
 }
 
+// ReadReader is the io.ReaderAt-backed counterpart to ReadFile. Reads
+// a Parquet file from any random-access byte source (S3 GetObject with
+// Range headers, in-memory bytes.Reader, etc.) whose size is known
+// upfront. Materializes the whole payload as a single Frame — memory
+// footprint mirrors ReadFile.
+//
+// The caller retains ownership of r; ReadReader does not Close it.
+// Pass io.ReaderAt + Size explicitly rather than requiring io.Seeker
+// so callers implementing thin S3 / HTTP shims don't need to fake
+// seeking against a known length.
+//
+// GeoParquet metadata + column projection + predicate pushdown work
+// the same as ReadFile — ReadOptions is honored uniformly.
+func ReadReader(r io.ReaderAt, size int64, opts *ReadOptions) (*gobi.Frame, error) {
+	rc, err := openReaderFromRS(newReaderAtSeeker(r, size), noopCloser{}, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.close()
+	table, err := rc.reader.ReadRowGroups(context.Background(), rc.colIndices, rc.rowGroups)
+	if err != nil {
+		return nil, err
+	}
+	return frameFromTable(table, rc.geoRaw)
+}
+
+// ReadReaderChunksFunc is the io.ReaderAt-backed counterpart to
+// ReadFileChunksFunc. Streams the Parquet payload as record-batch-sized
+// Frames without materializing the whole file. Batch lifetime + error
+// semantics mirror the path-based version.
+//
+// The caller retains ownership of r; ReadReaderChunksFunc does not
+// Close it.
+func ReadReaderChunksFunc(r io.ReaderAt, size int64, opts *ReadOptions, fn func(*gobi.Frame) error) error {
+	rc, err := openReaderFromRS(newReaderAtSeeker(r, size), noopCloser{}, opts)
+	if err != nil {
+		return err
+	}
+	defer rc.close()
+
+	rr, err := rc.reader.GetRecordReader(context.Background(), rc.colIndices, rc.rowGroups)
+	if err != nil {
+		return fmt.Errorf("parquetio: build record reader: %w", err)
+	}
+	defer rr.Release()
+
+	for rr.Next() {
+		rec := rr.RecordBatch()
+		frame, err := frameFromRecord(rec, rc.geoRaw)
+		if err != nil {
+			return err
+		}
+		cbErr := fn(frame)
+		frame.Release()
+		if cbErr != nil {
+			return fmt.Errorf("%w: %v", ErrChunksAborted, cbErr)
+		}
+	}
+	if err := rr.Err(); err != nil {
+		return fmt.Errorf("parquetio: %w", err)
+	}
+	return nil
+}
+
+// readerAtSeeker wraps io.ReaderAt + known Size into arrow-go's
+// parquet.ReaderAtSeeker interface. Seek is implemented against the
+// known size (arrow-go uses SeekEnd/0 to discover file length; the
+// remaining Seek modes track a virtual position for compatibility).
+type readerAtSeeker struct {
+	ra   io.ReaderAt
+	size int64
+	pos  int64
+}
+
+func newReaderAtSeeker(ra io.ReaderAt, size int64) *readerAtSeeker {
+	return &readerAtSeeker{ra: ra, size: size}
+}
+
+func (r *readerAtSeeker) ReadAt(p []byte, off int64) (int, error) {
+	return r.ra.ReadAt(p, off)
+}
+
+func (r *readerAtSeeker) Read(p []byte) (int, error) {
+	if r.pos >= r.size {
+		return 0, io.EOF
+	}
+	n, err := r.ra.ReadAt(p, r.pos)
+	r.pos += int64(n)
+	return n, err
+}
+
+func (r *readerAtSeeker) Seek(offset int64, whence int) (int64, error) {
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = offset
+	case io.SeekCurrent:
+		abs = r.pos + offset
+	case io.SeekEnd:
+		abs = r.size + offset
+	default:
+		return 0, fmt.Errorf("parquetio: readerAtSeeker: invalid whence %d", whence)
+	}
+	if abs < 0 {
+		return 0, fmt.Errorf("parquetio: readerAtSeeker: negative position")
+	}
+	r.pos = abs
+	return abs, nil
+}
+
+// noopCloser satisfies io.Closer for reader-based paths where the
+// caller retains ownership of the byte source.
+type noopCloser struct{}
+
+func (noopCloser) Close() error { return nil }
+
 // WriteFile writes f to path. A nil opts uses defaults:
 // CodecSnappy compression and parquet-arrow's default row-group
 // sizing (~1M rows).
@@ -519,7 +636,10 @@ func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 // GetRecordReader which treats nil as "read everything," so we always
 // pass concrete lists to keep both paths symmetric.
 type readerContext struct {
-	file        *os.File
+	// closer is the outer resource owning the parquet bytes — an
+	// *os.File for path-based reads, a no-op for reader-based reads
+	// where the caller manages the underlying stream. Always non-nil.
+	closer      io.Closer
 	parquetFile *file.Reader
 	reader      *pqarrow.FileReader
 	colIndices  []int
@@ -531,15 +651,28 @@ func (rc *readerContext) close() {
 	if rc.parquetFile != nil {
 		_ = rc.parquetFile.Close()
 	}
-	if rc.file != nil {
-		_ = rc.file.Close()
+	if rc.closer != nil {
+		_ = rc.closer.Close()
 	}
 }
 
-// openReader opens path, builds a pqarrow.FileReader with a batch size
-// suitable for streaming, extracts geo metadata, and resolves
-// opts.Columns to arrow-schema indices.
+// openReader opens path and calls openReaderFromRS. Kept as a thin
+// wrapper so path-based callers (ReadFile / ScanFile / etc.) don't
+// have to know about the ReaderAtSeeker interface.
 func openReader(path string, opts *ReadOptions) (*readerContext, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return openReaderFromRS(f, f, opts)
+}
+
+// openReaderFromRS is the shared reader-construction path for both
+// path-based (openReader) and reader-based (ReadReader et al.) entry
+// points. rs is the parquet.ReaderAtSeeker fed to arrow-go's parquet
+// reader; closer owns the underlying byte source. rs and closer may
+// point at the same value (as they do for *os.File).
+func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOptions) (*readerContext, error) {
 	if opts == nil {
 		opts = &ReadOptions{}
 	}
@@ -548,14 +681,9 @@ func openReader(path string, opts *ReadOptions) (*readerContext, error) {
 		pool = memory.DefaultAllocator
 	}
 
-	f, err := os.Open(path)
+	pf, err := file.NewParquetReader(rs)
 	if err != nil {
-		return nil, err
-	}
-
-	pf, err := file.NewParquetReader(f)
-	if err != nil {
-		_ = f.Close()
+		_ = closer.Close()
 		return nil, err
 	}
 
@@ -572,14 +700,14 @@ func openReader(path string, opts *ReadOptions) (*readerContext, error) {
 	}, pool)
 	if err != nil {
 		_ = pf.Close()
-		_ = f.Close()
+		_ = closer.Close()
 		return nil, err
 	}
 
 	colIndices, err := resolveColumns(pf, fr, opts.Columns)
 	if err != nil {
 		_ = pf.Close()
-		_ = f.Close()
+		_ = closer.Close()
 		return nil, err
 	}
 
@@ -592,7 +720,7 @@ func openReader(path string, opts *ReadOptions) (*readerContext, error) {
 		for _, rg := range opts.RowGroups {
 			if rg < 0 || rg >= total {
 				_ = pf.Close()
-				_ = f.Close()
+				_ = closer.Close()
 				return nil, fmt.Errorf("parquetio: row-group index %d out of range [0,%d)", rg, total)
 			}
 			rowGroups = append(rowGroups, rg)
@@ -610,7 +738,7 @@ func openReader(path string, opts *ReadOptions) (*readerContext, error) {
 	rowGroups = filterRowGroupsByPredicate(pf, opts.Predicate, rowGroups)
 
 	return &readerContext{
-		file:        f,
+		closer:      closer,
 		parquetFile: pf,
 		reader:      fr,
 		colIndices:  colIndices,

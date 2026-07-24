@@ -142,6 +142,11 @@ type withColumnExecOp struct {
 	name      string
 	expr      Expr
 	outSchema *arrow.Schema
+	// inputMeta is the partition claim carried by the input plan
+	// node at Compile time. Attached to the per-batch Frame before
+	// expression eval so consumers like Over can check alignment.
+	// Nil = no claim (unaligned path).
+	inputMeta *PartitionMetadata
 }
 
 func (e *withColumnExecOp) Schema() *arrow.Schema { return e.outSchema }
@@ -158,6 +163,9 @@ func (e *withColumnExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) 
 	batch.Release()
 	if err != nil {
 		return nil, err
+	}
+	if e.inputMeta != nil {
+		frame.WithPartitionMeta(e.inputMeta)
 	}
 	out, err := frame.WithColumnExpr(e.name, e.expr)
 	if err != nil {
@@ -247,9 +255,9 @@ type emptyExecOp struct {
 	schema *arrow.Schema
 }
 
-func (e *emptyExecOp) Schema() *arrow.Schema                         { return e.schema }
+func (e *emptyExecOp) Schema() *arrow.Schema                               { return e.schema }
 func (e *emptyExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) { return nil, io.EOF }
-func (e *emptyExecOp) Close() error                                  { return nil }
+func (e *emptyExecOp) Close() error                                        { return nil }
 
 // -----------------------------------------------------------------------------
 // materializeExec: fallback for blocking operators (Sort, Aggregate,

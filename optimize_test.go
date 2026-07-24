@@ -417,9 +417,10 @@ type projectableTestScan struct {
 	callCount      int
 }
 
-func (s *projectableTestScan) Schema() *arrow.Schema   { return s.schema }
-func (s *projectableTestScan) Children() []LogicalPlan { return nil }
-func (s *projectableTestScan) String() string          { return "Scan[test]" }
+func (s *projectableTestScan) Schema() *arrow.Schema                 { return s.schema }
+func (s *projectableTestScan) Children() []LogicalPlan               { return nil }
+func (s *projectableTestScan) String() string                        { return "Scan[test]" }
+func (s *projectableTestScan) PartitionMetadata() *PartitionMetadata { return nil }
 func (s *projectableTestScan) ProjectColumns(cols []string) LogicalPlan {
 	s.callCount++
 	s.appliedCols = append([]string{}, cols...)
@@ -610,9 +611,10 @@ type predicateTestScan struct {
 	callCount   int
 }
 
-func (s *predicateTestScan) Schema() *arrow.Schema   { return s.schema }
-func (s *predicateTestScan) Children() []LogicalPlan { return nil }
-func (s *predicateTestScan) String() string          { return "Scan[test]" }
+func (s *predicateTestScan) Schema() *arrow.Schema                 { return s.schema }
+func (s *predicateTestScan) Children() []LogicalPlan               { return nil }
+func (s *predicateTestScan) String() string                        { return "Scan[test]" }
+func (s *predicateTestScan) PartitionMetadata() *PartitionMetadata { return nil }
 func (s *predicateTestScan) ApplyPredicate(pred Expr) LogicalPlan {
 	s.callCount++
 	s.appliedPred = pred

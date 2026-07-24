@@ -171,6 +171,18 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 	} else if ok {
 		return f, nil
 	}
+	// Alignment-aware fast path: when the input Frame's
+	// PartitionMetadata proves rows are grouped by the GroupBy keys
+	// AND sorted by them (writer-enforced), same-key rows are
+	// guaranteed contiguous. Linear-scan aggregate skips the
+	// row-key-to-groups hash map entirely — see groupby_aligned.go.
+	keyNames := make([]string, len(g.keys))
+	for i, k := range g.keys {
+		keyNames[i] = k.name
+	}
+	if groupByFastPathApplicable(g.frame.PartitionMetadata(), keyNames) {
+		return g.aggAligned(aggs)
+	}
 	// Compute a stable, deterministic order over group keys: build a
 	// canonical string for each row, then sort the unique ones.
 	rowCount := g.frame.NumRows()

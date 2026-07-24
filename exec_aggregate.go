@@ -792,8 +792,8 @@ func (e *streamingAggregateExec) buildResultBatch() (arrow.RecordBatch, error) {
 	if e.keyMode == keyModeInt641 {
 		nRows = int64(len(e.orderInt64))
 	}
-	// array.NewRecord retains each array; we defer-Release ours.
-	return array.NewRecord(e.outSchema, arrs, nRows), nil
+	// array.NewRecordBatch retains each array; we defer-Release ours.
+	return array.NewRecordBatch(e.outSchema, arrs, nRows), nil
 }
 
 // readScalarAt extracts a Go-typed scalar from a Series at row for

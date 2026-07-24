@@ -31,6 +31,20 @@ type LogicalPlan interface {
 	// no children, no formatting. Used as the label in Explain
 	// output; the tree walker handles indentation and recursion.
 	String() string
+
+	// PartitionMetadata returns the partition claim carried by this
+	// node's output rows. nil = no claim; alignment proofs never
+	// prove anything against a nil claim. Consumed by the optimizer
+	// to prove shuffle-free .Over(K) / Join(K) / GroupBy(K).
+	//
+	// Scan sources (parquetio's ScanFile, athenaio's UnloadAndRead,
+	// hand-annotated via LazyFrame.WithPartitionAssertion) attach
+	// metadata at construction time. Intermediate nodes derive
+	// their output metadata from their inputs — see the propagation
+	// rules in contrib/athenaio/PARTITION-METADATA.md. Every non-
+	// scan node returns nil today (step 1 of the v0.3.0 plan);
+	// propagation wiring lands in step 2.
+	PartitionMetadata() *PartitionMetadata
 }
 
 // Namer is implemented by expression nodes that carry a meaningful
@@ -58,6 +72,12 @@ func (n *scanFrameNode) String() string {
 	return fmt.Sprintf("Scan[frame](%d rows x %d cols)", rows, cols)
 }
 
+// Materialized in-memory frames make no partitioning claim by
+// default — the Frame type doesn't carry PartitionMetadata today.
+// Users who need a partition claim on an in-memory frame attach
+// one via LazyFrame.WithPartitionAssertion (step 3).
+func (n *scanFrameNode) PartitionMetadata() *PartitionMetadata { return nil }
+
 // -----------------------------------------------------------------------------
 // filterNode: keep rows where cond evaluates true
 // -----------------------------------------------------------------------------
@@ -70,6 +90,13 @@ type filterNode struct {
 func (n *filterNode) Schema() *arrow.Schema   { return n.input.Schema() }
 func (n *filterNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
 func (n *filterNode) String() string          { return fmt.Sprintf("Filter(%s)", n.cond) }
+
+// Filter is a pure row-subset operator. Same-K rows remain in the
+// same partition after filtering, and within-partition order is
+// preserved. Metadata passes through unchanged.
+func (n *filterNode) PartitionMetadata() *PartitionMetadata {
+	return n.input.PartitionMetadata()
+}
 
 // -----------------------------------------------------------------------------
 // projectNode: reshape output schema to a set of expressions
@@ -109,6 +136,18 @@ func newProjectNode(input LogicalPlan, exprs []Expr) *projectNode {
 
 func (n *projectNode) Schema() *arrow.Schema   { return n.outSchema }
 func (n *projectNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
+
+// Project preserves the partition claim iff every partition column
+// survives the projection — losing any partition column strands the
+// hash function with no input, so the whole claim is dropped.
+//
+// SortedBy is treated separately: keep the longest surviving prefix
+// (a lex sort's suffix breaks the moment any earlier key vanishes,
+// so the prefix that survives is still enforced by the same writer
+// contract). Full drop only when zero prefix survives.
+func (n *projectNode) PartitionMetadata() *PartitionMetadata {
+	return propagateProjection(n.input.PartitionMetadata(), n.outSchema)
+}
 func (n *projectNode) String() string {
 	parts := make([]string, len(n.exprs))
 	for i, e := range n.exprs {
@@ -161,6 +200,13 @@ func newWithColumnNode(input LogicalPlan, name string, e Expr) *withColumnNode {
 
 func (n *withColumnNode) Schema() *arrow.Schema   { return n.outSchema }
 func (n *withColumnNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
+
+// WithColumn is additive — it appends a computed column without
+// removing or reordering existing ones. Partition columns and
+// SortedBy references stay intact; metadata passes through.
+func (n *withColumnNode) PartitionMetadata() *PartitionMetadata {
+	return n.input.PartitionMetadata()
+}
 func (n *withColumnNode) String() string {
 	return fmt.Sprintf("WithColumn(%q = %s)", n.name, n.expr)
 }
@@ -178,6 +224,16 @@ func (l *limitNode) Schema() *arrow.Schema   { return l.input.Schema() }
 func (l *limitNode) Children() []LogicalPlan { return []LogicalPlan{l.input} }
 func (l *limitNode) String() string          { return fmt.Sprintf("Limit(%d)", l.n) }
 
+// Limit takes a row subset. Partition claim survives (same-K still
+// in same partition). SortedBy survives only if the source
+// enforced the sort — a hint-only sort is meaningless once we've
+// taken a subset (the "first n rows" of an unsorted-but-hinted
+// stream aren't reproducibly the same subset). Strip SortedBy in
+// that case so downstream operators don't rely on false sortedness.
+func (l *limitNode) PartitionMetadata() *PartitionMetadata {
+	return propagateLimit(l.input.PartitionMetadata())
+}
+
 // -----------------------------------------------------------------------------
 // sortNode: reorder rows by one or more SortKeys
 // -----------------------------------------------------------------------------
@@ -189,6 +245,20 @@ type sortNode struct {
 
 func (n *sortNode) Schema() *arrow.Schema   { return n.input.Schema() }
 func (n *sortNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
+
+// Sort is global — same-K rows are redistributed across the output
+// according to the sort keys, so any partition claim on the input
+// is broken. Output has an explicit no-partitioning claim (non-nil
+// with empty Columns) so downstream operators can distinguish
+// "sort destroyed partitioning" from "no source ever claimed
+// partitioning." SortedBy becomes the sort keys, SortEnforced=true
+// because gobi's Sort is a real sort (not a hint).
+func (n *sortNode) PartitionMetadata() *PartitionMetadata {
+	return &PartitionMetadata{
+		SortedBy:     append([]SortKey(nil), n.keys...),
+		SortEnforced: true,
+	}
+}
 func (n *sortNode) String() string {
 	parts := make([]string, len(n.keys))
 	for i, k := range n.keys {
@@ -256,6 +326,43 @@ func newAggregateNode(input LogicalPlan, keys []string, aggs []Aggregation) *agg
 
 func (n *aggregateNode) Schema() *arrow.Schema   { return n.outSchema }
 func (n *aggregateNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
+
+// Aggregate collapses input rows into groups. Output partition
+// metadata is nil in the general case (output rows are groups,
+// not input rows). Special case: if the input is partitioned on
+// exactly the GroupBy keys (ordered) with a hash function, then
+// each output group's single row inherits the partition assignment
+// of its constituent input rows — so the output is partitioned
+// the same way. SortedBy doesn't survive aggregation regardless
+// (group iteration order isn't a within-partition sort).
+func (n *aggregateNode) PartitionMetadata() *PartitionMetadata {
+	in := n.input.PartitionMetadata()
+	if in == nil || len(in.Columns) == 0 {
+		return nil
+	}
+	if !stringSlicesEqual(in.Columns, n.keys) {
+		return nil
+	}
+	return &PartitionMetadata{
+		Columns: append([]string(nil), n.keys...),
+		HashFn:  in.HashFn,
+	}
+}
+
+// stringSlicesEqual reports element-and-order equality for two
+// string slices. Nil and empty-non-nil are treated as equal (both
+// represent "no elements"), matching what `slices.Equal` does.
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 func (n *aggregateNode) String() string {
 	aggParts := make([]string, len(n.aggs))
 	for i, a := range n.aggs {
@@ -329,6 +436,37 @@ func newJoinNode(left, right LogicalPlan, leftKey, rightKey string, kind JoinTyp
 
 func (n *joinNode) Schema() *arrow.Schema   { return n.outSchema }
 func (n *joinNode) Children() []LogicalPlan { return []LogicalPlan{n.input, n.right} }
+
+// Join output metadata reflects which input each output row derives
+// from:
+//
+//   - Inner / Left / Semi / Anti: every output row derives from a
+//     left row (Inner extends left with matching right; Left keeps
+//     unmatched left with null right; Semi/Anti keep left rows only).
+//     Left's partition columns remain intact and unchanged in the
+//     output, so the claim survives. SortedBy doesn't — hash-join
+//     doesn't preserve within-partition order.
+//   - Right: symmetric case (rows derive from right), but the right
+//     join key is dropped from the output schema (see
+//     buildJoinSchema), so right's partition-on-join-key claim
+//     doesn't map to output columns. Conservatively drop.
+//   - Full: unmatched rows from both sides mean neither side's
+//     partition claim covers all output rows. Drop.
+func (n *joinNode) PartitionMetadata() *PartitionMetadata {
+	switch n.kind {
+	case JoinInner, JoinLeft, JoinSemi, JoinAnti:
+		left := n.input.PartitionMetadata()
+		if left == nil {
+			return nil
+		}
+		out := left.Clone()
+		out.SortedBy = nil
+		out.SortEnforced = false
+		return out
+	}
+	// JoinRight / JoinFull: no coherent output partition claim.
+	return nil
+}
 func (n *joinNode) String() string {
 	return fmt.Sprintf("Join(%s, left.%s = right.%s)", joinKindLabel(n.kind), n.leftKey, n.rightKey)
 }
@@ -419,6 +557,15 @@ func newDropNode(input LogicalPlan, name string) *dropNode {
 
 func (n *dropNode) Schema() *arrow.Schema   { return n.outSchema }
 func (n *dropNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
+
+// Drop is Project's negative shape: the output schema equals the
+// input schema minus one column. Rules mirror projectNode — reusing
+// propagateProjection means dropping a partition column drops the
+// whole claim, and dropping a SortedBy column truncates to the
+// surviving prefix.
+func (n *dropNode) PartitionMetadata() *PartitionMetadata {
+	return propagateProjection(n.input.PartitionMetadata(), n.outSchema)
+}
 func (n *dropNode) String() string          { return fmt.Sprintf("Drop(%q)", n.name) }
 
 // -----------------------------------------------------------------------------
@@ -433,6 +580,12 @@ type tailNode struct {
 
 func (n *tailNode) Schema() *arrow.Schema   { return n.input.Schema() }
 func (n *tailNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
+
+// Tail is symmetric with Limit — row subset, partition claim
+// survives, SortedBy survives only when enforced by the source.
+func (n *tailNode) PartitionMetadata() *PartitionMetadata {
+	return propagateLimit(n.input.PartitionMetadata())
+}
 func (n *tailNode) String() string          { return fmt.Sprintf("Tail(%d)", n.n) }
 
 // -----------------------------------------------------------------------------
@@ -454,10 +607,11 @@ type scanFileNode struct {
 	label          string
 	schema         *arrow.Schema
 	read           func() (*Frame, error)
-	streamRead     func(cb func(*Frame) error) error       // nil = falls back to `read`
+	streamRead     func(cb func(*Frame) error) error          // nil = falls back to `read`
 	parallelStream func() []func(cb func(*Frame) error) error // nil = falls back to `streamRead`
-	projectFn      func(cols []string) LogicalPlan         // nil = no projection support
-	predicateFn    func(pred Expr) LogicalPlan             // nil = no predicate pushdown
+	projectFn      func(cols []string) LogicalPlan            // nil = no projection support
+	predicateFn    func(pred Expr) LogicalPlan                // nil = no predicate pushdown
+	partitionMeta  *PartitionMetadata                         // nil = no partitioning claim
 }
 
 // ScanOption configures optional capabilities on a scan node.
@@ -532,6 +686,19 @@ func WithStreamRead(fn func(cb func(*Frame) error) error) ScanOption {
 // shape.
 func WithParallelStreamReads(fn func() []func(cb func(*Frame) error) error) ScanOption {
 	return func(n *scanFileNode) { n.parallelStream = fn }
+}
+
+// WithPartitionMetadata attaches a partition claim to a scan node.
+// Sources that can prove partitioning (athenaio's UnloadAndRead
+// after read-back verification, parquetio when per-file partition
+// info is available, etc.) use this option to populate metadata
+// the optimizer will consume in step 4 / step 6 of the v0.3.0 plan.
+//
+// Nil meta is a no-op — same as not calling the option. Callers
+// that want to explicitly claim "no partitioning" (distinct from
+// "no claim made") pass a non-nil pointer with Columns == nil.
+func WithPartitionMetadata(meta *PartitionMetadata) ScanOption {
+	return func(n *scanFileNode) { n.partitionMeta = meta }
 }
 
 // NewScanNode constructs a leaf plan node representing a deferred I/O
@@ -633,8 +800,9 @@ func (n *emptyNode) Schema() *arrow.Schema {
 	}
 	return n.schema
 }
-func (n *emptyNode) Children() []LogicalPlan { return nil }
-func (n *emptyNode) String() string          { return "Empty" }
+func (n *emptyNode) Children() []LogicalPlan               { return nil }
+func (n *emptyNode) String() string                        { return "Empty" }
+func (n *emptyNode) PartitionMetadata() *PartitionMetadata { return nil }
 
 func (n *scanFileNode) Schema() *arrow.Schema {
 	if n.schema == nil {
@@ -642,8 +810,38 @@ func (n *scanFileNode) Schema() *arrow.Schema {
 	}
 	return n.schema
 }
-func (n *scanFileNode) Children() []LogicalPlan { return nil }
-func (n *scanFileNode) String() string          { return n.label }
+func (n *scanFileNode) Children() []LogicalPlan               { return nil }
+func (n *scanFileNode) String() string                        { return n.label }
+func (n *scanFileNode) PartitionMetadata() *PartitionMetadata { return n.partitionMeta }
+
+// -----------------------------------------------------------------------------
+// partitionAssertionNode: user-provided PartitionMetadata attachment.
+//
+// Runtime-transparent — passes rows and schema through unchanged.
+// Only side effect is overriding the input's PartitionMetadata claim
+// with the assertion. Constructed via LazyFrame.WithPartitionAssertion,
+// which validates the assertion is a narrowing (not a widening) of
+// the input's claim before returning the node.
+//
+// User owns correctness. gobi never verifies the assertion against
+// actual data — the plan takes it on faith.
+// -----------------------------------------------------------------------------
+
+type partitionAssertionNode struct {
+	input     LogicalPlan
+	assertion *PartitionMetadata
+}
+
+func (n *partitionAssertionNode) Schema() *arrow.Schema                 { return n.input.Schema() }
+func (n *partitionAssertionNode) Children() []LogicalPlan               { return []LogicalPlan{n.input} }
+func (n *partitionAssertionNode) PartitionMetadata() *PartitionMetadata { return n.assertion }
+func (n *partitionAssertionNode) String() string {
+	if n.assertion == nil {
+		return "Assert(partition=nil)"
+	}
+	return fmt.Sprintf("Assert(partition: cols=%v hash=%q sort=%v enforced=%v)",
+		n.assertion.Columns, n.assertion.HashFn, n.assertion.SortedBy, n.assertion.SortEnforced)
+}
 
 // -----------------------------------------------------------------------------
 // Helpers

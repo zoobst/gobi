@@ -137,7 +137,7 @@ func frameToBatch(f *Frame) arrow.RecordBatch {
 		arrs[i] = chunks[0]
 		arrs[i].Retain() // NewRecord's contract requires a live ref
 	}
-	return array.NewRecord(schema, arrs, int64(f.NumRows()))
+	return array.NewRecordBatch(schema, arrs, int64(f.NumRows()))
 }
 
 // batchToFrame wraps a RecordBatch as a Frame — inverse of

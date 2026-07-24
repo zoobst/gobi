@@ -34,7 +34,9 @@ type streamingJoinExec struct {
 	outSchema         *arrow.Schema
 
 	built      bool
-	buildFrame *Frame // right side, materialized on first Next
+	buildFrame *Frame              // right side, materialized on first Next
+	rightIndex map[string][]int    // right key → rows, built once and reused
+	rightKeyS  Series              // right's key column, cached for the per-batch join
 	closed     bool
 }
 
@@ -62,7 +64,17 @@ func (e *streamingJoinExec) Next(ctx context.Context) (arrow.RecordBatch, error)
 		if err != nil {
 			return nil, err
 		}
-		joined, err := probeFrame.Join(e.buildFrame, e.leftKey, e.rightKey, e.kind)
+		// Grab the probe's key column each batch (schema is the same
+		// but the column arrays differ per batch); reuse the cached
+		// right index built once in buildIfNeeded so we don't rebuild
+		// the whole right-side hash table per probe batch — the
+		// original bug this exec was accidentally hitting.
+		lKey, err := probeFrame.Column(e.leftKey)
+		if err != nil {
+			return nil, err
+		}
+		joined, err := probeFrame.joinHashRightWithIndex(
+			e.buildFrame, e.leftKey, e.rightKey, lKey, e.rightKeyS, e.kind, e.rightIndex)
 		if err != nil {
 			return nil, err
 		}
@@ -86,6 +98,18 @@ func (e *streamingJoinExec) buildIfNeeded(ctx context.Context) error {
 		return err
 	}
 	e.buildFrame = rf
+	// Build the right-side hash index once here (rather than
+	// per-probe-batch inside the join loop). Big-O drops from
+	// O(right rows × probe batches) to O(right rows + probe rows).
+	rKey, err := rf.Column(e.rightKey)
+	if err != nil {
+		return err
+	}
+	e.rightKeyS = rKey
+	e.rightIndex, err = buildKeyIndex(rKey, rf.NumRows())
+	if err != nil {
+		return err
+	}
 	return nil
 }
 

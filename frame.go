@@ -15,6 +15,12 @@ import (
 type Frame struct {
 	schema *arrow.Schema
 	series []Series
+	// partitionMeta is the partition claim carried through by Collect
+	// when the source plan node attaches one. Consumers like Over.Eval
+	// check this at runtime to decide whether the aligned fast path
+	// applies. Nil = no claim; runtime paths fall through to the
+	// unaligned implementation.
+	partitionMeta *PartitionMetadata
 }
 
 // NewFrame builds a Frame from a schema and a set of arrow columns. The
@@ -52,6 +58,32 @@ func NewFrameFromTable(t arrow.Table) *Frame {
 
 // Schema returns the underlying Arrow schema.
 func (f *Frame) Schema() *arrow.Schema { return f.schema }
+
+// PartitionMetadata returns the partition claim carried through by
+// Collect from the source plan node, or nil if no claim was made.
+// Runtime consumers (Over's aligned fast path, future partition-wise
+// join / GroupBy dispatch) check this to decide whether shuffle-skip
+// optimizations apply.
+//
+// Users constructing Frames via NewFrame get a nil claim by default.
+// The LazyFrame → Collect path attaches whatever the root plan node's
+// PartitionMetadata() reports. Attach explicitly via
+// Frame.WithPartitionMeta for hand-built frames that carry a claim.
+func (f *Frame) PartitionMetadata() *PartitionMetadata { return f.partitionMeta }
+
+// WithPartitionMeta returns f with the given partition claim
+// attached. Used by collectPlan to propagate plan-node metadata
+// onto the emitted Frame; also available for hand-built frames
+// that carry a claim (rare — most callers should compose a
+// LazyFrame + WithPartitionAssertion instead).
+//
+// Returns the same Frame receiver — this is a mutating helper on a
+// value that's already immutable-by-convention, so callers should
+// only call it once immediately after construction.
+func (f *Frame) WithPartitionMeta(meta *PartitionMetadata) *Frame {
+	f.partitionMeta = meta
+	return f
+}
 
 // NumRows returns the number of rows in the frame (0 if there are no
 // columns).

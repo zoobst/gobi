@@ -139,13 +139,23 @@ func (n *overNode) Eval(input *Frame) (Series, error) {
 		partCols[i] = s
 	}
 
+	// Aligned + sorted fast path: if the input Frame carries a
+	// PartitionMetadata claim proving rows are grouped by the
+	// partition columns AND sorted by them (writer-enforced),
+	// same-K rows are guaranteed contiguous. Skip the row →
+	// group-id hash-map build; do a single-pass linear scan
+	// detecting group boundaries and reduce per contiguous run.
+	if overFastPathApplicable(input.PartitionMetadata(), n.partitionCols) {
+		return n.evalContiguous(input, agg, col, partCols)
+	}
+
 	// Build row → group-id + group-id → rows[] in first-seen order.
 	nRows := input.NumRows()
 	rowToGroup := make([]int, nRows)
 	keyToGID := map[string]int{}
 	groupRows := [][]int{}
 	var keyScratch []byte
-	for row := 0; row < nRows; row++ {
+	for row := range nRows {
 		keyScratch = keyScratch[:0]
 		keyScratch, err = composeCompositeKeyInto(keyScratch, partCols, row)
 		if err != nil {
@@ -194,7 +204,7 @@ func (n *overNode) Eval(input *Frame) (Series, error) {
 		return Series{}, fmt.Errorf("Over: %w", err)
 	}
 	defer b.Release()
-	for row := 0; row < nRows; row++ {
+	for row := range nRows {
 		v := groupVals[rowToGroup[row]]
 		if v == nil {
 			b.AppendNull()
@@ -216,6 +226,147 @@ func (n *overNode) String() string {
 	return fmt.Sprintf("%s.over(%v)", n.inner, n.partitionCols)
 }
 
+// overFastPathApplicable reports whether the aligned + sorted fast
+// path is safe to take. Requires all three:
+//
+//  1. `Aligned(meta, partitionCols)` — meta must claim partitioning
+//     on exactly partitionCols (ordered).
+//  2. `meta.SortedBy` starts with partitionCols (a prefix suffices —
+//     sorted by [K, ts] is fine for Over("K") because same-K rows
+//     are still contiguous). Descending flags are ignored: same-K
+//     rows are neighbors either way.
+//  3. `meta.SortEnforced == true` — writer guaranteed the sort. A
+//     hint-only sort would let Over produce silently-wrong results
+//     if the actual data isn't ordered.
+//
+// Any failure falls through to the row→group-id hash-map path,
+// which is correct for any input regardless of metadata claims.
+func overFastPathApplicable(meta *PartitionMetadata, partitionCols []string) bool {
+	if meta == nil || !meta.SortEnforced {
+		return false
+	}
+	if !Aligned(meta, partitionCols) {
+		return false
+	}
+	if len(meta.SortedBy) < len(partitionCols) {
+		return false
+	}
+	for i, c := range partitionCols {
+		if meta.SortedBy[i].Column != c {
+			return false
+		}
+	}
+	return true
+}
+
+// evalContiguous is the aligned + sorted fast path for overNode.
+// Rows are guaranteed contiguous by partition key, so a linear scan
+// detects group boundaries and reduces per contiguous run. Skips the
+// `keyToGID` map, `rowToGroup` index, and `groupRows [][]int`
+// allocations of the general path — the main saving. Correctness
+// hinges on the caller having proven contiguity via
+// overFastPathApplicable before dispatching here.
+func (n *overNode) evalContiguous(input *Frame, agg *scalarAggNode, col Series, partCols []Series) (Series, error) {
+	nRows := input.NumRows()
+
+	// Discover the output type via a throwaway accumulator (cheap;
+	// same call the general path makes per group).
+	protoAcc, err := newAccumulator(Aggregation{Kind: agg.kind, Column: col.Name()})
+	if err != nil {
+		return Series{}, fmt.Errorf("Over: %w", err)
+	}
+	outType := protoAcc.OutputType()
+
+	pool := memory.DefaultAllocator
+	b, err := builderForType(pool, outType)
+	if err != nil {
+		return Series{}, fmt.Errorf("Over: %w", err)
+	}
+	defer b.Release()
+
+	if nRows == 0 {
+		return buildSeries(agg.kind.String()+"_over", outType, b.NewArray()), nil
+	}
+
+	// Reusable row-index buffer for feeding acc.Update. Grown to
+	// max-group-size on the fly; per-group Update takes a slice
+	// view of the first (end-start) entries.
+	rowsBuf := make([]int, 0, nRows)
+
+	// Group-boundary detection via composite-key comparison of
+	// current vs. previous row. Two scratch buffers, swapped each
+	// time we advance across a boundary.
+	curKey := make([]byte, 0, 32)
+	nextKey := make([]byte, 0, 32)
+	curKey, err = composeCompositeKeyInto(curKey, partCols, 0)
+	if err != nil {
+		return Series{}, fmt.Errorf("Over: partition key row 0: %w", err)
+	}
+
+	groupStart := 0
+	// emit reduces rows [groupStart, groupEnd) and appends the
+	// aggregate value to `b` groupEnd-groupStart times.
+	emit := func(groupStart, groupEnd int) error {
+		rowsBuf = rowsBuf[:0]
+		for k := groupStart; k < groupEnd; k++ {
+			rowsBuf = append(rowsBuf, k)
+		}
+		acc, err := newAccumulator(Aggregation{Kind: agg.kind, Column: col.Name()})
+		if err != nil {
+			return fmt.Errorf("Over: %w", err)
+		}
+		if err := acc.Update(col, rowsBuf); err != nil {
+			return fmt.Errorf("Over: group [%d,%d): %w", groupStart, groupEnd, err)
+		}
+		v := acc.Finalize()
+		for k := groupStart; k < groupEnd; k++ {
+			if v == nil {
+				b.AppendNull()
+				continue
+			}
+			if err := appendCustomValue(b, v); err != nil {
+				return fmt.Errorf("Over: emit row %d: %w", k, err)
+			}
+		}
+		return nil
+	}
+
+	for row := 1; row < nRows; row++ {
+		nextKey, err = composeCompositeKeyInto(nextKey[:0], partCols, row)
+		if err != nil {
+			return Series{}, fmt.Errorf("Over: partition key row %d: %w", row, err)
+		}
+		if bytesEqual(curKey, nextKey) {
+			continue
+		}
+		if err := emit(groupStart, row); err != nil {
+			return Series{}, err
+		}
+		groupStart = row
+		curKey, nextKey = nextKey, curKey // swap: cur is now this row's key
+	}
+	// Final group [groupStart, nRows).
+	if err := emit(groupStart, nRows); err != nil {
+		return Series{}, err
+	}
+	return buildSeries(agg.kind.String()+"_over", outType, b.NewArray()), nil
+}
+
+// bytesEqual is a small inline byte-slice equality check. Kept local
+// so the Over fast path doesn't pull in the "bytes" package just for
+// one call site — cheaper for compile time and inline-cost.
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // broadcastScalar builds a length-n Series where every row holds v.
 // nil v produces an all-null series.
 func broadcastScalar(v any, dtype arrow.DataType, n int, name string) (Series, error) {
@@ -225,7 +376,7 @@ func broadcastScalar(v any, dtype arrow.DataType, n int, name string) (Series, e
 		return Series{}, fmt.Errorf("%s broadcast: %w", name, err)
 	}
 	defer b.Release()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if v == nil {
 			b.AppendNull()
 			continue
@@ -236,4 +387,3 @@ func broadcastScalar(v any, dtype arrow.DataType, n int, name string) (Series, e
 	}
 	return buildSeries(name, dtype, b.NewArray()), nil
 }
-

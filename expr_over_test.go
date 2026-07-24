@@ -1,6 +1,7 @@
 package gobi
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -204,6 +205,159 @@ func TestOver_RejectsNonAggregate(t *testing.T) {
 	_, err := f.WithColumnExpr("bad", Col("v").Over("group"))
 	if err == nil {
 		t.Fatal("expected error when Over wraps a non-aggregate expression")
+	}
+}
+
+// sortedOverFrame builds a contiguous-by-group fixture (rows already
+// ordered by "group") with the "aligned + sorted + enforced"
+// PartitionMetadata that overFastPathApplicable requires. Feeds the
+// step-4 fast-path tests + benchmark.
+func sortedOverFrame(t testing.TB, nGroups, rowsPerGroup int) *Frame {
+	t.Helper()
+	pool := memory.DefaultAllocator
+	gb := array.NewStringBuilder(pool)
+	defer gb.Release()
+	vb := array.NewInt64Builder(pool)
+	defer vb.Release()
+
+	nRows := nGroups * rowsPerGroup
+	groupNames := make([]string, nRows)
+	values := make([]int64, nRows)
+	for g := 0; g < nGroups; g++ {
+		name := fmt.Sprintf("g%06d", g)
+		for r := 0; r < rowsPerGroup; r++ {
+			idx := g*rowsPerGroup + r
+			groupNames[idx] = name
+			values[idx] = int64(idx)
+		}
+	}
+	gb.AppendValues(groupNames, nil)
+	vb.AppendValues(values, nil)
+
+	fields := []arrow.Field{
+		{Name: "group", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "v", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+	}
+	schema := arrow.NewSchema(fields, nil)
+	arrs := []arrow.Array{gb.NewArray(), vb.NewArray()}
+	defer func() {
+		for _, a := range arrs {
+			a.Release()
+		}
+	}()
+	cols := []arrow.Column{
+		*arrow.NewColumn(fields[0], arrow.NewChunked(arrs[0].DataType(), []arrow.Array{arrs[0]})),
+		*arrow.NewColumn(fields[1], arrow.NewChunked(arrs[1].DataType(), []arrow.Array{arrs[1]})),
+	}
+	f, err := NewFrame(schema, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// alignedSortedMeta constructs the PartitionMetadata claim that
+// overFastPathApplicable requires: partitioned on ["group"], sorted
+// on ["group"], writer-enforced.
+func alignedSortedMeta() *PartitionMetadata {
+	return &PartitionMetadata{
+		Columns:      []string{"group"},
+		HashFn:       "athenaio/iceberg/murmur3-32/v1",
+		SortedBy:     []SortKey{{Column: "group"}},
+		SortEnforced: true,
+	}
+}
+
+// TestOver_FastPathMatchesSlowPath is the correctness oracle for
+// step 4: the aligned+sorted fast path must produce byte-identical
+// output to the unaligned hash-map path on the same input.
+func TestOver_FastPathMatchesSlowPath(t *testing.T) {
+	// 10 groups × 100 rows, contiguously ordered.
+	f := sortedOverFrame(t, 10, 100)
+
+	// Slow-path baseline: no metadata attached, hash-map path runs.
+	slow, err := f.WithColumnExpr("gsum", Col("v").Sum().Over("group"))
+	if err != nil {
+		t.Fatalf("slow path: %v", err)
+	}
+
+	// Fast path: attach the aligned+sorted claim; overFastPathApplicable
+	// returns true and evalContiguous runs.
+	f.WithPartitionMeta(alignedSortedMeta())
+	fast, err := f.WithColumnExpr("gsum", Col("v").Sum().Over("group"))
+	if err != nil {
+		t.Fatalf("fast path: %v", err)
+	}
+
+	// Rows should match element-wise. AggSum output type is Float64.
+	slowArr := slow.series[2].col.Data().Chunks()[0].(*array.Float64)
+	fastArr := fast.series[2].col.Data().Chunks()[0].(*array.Float64)
+	if slowArr.Len() != fastArr.Len() {
+		t.Fatalf("length divergence: slow=%d fast=%d", slowArr.Len(), fastArr.Len())
+	}
+	for i := 0; i < slowArr.Len(); i++ {
+		if slowArr.Value(i) != fastArr.Value(i) {
+			t.Fatalf("row %d divergence: slow=%v fast=%v", i, slowArr.Value(i), fastArr.Value(i))
+		}
+	}
+}
+
+// TestOver_FastPathRejectsHintOnlySort confirms the fast path does
+// NOT kick in when SortEnforced is false — a hint-only sort could
+// silently produce wrong results if the actual data isn't ordered,
+// so the fast-path guard must reject it.
+func TestOver_FastPathRejectsHintOnlySort(t *testing.T) {
+	meta := alignedSortedMeta()
+	meta.SortEnforced = false
+	if overFastPathApplicable(meta, []string{"group"}) {
+		t.Error("hint-only SortedBy must not activate the fast path")
+	}
+}
+
+// TestOver_FastPathRejectsWrongSortPrefix confirms the fast path
+// requires SortedBy to start with the partition columns. Sorted by
+// [v] (a non-partition column) doesn't make same-group rows
+// contiguous — fast path must reject.
+func TestOver_FastPathRejectsWrongSortPrefix(t *testing.T) {
+	meta := &PartitionMetadata{
+		Columns:      []string{"group"},
+		HashFn:       "athenaio/iceberg/murmur3-32/v1",
+		SortedBy:     []SortKey{{Column: "v"}},
+		SortEnforced: true,
+	}
+	if overFastPathApplicable(meta, []string{"group"}) {
+		t.Error("SortedBy prefix must match partition columns; wrong prefix must reject fast path")
+	}
+}
+
+// BenchmarkOver_UnalignedHashMap measures the current hash-map path
+// on an unaligned input (no PartitionMetadata claim) — the baseline
+// against which the aligned fast path is compared.
+func BenchmarkOver_UnalignedHashMap(b *testing.B) {
+	f := sortedOverFrame(b, 100, 1000) // 100 groups × 1000 rows = 100k rows
+	expr := Col("v").Sum().Over("group")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := f.WithColumnExpr("gsum", expr)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkOver_AlignedFastPath measures the same workload with an
+// attached aligned+sorted+enforced claim, activating the linear-scan
+// fast path.
+func BenchmarkOver_AlignedFastPath(b *testing.B) {
+	f := sortedOverFrame(b, 100, 1000)
+	f.WithPartitionMeta(alignedSortedMeta())
+	expr := Col("v").Sum().Over("group")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := f.WithColumnExpr("gsum", expr)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

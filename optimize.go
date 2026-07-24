@@ -153,6 +153,12 @@ func mapExprs(p LogicalPlan, fn func(Expr) Expr) LogicalPlan {
 			return p
 		}
 		return newDropNode(newInput, n.name)
+	case *partitionAssertionNode:
+		newInput = mapExprs(n.input, fn)
+		if newInput == n.input {
+			return p
+		}
+		return &partitionAssertionNode{input: newInput, assertion: n.assertion}
 	case *scanFrameNode, *scanFileNode:
 		return p
 	}
@@ -913,6 +919,11 @@ func walkRewrite(p LogicalPlan, visit func(LogicalPlan) (LogicalPlan, bool)) (Lo
 		newIn := rewriteChild(n.input)
 		if newIn != n.input {
 			rebuilt = newDropNode(newIn, n.name)
+		}
+	case *partitionAssertionNode:
+		newIn := rewriteChild(n.input)
+		if newIn != n.input {
+			rebuilt = &partitionAssertionNode{input: newIn, assertion: n.assertion}
 		}
 	}
 	if rebuilt == nil {

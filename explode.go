@@ -58,7 +58,7 @@ func (f *Frame) explodeGeometry(s Series, geomCol string) (*Frame, error) {
 			return nil, fmt.Errorf("%w: geometry column not Binary (%T)",
 				ErrColumnTypeMismatch, chunk)
 		}
-		for i := 0; i < bin.Len(); i++ {
+		for i := range bin.Len() {
 			if bin.IsNull(i) {
 				parentIdx = append(parentIdx, rowIdx)
 				componentB.AppendNull()

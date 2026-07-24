@@ -154,6 +154,58 @@ func (lf *LazyFrame) Schema() *arrow.Schema {
 	return lf.plan.Schema()
 }
 
+// PartitionMetadata returns the partition claim on this LazyFrame's
+// output, or nil if no claim has been made. The claim is derived
+// from the root plan node — scan sources populate it at
+// construction time (see NewScanNode's WithPartitionMetadata
+// option), intermediate nodes propagate it via rules landing in
+// step 2 of the v0.3.0 plan.
+//
+// Consumers of this method today are primarily test code and
+// debugging; the alignment predicate that decides whether
+// .Over(K) / Join(K) / GroupBy(K) can skip shuffle lands in step
+// 3-4 of the v0.3.0 plan. Users composing hand-annotated claims
+// go through LazyFrame.WithPartitionAssertion (step 3).
+func (lf *LazyFrame) PartitionMetadata() *PartitionMetadata {
+	return lf.plan.PartitionMetadata()
+}
+
+// WithPartitionAssertion attaches user-provided PartitionMetadata to
+// the LazyFrame. Enables partition-aware operators (.Over(K), future
+// partition-wise Join / GroupBy) on sources whose partitioning can't
+// be inferred automatically — RawUnload / RawCTAS in athenaio,
+// hand-crafted parquet scans, custom UDFs that write partitioned
+// output.
+//
+// Only narrowing is allowed. The assertion must:
+//   - Match the input's Columns exactly (can't change what's
+//     partitioned on).
+//   - Match the input's HashFn exactly (can't change hash function).
+//   - Provide a SortedBy that's a (possibly empty) prefix of the
+//     input's SortedBy. A writer that enforced [a, b, c] as a lex
+//     sort also enforced [a, b] as a prefix, so shorter prefixes are
+//     narrowings; different columns or reorderings are not.
+//   - Downgrade SortEnforced from true to false, or leave it. It may
+//     not upgrade false → true (that would be a stronger claim than
+//     the source made).
+//
+// Nil input claim → any assertion allowed (opaque source, user owns
+// the whole claim). Nil assertion → always allowed (narrows any
+// claim to "no claim").
+//
+// User owns correctness. gobi never verifies the assertion against
+// actual data. A wrong assertion produces wrong window results with
+// no visible error.
+func (lf *LazyFrame) WithPartitionAssertion(assertion *PartitionMetadata) (*LazyFrame, error) {
+	if err := validateAssertion(lf.plan.PartitionMetadata(), assertion); err != nil {
+		return nil, err
+	}
+	return NewLazyFrame(&partitionAssertionNode{
+		input:     lf.plan,
+		assertion: assertion,
+	}), nil
+}
+
 // Explain returns a human-readable representation of the plan tree.
 // Deepest node first (which is how the tree evaluates: bottom-up).
 // Handy for debugging what a chain of fluent methods actually built.
@@ -229,7 +281,26 @@ func (lf *LazyFrame) ExplainOptimized() string {
 	return sb.String()
 }
 
+// collectPlan is the recursive CollectRaw walker. It attaches each
+// plan node's PartitionMetadata to the emitted Frame so downstream
+// consumers (Over's aligned fast path, future partition-wise
+// operators) can see the claim at expression-eval time. The primary
+// Collect path goes through Compile+Execute and threads metadata via
+// each executor op's inputMeta field (see withColumnExecOp) — this
+// wrapper covers the CollectRaw / debug-benchmark path with the same
+// contract.
 func collectPlan(p LogicalPlan) (*Frame, error) {
+	f, err := collectPlanRaw(p)
+	if err != nil {
+		return nil, err
+	}
+	if f != nil {
+		f.WithPartitionMeta(p.PartitionMetadata())
+	}
+	return f, nil
+}
+
+func collectPlanRaw(p LogicalPlan) (*Frame, error) {
 	switch n := p.(type) {
 	case *scanFrameNode:
 		return n.frame, nil
@@ -311,6 +382,10 @@ func collectPlan(p LogicalPlan) (*Frame, error) {
 		return n.read()
 	case *emptyNode:
 		return emptyFrame(n.Schema())
+	case *partitionAssertionNode:
+		// Runtime-transparent — the assertion only affects
+		// PartitionMetadata; row-level output equals the input.
+		return collectPlan(n.input)
 	}
 	return nil, fmt.Errorf("gobi: collectPlan: unknown node %T", p)
 }

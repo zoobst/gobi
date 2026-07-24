@@ -1,11 +1,14 @@
 package parquetio_test
 
 import (
+	"bytes"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/zoobst/gobi"
 	"github.com/zoobst/gobi/csvio"
 	"github.com/zoobst/gobi/geometry"
 	"github.com/zoobst/gobi/parquetio"
@@ -116,5 +119,82 @@ func testRoundTrip(t *testing.T, codec parquetio.Codec) {
 	}
 	if _, ok := g.(geometry.Point); !ok {
 		t.Fatalf("expected Point, got %T", g)
+	}
+}
+
+// TestReadReader confirms the io.ReaderAt-backed entrypoint reads a
+// Parquet payload identically to ReadFile. Writes to a file, slurps
+// the bytes, feeds them back via bytes.Reader (which satisfies
+// io.ReaderAt). Same round-trip contract as TestWriteRead_RoundTrip_*.
+//
+// This is the code path athenaio T1 will exercise via s3.GetObject's
+// io.ReaderAt-shaped output — the test uses bytes.Reader as a stand-in
+// so it can run in CI without touching AWS.
+func TestReadReader(t *testing.T) {
+	df, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.ReadOptions{CRSHint: 4326})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "cities.parquet")
+	if err := parquetio.WriteFile(df, path, &parquetio.WriteOptions{Codec: parquetio.CodecSnappy}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := parquetio.ReadReader(bytes.NewReader(buf), int64(len(buf)), nil)
+	if err != nil {
+		t.Fatalf("ReadReader: %v", err)
+	}
+	if rows, cols := loaded.Shape(); rows != 3 || cols != 3 {
+		t.Fatalf("shape got (%d, %d), want (3, 3)", rows, cols)
+	}
+	// Geo metadata should survive the reader-based path just like the
+	// path-based one — the file-level KeyValueMetadata is read from
+	// the parquet footer regardless of source.
+	g, err := loaded.Geometry("geometry", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := g.(geometry.Point); !ok {
+		t.Fatalf("expected Point, got %T", g)
+	}
+}
+
+// TestReadReaderChunksFunc confirms the streaming reader-based path
+// behaves like ReadFileChunksFunc — batches arrive, fn is called per
+// batch, error propagation works.
+func TestReadReaderChunksFunc(t *testing.T) {
+	df, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.ReadOptions{CRSHint: 4326})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "cities.parquet")
+	if err := parquetio.WriteFile(df, path, &parquetio.WriteOptions{Codec: parquetio.CodecSnappy}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var totalRows int64
+	err = parquetio.ReadReaderChunksFunc(
+		bytes.NewReader(buf),
+		int64(len(buf)),
+		nil,
+		func(f *gobi.Frame) error {
+			r, _ := f.Shape()
+			totalRows += int64(r)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("ReadReaderChunksFunc: %v", err)
+	}
+	if totalRows != 3 {
+		t.Errorf("streamed row count = %d, want 3", totalRows)
 	}
 }

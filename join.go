@@ -89,7 +89,22 @@ func (f *Frame) joinHashRight(right *Frame, leftKey, rightKey string,
 	if err != nil {
 		return nil, err
 	}
+	return f.joinHashRightWithIndex(right, leftKey, rightKey, lKey, rKey, kind, rightIndex)
+}
 
+// joinHashRightWithIndex is the index-agnostic core of joinHashRight,
+// exposed for callers that build the right-side index once and reuse
+// it across many probe frames — streamingJoinExec is the primary
+// consumer (its Next-per-batch used to rebuild the index every call,
+// costing O(right rows × probe batches) instead of O(right rows +
+// probe batches × left row work)).
+//
+// Not exported outside the package; the streaming path and Frame.Join
+// share this helper, but external callers stick to Frame.Join, which
+// still builds the index internally on each call.
+func (f *Frame) joinHashRightWithIndex(right *Frame, leftKey, rightKey string,
+	lKey, rKey Series, kind JoinType, rightIndex map[string][]int,
+) (*Frame, error) {
 	// Track which right rows have been matched so JoinFull can emit
 	// unmatched right rows afterwards.
 	var rightMatched []bool
