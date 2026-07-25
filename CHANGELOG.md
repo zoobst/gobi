@@ -5,6 +5,34 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.5]
+
+### Added
+
+- **`gobi.Coalesce(exprs ...Expr) — SQL-style first-non-null.`**
+  Variadic. Per row, returns the first operand whose value is non-
+  null; if every operand is null at a given row, the output is null.
+  All operands must produce the same arrow type — no automatic
+  widening; cast explicitly or match `Lit` types. Zero operands
+  errors; a single operand is a passthrough. Not short-circuit: every
+  operand is evaluated in full (`gobi.If` splits pipelines if that
+  matters). Supports primitives + `List<T>` (list values are copied
+  per-row via `copyRowValue`, which walks the offsets and reuses
+  `appendArrayValueAt` for elements). Polars parity: `coalesce()`.
+- **`gobi.LitEmptyList(elemType arrow.DataType)` — empty-list
+  literal.** Companion to `LitNull` for the "coalesce list-null to
+  empty-list" pattern. Broadcasts a non-null zero-length list of the
+  given element type to every input row. Distinct from
+  `LitNull(ListOf(elemType))`, which produces null-list rows —
+  `LitEmptyList` produces non-null empty rows. Enables the full-
+  outer-join + `ListUnion` shape without a Go-side merge:
+
+  ```go
+  segSafe  := gobi.Coalesce(gobi.Col("seg_providers"),  gobi.LitEmptyList(arrow.BinaryTypes.String))
+  pingSafe := gobi.Coalesce(gobi.Col("ping_providers"), gobi.LitEmptyList(arrow.BinaryTypes.String))
+  merged   := segSafe.ListUnion(pingSafe)
+  ```
+
 ## [v0.2.4]
 
 ### Added

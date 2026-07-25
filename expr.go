@@ -104,6 +104,22 @@ func LitNull(dtype arrow.DataType) Expr {
 	return Expr{node: &literalNullNode{dtype: dtype}}
 }
 
+// LitEmptyList returns an expression that broadcasts a non-null empty
+// list of the given element type to every input row. Companion to
+// LitNull for the "coalesce null-list to empty-list" pattern that
+// makes ListUnion usable across a full outer join:
+//
+//	segSafe  := gobi.Coalesce(gobi.Col("seg_providers"),  gobi.LitEmptyList(arrow.BinaryTypes.String))
+//	pingSafe := gobi.Coalesce(gobi.Col("ping_providers"), gobi.LitEmptyList(arrow.BinaryTypes.String))
+//	merged   := segSafe.ListUnion(pingSafe)
+//
+// LitNull(ListOf(t)) produces all-NULL lists per row; LitEmptyList(t)
+// produces all-non-null empty lists per row. Different — the latter
+// gets ListUnion past its null-propagation gate.
+func LitEmptyList(elemType arrow.DataType) Expr {
+	return Expr{node: &literalEmptyListNode{elemType: elemType}}
+}
+
 // -----------------------------------------------------------------------------
 // Fluent combinators
 // -----------------------------------------------------------------------------

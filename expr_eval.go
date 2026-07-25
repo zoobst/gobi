@@ -122,6 +122,38 @@ func (n *literalNullNode) Type(_ *arrow.Schema) (arrow.DataType, error) {
 func (n *literalNullNode) Children() []Expr { return nil }
 func (n *literalNullNode) String() string   { return fmt.Sprintf("lit_null(%s)", n.dtype) }
 
+// literalEmptyListNode broadcasts a non-null empty list of the given
+// element type to every input row. Distinct from LitNull(ListOf(t)),
+// which produces null-list rows. Built via gobi.LitEmptyList(elemType).
+type literalEmptyListNode struct {
+	elemType arrow.DataType
+}
+
+func (n *literalEmptyListNode) Eval(input *Frame) (Series, error) {
+	if n.elemType == nil {
+		return Series{}, fmt.Errorf("gobi: LitEmptyList with nil element type")
+	}
+	pool := memory.DefaultAllocator
+	lb := array.NewListBuilder(pool, n.elemType)
+	defer lb.Release()
+	for range input.NumRows() {
+		lb.Append(true) // non-null, zero elements — the value builder gets nothing.
+	}
+	return arrayToSeries(pool, "lit_empty_list", arrow.ListOf(n.elemType), lb.NewArray())
+}
+
+func (n *literalEmptyListNode) Type(_ *arrow.Schema) (arrow.DataType, error) {
+	if n.elemType == nil {
+		return nil, fmt.Errorf("gobi: LitEmptyList with nil element type")
+	}
+	return arrow.ListOf(n.elemType), nil
+}
+
+func (n *literalEmptyListNode) Children() []Expr { return nil }
+func (n *literalEmptyListNode) String() string {
+	return fmt.Sprintf("lit_empty_list(%s)", n.elemType)
+}
+
 // asFloat64 extracts a float64 from a literal that could be int32/int64/
 // float32/float64. Used to hit the *Scalar fast paths on Series, which
 // speak float64.
