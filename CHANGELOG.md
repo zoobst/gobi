@@ -5,7 +5,28 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
-## [v0.2.5]
+## [v0.2.6]
+
+### Fixed
+
+- **`Frame.Join` now carries `List<T>` columns across.** Previously
+  any join whose payload included a `List<T>` (String / Int64 /
+  Uint64 / ...) errored with
+  `ErrColumnTypeMismatch: join not implemented for list<...>` (for
+  Left/Right/Full) or `take not implemented for %T` (for Inner). The
+  three take-family helpers — `takeArrayFast` (single-chunk),
+  `takeArraySlow` (multi-chunk), and `takeArrayWithNulls` (unmatched-
+  side null-emit for outer joins) — gained a `LIST` case that copies
+  each row via a new shared `appendListRowFromArray` helper. Null
+  lists are preserved; `-1` unmatched-side indexes emit a null list.
+  Also fixes any pipeline that Explodes a Frame with a companion
+  `List<T>` column (Explode's `takeArray` call now works too).
+
+  Nested `List<List<T>>` and `List<Struct<...>>` fall through
+  `appendArrayValueAt`'s primitive-only element dispatch and surface
+  a clear error — noted as a follow-up.
+
+## [v0.2.5] — 2026-07-25
 
 ### Added
 

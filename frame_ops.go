@@ -275,6 +275,16 @@ func takeArrayFast(pool memory.Allocator, chunk arrow.Array, indexes []int) (arr
 			b.Append(a.Value(idx))
 		}
 		return b.NewArray(), nil
+	case *array.List:
+		lt := a.DataType().(*arrow.ListType)
+		lb := array.NewListBuilder(pool, lt.Elem())
+		defer lb.Release()
+		for _, idx := range indexes {
+			if err := appendListRowFromArray(lb, a, idx); err != nil {
+				return nil, err
+			}
+		}
+		return lb.NewArray(), nil
 	}
 	return nil, fmt.Errorf("%w: take not implemented for %T", ErrColumnTypeMismatch, chunk)
 }
@@ -346,6 +356,27 @@ func takeArraySlow(pool memory.Allocator, s Series, indexes []int) (arrow.Array,
 			}
 		}
 		return b.NewArray(), nil
+	case arrow.LIST:
+		lt := dt.(*arrow.ListType)
+		lb := array.NewListBuilder(pool, lt.Elem())
+		defer lb.Release()
+		chunks := s.col.Data().Chunks()
+		for _, idx := range indexes {
+			chunk, local, ok := locateRowInChunks(chunks, idx)
+			if !ok {
+				return nil, fmt.Errorf("%w: list row %d unreachable",
+					ErrRowOutOfRange, idx)
+			}
+			la, ok := chunk.(*array.List)
+			if !ok {
+				return nil, fmt.Errorf("%w: list chunk not *array.List (%T)",
+					ErrColumnTypeMismatch, chunk)
+			}
+			if err := appendListRowFromArray(lb, la, local); err != nil {
+				return nil, err
+			}
+		}
+		return lb.NewArray(), nil
 	default:
 		return nil, fmt.Errorf("%w: take not implemented for %s",
 			ErrColumnTypeMismatch, dt)

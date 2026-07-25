@@ -248,3 +248,33 @@ func appendArrayValueAt(b array.Builder, arr arrow.Array, idx int) error {
 	}
 	return nil
 }
+
+// appendListRowFromArray copies the list at src[idx] into dst,
+// preserving null lists (via AppendNull on the outer builder) and null
+// elements (via AppendNull on the inner value builder). Used by the
+// take-family helpers to carry `List<T>` columns through Explode /
+// Join / Take without losing the list shape.
+//
+// Deep-nested lists (List<List<T>>, List<Struct<...>>) fall through
+// appendArrayValueAt's primitive-only dispatch and surface an error
+// at the element-copy step — noted as a follow-up.
+func appendListRowFromArray(dst *array.ListBuilder, src *array.List, idx int) error {
+	if src.IsNull(idx) {
+		dst.AppendNull()
+		return nil
+	}
+	dst.Append(true)
+	start, end := src.ValueOffsets(idx)
+	values := src.ListValues()
+	inner := dst.ValueBuilder()
+	for j := int(start); j < int(end); j++ {
+		if values.IsNull(j) {
+			inner.AppendNull()
+			continue
+		}
+		if err := appendArrayValueAt(inner, values, j); err != nil {
+			return fmt.Errorf("appendListRowFromArray elem %d: %w", j, err)
+		}
+	}
+	return nil
+}
