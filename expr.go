@@ -84,9 +84,24 @@ func Col(name string) Expr {
 //	string              → String
 //
 // Other Go types return an Expr whose Eval reports a type-inference
-// error.
+// error. For a typed-null literal (e.g. a null-of-type-String column),
+// use LitNull.
 func Lit(v any) Expr {
 	return Expr{node: newLiteralNode(v)}
+}
+
+// LitNull returns an expression that broadcasts a null value of the
+// given arrow type to every input row. Useful for filling a column
+// with typed nulls (e.g. when unioning two branches where one side
+// legitimately lacks a value):
+//
+//	pings.WithColumn("provider", gobi.LitNull(arrow.BinaryTypes.String))
+//
+// The type must be one that builderForType supports (every primitive
+// gobi handles today plus List / Struct). Passing an unsupported type
+// surfaces the error at Eval, not at construction.
+func LitNull(dtype arrow.DataType) Expr {
+	return Expr{node: &literalNullNode{dtype: dtype}}
 }
 
 // -----------------------------------------------------------------------------

@@ -225,6 +225,20 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 			},
 		}, nil
 
+	case *renameNode:
+		// Rename is schema-only — a per-batch relabel, no buffering
+		// required. Streams like Filter / Project / Drop.
+		child, err := Compile(n.input)
+		if err != nil {
+			return nil, err
+		}
+		return &renameExecOp{
+			input:     child,
+			old:       n.old,
+			new:       n.new,
+			outSchema: n.Schema(),
+		}, nil
+
 	case *partitionAssertionNode:
 		// Assertion is a metadata-only wrapper — compile the input
 		// directly, no executor node needed. The metadata claim is
@@ -236,12 +250,17 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 }
 
 // allBuiltInAggs reports whether every Aggregation uses a built-in
-// Kind (no custom Fn). The streaming hash aggregate only supports
-// built-ins; custom aggregators need the whole row set at once and
+// Kind (no custom Fn) AND has no per-agg Filter. The streaming hash
+// aggregate only supports the plain built-in case; custom aggregators
+// need the whole row set at once, and filtered aggregations need the
+// whole row set to apply the filter before per-group dispatch — both
 // fall back to the materializing path.
 func allBuiltInAggs(aggs []Aggregation) bool {
 	for _, a := range aggs {
 		if a.Fn != nil {
+			return false
+		}
+		if a.Filter.node != nil {
 			return false
 		}
 	}

@@ -75,6 +75,19 @@ type Aggregation struct {
 	Kind   AggKind
 	Alias  string
 	Fn     Aggregator
+	// Filter is an optional predicate expression. When non-zero
+	// (Filter.node != nil), only rows where Filter evaluates to
+	// TRUE (non-null) participate in this aggregation. Different
+	// aggregations in the same Agg call may carry different
+	// filters — each is applied independently to that agg's row
+	// set. Polars-parity `pl.col("x").sum().filter(cond)`.
+	//
+	// Filtered aggregations currently route through the eager
+	// GroupBy.Agg path (the streaming aggregate rejects them via
+	// allBuiltInAggs, forcing the materializing fallback). This
+	// keeps the streaming hot path unchanged for filter-free
+	// workloads.
+	Filter Expr
 }
 
 // Aggregator is a user-defined aggregation function called once per
@@ -267,14 +280,28 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 	}
 	defer releaseBuilders(aggBuilders)
 
+	// Precompute per-agg filter masks. nil entry = no filter, all rows
+	// participate; non-nil entry = Boolean bitmap, only rows where
+	// mask[i] is true & non-null participate in that agg.
+	filterMasks, err := precomputeFilterMasks(g.frame, aggs)
+	if err != nil {
+		return nil, err
+	}
+
 	// For each group, emit keys + aggregations.
+	filteredRows := make([]int, 0)
 	for _, gk := range order {
 		rows := groups[gk]
 		if err := appendKeyRow(keyBuilders, g.keys, rows[0]); err != nil {
 			return nil, err
 		}
 		for i, a := range aggs {
-			if err := g.appendAgg(aggBuilders[i], a, rows); err != nil {
+			toAgg := rows
+			if filterMasks[i] != nil {
+				toAgg = applyFilterMask(rows, filterMasks[i], filteredRows[:0])
+				filteredRows = toAgg
+			}
+			if err := g.appendAgg(aggBuilders[i], a, toAgg); err != nil {
 				return nil, err
 			}
 		}
@@ -606,6 +633,66 @@ func appendCustomStructValue(b *array.StructBuilder, v any) error {
 		}
 	}
 	return nil
+}
+
+// precomputeFilterMasks evaluates each Aggregation's Filter expression
+// once against f and returns a slice of []bool masks (nil entry = no
+// filter, all rows participate). The mask is length f.NumRows(): true
+// = keep row for this agg, false = skip. Null filter results are
+// treated as false (SQL FILTER (WHERE cond) semantics).
+//
+// One eval per unique filter would deduplicate common predicates, but
+// most pipelines have a small number of distinct filters and the
+// bookkeeping overhead outweighs the win. Straight per-agg eval is
+// simple and correct.
+func precomputeFilterMasks(f *Frame, aggs []Aggregation) ([][]bool, error) {
+	masks := make([][]bool, len(aggs))
+	for i, a := range aggs {
+		if a.Filter.node == nil {
+			continue
+		}
+		s, err := a.Filter.node.Eval(f)
+		if err != nil {
+			return nil, fmt.Errorf("agg %d filter: %w", i, err)
+		}
+		if s.DataType().ID() != arrow.BOOL {
+			return nil, fmt.Errorf("agg %d filter must be Boolean, got %s",
+				i, s.DataType())
+		}
+		mask := make([]bool, f.NumRows())
+		idx := 0
+		for _, chunk := range s.col.Data().Chunks() {
+			ba, ok := chunk.(*array.Boolean)
+			if !ok {
+				return nil, fmt.Errorf("agg %d filter chunk not Boolean (%T)",
+					i, chunk)
+			}
+			for j := range ba.Len() {
+				if ba.IsNull(j) {
+					// SQL FILTER: null cond → treated as false.
+					continue
+				}
+				if ba.Value(j) {
+					mask[idx+j] = true
+				}
+			}
+			idx += ba.Len()
+		}
+		masks[i] = mask
+	}
+	return masks, nil
+}
+
+// applyFilterMask returns a slice containing the rows from `rows`
+// where `mask[row]` is true. The caller passes a reusable dst slice
+// to amortize allocations across many groups.
+func applyFilterMask(rows []int, mask []bool, dst []int) []int {
+	for _, r := range rows {
+		if mask[r] {
+			dst = append(dst, r)
+		}
+	}
+	return dst
 }
 
 func (g *GroupBy) rowKey(row int) (string, error) {

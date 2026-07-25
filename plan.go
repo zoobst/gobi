@@ -570,6 +570,65 @@ func (n *dropNode) PartitionMetadata() *PartitionMetadata {
 func (n *dropNode) String() string { return fmt.Sprintf("Drop(%q)", n.name) }
 
 // -----------------------------------------------------------------------------
+// renameNode: input schema with one field's name changed.
+// -----------------------------------------------------------------------------
+
+type renameNode struct {
+	input     LogicalPlan
+	old, new  string
+	outSchema *arrow.Schema
+}
+
+func newRenameNode(input LogicalPlan, old, new string) *renameNode {
+	inSchema := input.Schema()
+	oldFields := inSchema.Fields()
+	newFields := make([]arrow.Field, len(oldFields))
+	for i, f := range oldFields {
+		newFields[i] = f
+		if f.Name == old {
+			newFields[i].Name = new
+		}
+	}
+	return &renameNode{
+		input:     input,
+		old:       old,
+		new:       new,
+		outSchema: arrow.NewSchema(newFields, schemaMetadataPtr(inSchema)),
+	}
+}
+
+func (n *renameNode) Schema() *arrow.Schema   { return n.outSchema }
+func (n *renameNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
+func (n *renameNode) String() string {
+	return fmt.Sprintf("Rename(%q → %q)", n.old, n.new)
+}
+
+// Rename preserves rows exactly; only a schema field label changes.
+// If the renamed column is a partition column, we need to rewrite
+// PartitionMetadata.Columns to reflect the new name — the alignment
+// predicate compares by column name, so the claim must move with it.
+// Same for SortedBy entries. Non-partition renames pass metadata
+// through unchanged.
+func (n *renameNode) PartitionMetadata() *PartitionMetadata {
+	in := n.input.PartitionMetadata()
+	if in == nil {
+		return nil
+	}
+	out := in.Clone()
+	for i, c := range out.Columns {
+		if c == n.old {
+			out.Columns[i] = n.new
+		}
+	}
+	for i, k := range out.SortedBy {
+		if k.Column == n.old {
+			out.SortedBy[i].Column = n.new
+		}
+	}
+	return out
+}
+
+// -----------------------------------------------------------------------------
 // tailNode: keep last n rows. Schema unchanged; row count resolved at
 // Collect() since intermediate plan stages don't know their row count.
 // -----------------------------------------------------------------------------

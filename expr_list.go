@@ -798,3 +798,210 @@ func reduceFloatRow(b array.Builder, kind listAggKind, getter func(int) float64,
 	}
 	return nil
 }
+
+// -----------------------------------------------------------------------------
+// ListUnion — per-row deduplicated union of two List<T> columns.
+// -----------------------------------------------------------------------------
+
+// ListUnion returns an expression that unions each row's list with the
+// corresponding row of other's list, deduplicating elements. Both e
+// and other must be List<T> columns with the same element type.
+//
+// Order semantics: first-seen order preserved. Elements from e come
+// first (in their order), then any new elements from other in their
+// order.
+//
+// Null semantics: null elements inside a list are skipped. A null
+// list itself (either side) makes the whole row null — polars /
+// Spark array_union parity. Users who want "treat null as empty set"
+// should wrap with a coalesce-to-empty step upstream.
+//
+// Polars parity: pl.col("a").list.set_union(pl.col("b")).
+// Spark parity: array_union(a, b).
+func (e Expr) ListUnion(other Expr) Expr {
+	return Expr{node: &listUnionNode{left: e.node, right: other.node}}
+}
+
+type listUnionNode struct {
+	left, right ExprNode
+}
+
+func (n *listUnionNode) Eval(input *Frame) (Series, error) {
+	if n.left == nil || n.right == nil {
+		return Series{}, fmt.Errorf("gobi: ListUnion with nil inner")
+	}
+	ls, err := n.left.Eval(input)
+	if err != nil {
+		return Series{}, fmt.Errorf("ListUnion.left: %w", err)
+	}
+	rs, err := n.right.Eval(input)
+	if err != nil {
+		return Series{}, fmt.Errorf("ListUnion.right: %w", err)
+	}
+	llt, ok := ls.DataType().(*arrow.ListType)
+	if !ok {
+		return Series{}, fmt.Errorf("%w: ListUnion.left requires List column, got %s",
+			ErrExprTypeMismatch, ls.DataType())
+	}
+	rlt, ok := rs.DataType().(*arrow.ListType)
+	if !ok {
+		return Series{}, fmt.Errorf("%w: ListUnion.right requires List column, got %s",
+			ErrExprTypeMismatch, rs.DataType())
+	}
+	if !arrow.TypeEqual(llt.Elem(), rlt.Elem()) {
+		return Series{}, fmt.Errorf("%w: ListUnion element-type mismatch (%s vs %s)",
+			ErrExprTypeMismatch, llt.Elem(), rlt.Elem())
+	}
+	if ls.Len() != rs.Len() {
+		return Series{}, fmt.Errorf("ListUnion length mismatch (%d vs %d)",
+			ls.Len(), rs.Len())
+	}
+
+	// Assume single-chunk on each side (matches every other list op in
+	// this file). Multi-chunk lockstep alignment is possible but adds
+	// complexity for negligible real-world value — lists rarely span
+	// chunk boundaries after normal ops.
+	lChunks := ls.col.Data().Chunks()
+	rChunks := rs.col.Data().Chunks()
+	if len(lChunks) != 1 || len(rChunks) != 1 {
+		return Series{}, fmt.Errorf("ListUnion: multi-chunk lists not yet supported")
+	}
+	la, ok := lChunks[0].(*array.List)
+	if !ok {
+		return Series{}, fmt.Errorf("ListUnion.left chunk not *array.List (%T)", lChunks[0])
+	}
+	ra, ok := rChunks[0].(*array.List)
+	if !ok {
+		return Series{}, fmt.Errorf("ListUnion.right chunk not *array.List (%T)", rChunks[0])
+	}
+	lVals := la.ListValues()
+	rVals := ra.ListValues()
+
+	pool := memory.DefaultAllocator
+	lb := array.NewListBuilder(pool, llt.Elem())
+	defer lb.Release()
+	inner := lb.ValueBuilder()
+
+	for i := range la.Len() {
+		if la.IsNull(i) || ra.IsNull(i) {
+			lb.AppendNull()
+			continue
+		}
+		lb.Append(true)
+		seen := make(map[any]struct{})
+		lStart, lEnd := la.ValueOffsets(i)
+		for j := int(lStart); j < int(lEnd); j++ {
+			if lVals.IsNull(j) {
+				continue
+			}
+			v, err := arrayScalarAt(lVals, j)
+			if err != nil {
+				return Series{}, fmt.Errorf("ListUnion.left elem: %w", err)
+			}
+			if _, dup := seen[v]; dup {
+				continue
+			}
+			seen[v] = struct{}{}
+			if err := appendArrayValueAt(inner, lVals, j); err != nil {
+				return Series{}, fmt.Errorf("ListUnion emit left: %w", err)
+			}
+		}
+		rStart, rEnd := ra.ValueOffsets(i)
+		for j := int(rStart); j < int(rEnd); j++ {
+			if rVals.IsNull(j) {
+				continue
+			}
+			v, err := arrayScalarAt(rVals, j)
+			if err != nil {
+				return Series{}, fmt.Errorf("ListUnion.right elem: %w", err)
+			}
+			if _, dup := seen[v]; dup {
+				continue
+			}
+			seen[v] = struct{}{}
+			if err := appendArrayValueAt(inner, rVals, j); err != nil {
+				return Series{}, fmt.Errorf("ListUnion emit right: %w", err)
+			}
+		}
+	}
+	return buildSeries("list_union", arrow.ListOf(llt.Elem()), lb.NewArray()), nil
+}
+
+func (n *listUnionNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
+	lt, err := n.left.Type(schema)
+	if err != nil {
+		return nil, err
+	}
+	rt, err := n.right.Type(schema)
+	if err != nil {
+		return nil, err
+	}
+	if lt == nil || rt == nil {
+		return nil, nil
+	}
+	llt, ok := lt.(*arrow.ListType)
+	if !ok {
+		return nil, fmt.Errorf("%w: ListUnion.left requires List column, got %s",
+			ErrExprTypeMismatch, lt)
+	}
+	rlt, ok := rt.(*arrow.ListType)
+	if !ok {
+		return nil, fmt.Errorf("%w: ListUnion.right requires List column, got %s",
+			ErrExprTypeMismatch, rt)
+	}
+	if !arrow.TypeEqual(llt.Elem(), rlt.Elem()) {
+		return nil, fmt.Errorf("%w: ListUnion element-type mismatch (%s vs %s)",
+			ErrExprTypeMismatch, llt.Elem(), rlt.Elem())
+	}
+	return lt, nil
+}
+
+func (n *listUnionNode) Children() []Expr {
+	return []Expr{{node: n.left}, {node: n.right}}
+}
+
+func (n *listUnionNode) String() string {
+	return fmt.Sprintf("list_union(%s, %s)", n.left, n.right)
+}
+
+// arrayScalarAt is arrayScalarAt's Array-level counterpart of
+// readScalarAt. Returns the value at arr[idx] as a Go-typed any, or
+// nil if the position is null. Supported element types match the ones
+// listContainsNode / listUnionNode dedup on: comparable primitives
+// (String, Int/Uint variants, Float variants, Bool, Timestamp).
+func arrayScalarAt(arr arrow.Array, idx int) (any, error) {
+	if arr.IsNull(idx) {
+		return nil, nil
+	}
+	switch a := arr.(type) {
+	case *array.String:
+		return a.Value(idx), nil
+	case *array.LargeString:
+		return a.Value(idx), nil
+	case *array.Boolean:
+		return a.Value(idx), nil
+	case *array.Int64:
+		return a.Value(idx), nil
+	case *array.Int32:
+		return a.Value(idx), nil
+	case *array.Int16:
+		return a.Value(idx), nil
+	case *array.Int8:
+		return a.Value(idx), nil
+	case *array.Uint64:
+		return a.Value(idx), nil
+	case *array.Uint32:
+		return a.Value(idx), nil
+	case *array.Uint16:
+		return a.Value(idx), nil
+	case *array.Uint8:
+		return a.Value(idx), nil
+	case *array.Float64:
+		return a.Value(idx), nil
+	case *array.Float32:
+		return a.Value(idx), nil
+	case *array.Timestamp:
+		return a.Value(idx), nil
+	}
+	return nil, fmt.Errorf("unsupported list element type %T", arr)
+}

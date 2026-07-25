@@ -41,6 +41,12 @@ func (g *GroupBy) aggFast(aggs []Aggregation) (*Frame, bool, error) {
 		if a.Fn != nil {
 			return nil, false, nil
 		}
+		if a.Filter.node != nil {
+			// Filtered aggs need per-row mask lookup; the numeric
+			// fast path doesn't carry that plumbing. Fall back to the
+			// general appendAgg path.
+			return nil, false, nil
+		}
 		switch a.Kind {
 		case AggFirst, AggLast, AggNUnique:
 			return nil, false, nil

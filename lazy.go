@@ -70,6 +70,32 @@ func (lf *LazyFrame) Select(exprs ...Expr) *LazyFrame {
 	return &LazyFrame{plan: newProjectNode(lf.plan, exprs)}
 }
 
+// SelectCols is a name-based shorthand for Select — picks the given
+// columns from the input plan, in the given order. Equivalent to
+// Select(Col(names[0]), Col(names[1]), ...).
+//
+// Also handles column reordering: SelectCols("b", "a") returns a
+// LazyFrame whose output has "b" before "a". Missing columns surface
+// at Collect() (colRefNode's Eval reports the not-found error).
+func (lf *LazyFrame) SelectCols(names ...string) *LazyFrame {
+	exprs := make([]Expr, len(names))
+	for i, n := range names {
+		exprs[i] = Col(n)
+	}
+	return lf.Select(exprs...)
+}
+
+// Rename appends a Rename step that changes the column named old to
+// new, preserving column order and buffers. Missing old surfaces
+// ErrColumnNotFound at Collect(). Same-name rename (old == new) is a
+// no-op.
+func (lf *LazyFrame) Rename(old, new string) *LazyFrame {
+	if old == new {
+		return lf
+	}
+	return &LazyFrame{plan: newRenameNode(lf.plan, old, new)}
+}
+
 // WithColumn appends a WithColumn node. If a column named name
 // already exists at this point in the plan, it will be replaced;
 // otherwise the new column is appended.
@@ -396,6 +422,12 @@ func collectPlanRaw(p LogicalPlan) (*Frame, error) {
 			return nil, err
 		}
 		return f.Explode(n.name)
+	case *renameNode:
+		f, err := collectPlan(n.input)
+		if err != nil {
+			return nil, err
+		}
+		return f.Rename(n.old, n.new)
 	case *scanFileNode:
 		if n.read == nil {
 			return nil, fmt.Errorf("gobi: scanFileNode has no read function")

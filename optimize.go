@@ -159,6 +159,12 @@ func mapExprs(p LogicalPlan, fn func(Expr) Expr) LogicalPlan {
 			return p
 		}
 		return newExplodeNode(newInput, n.name)
+	case *renameNode:
+		newInput = mapExprs(n.input, fn)
+		if newInput == n.input {
+			return p
+		}
+		return newRenameNode(newInput, n.old, n.new)
 	case *partitionAssertionNode:
 		newInput = mapExprs(n.input, fn)
 		if newInput == n.input {
@@ -682,6 +688,20 @@ func pushProjection(p LogicalPlan, neededOut map[string]struct{}) (LogicalPlan, 
 		}
 		return newExplodeNode(newIn, n.name), true
 
+	case *renameNode:
+		// Rename maps `new` at this level back to `old` in the child.
+		// If neededOut contains n.new, the child needs n.old instead.
+		child := copyColSet(neededOut)
+		if _, wantsNew := child[n.new]; wantsNew {
+			delete(child, n.new)
+			child[n.old] = struct{}{}
+		}
+		newIn, changed := pushProjection(n.input, child)
+		if !changed {
+			return p, false
+		}
+		return newRenameNode(newIn, n.old, n.new), true
+
 	case *limitNode:
 		newIn, changed := pushProjection(n.input, neededOut)
 		if !changed {
@@ -846,6 +866,10 @@ func (r *cascadeEmptyRule) Apply(p LogicalPlan) (LogicalPlan, bool) {
 			if _, ok := n.input.(*emptyNode); ok {
 				return &emptyNode{schema: n.Schema()}, true
 			}
+		case *renameNode:
+			if _, ok := n.input.(*emptyNode); ok {
+				return &emptyNode{schema: n.Schema()}, true
+			}
 		case *joinNode:
 			_, leftEmpty := n.input.(*emptyNode)
 			_, rightEmpty := n.right.(*emptyNode)
@@ -946,6 +970,11 @@ func walkRewrite(p LogicalPlan, visit func(LogicalPlan) (LogicalPlan, bool)) (Lo
 		newIn := rewriteChild(n.input)
 		if newIn != n.input {
 			rebuilt = newExplodeNode(newIn, n.name)
+		}
+	case *renameNode:
+		newIn := rewriteChild(n.input)
+		if newIn != n.input {
+			rebuilt = newRenameNode(newIn, n.old, n.new)
 		}
 	case *partitionAssertionNode:
 		newIn := rewriteChild(n.input)

@@ -5,7 +5,112 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
-## [v0.2.3]
+## [v0.2.4]
+
+### Added
+
+- **`gobi.LitNull(dtype)` — typed-null literal.** Broadcasts a
+  null of the given arrow type to every input row. Complements
+  `Lit(v)` for the case where the value is null but a specific
+  type is required (e.g. filling a `List<String>`-shaped column on
+  one branch of a union). Works with any type `builderForType`
+  supports (all primitives, List, Struct).
+- **`LazyFrame.SelectCols(names ...string)` + `Frame.SelectCols(names ...string)`.**
+  Name-based Select shorthand — equivalent to
+  `Select(Col(n0), Col(n1), ...)` on the lazy side, a fresh Frame
+  with reordered columns on the eager side. Handles column
+  reordering as a side effect (output order = argument order).
+  Missing columns error with `ErrColumnNotFound`.
+- **`LazyFrame.Rename(old, new)` + `Frame.Rename(old, new)`.**
+  Single-op column rename that preserves column position and
+  buffers (schema field's Name changes; arrow arrays are shared
+  via ref-count). `LazyFrame.Rename` compiles to a streaming
+  `renameExecOp` — per-batch relabel, no buffering. `renameNode`
+  in the plan tree carries partition metadata across the rename:
+  if the renamed column is a partition column, `PartitionMetadata.Columns`
+  and `SortedBy` entries are rewritten to the new name so alignment
+  proofs stay valid. Same-name rename (old == new) is a no-op that
+  returns the receiver.
+- **Filtered aggregation — `Aggregation.Filter Expr` field.** Optional
+  per-agg predicate; when set, only rows where the filter evaluates
+  to TRUE (non-null) participate in that aggregation. Different aggs
+  in the same `Agg` call may carry different filters — each is
+  applied independently. SQL FILTER (WHERE cond) semantics: null cond
+  → row excluded. Polars parity:
+  `pl.col("x").sum().filter(pl.col("source") == "seg")`.
+
+  Filtered aggregations route through the eager `GroupBy.Agg` path
+  today. `allBuiltInAggs` treats a Filter-having agg as "not built-
+  in", so `LazyFrame.Collect()` falls back to the materializing
+  executor — the streaming hash-aggregate hot path stays unchanged
+  for filter-free workloads. Both the general and aligned linear-
+  scan paths honor filters via a precomputed per-agg `[]bool` mask.
+  `aggFast` (single-primitive-key path) bails when any agg has a
+  filter — falls through to the general path.
+- **Typed row extraction on `Series`.** Ergonomic accessors that
+  copy a Series' values into a fresh `[]T` Go slice without needing
+  to walk arrow chunks by hand:
+  - `Series.Int64s()` / `Int32s()` / `Uint64s()` / `Uint32s()`
+  - `Series.Float64s()` / `Float32s()`
+  - `Series.Strings()` (String + LargeString)
+  - `Series.Bools()`
+  - `Series.Timestamps()` (returns `[]arrow.Timestamp`)
+  - `Series.Nulls()` — parallel `[]bool` mask (true = null); pair
+    with any value extractor to distinguish arrow-null from a
+    zero-valued row.
+
+  Errors on arrow-type mismatch (`ErrColumnTypeMismatch`). Returned
+  slices own their memory — safe to mutate, safe to hold past the
+  source Frame's `Release`. Walks multi-chunk sources internally.
+  Sits between the raw arrow chunk API (fast but needs walking +
+  type-asserting each Series) and `ToStructs[T]` (which needs a
+  matching Go struct).
+- **`Expr.ListUnion(other)` — per-row deduplicated list union.**
+  Both sides must be `List<T>` with the same element type; row `i`'s
+  output is the union of left[i] and right[i] with duplicates removed,
+  preserving first-seen order (left elements first, then any new
+  elements from right). Nulls inside a list are skipped; a null list
+  itself propagates (null on either side → null output). Enables the
+  "join two aggregated sets and combine them" pattern in-plan —
+  combines with `NewStringSetAggregator` / `NewInt64SetAggregator`
+  outputs to produce cross-branch distinct sets without a Go-side
+  merge step. Polars `list.set_union` / Spark `array_union` parity.
+- **`gobi.If(cond, a, b)` — SQL CASE-WHEN expression.** Package-level
+  constructor that evaluates to `a` where `cond` is true, `b` where
+  false, and null where `cond` itself is null (SQL semantics — users
+  can wrap `cond` in `.IsNotNull().And(cond)` to force false-on-null).
+  `cond` must be Boolean; `a` and `b` must have identical arrow
+  output types — no automatic numeric widening in v1 (cast explicitly
+  or match Lit types). Chains for nested else-if:
+
+  ```go
+  gobi.If(cond1, valA,
+      gobi.If(cond2, valB, valC))
+  ```
+
+  Composes with `IsNull` / `IsNotNull` for mean-fill / null-fallback
+  patterns. Not short-circuit — all three subtrees are evaluated in
+  full; split into filtered pipelines if that matters.
+- **Built-in distinct-set aggregators — `List<T>` collect_set.**
+  Ready-to-use `Aggregator` factories for the common "give me the set
+  of distinct X per group" pattern, matching polars `.list.unique()`
+  / Spark `collect_set(x)`:
+  - `NewStringSetAggregator()` → `List<String>`
+  - `NewInt64SetAggregator()`  → `List<Int64>`
+  - `NewInt32SetAggregator()`  → `List<Int32>`
+  - `NewUint64SetAggregator()` → `List<Uint64>` (h3 cell-id shape)
+  - `NewUint32SetAggregator()` → `List<Uint32>`
+
+  Passed via `Aggregation{Column: "x", Fn: gobi.NewStringSetAggregator(), Alias: "..."}`.
+  Per-group output is deduplicated and sorted (stable, equality-
+  friendly). Nulls are skipped. `Merge` combines peer sets as a union
+  (used by future parallel/window paths). All variants share a
+  generic `setAggregator[T]` under the hood; adding a new type is a
+  ~15-line constructor. Adding this ships the aggregator layer that
+  `appendCustomListValue`'s typed-slice dispatch (v0.2.1) was
+  originally built to support.
+
+## [v0.2.3] — 2026-07-25
 
 ### Added
 

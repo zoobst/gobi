@@ -88,6 +88,40 @@ func (n *literalNode) String() string {
 	return fmt.Sprintf("lit(%v)", n.value)
 }
 
+// literalNullNode broadcasts a typed null to every input row. Kept
+// separate from literalNode because null literals need explicit type
+// info at construction time (a Go nil has no arrow-shaped type). Users
+// build these via gobi.LitNull(dtype).
+type literalNullNode struct {
+	dtype arrow.DataType
+}
+
+func (n *literalNullNode) Eval(input *Frame) (Series, error) {
+	if n.dtype == nil {
+		return Series{}, fmt.Errorf("gobi: LitNull with nil dtype")
+	}
+	pool := memory.DefaultAllocator
+	b, err := builderForType(pool, n.dtype)
+	if err != nil {
+		return Series{}, fmt.Errorf("LitNull: %w", err)
+	}
+	defer b.Release()
+	for range input.NumRows() {
+		b.AppendNull()
+	}
+	return arrayToSeries(pool, "lit_null", n.dtype, b.NewArray())
+}
+
+func (n *literalNullNode) Type(_ *arrow.Schema) (arrow.DataType, error) {
+	if n.dtype == nil {
+		return nil, fmt.Errorf("gobi: LitNull with nil dtype")
+	}
+	return n.dtype, nil
+}
+
+func (n *literalNullNode) Children() []Expr { return nil }
+func (n *literalNullNode) String() string   { return fmt.Sprintf("lit_null(%s)", n.dtype) }
+
 // asFloat64 extracts a float64 from a literal that could be int32/int64/
 // float32/float64. Used to hit the *Scalar fast paths on Series, which
 // speak float64.

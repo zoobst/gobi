@@ -211,6 +211,41 @@ func (e *dropExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 func (e *dropExecOp) Close() error { return e.input.Close() }
 
 // -----------------------------------------------------------------------------
+// renameExec: relabels one column per batch. Streaming — pass-through
+// batch with a rebuilt schema; underlying arrow arrays unchanged.
+// -----------------------------------------------------------------------------
+
+type renameExecOp struct {
+	input     ExecOperator
+	old, new  string
+	outSchema *arrow.Schema
+}
+
+func (e *renameExecOp) Schema() *arrow.Schema { return e.outSchema }
+
+func (e *renameExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	batch, err := e.input.Next(ctx)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := batchToFrame(batch)
+	batch.Release()
+	if err != nil {
+		return nil, err
+	}
+	out, err := frame.Rename(e.old, e.new)
+	if err != nil {
+		return nil, err
+	}
+	return frameToBatch(out), nil
+}
+
+func (e *renameExecOp) Close() error { return e.input.Close() }
+
+// -----------------------------------------------------------------------------
 // limitExec: caps the total row count across batches, short-circuits
 // its upstream once satisfied.
 // -----------------------------------------------------------------------------

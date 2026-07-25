@@ -332,3 +332,85 @@ func (f *Frame) DropColumn(name string) (*Frame, error) {
 func carryColumn(existing Series) Series {
 	return NewSeries(arrow.NewColumn(existing.col.Field(), existing.col.Data()))
 }
+
+// Rename returns a new Frame with the column named old renamed to new.
+// Column order and buffers are preserved (the underlying arrow arrays
+// are shared via ref-count; only the arrow.Field's Name changes).
+//
+// Returns ErrColumnNotFound if old doesn't exist. If new already
+// exists on the Frame under a different index, the returned Frame has
+// two columns with the same name — usually an error at downstream
+// operators. Callers who want swap-safety should DropColumn(new)
+// first.
+func (f *Frame) Rename(old, new string) (*Frame, error) {
+	if old == new {
+		return f, nil
+	}
+	oldIdx := -1
+	for i, s := range f.series {
+		if s.name == old {
+			oldIdx = i
+			break
+		}
+	}
+	if oldIdx < 0 {
+		return nil, fmt.Errorf("%w: %q", ErrColumnNotFound, old)
+	}
+
+	oldFields := f.schema.Fields()
+	newFields := make([]arrow.Field, len(oldFields))
+	newSeries := make([]Series, len(f.series))
+	for i, existing := range f.series {
+		if i == oldIdx {
+			renamed := oldFields[i]
+			renamed.Name = new
+			newFields[i] = renamed
+			newCol := arrow.NewColumn(renamed, existing.col.Data())
+			newSeries[i] = NewSeries(newCol)
+			continue
+		}
+		newFields[i] = oldFields[i]
+		newSeries[i] = carryColumn(existing)
+	}
+	var md *arrow.Metadata
+	if f.schema.HasMetadata() {
+		m := f.schema.Metadata()
+		md = &m
+	}
+	return &Frame{schema: arrow.NewSchema(newFields, md), series: newSeries}, nil
+}
+
+// SelectCols returns a Frame containing only the named columns, in the
+// given order. Buffers are shared with the source Frame — the returned
+// Frame owns its own field/schema structure but the underlying arrow
+// arrays are ref-counted.
+//
+// Also handles reordering: SelectCols("b", "a") returns a Frame whose
+// output has "b" before "a". Zero names produce an empty Frame with
+// the same row count and no columns. Missing columns error with
+// ErrColumnNotFound.
+func (f *Frame) SelectCols(names ...string) (*Frame, error) {
+	newFields := make([]arrow.Field, len(names))
+	newSeries := make([]Series, len(names))
+	oldFields := f.schema.Fields()
+	for i, name := range names {
+		idx := -1
+		for j, s := range f.series {
+			if s.name == name {
+				idx = j
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("%w: %q", ErrColumnNotFound, name)
+		}
+		newFields[i] = oldFields[idx]
+		newSeries[i] = carryColumn(f.series[idx])
+	}
+	var md *arrow.Metadata
+	if f.schema.HasMetadata() {
+		m := f.schema.Metadata()
+		md = &m
+	}
+	return &Frame{schema: arrow.NewSchema(newFields, md), series: newSeries}, nil
+}

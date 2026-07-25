@@ -82,6 +82,12 @@ func (g *GroupBy) aggAligned(aggs []Aggregation) (*Frame, error) {
 		return g.assembleOutput(keyBuilders, aggBuilders, aggFields)
 	}
 
+	// Precompute per-agg filter masks (nil entry = no filter).
+	filterMasks, err := precomputeFilterMasks(frame, aggs)
+	if err != nil {
+		return nil, err
+	}
+
 	// Group-boundary detection: composite-key comparison of
 	// consecutive rows via two scratch buffers, swapped whenever we
 	// cross a boundary.
@@ -95,6 +101,8 @@ func (g *GroupBy) aggAligned(aggs []Aggregation) (*Frame, error) {
 	// Reusable per-group row-index buffer. Slice-view semantics —
 	// each emit call takes rowsBuf[:0..end-start].
 	rowsBuf := make([]int, 0, 64)
+	// Reusable scratch for per-agg filtered subset.
+	filteredBuf := make([]int, 0, 64)
 
 	// emit reduces rows [start, end) as a single group and appends
 	// its key row + aggregation values to the output builders.
@@ -107,7 +115,12 @@ func (g *GroupBy) aggAligned(aggs []Aggregation) (*Frame, error) {
 			return err
 		}
 		for i, a := range aggs {
-			if err := g.appendAgg(aggBuilders[i], a, rowsBuf); err != nil {
+			toAgg := rowsBuf
+			if filterMasks[i] != nil {
+				toAgg = applyFilterMask(rowsBuf, filterMasks[i], filteredBuf[:0])
+				filteredBuf = toAgg
+			}
+			if err := g.appendAgg(aggBuilders[i], a, toAgg); err != nil {
 				return err
 			}
 		}
