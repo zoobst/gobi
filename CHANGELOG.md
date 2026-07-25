@@ -5,6 +5,92 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.2]
+
+### Added
+
+- **Shape-preserving `.Over(K)` + `Expr.OverOrdered(cols, keys...)`.**
+  `.Over(...)` now accepts shape-preserving inner expressions
+  (`Shift`, arithmetic chains, custom row-order-preserving
+  ExprNodes) in addition to the existing scalar aggregate shape.
+  The inner is evaluated separately on each partition's mini-Frame
+  and scattered back to original row positions — input row order is
+  preserved (polars-parity). `OverOrdered(partitionCols, orderBy...)`
+  is the ordered-window variant: rows within each partition are
+  sorted by `orderBy` (stable, per-key `Descending`, nulls-last)
+  before the inner runs, so
+  `Col("v").Shift(1).OverOrdered([]string{"K"}, SortKey{Column: "t"})`
+  gives the previous `v` within each `K` ordered by `t`. Aligned
+  fast path fires when `PartitionMetadata` proves both contiguity
+  and matching within-partition sort (columns + `Descending` flags)
+  — skips the hash-bucket build and the per-partition sort. Scalar-
+  aggregate Over is unchanged; `orderBy` is silently ignored on
+  order-invariant aggregates (Sum / Mean / Min / Max / Count).
+
+### Changed
+
+- **`Expr.Over(K)` with a non-aggregate inner no longer errors.**
+  Previously `Col("v").Over("K")` (or any chain whose immediate
+  inner wasn't `*scalarAggNode`) failed with
+  `ErrExprTypeMismatch: Over requires a scalar aggregate`.
+  It now dispatches to the shape-preserving path. Downstream users
+  who relied on the error to catch mistyped expressions should
+  switch to explicit type checks or reject in a lint layer — the
+  eval-time gate is no longer available.
+
+## [v0.2.1]
+
+### Added
+
+- **`LazyFrame.Explode(col)`.** Exposes the eager `Frame.Explode`
+  through the lazy plan surface. Same semantics — geometry columns
+  expand multi-part geometries to their constituents; `List<T>`
+  columns expand one row per element (empty and null lists both
+  produce a single output row with a null element, polars-parity);
+  non-exploded columns duplicate across the expansion. Plan-time
+  schema propagates the list element type so downstream lazy
+  operators see the post-explode column shape. Partition metadata
+  drops `SortedBy` unconditionally (row cardinality changes), drops
+  the whole claim if the exploded column is itself a partition
+  column. Wired through the optimizer walkers, `CascadeEmpty`, and
+  the projection-pushdown rule; the executor compiles it via
+  `materializeExecOp` since the WKB-decode / element-scatter needs
+  the whole batch at hand.
+- **`Expr.Shift(n)`.** First-class expression wrapper around
+  `Series.Shift` — positive `n` shifts forward (lag), negative
+  shifts back (lead). Composes with `WithColumn` / `Select` and
+  other Expr combinators (e.g.
+  `Col("price").Sub(Col("price").Shift(1))` for period-over-period
+  deltas). Works on any column type `Series.Shift` supports
+  (numeric, string, timestamp, ...). Per-group shifts via `.Over(K)`
+  don't chain in v0.2.1 — see v0.2.2 where the shape-preserving
+  Over lands.
+
+### Fixed
+
+- **`AggCount` on non-numeric hashable columns.** The eager
+  `GroupBy.Agg` path called `Series.numericAt` in the AggCount
+  branch, which rejects UINT64 / UINT32 / STRING / TIMESTAMP (and any
+  other type outside the numeric shortlist). Counting non-null values
+  in those columns produced `ErrNotNumeric`. Now routes through
+  `isNullAtSeries`, so AggCount works on any hashable column type.
+  The streaming executor's `countAcc` already had a fallback for this
+  case, so `LazyFrame.Collect()` was unaffected — the bug hit only the
+  eager `Frame.GroupBy(...).Agg(...)` path.
+- **Custom aggregators returning `List<T>` or `Struct<...>`.**
+  `builderForType` has supported `arrow.LIST` and `arrow.STRUCT`
+  since Track 1a and Track 4 (respectively), but `appendCustomValue`
+  had no matching dispatch arm — every custom Aggregator declaring
+  one of those output types crashed at emit time with
+  `"unhandled builder type *array.ListBuilder"` (or `*array.StructBuilder`).
+  Added `appendCustomListValue` (accepts typed slices — `[]string`,
+  `[]int64`, `[]float64`, `[]bool`, `[]uint64`, ... — plus `[]any`
+  for heterogeneous elements) and `appendCustomStructValue` (accepts
+  `[]any` of positional field values, dispatched recursively through
+  `appendCustomValue`). Unblocks patterns like "distinct providers
+  per group as `List<String>`" and "summary struct per group as
+  `Struct<Count, First>`".
+
 ## [v0.2.0]
 
 ### Added
@@ -62,30 +148,6 @@ introduce breaking changes; check this file when upgrading.
   round-trips. Same options/geo-metadata/predicate-pushdown surface
   as the path-based API. Internal refactor: `openReader` split into
   path-based + reader-based paths that share `openReaderFromRS`.
-- **`LazyFrame.Explode(col)`.** Exposes the eager `Frame.Explode`
-  through the lazy plan surface. Same semantics — geometry columns
-  expand multi-part geometries to their constituents; `List<T>`
-  columns expand one row per element (empty and null lists both
-  produce a single output row with a null element, polars-parity);
-  non-exploded columns duplicate across the expansion. Plan-time
-  schema propagates the list element type so downstream lazy
-  operators see the post-explode column shape. Partition metadata
-  drops `SortedBy` unconditionally (row cardinality changes), drops
-  the whole claim if the exploded column is itself a partition
-  column. Wired through the optimizer walkers, `CascadeEmpty`, and
-  the projection-pushdown rule; the executor compiles it via
-  `materializeExecOp` since the WKB-decode / element-scatter needs
-  the whole batch at hand.
-- **`Expr.Shift(n)`.** First-class expression wrapper around
-  `Series.Shift` — positive `n` shifts forward (lag), negative
-  shifts back (lead). Composes with `WithColumn` / `Select` and
-  other Expr combinators (e.g.
-  `Col("price").Sub(Col("price").Shift(1))` for period-over-period
-  deltas). Works on any column type `Series.Shift` supports
-  (numeric, string, timestamp, ...). Per-group shifts via `.Over(K)`
-  remain out of scope for v0.2 — Over still requires a scalar
-  aggregate as its immediate inner (see the Track 3 note on
-  ordered-partition windows).
 
 ### Changed
 
@@ -97,31 +159,6 @@ introduce breaking changes; check this file when upgrading.
   executor never invokes Merge). Aggregator implementations must also
   reset internal state at the start of Aggregate; the eager engine
   reuses a single instance across every group.
-
-### Fixed
-
-- **`AggCount` on non-numeric hashable columns.** The eager
-  `GroupBy.Agg` path called `Series.numericAt` in the AggCount
-  branch, which rejects UINT64 / UINT32 / STRING / TIMESTAMP (and any
-  other type outside the numeric shortlist). Counting non-null values
-  in those columns produced `ErrNotNumeric`. Now routes through
-  `isNullAtSeries`, so AggCount works on any hashable column type.
-  The streaming executor's `countAcc` already had a fallback for this
-  case, so `LazyFrame.Collect()` was unaffected — the bug hit only the
-  eager `Frame.GroupBy(...).Agg(...)` path.
-- **Custom aggregators returning `List<T>` or `Struct<...>`.**
-  `builderForType` has supported `arrow.LIST` and `arrow.STRUCT`
-  since Track 1a and Track 4 (respectively), but `appendCustomValue`
-  had no matching dispatch arm — every custom Aggregator declaring
-  one of those output types crashed at emit time with
-  `"unhandled builder type *array.ListBuilder"` (or `*array.StructBuilder`).
-  Added `appendCustomListValue` (accepts typed slices — `[]string`,
-  `[]int64`, `[]float64`, `[]bool`, `[]uint64`, ... — plus `[]any`
-  for heterogeneous elements) and `appendCustomStructValue` (accepts
-  `[]any` of positional field values, dispatched recursively through
-  `appendCustomValue`). Unblocks patterns like "distinct providers
-  per group as `List<String>`" and "summary struct per group as
-  `Struct<Count, First>`".
 
 ### Performance
 

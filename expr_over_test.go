@@ -199,12 +199,24 @@ func TestOver_MultiKeyPartition(t *testing.T) {
 	}
 }
 
-func TestOver_RejectsNonAggregate(t *testing.T) {
+func TestOver_ShapePreservingInner(t *testing.T) {
 	f := overFrame(t)
-	// Col("v").Over(...) skips the aggregate — should error.
-	_, err := f.WithColumnExpr("bad", Col("v").Over("group"))
-	if err == nil {
-		t.Fatal("expected error when Over wraps a non-aggregate expression")
+	// Col("v").Over("group") is shape-preserving: each partition
+	// gets its own mini-Frame evaluated, output row-count matches
+	// input. With Col("v") as the inner, per-partition eval just
+	// echoes v back — so the output equals the input v column
+	// (input row order preserved on scatter-back).
+	out, err := f.WithColumnExpr("v_echo", Col("v").Over("group"))
+	if err != nil {
+		t.Fatalf("shape-preserving Over: %v", err)
+	}
+	echoS, _ := out.Column("v_echo")
+	arr := echoS.col.Data().Chunks()[0].(*array.Int64)
+	want := []int64{1, 2, 10, 3, 20, 100}
+	for i, w := range want {
+		if arr.Value(i) != w {
+			t.Errorf("row %d v_echo = %d, want %d", i, arr.Value(i), w)
+		}
 	}
 }
 
