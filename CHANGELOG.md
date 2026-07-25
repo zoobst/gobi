@@ -5,6 +5,19 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.3]
+
+### Added
+
+- **`Expr.IsNull()` / `Expr.IsNotNull()`.** Return a Boolean
+  expression that's true where the inner evaluates to null / non-
+  null. Output is never itself null. Composes with `And` / `Or` /
+  `Not` and works anywhere an Expr does — `Filter` predicates,
+  `WithColumn` derived columns, `Select` projections. Default
+  output name via `Namer` is `<inner>_is_null` /
+  `<inner>_is_not_null` when the inner has a stable name (e.g.
+  `Col("x").IsNull()` → `x_is_null`).
+
 ## [v0.2.2]
 
 ### Added
