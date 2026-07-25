@@ -160,3 +160,68 @@ func TestGroupBy_NoAggregations(t *testing.T) {
 		t.Fatalf("shape: (%d, %d), want (3, 1)", r, c)
 	}
 }
+
+// TestGroupBy_CountOnUint64Column — AggCount on a non-numeric-shortlist
+// column (Uint64 here) must count non-null rows without erroring. The
+// eager engine used to call numericAt for the per-row check, which
+// rejects UINT64; the fix routes through isNullAtSeries so any
+// hashable column type works.
+func TestGroupBy_CountOnUint64Column(t *testing.T) {
+	pool := memory.DefaultAllocator
+	region := array.NewStringBuilder(pool)
+	defer region.Release()
+	region.AppendValues([]string{"NA", "NA", "EU", "EU", "NA"}, nil)
+
+	gridB := array.NewUint64Builder(pool)
+	defer gridB.Release()
+	// One null in the middle to prove non-null counting works.
+	gridB.Append(100)
+	gridB.Append(200)
+	gridB.AppendNull()
+	gridB.Append(400)
+	gridB.Append(500)
+
+	fields := []arrow.Field{
+		{Name: "region", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "grid_path", Type: arrow.PrimitiveTypes.Uint64, Nullable: true},
+	}
+	schema := arrow.NewSchema(fields, nil)
+	arrays := []arrow.Array{region.NewArray(), gridB.NewArray()}
+	defer func() {
+		for _, a := range arrays {
+			a.Release()
+		}
+	}()
+	cols := make([]arrow.Column, len(fields))
+	for i, a := range arrays {
+		cols[i] = *arrow.NewColumn(fields[i], arrow.NewChunked(a.DataType(), []arrow.Array{a}))
+	}
+	f, err := NewFrame(schema, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gb, err := f.GroupBy("region")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := gb.Agg(Aggregation{Column: "grid_path", Kind: AggCount, Alias: "n"})
+	if err != nil {
+		t.Fatalf("AggCount on Uint64 failed: %v", err)
+	}
+
+	// regions: NA, NA, EU, EU, NA. grid_path: 100, 200, null, 400, 500.
+	// EU rows have one non-null (400) → count = 1. NA rows are all
+	// non-null (100, 200, 500) → count = 3.
+	regions, _ := out.Column("region")
+	rArr := regions.col.Data().Chunks()[0].(*array.String)
+	counts, _ := out.Column("n")
+	cArr := counts.col.Data().Chunks()[0].(*array.Int64)
+	// Sorted alphabetically: EU, NA
+	if rArr.Value(0) != "EU" || cArr.Value(0) != 1 {
+		t.Fatalf("EU count = %d, want 1 (one non-null)", cArr.Value(0))
+	}
+	if rArr.Value(1) != "NA" || cArr.Value(1) != 3 {
+		t.Fatalf("NA count = %d, want 3", cArr.Value(1))
+	}
+}

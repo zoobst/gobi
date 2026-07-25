@@ -452,8 +452,158 @@ func appendCustomValue(b array.Builder, v any) error {
 			return fmt.Errorf("value %T does not match declared Timestamp", v)
 		}
 		tb.Append(x)
+	case *array.ListBuilder:
+		return appendCustomListValue(tb, v)
+	case *array.StructBuilder:
+		return appendCustomStructValue(tb, v)
 	default:
 		return fmt.Errorf("unhandled builder type %T", b)
+	}
+	return nil
+}
+
+// appendCustomListValue writes one List<T> row from a Go value into b.
+// Accepts common typed slices ([]string, []int64, []float64, ...) plus
+// a generic []any that recurses through appendCustomValue for each
+// element. nil slice or nil any → null list. Length-zero non-nil slice
+// → empty-but-non-null list.
+func appendCustomListValue(b *array.ListBuilder, v any) error {
+	inner := b.ValueBuilder()
+	switch xs := v.(type) {
+	case []string:
+		if xs == nil {
+			b.AppendNull()
+			return nil
+		}
+		b.Append(true)
+		for i, s := range xs {
+			if err := appendCustomValue(inner, s); err != nil {
+				return fmt.Errorf("list elem %d: %w", i, err)
+			}
+		}
+		return nil
+	case []bool:
+		if xs == nil {
+			b.AppendNull()
+			return nil
+		}
+		b.Append(true)
+		for i, x := range xs {
+			if err := appendCustomValue(inner, x); err != nil {
+				return fmt.Errorf("list elem %d: %w", i, err)
+			}
+		}
+		return nil
+	case []int64:
+		if xs == nil {
+			b.AppendNull()
+			return nil
+		}
+		b.Append(true)
+		for i, x := range xs {
+			if err := appendCustomValue(inner, x); err != nil {
+				return fmt.Errorf("list elem %d: %w", i, err)
+			}
+		}
+		return nil
+	case []int32:
+		if xs == nil {
+			b.AppendNull()
+			return nil
+		}
+		b.Append(true)
+		for i, x := range xs {
+			if err := appendCustomValue(inner, x); err != nil {
+				return fmt.Errorf("list elem %d: %w", i, err)
+			}
+		}
+		return nil
+	case []uint64:
+		if xs == nil {
+			b.AppendNull()
+			return nil
+		}
+		b.Append(true)
+		for i, x := range xs {
+			if err := appendCustomValue(inner, x); err != nil {
+				return fmt.Errorf("list elem %d: %w", i, err)
+			}
+		}
+		return nil
+	case []uint32:
+		if xs == nil {
+			b.AppendNull()
+			return nil
+		}
+		b.Append(true)
+		for i, x := range xs {
+			if err := appendCustomValue(inner, x); err != nil {
+				return fmt.Errorf("list elem %d: %w", i, err)
+			}
+		}
+		return nil
+	case []float64:
+		if xs == nil {
+			b.AppendNull()
+			return nil
+		}
+		b.Append(true)
+		for i, x := range xs {
+			if err := appendCustomValue(inner, x); err != nil {
+				return fmt.Errorf("list elem %d: %w", i, err)
+			}
+		}
+		return nil
+	case []float32:
+		if xs == nil {
+			b.AppendNull()
+			return nil
+		}
+		b.Append(true)
+		for i, x := range xs {
+			if err := appendCustomValue(inner, x); err != nil {
+				return fmt.Errorf("list elem %d: %w", i, err)
+			}
+		}
+		return nil
+	case []any:
+		if xs == nil {
+			b.AppendNull()
+			return nil
+		}
+		b.Append(true)
+		for i, x := range xs {
+			if err := appendCustomValue(inner, x); err != nil {
+				return fmt.Errorf("list elem %d: %w", i, err)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("value %T does not match declared List (want typed slice or []any)", v)
+}
+
+// appendCustomStructValue writes one struct row from a []any of
+// positional field values into b. Length must match the struct type's
+// field count. nil → null struct. Each field is dispatched through
+// appendCustomValue with the field's own builder — nested lists,
+// structs, and primitives are all supported.
+func appendCustomStructValue(b *array.StructBuilder, v any) error {
+	xs, ok := v.([]any)
+	if !ok {
+		return fmt.Errorf("value %T does not match declared Struct (want []any positional)", v)
+	}
+	st, ok := b.Type().(*arrow.StructType)
+	if !ok {
+		return fmt.Errorf("struct builder has non-struct type %T", b.Type())
+	}
+	if len(xs) != st.NumFields() {
+		return fmt.Errorf("struct value has %d fields, want %d", len(xs), st.NumFields())
+	}
+	b.Append(true)
+	for i, x := range xs {
+		if err := appendCustomValue(b.FieldBuilder(i), x); err != nil {
+			return fmt.Errorf("struct field %d (%s): %w", i, st.Field(i).Name, err)
+		}
 	}
 	return nil
 }
@@ -547,10 +697,6 @@ func appendI64BE(dst []byte, v int64) []byte {
 	)
 }
 
-func i64Bytes(v int64) []byte {
-	return appendI64BE(nil, v)
-}
-
 func isHashable(t arrow.DataType) bool {
 	switch t.ID() {
 	case arrow.STRING, arrow.LARGE_STRING, arrow.INT64, arrow.INT32, arrow.BOOL,
@@ -629,13 +775,16 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 		if err != nil {
 			return err
 		}
+		// Count = non-null rows. Uses the type-generic null check
+		// rather than numericAt so any hashable column type (Uint64,
+		// String, Timestamp, ...) works, not just the numeric shortlist.
 		var n int64
 		for _, row := range rows {
-			_, ok, err := s.numericAt(row)
+			null, err := isNullAtSeries(s, row)
 			if err != nil {
 				return err
 			}
-			if ok {
+			if !null {
 				n++
 			}
 		}

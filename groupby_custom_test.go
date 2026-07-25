@@ -408,3 +408,231 @@ func stringIndex(s, sub string) int {
 // silence unused import warnings when tests are rearranged.
 var _ = errors.New
 var _ = fmt.Sprintf
+
+// providersSetAggregator collects the distinct non-null string values
+// seen per group into a List<String>. Mirrors the shape the user hit
+// friction with — appendCustomValue used to reject *array.ListBuilder
+// with "unhandled builder type", parking any real List<T>-emitting
+// aggregator. The regression exercises the new dispatch arm.
+type providersSetAggregator struct {
+	seen  map[string]struct{}
+	order []string
+}
+
+func (p *providersSetAggregator) Aggregate(s Series, rows []int) (any, error) {
+	// Reset per group — the eager engine reuses one instance across groups.
+	p.seen = make(map[string]struct{}, len(rows))
+	p.order = p.order[:0]
+	chunk := s.col.Data().Chunks()[0].(*array.String)
+	for _, r := range rows {
+		if chunk.IsNull(r) {
+			continue
+		}
+		v := chunk.Value(r)
+		if _, ok := p.seen[v]; ok {
+			continue
+		}
+		p.seen[v] = struct{}{}
+		p.order = append(p.order, v)
+	}
+	// Copy to avoid callers observing later resets on the same slice
+	// backing array.
+	out := make([]string, len(p.order))
+	copy(out, p.order)
+	return out, nil
+}
+
+func (p *providersSetAggregator) Merge(other Aggregator) error {
+	o, ok := other.(*providersSetAggregator)
+	if !ok {
+		return fmt.Errorf("providersSetAggregator.Merge: peer is %T", other)
+	}
+	if p.seen == nil {
+		p.seen = make(map[string]struct{}, len(o.seen))
+	}
+	for _, v := range o.order {
+		if _, ok := p.seen[v]; ok {
+			continue
+		}
+		p.seen[v] = struct{}{}
+		p.order = append(p.order, v)
+	}
+	return nil
+}
+
+func (p *providersSetAggregator) Type() arrow.DataType {
+	return arrow.ListOf(arrow.BinaryTypes.String)
+}
+func (p *providersSetAggregator) Name() string { return "providers" }
+
+func TestCustomAggregator_ListStringOutput(t *testing.T) {
+	pool := memory.DefaultAllocator
+
+	region := array.NewStringBuilder(pool)
+	defer region.Release()
+	region.AppendValues([]string{"NA", "NA", "NA", "EU", "EU"}, nil)
+
+	provider := array.NewStringBuilder(pool)
+	defer provider.Release()
+	// NA sees a, b, a again → set {a, b}. EU sees c, null → set {c}.
+	provider.Append("a")
+	provider.Append("b")
+	provider.Append("a")
+	provider.Append("c")
+	provider.AppendNull()
+
+	fields := []arrow.Field{
+		{Name: "region", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "provider", Type: arrow.BinaryTypes.String, Nullable: true},
+	}
+	schema := arrow.NewSchema(fields, nil)
+	arrays := []arrow.Array{region.NewArray(), provider.NewArray()}
+	defer func() {
+		for _, a := range arrays {
+			a.Release()
+		}
+	}()
+	cols := make([]arrow.Column, len(fields))
+	for i, a := range arrays {
+		cols[i] = *arrow.NewColumn(fields[i], arrow.NewChunked(a.DataType(), []arrow.Array{a}))
+	}
+	f, err := NewFrame(schema, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gb, err := f.GroupBy("region")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := gb.Agg(Aggregation{
+		Column: "provider",
+		Fn:     &providersSetAggregator{},
+		Alias:  "providers",
+	})
+	if err != nil {
+		t.Fatalf("custom List<String> aggregator failed: %v", err)
+	}
+
+	providers, err := out.Column("providers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if providers.DataType().ID() != arrow.LIST {
+		t.Fatalf("providers column type = %s, want LIST", providers.DataType())
+	}
+	listArr := providers.col.Data().Chunks()[0].(*array.List)
+	values := listArr.ListValues().(*array.String)
+
+	// Sorted alphabetically: EU (row 0), NA (row 1).
+	getRow := func(row int) []string {
+		start, end := listArr.ValueOffsets(row)
+		out := make([]string, end-start)
+		for i := start; i < end; i++ {
+			out[i-start] = values.Value(int(i))
+		}
+		return out
+	}
+	euSet := getRow(0)
+	if len(euSet) != 1 || euSet[0] != "c" {
+		t.Fatalf("EU providers = %v, want [c]", euSet)
+	}
+	naSet := getRow(1)
+	if len(naSet) != 2 || naSet[0] != "a" || naSet[1] != "b" {
+		t.Fatalf("NA providers = %v, want [a b]", naSet)
+	}
+}
+
+// structRowAggregator emits a two-field Struct{Count Int64, First
+// String} — the minimal shape that exercises appendCustomValue's
+// new *array.StructBuilder arm.
+type structRowAggregator struct {
+	count int64
+	first string
+	seen  bool
+}
+
+func (a *structRowAggregator) Aggregate(s Series, rows []int) (any, error) {
+	a.count = 0
+	a.first = ""
+	a.seen = false
+	chunk := s.col.Data().Chunks()[0].(*array.String)
+	for _, r := range rows {
+		if chunk.IsNull(r) {
+			continue
+		}
+		if !a.seen {
+			a.first = chunk.Value(r)
+			a.seen = true
+		}
+		a.count++
+	}
+	if !a.seen {
+		return nil, nil
+	}
+	return []any{a.count, a.first}, nil
+}
+func (a *structRowAggregator) Merge(Aggregator) error { return nil }
+func (a *structRowAggregator) Type() arrow.DataType {
+	return arrow.StructOf(
+		arrow.Field{Name: "count", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		arrow.Field{Name: "first", Type: arrow.BinaryTypes.String, Nullable: true},
+	)
+}
+func (a *structRowAggregator) Name() string { return "summary" }
+
+func TestCustomAggregator_StructOutput(t *testing.T) {
+	pool := memory.DefaultAllocator
+	region := array.NewStringBuilder(pool)
+	defer region.Release()
+	region.AppendValues([]string{"NA", "NA", "EU"}, nil)
+	name := array.NewStringBuilder(pool)
+	defer name.Release()
+	name.Append("alpha")
+	name.Append("bravo")
+	name.Append("charlie")
+
+	fields := []arrow.Field{
+		{Name: "region", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: false},
+	}
+	schema := arrow.NewSchema(fields, nil)
+	arrays := []arrow.Array{region.NewArray(), name.NewArray()}
+	defer func() {
+		for _, a := range arrays {
+			a.Release()
+		}
+	}()
+	cols := make([]arrow.Column, len(fields))
+	for i, a := range arrays {
+		cols[i] = *arrow.NewColumn(fields[i], arrow.NewChunked(a.DataType(), []arrow.Array{a}))
+	}
+	f, err := NewFrame(schema, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gb, _ := f.GroupBy("region")
+	out, err := gb.Agg(Aggregation{
+		Column: "name",
+		Fn:     &structRowAggregator{},
+		Alias:  "summary",
+	})
+	if err != nil {
+		t.Fatalf("custom Struct aggregator failed: %v", err)
+	}
+	summary, _ := out.Column("summary")
+	if summary.DataType().ID() != arrow.STRUCT {
+		t.Fatalf("summary type = %s, want STRUCT", summary.DataType())
+	}
+	// Sorted alphabetically: EU (row 0), NA (row 1).
+	structArr := summary.col.Data().Chunks()[0].(*array.Struct)
+	countArr := structArr.Field(0).(*array.Int64)
+	firstArr := structArr.Field(1).(*array.String)
+	if countArr.Value(0) != 1 || firstArr.Value(0) != "charlie" {
+		t.Fatalf("EU summary = {%d, %q}, want {1, charlie}", countArr.Value(0), firstArr.Value(0))
+	}
+	if countArr.Value(1) != 2 || firstArr.Value(1) != "alpha" {
+		t.Fatalf("NA summary = {%d, %q}, want {2, alpha}", countArr.Value(1), firstArr.Value(1))
+	}
+}

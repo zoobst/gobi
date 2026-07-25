@@ -126,6 +126,21 @@ func (lf *LazyFrame) Tail(n int) *LazyFrame {
 	return &LazyFrame{plan: &tailNode{input: lf.plan, n: n}}
 }
 
+// Explode appends an Explode node — one row per component of the named
+// geometry or list column. Semantics match Frame.Explode: multi-part
+// geometries expand to their constituents; List<T> columns expand to
+// one row per element, with null/empty lists producing a single output
+// row with a null element (polars-parity); non-exploded columns are
+// duplicated across the expansion.
+//
+// The exploded column's output type is the list element type for
+// List<T> columns, or unchanged for geometry columns (Binary/WKB with
+// the multi-part reduced to a single part). Errors for non-exploded-
+// able column types surface at Collect().
+func (lf *LazyFrame) Explode(col string) *LazyFrame {
+	return &LazyFrame{plan: newExplodeNode(lf.plan, col)}
+}
+
 // LazyGroupBy is the intermediate builder returned by
 // LazyFrame.GroupBy. Its only method, Agg, closes the group-by out
 // into a LazyFrame.
@@ -375,6 +390,12 @@ func collectPlanRaw(p LogicalPlan) (*Frame, error) {
 			return f.Tail(0), nil
 		}
 		return f.Tail(n.n), nil
+	case *explodeNode:
+		f, err := collectPlan(n.input)
+		if err != nil {
+			return nil, err
+		}
+		return f.Explode(n.name)
 	case *scanFileNode:
 		if n.read == nil {
 			return nil, fmt.Errorf("gobi: scanFileNode has no read function")

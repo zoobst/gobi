@@ -218,3 +218,87 @@ func TestExplode_MissingColumnErrors(t *testing.T) {
 		t.Fatalf("expected ErrColumnNotFound, got %v", err)
 	}
 }
+
+func TestLazyExplode_GeometryMatchesEager(t *testing.T) {
+	f := mixedGeomFrame(t)
+	eager, err := f.Explode("geometry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lazy, err := f.Lazy().Explode("geometry").Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eager.NumRows() != lazy.NumRows() {
+		t.Fatalf("row count mismatch: eager=%d lazy=%d", eager.NumRows(), lazy.NumRows())
+	}
+	eName, _ := eager.Column("name")
+	lName, _ := lazy.Column("name")
+	eArr := eName.col.Data().Chunks()[0].(*array.String)
+	lArr := lName.col.Data().Chunks()[0].(*array.String)
+	for i := 0; i < eager.NumRows(); i++ {
+		if eArr.Value(i) != lArr.Value(i) {
+			t.Fatalf("row %d name eager=%q lazy=%q", i, eArr.Value(i), lArr.Value(i))
+		}
+	}
+}
+
+func TestLazyExplode_ListSchemaChanges(t *testing.T) {
+	f := listExplodeFrame(t)
+	lf := f.Lazy().Explode("tags")
+	// Plan-time schema should already reflect the element type, not the
+	// list-of type. This is what makes downstream WithColumn / Filter
+	// operate on tags-as-Int64 without materializing.
+	tagsField, ok := lf.Schema().FieldsByName("tags")
+	if !ok || len(tagsField) == 0 {
+		t.Fatalf("tags field missing from lazy explode schema: %s", lf.Schema())
+	}
+	if tagsField[0].Type.ID() != arrow.INT64 {
+		t.Fatalf("lazy explode tags field type = %s, want INT64", tagsField[0].Type)
+	}
+	out, err := lf.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.NumRows() != 6 {
+		t.Fatalf("row count = %d, want 6", out.NumRows())
+	}
+}
+
+func TestLazyExplode_ComposesWithFilterAndSelect(t *testing.T) {
+	// Explode a list, then filter on the exploded element, then select
+	// two columns. Verifies the lazy chain preserves per-row semantics
+	// through the row-cardinality change.
+	f := listExplodeFrame(t)
+	out, err := f.Lazy().
+		Explode("tags").
+		Filter(Col("tags").Gt(Lit(int64(15)))).
+		Select(Col("id"), Col("tags")).
+		Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// tags after explode: 10, 20, 30, 40, null, null. Filter keeps
+	// non-null > 15 → 20, 30, 40, giving 3 rows.
+	if out.NumRows() != 3 {
+		t.Fatalf("row count = %d, want 3", out.NumRows())
+	}
+	tagsS, _ := out.Column("tags")
+	tagsArr := tagsS.col.Data().Chunks()[0].(*array.Int64)
+	want := []int64{20, 30, 40}
+	for i, w := range want {
+		if tagsArr.Value(i) != w {
+			t.Fatalf("tags row %d = %d, want %d", i, tagsArr.Value(i), w)
+		}
+	}
+}
+
+func TestLazyExplode_MissingColumnSurfacesAtCollect(t *testing.T) {
+	f := mixedGeomFrame(t)
+	// Plan-build should succeed (schema is best-effort); the error only
+	// surfaces once Collect asks the eager engine to actually explode.
+	lf := f.Lazy().Explode("nope")
+	if _, err := lf.Collect(); !errors.Is(err, ErrColumnNotFound) {
+		t.Fatalf("expected ErrColumnNotFound, got %v", err)
+	}
+}

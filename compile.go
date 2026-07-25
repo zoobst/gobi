@@ -206,6 +206,25 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 			},
 		}, nil
 
+	case *explodeNode:
+		// Row-cardinality change (one → N per parent), so we buffer
+		// the input Frame and delegate to Frame.Explode. No streaming
+		// implementation today — the underlying WKB-decode / list-
+		// element scatter both need the whole input array at hand to
+		// resolve child-parent index mapping.
+		child, err := Compile(n.input)
+		if err != nil {
+			return nil, err
+		}
+		name := n.name
+		return &materializeExecOp{
+			input:     child,
+			outSchema: n.Schema(),
+			compute: func(f *Frame) (*Frame, error) {
+				return f.Explode(name)
+			},
+		}, nil
+
 	case *partitionAssertionNode:
 		// Assertion is a metadata-only wrapper — compile the input
 		// directly, no executor node needed. The metadata claim is

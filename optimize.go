@@ -153,6 +153,12 @@ func mapExprs(p LogicalPlan, fn func(Expr) Expr) LogicalPlan {
 			return p
 		}
 		return newDropNode(newInput, n.name)
+	case *explodeNode:
+		newInput = mapExprs(n.input, fn)
+		if newInput == n.input {
+			return p
+		}
+		return newExplodeNode(newInput, n.name)
 	case *partitionAssertionNode:
 		newInput = mapExprs(n.input, fn)
 		if newInput == n.input {
@@ -664,6 +670,18 @@ func pushProjection(p LogicalPlan, neededOut map[string]struct{}) (LogicalPlan, 
 		}
 		return newDropNode(newIn, n.name), true
 
+	case *explodeNode:
+		// Explode preserves every column downstream sees, but the
+		// exploded column itself must exist in the input (its content
+		// drives the expansion). Add it to the child needs set.
+		child := copyColSet(neededOut)
+		child[n.name] = struct{}{}
+		newIn, changed := pushProjection(n.input, child)
+		if !changed {
+			return p, false
+		}
+		return newExplodeNode(newIn, n.name), true
+
 	case *limitNode:
 		newIn, changed := pushProjection(n.input, neededOut)
 		if !changed {
@@ -824,6 +842,10 @@ func (r *cascadeEmptyRule) Apply(p LogicalPlan) (LogicalPlan, bool) {
 			if _, ok := n.input.(*emptyNode); ok {
 				return &emptyNode{schema: n.Schema()}, true
 			}
+		case *explodeNode:
+			if _, ok := n.input.(*emptyNode); ok {
+				return &emptyNode{schema: n.Schema()}, true
+			}
 		case *joinNode:
 			_, leftEmpty := n.input.(*emptyNode)
 			_, rightEmpty := n.right.(*emptyNode)
@@ -919,6 +941,11 @@ func walkRewrite(p LogicalPlan, visit func(LogicalPlan) (LogicalPlan, bool)) (Lo
 		newIn := rewriteChild(n.input)
 		if newIn != n.input {
 			rebuilt = newDropNode(newIn, n.name)
+		}
+	case *explodeNode:
+		newIn := rewriteChild(n.input)
+		if newIn != n.input {
+			rebuilt = newExplodeNode(newIn, n.name)
 		}
 	case *partitionAssertionNode:
 		newIn := rewriteChild(n.input)

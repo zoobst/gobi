@@ -195,7 +195,7 @@ func arithF64F64(a, b []float64, aArr, bArr *array.Float64, op arithOp, name str
 		return buildFloat64Series(name, out, nil)
 	}
 	validity := make([]bool, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if aArr.IsNull(i) || bArr.IsNull(i) {
 			continue
 		}

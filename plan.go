@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -566,7 +567,7 @@ func (n *dropNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
 func (n *dropNode) PartitionMetadata() *PartitionMetadata {
 	return propagateProjection(n.input.PartitionMetadata(), n.outSchema)
 }
-func (n *dropNode) String() string          { return fmt.Sprintf("Drop(%q)", n.name) }
+func (n *dropNode) String() string { return fmt.Sprintf("Drop(%q)", n.name) }
 
 // -----------------------------------------------------------------------------
 // tailNode: keep last n rows. Schema unchanged; row count resolved at
@@ -586,7 +587,74 @@ func (n *tailNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
 func (n *tailNode) PartitionMetadata() *PartitionMetadata {
 	return propagateLimit(n.input.PartitionMetadata())
 }
-func (n *tailNode) String() string          { return fmt.Sprintf("Tail(%d)", n.n) }
+func (n *tailNode) String() string { return fmt.Sprintf("Tail(%d)", n.n) }
+
+// -----------------------------------------------------------------------------
+// explodeNode: expand one row per component of a multi-part geometry
+// or list column, duplicating every other column across the expansion.
+//
+// Schema shape mirrors Frame.Explode: geometry columns pass through
+// (still Binary WKB, single-part per row); list columns replace the
+// List<T> field with a scalar T field. Any other column type stays
+// as-is at plan time — Frame.Explode will surface the real error at
+// Collect().
+// -----------------------------------------------------------------------------
+
+type explodeNode struct {
+	input     LogicalPlan
+	name      string
+	outSchema *arrow.Schema
+}
+
+func newExplodeNode(input LogicalPlan, name string) *explodeNode {
+	inSchema := input.Schema()
+	fields := inSchema.Fields()
+	newFields := make([]arrow.Field, len(fields))
+	for i, f := range fields {
+		newFields[i] = f
+		if f.Name != name {
+			continue
+		}
+		if lt, ok := f.Type.(*arrow.ListType); ok {
+			newFields[i] = arrow.Field{
+				Name:     f.Name,
+				Type:     lt.Elem(),
+				Nullable: true,
+				Metadata: f.Metadata,
+			}
+		}
+	}
+	return &explodeNode{
+		input:     input,
+		name:      name,
+		outSchema: arrow.NewSchema(newFields, schemaMetadataPtr(inSchema)),
+	}
+}
+
+func (n *explodeNode) Schema() *arrow.Schema   { return n.outSchema }
+func (n *explodeNode) Children() []LogicalPlan { return []LogicalPlan{n.input} }
+func (n *explodeNode) String() string          { return fmt.Sprintf("Explode(%q)", n.name) }
+
+// Explode changes row cardinality per parent row (one → N). Downstream
+// operators can no longer rely on within-partition order, so SortedBy
+// is dropped. If the exploded column is itself a partition column its
+// value semantics change (List<T> → T, or Multi → single), so the
+// partition claim is broken entirely — return nil. Otherwise preserve
+// Columns + HashFn: same-K rows remain in the same partition after the
+// per-parent duplication.
+func (n *explodeNode) PartitionMetadata() *PartitionMetadata {
+	in := n.input.PartitionMetadata()
+	if in == nil {
+		return nil
+	}
+	if slices.Contains(in.Columns, n.name) {
+		return nil
+	}
+	out := in.Clone()
+	out.SortedBy = nil
+	out.SortEnforced = false
+	return out
+}
 
 // -----------------------------------------------------------------------------
 // scanFileNode: deferred I/O source, format-agnostic via a closure.
