@@ -11,6 +11,28 @@ see [Versioning](#versioning) below.
 
 ## [v0.1.2]
 
+### Fixed
+
+- **Athena engine v2 CTAS output was invisible to athenaio.**
+  `listBucketFiles` filtered results with `HasSuffix(key, ".parquet")`,
+  but engine v2 writes parquets *without* an extension (files look
+  like `20240101_120000_00000_asdfg_bucket-00000`). Every v2 data
+  file got dropped at list time and callers saw a spurious "no
+  result files under ..." error — the same error text as the
+  workgroup-override case in v0.1.1, but a completely unrelated
+  root cause.
+
+  Fix: switch to a negative filter (`isCTASDataKey`). Exclude the
+  paths that are provably non-data — Iceberg `metadata/*` files
+  (`*.metadata.json`, `*.avro`), Hive symlink manifests
+  (`_symlink_format_manifest/*`), Hadoop-style job markers
+  (`_SUCCESS`, `_committed_*`, `_started_*`), checksum sidecars
+  (`*.crc`), directory markers (keys ending in `/`) — and accept
+  everything else. Anything mis-classified as data slips through to
+  `parquetio.ReadReader` which fails loudly, so a stray file
+  surfaces at read time with a clear parse error rather than
+  silently vanishing at list time.
+
 ### Changed
 
 - **CTAS output location is now steered exclusively via

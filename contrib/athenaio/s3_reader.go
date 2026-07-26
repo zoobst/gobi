@@ -98,9 +98,16 @@ func (r *s3ReaderAt) ReadAt(p []byte, off int64) (int, error) {
 
 // listBucketFiles enumerates all objects under prefix (an
 // s3://bucket/prefix/ URI), returning fully-qualified s3://
-// URIs. Filters to *.parquet files only — Iceberg writes metadata
-// files (metadata/*.json, metadata/*.avro) under the same location
-// that athenaio should not treat as data.
+// URIs to data files.
+//
+// Uses a negative filter (skip known non-data patterns; accept
+// everything else) rather than a positive `.parquet` suffix filter,
+// because Athena engine v2 CTAS writes parquet outputs *without* a
+// `.parquet` extension — files look like
+// `20240101_120000_00000_bucket-00000`. A positive suffix filter
+// dropped every v2 data file and surfaced as a spurious "no result
+// files" error at the caller. See the `isCTASDataKey` helper for
+// the exclusion list.
 //
 // Handles ListObjectsV2 pagination via ContinuationToken. Returns
 // results in the order ListObjectsV2 emits them (lexicographic by
@@ -125,14 +132,10 @@ func listBucketFiles(ctx context.Context, api S3API, prefix string) ([]string, e
 			if obj.Key == nil {
 				continue
 			}
-			key := *obj.Key
-			// Iceberg writes metadata/*.avro + metadata/*.json under
-			// the same location; skip anything that isn't a data
-			// parquet file.
-			if !strings.HasSuffix(key, ".parquet") {
+			if !isCTASDataKey(*obj.Key) {
 				continue
 			}
-			out = append(out, fmt.Sprintf("s3://%s/%s", bucket, key))
+			out = append(out, fmt.Sprintf("s3://%s/%s", bucket, *obj.Key))
 		}
 		if resp.IsTruncated == nil || !*resp.IsTruncated {
 			break
@@ -140,6 +143,43 @@ func listBucketFiles(ctx context.Context, api S3API, prefix string) ([]string, e
 		token = resp.NextContinuationToken
 	}
 	return out, nil
+}
+
+// isCTASDataKey reports whether an S3 object key looks like a CTAS
+// data file (as opposed to Iceberg metadata / Hive symlink manifest
+// / zero-byte directory marker / checksum sidecar). The filter is
+// deliberately permissive: Athena engine v2 writes parquet outputs
+// with no extension, so any suffix-based positive filter would
+// under-count. Anything not on this exclusion list is treated as
+// data — downstream `parquetio.ReadReader` will fail loudly if a
+// non-parquet blob slips through, which is more actionable than
+// silently dropping the file at list time.
+func isCTASDataKey(key string) bool {
+	// Directory marker (zero-byte object whose key ends with `/`).
+	if strings.HasSuffix(key, "/") {
+		return false
+	}
+	// Iceberg metadata sits under a `metadata/` subdirectory.
+	if strings.Contains(key, "/metadata/") {
+		return false
+	}
+	// Hive symlink manifest layout.
+	if strings.Contains(key, "/_symlink_format_manifest/") {
+		return false
+	}
+	// Common non-data suffixes across Athena / Iceberg / Hive:
+	//   - .metadata.json / .avro   → Iceberg manifests
+	//   - .crc                     → Hadoop checksum sidecar
+	//   - _SUCCESS / _committed_*  → job-marker files
+	if strings.HasSuffix(key, ".metadata.json") ||
+		strings.HasSuffix(key, ".avro") ||
+		strings.HasSuffix(key, ".crc") ||
+		strings.HasSuffix(key, "/_SUCCESS") ||
+		strings.Contains(key, "/_committed_") ||
+		strings.Contains(key, "/_started_") {
+		return false
+	}
+	return true
 }
 
 // parseS3URI splits an s3://bucket/key URI into (bucket, key). Result
