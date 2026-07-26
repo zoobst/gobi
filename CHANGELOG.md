@@ -5,7 +5,153 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
-## [v0.2.6]
+## [v0.2.7]
+
+### Added
+
+- **`IncrementalAggregator` interface — streaming custom
+  aggregators.** New optional interface (extends `Aggregator`) that
+  signals per-batch incremental support:
+
+  ```go
+  type IncrementalAggregator interface {
+      Aggregator
+      Clone() IncrementalAggregator
+      Update(col Series, rows []int) error
+      Finalize() any
+  }
+  ```
+
+  Custom aggregators that implement it route through
+  `streamingAggregateExec` instead of the materializing fallback —
+  each group gets a `Clone()`-produced instance at first-touch, and
+  the executor calls `Update` per batch, then `Finalize` once per
+  group. Legacy `Aggregator`-only custom Fns continue to route
+  through materialize (additive change, non-breaking).
+
+  All shipped `NewStringSetAggregator` / `NewInt64SetAggregator` /
+  `NewInt32SetAggregator` / `NewUint64SetAggregator` /
+  `NewUint32SetAggregator` factories now implement
+  `IncrementalAggregator`. Existing code using them gets streaming
+  execution automatically.
+
+### Fixed
+
+- **`Over` in a streaming pipeline no longer splits partitions
+  across batch boundaries.** Previously `Col("v").Shift(1).Over("id")`
+  (or any Over expression) inside a lazy `WithColumn` / `Filter` /
+  `Select` evaluated against each batch's Frame independently — a
+  partition with rows in batches 1 and 2 was treated as two disjoint
+  partitions, and Shift's "first row of the partition" semantics
+  wrongly fired at every batch boundary. Same shape broke scalar-
+  aggregate `Sum().Over("id")` (per-batch sum instead of partition-
+  wide) and predicates like `Filter(Col("v").Eq(Col("v").MaxAgg().Over("id")))`
+  (per-batch max instead of partition max).
+
+  Fix: at Compile time, `withColumnNode` / `filterNode` /
+  `projectNode` inspect their expression via a new
+  `exprContainsOver` walker; if any `overNode` is present anywhere
+  in the tree, they route through `materializeExecOp` instead of
+  their streaming counterparts. `Over` needs to see the whole input
+  Frame at once for correctness — no way to stream it without
+  partition-aware batch splitting, which is not something the
+  executor supports.
+
+  Cost: any WithColumn / Filter / Select containing Over now
+  materializes its input. In practice this rarely regresses real
+  pipelines because upstream operations that produce cross-batch
+  partitions (Full/Right joins, sorts) already materialize. The
+  fix is strictly a correctness gate — previously wrong-quiet
+  became correct-materialized.
+
+  Regression tests: `TestOver_StreamingCrossBatchCorrectness`
+  (Shift row-64K boundary), `TestOver_StreamingScalarAggCrossBatch`
+  (Sum partition-wide across batches),
+  `TestOver_StreamingInFilterPredicate` (Max-based filter).
+
+### Changed
+
+- **`Explode` now runs per-batch in the streaming executor.** The
+  `explodeNode` no longer compiles to `materializeExecOp`; it now
+  uses a new `explodeExecOp` that calls `Frame.Explode` on each
+  input batch independently. Correctness is preserved because
+  per-parent-row expansion has no cross-batch dependency. Output
+  batches may exceed the batch-size soft cap when dense multi-part
+  geometries or long lists arrive — downstream operators handle
+  variable batch sizes fine. Segment-branch pipelines like
+  `h3CellExprNode → gridPathExprNode → Explode → GroupBy` now
+  stream end-to-end (with CollectSet's IncrementalAggregator
+  support below).
+
+### Performance
+
+- **Shape-preserving `Over` — projection + aligned slice fast path.**
+  Two cuts to `overNode.evalShapePreserving`'s per-partition
+  allocation:
+
+  1. **Referenced-column projection.** `Over` now inspects the
+     inner expression's referenced columns via
+     `referencedColumns(...)` and `SelectCols`-narrows the input
+     Frame before the per-partition loop. On a 22-column input
+     where the inner reads only 1 column (typical
+     `Col("v").Shift(1).Over("id")` shape), per-partition
+     mini-Frame construction now copies just the referenced
+     columns instead of all 22.
+
+  2. **Aligned slice.** When `PartitionMetadata` proves aligned
+     + sorted contiguity, `evalShapePreservingAligned` replaces
+     the per-partition `take` (O(N) copy) with `Frame.slice`
+     (zero-copy ref-count). Partitions become Frame views, not
+     Frame copies.
+
+  Measured on 10k rows / 100 partitions / 20 payload columns,
+  eager `Col("v").Shift(1).Over("id")`:
+
+  | Path                    | ns/op | B/op    | allocs/op |
+  |-------------------------|------:|--------:|----------:|
+  | General (w/ projection) | 745µs | 1.62 MB |    23,815 |
+  | Aligned + slice         | 498µs | 0.98 MB |    12,097 |
+
+  33% faster, 40% smaller footprint, 49% fewer allocations on the
+  aligned path. Benchmarks landed as
+  `BenchmarkOver_ShapePreserving_WideFrame` vs
+  `BenchmarkOver_ShapePreserving_AlignedSlice`.
+- **`Explode` streaming — 12.5% faster, 19% fewer allocations.**
+  Measured on 10k rows × 3 list-element = 30k exploded rows,
+  streaming (`explodeExecOp`) vs the previous materialize path:
+
+  | Path                   | ns/op | B/op    | allocs/op |
+  |------------------------|------:|--------:|----------:|
+  | Materialize (baseline) | 456µs | 3.12 MB |       180 |
+  | Streaming (new)        | 399µs | 2.75 MB |       146 |
+
+  Modest per-op delta because `takeArray` inside `Frame.Explode`
+  dominates the cost — both paths pay it. What streaming removes is
+  the pre-Explode `concatBatchesToFrame` copy plus the
+  post-Explode output-batch slicing. On larger fixtures the
+  qualitative win compounds: downstream operators start consuming
+  exploded batches immediately instead of after a full buffered
+  materialize. Benchmarks landed as `BenchmarkExplode_Streaming`
+  vs `BenchmarkExplode_Materialize`.
+- **collect-set aggregation now streams — 75% faster, 98.7% fewer
+  allocations.** Measured on 100k rows / 100 groups with
+  `NewStringSetAggregator`:
+
+  | Path                    | ns/op | B/op | allocs/op |
+  |-------------------------|------:|-----:|----------:|
+  | Materialize (baseline)  | 7.64ms | 14.16 MB | 302,873 |
+  | Streaming (Incremental) | 1.92ms |  9.60 MB |   4,043 |
+
+  The allocation count reduction (~75× fewer) comes from removing
+  the `concatBatchesToFrame` copy inside `materializeExecOp` —
+  every input batch used to be concatenated into one giant Frame
+  before the aggregator ran on it; now each batch's `Update` runs
+  in place. Benchmarks landed as `BenchmarkAggregator_CollectSet_Materialize`
+  vs `BenchmarkAggregator_CollectSet_Streaming` — same fixture,
+  only difference is whether the aggregator hides its
+  `IncrementalAggregator` methods.
+
+## [v0.2.6] — 2026-07-25
 
 ### Fixed
 

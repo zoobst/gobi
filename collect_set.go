@@ -42,22 +42,54 @@ type setAggregator[T comparable] struct {
 func (a *setAggregator[T]) Aggregate(s Series, rows []int) (any, error) {
 	// Reset per group — eager engine reuses one instance across groups.
 	a.seen = make(map[T]struct{}, len(rows))
-	chunks := s.col.Data().Chunks()
+	if err := a.Update(s, rows); err != nil {
+		return nil, err
+	}
+	return a.snapshot(), nil
+}
+
+// Update adds col[rows] to the receiver's distinct-value set.
+// Implements IncrementalAggregator — enables the streaming executor
+// to route this aggregator without buffering all input into one Frame.
+func (a *setAggregator[T]) Update(col Series, rows []int) error {
+	if a.seen == nil {
+		a.seen = make(map[T]struct{}, len(rows))
+	}
+	chunks := col.col.Data().Chunks()
 	for _, r := range rows {
 		chunk, local, ok := locateRowInChunks(chunks, r)
 		if !ok {
-			return nil, fmt.Errorf("%s: row %d out of range", a.name, r)
+			return fmt.Errorf("%s: row %d out of range", a.name, r)
 		}
 		v, notNull, err := a.extract(chunk, local)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", a.name, err)
+			return fmt.Errorf("%s: %w", a.name, err)
 		}
 		if !notNull {
 			continue
 		}
 		a.seen[v] = struct{}{}
 	}
-	return a.snapshot(), nil
+	return nil
+}
+
+// Finalize returns the group's collected set as a sorted []T. Safe to
+// call repeatedly; state isn't cleared here (Clone provides fresh
+// state for the next group).
+func (a *setAggregator[T]) Finalize() any {
+	return a.snapshot()
+}
+
+// Clone returns a fresh setAggregator[T] with empty per-group state
+// and the same type-dispatch closures as the receiver. Used by the
+// streaming executor to give each group its own instance.
+func (a *setAggregator[T]) Clone() IncrementalAggregator {
+	return &setAggregator[T]{
+		elemType: a.elemType,
+		name:     a.name,
+		extract:  a.extract,
+		less:     a.less,
+	}
 }
 
 func (a *setAggregator[T]) Merge(other Aggregator) error {

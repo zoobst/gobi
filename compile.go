@@ -39,6 +39,18 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Over in a filter predicate would slice partitions across
+		// batch boundaries. Force materialize before per-batch filter.
+		if exprContainsOver(n.cond.node) {
+			cond := n.cond
+			return &materializeExecOp{
+				input:     child,
+				outSchema: n.Schema(),
+				compute: func(f *Frame) (*Frame, error) {
+					return f.FilterExpr(cond)
+				},
+			}, nil
+		}
 		return &filterExecOp{input: child, cond: n.cond}, nil
 
 	case *projectNode:
@@ -46,12 +58,43 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Same Over-crossing-batches concern for Select expressions.
+		for _, e := range n.exprs {
+			if exprContainsOver(e.node) {
+				exprs := n.exprs
+				return &materializeExecOp{
+					input:     child,
+					outSchema: n.outSchema,
+					compute: func(f *Frame) (*Frame, error) {
+						return executeSelect(f, exprs)
+					},
+				}, nil
+			}
+		}
 		return &projectExecOp{input: child, exprs: n.exprs, outSchema: n.outSchema}, nil
 
 	case *withColumnNode:
 		child, err := Compile(n.input)
 		if err != nil {
 			return nil, err
+		}
+		// If the expression contains an Over (scalar-agg or shape-
+		// preserving), it needs to see the whole input Frame at once
+		// — per-batch eval would slice partitions at batch boundaries
+		// and produce wrong results. Route through materialize.
+		if exprContainsOver(n.expr.node) {
+			name, expr := n.name, n.expr
+			inputMeta := n.input.PartitionMetadata()
+			return &materializeExecOp{
+				input:     child,
+				outSchema: n.outSchema,
+				compute: func(f *Frame) (*Frame, error) {
+					if inputMeta != nil {
+						f.WithPartitionMeta(inputMeta)
+					}
+					return f.WithColumnExpr(name, expr)
+				},
+			}, nil
 		}
 		return &withColumnExecOp{
 			input:     child,
@@ -207,22 +250,19 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		}, nil
 
 	case *explodeNode:
-		// Row-cardinality change (one → N per parent), so we buffer
-		// the input Frame and delegate to Frame.Explode. No streaming
-		// implementation today — the underlying WKB-decode / list-
-		// element scatter both need the whole input array at hand to
-		// resolve child-parent index mapping.
+		// Row-cardinality change (one → N per parent), but each parent
+		// row expands independently — no cross-batch dependency. Runs
+		// per-batch through explodeExecOp; output batches may exceed
+		// the batch-size soft cap when dense multi-part geometries or
+		// long lists arrive.
 		child, err := Compile(n.input)
 		if err != nil {
 			return nil, err
 		}
-		name := n.name
-		return &materializeExecOp{
+		return &explodeExecOp{
 			input:     child,
+			name:      n.name,
 			outSchema: n.Schema(),
-			compute: func(f *Frame) (*Frame, error) {
-				return f.Explode(name)
-			},
 		}, nil
 
 	case *renameNode:
@@ -249,18 +289,45 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 	return nil, fmt.Errorf("gobi: Compile: unknown plan node %T", p)
 }
 
-// allBuiltInAggs reports whether every Aggregation uses a built-in
-// Kind (no custom Fn) AND has no per-agg Filter. The streaming hash
-// aggregate only supports the plain built-in case; custom aggregators
-// need the whole row set at once, and filtered aggregations need the
-// whole row set to apply the filter before per-group dispatch — both
-// fall back to the materializing path.
+// exprContainsOver reports whether the expression tree rooted at node
+// includes any *overNode. Over evaluates per-partition and needs to
+// see the whole input Frame at once — streaming per-batch execution
+// would treat each batch as a disjoint partition and produce wrong
+// results at batch boundaries. Callers force materialize when this
+// returns true.
+//
+// Applies to every Over shape (scalar-aggregate and shape-preserving)
+// because both have cross-batch partition semantics.
+func exprContainsOver(node ExprNode) bool {
+	if node == nil {
+		return false
+	}
+	if _, ok := node.(*overNode); ok {
+		return true
+	}
+	for _, c := range node.Children() {
+		if exprContainsOver(c.node) {
+			return true
+		}
+	}
+	return false
+}
+
+// allBuiltInAggs reports whether every Aggregation is runnable through
+// the streaming aggregate executor. That's true when either the
+// aggregation uses a built-in Kind (no custom Fn) or the custom Fn
+// implements IncrementalAggregator (per-batch Update + Finalize +
+// Clone). Filtered aggregations still force the materializing path —
+// per-agg filter masks need the whole row set to precompute against.
 func allBuiltInAggs(aggs []Aggregation) bool {
 	for _, a := range aggs {
-		if a.Fn != nil {
+		if a.Filter.node != nil {
 			return false
 		}
-		if a.Filter.node != nil {
+		if a.Fn == nil {
+			continue
+		}
+		if _, ok := a.Fn.(IncrementalAggregator); !ok {
 			return false
 		}
 	}

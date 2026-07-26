@@ -142,6 +142,38 @@ type Aggregator interface {
 	Name() string
 }
 
+// IncrementalAggregator is the optional extension that opts a custom
+// aggregator into the streaming aggregate executor. Implementers
+// process a group's rows incrementally across batches instead of
+// receiving the whole row set at once via Aggregate, avoiding the
+// materialize-both-sides concat that plain Aggregator triggers.
+//
+// Contract:
+//   - Clone returns a fresh instance with empty per-group state. The
+//     streaming executor calls Clone once per group at first-touch;
+//     each group's Update / Finalize / Merge run on its own clone.
+//     Callers never share a clone across groups.
+//   - Update adds col[rows] to this instance's state. Called at most
+//     once per input batch per group. Must be additive — do not reset
+//     internal state at the top of Update.
+//   - Finalize returns the group's aggregated value. Called once per
+//     group after all Updates. Should not mutate state.
+//   - Aggregate (inherited from Aggregator) is still called by the
+//     eager path; implementers should keep it consistent with the
+//     Clone → Update → Finalize sequence. A typical implementation
+//     of Aggregate is just: reset state, call Update, return
+//     Finalize's value.
+//
+// Custom aggregators that implement only Aggregator (not this
+// interface) continue to work — they route through the materializing
+// fallback exactly as before.
+type IncrementalAggregator interface {
+	Aggregator
+	Clone() IncrementalAggregator
+	Update(col Series, rows []int) error
+	Finalize() any
+}
+
 // GroupBy partitions a Frame by the values in one or more key columns. The
 // keys must be of a hashable Arrow type (String, Int64, Int32, Bool, Float64).
 type GroupBy struct {

@@ -246,6 +246,46 @@ func (e *renameExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 func (e *renameExecOp) Close() error { return e.input.Close() }
 
 // -----------------------------------------------------------------------------
+// explodeExec: per-batch multi-part → single-part expansion. Streams
+// even though the row count grows — each input batch's Explode is
+// independent, no cross-batch dependency.
+//
+// Output batches may exceed defaultBatchRows when a batch contains
+// dense multi-part geometries or long lists. That's a soft cap, not a
+// hard one; downstream operators handle whatever size they receive.
+// -----------------------------------------------------------------------------
+
+type explodeExecOp struct {
+	input     ExecOperator
+	name      string
+	outSchema *arrow.Schema
+}
+
+func (e *explodeExecOp) Schema() *arrow.Schema { return e.outSchema }
+
+func (e *explodeExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	batch, err := e.input.Next(ctx)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := batchToFrame(batch)
+	batch.Release()
+	if err != nil {
+		return nil, err
+	}
+	out, err := frame.Explode(e.name)
+	if err != nil {
+		return nil, err
+	}
+	return frameToBatch(out), nil
+}
+
+func (e *explodeExecOp) Close() error { return e.input.Close() }
+
+// -----------------------------------------------------------------------------
 // limitExec: caps the total row count across batches, short-circuits
 // its upstream once satisfied.
 // -----------------------------------------------------------------------------

@@ -677,11 +677,18 @@ func newAggGroup(keys []Series, row int, aggs []Aggregation) (*aggGroup, error) 
 }
 
 // newAccumulator constructs the accumulator for one Aggregation kind.
-// Custom Fn accumulators are not supported here — the compiler routes
-// custom aggs to the materializing fallback.
+// Custom Fn accumulators route through this path when they implement
+// IncrementalAggregator — a fresh clone is instantiated per group.
+// Plain Aggregator-only custom Fns are still rejected here; the
+// compiler routes them to the materializing fallback via
+// allBuiltInAggs.
 func newAccumulator(a Aggregation) (aggAccumulator, error) {
 	if a.Fn != nil {
-		return nil, fmt.Errorf("gobi: streaming aggregate does not support custom Aggregator Fn")
+		inc, ok := a.Fn.(IncrementalAggregator)
+		if !ok {
+			return nil, fmt.Errorf("gobi: streaming aggregate does not support custom Aggregator Fn (implement IncrementalAggregator for streaming support)")
+		}
+		return &customIncrementalAcc{inner: inc.Clone(), outType: a.Fn.Type()}, nil
 	}
 	switch a.Kind {
 	case AggCount:
@@ -707,6 +714,21 @@ func newAccumulator(a Aggregation) (aggAccumulator, error) {
 	}
 	return nil, fmt.Errorf("gobi: streaming aggregate: unknown Kind %d", a.Kind)
 }
+
+// customIncrementalAcc bridges a user-supplied IncrementalAggregator
+// to the streaming executor's aggAccumulator interface. Each group
+// owns its own inner instance (produced by IncrementalAggregator.Clone
+// at group first-touch), so per-group state stays isolated.
+type customIncrementalAcc struct {
+	inner   IncrementalAggregator
+	outType arrow.DataType
+}
+
+func (a *customIncrementalAcc) Update(col Series, rows []int) error {
+	return a.inner.Update(col, rows)
+}
+func (a *customIncrementalAcc) Finalize() any             { return a.inner.Finalize() }
+func (a *customIncrementalAcc) OutputType() arrow.DataType { return a.outType }
 
 // buildResultBatch produces the single result RecordBatch by iterating
 // groups in sorted order and appending to per-column builders. Uses

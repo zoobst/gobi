@@ -301,7 +301,7 @@ func (n *overNode) evalShapePreserving(input *Frame) (Series, error) {
 		return n.inner.Eval(input)
 	}
 
-	// Resolve partition + order columns.
+	// Resolve partition columns from the full input (before projection).
 	partCols := make([]Series, len(n.partitionCols))
 	for i, name := range n.partitionCols {
 		s, err := input.Column(name)
@@ -311,31 +311,25 @@ func (n *overNode) evalShapePreserving(input *Frame) (Series, error) {
 		partCols[i] = s
 	}
 
-	// Bucket rows into partitions. Aligned-input fast path walks
-	// linear runs of same-key rows (no hash map). Otherwise hash-
-	// bucket into partition slices in first-seen order.
-	aligned := overShapeFastPathApplicable(input.PartitionMetadata(), n.partitionCols, n.orderBy)
-	var partitions [][]int
-	if aligned {
-		partitions = collectContiguousPartitions(nRows, partCols)
-	} else {
-		partitions = collectHashedPartitions(nRows, partCols)
-		// Only the general path needs a per-partition sort — the
-		// aligned path is already in-order by orderBy by construction.
-		if len(n.orderBy) > 0 {
-			cmps, err := buildOrderComparators(input, n.orderBy)
-			if err != nil {
-				return Series{}, fmt.Errorf("Over.OrderBy: %w", err)
-			}
-			for _, rows := range partitions {
-				sortRowIndicesBy(rows, cmps)
-			}
+	// Project the input down to just the columns the inner expression
+	// references — dramatically cuts per-partition take() copy cost
+	// on wide Frames. If the inner reads only 1 of 20 columns, we
+	// avoid copying the other 19 into each partition's mini-Frame.
+	// Falls back to the full input if projection isn't beneficial
+	// (inner references everything) or SelectCols fails.
+	projected := input
+	refs := referencedColumns(Expr{node: n.inner})
+	if len(refs) > 0 && len(refs) < input.NumCols() {
+		cols := make([]string, 0, len(refs))
+		for c := range refs {
+			cols = append(cols, c)
+		}
+		if p, err := input.SelectCols(cols...); err == nil {
+			projected = p
 		}
 	}
 
-	// Type inference on the inner expression against the input
-	// schema. Shape-preserving inners must return the same arrow
-	// type per partition, matching this.
+	// Type inference on the inner against the full input schema.
 	outType, err := n.inner.Type(input.Schema())
 	if err != nil {
 		return Series{}, fmt.Errorf("Over: type inference on inner: %w", err)
@@ -347,37 +341,18 @@ func (n *overNode) evalShapePreserving(input *Frame) (Series, error) {
 	// consumed by appendCustomValue.
 	outValues := make([]any, nRows)
 
-	for _, rows := range partitions {
-		if len(rows) == 0 {
-			continue
+	if overShapeFastPathApplicable(input.PartitionMetadata(), n.partitionCols, n.orderBy) {
+		// Aligned + sorted: partitions are contiguous ranges.
+		// Slice (zero-copy, ref-count) the projected Frame per
+		// partition instead of the general take() copy.
+		if err := n.evalShapePreservingAligned(projected, nRows, partCols, outValues); err != nil {
+			return Series{}, err
 		}
-		miniFrame, err := input.take(rows)
-		if err != nil {
-			return Series{}, fmt.Errorf("Over: take partition: %w", err)
-		}
-		miniResult, err := n.inner.Eval(miniFrame)
-		if err != nil {
-			return Series{}, fmt.Errorf("Over: eval partition: %w", err)
-		}
-		if miniResult.Len() != len(rows) {
-			return Series{}, fmt.Errorf(
-				"Over: inner returned %d rows for a partition of %d — Over requires a shape-preserving inner",
-				miniResult.Len(), len(rows))
-		}
-		for i, rowIdx := range rows {
-			null, err := isNullAtSeries(miniResult, i)
-			if err != nil {
-				return Series{}, fmt.Errorf("Over: read partition row: %w", err)
-			}
-			if null {
-				outValues[rowIdx] = nil
-				continue
-			}
-			v, err := readScalarAt(miniResult, i)
-			if err != nil {
-				return Series{}, fmt.Errorf("Over: read partition row: %w", err)
-			}
-			outValues[rowIdx] = v
+	} else {
+		// General path: hash-bucket rows, optional per-partition sort,
+		// per-partition take on the projected Frame.
+		if err := n.evalShapePreservingGeneral(input, projected, nRows, partCols, outValues); err != nil {
+			return Series{}, err
 		}
 	}
 
@@ -393,6 +368,138 @@ func (n *overNode) evalShapePreserving(input *Frame) (Series, error) {
 		}
 	}
 	return buildSeries("over", outType, b.NewArray()), nil
+}
+
+// evalShapePreservingGeneral walks hash-bucketed partitions,
+// optionally sorts each partition by orderBy, then per-partition
+// take()s from `projected` (already narrowed to referenced columns).
+func (n *overNode) evalShapePreservingGeneral(input, projected *Frame, nRows int, partCols []Series, outValues []any) error {
+	partitions := collectHashedPartitions(nRows, partCols)
+	if len(n.orderBy) > 0 {
+		cmps, err := buildOrderComparators(input, n.orderBy)
+		if err != nil {
+			return fmt.Errorf("Over.OrderBy: %w", err)
+		}
+		for _, rows := range partitions {
+			sortRowIndicesBy(rows, cmps)
+		}
+	}
+	for _, rows := range partitions {
+		if len(rows) == 0 {
+			continue
+		}
+		miniFrame, err := projected.take(rows)
+		if err != nil {
+			return fmt.Errorf("Over: take partition: %w", err)
+		}
+		miniResult, err := n.inner.Eval(miniFrame)
+		if err != nil {
+			return fmt.Errorf("Over: eval partition: %w", err)
+		}
+		if miniResult.Len() != len(rows) {
+			return fmt.Errorf(
+				"Over: inner returned %d rows for a partition of %d — Over requires a shape-preserving inner",
+				miniResult.Len(), len(rows))
+		}
+		if err := scatterPartitionByRows(miniResult, rows, outValues); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// evalShapePreservingAligned is the aligned + sorted fast path. Same
+// semantics as the general path, but partitions are contiguous ranges
+// so we can slice `projected` per partition instead of take-copying.
+// Slice is a ref-count carry — the mini-Frame shares buffers with
+// projected, no allocation proportional to partition size.
+func (n *overNode) evalShapePreservingAligned(projected *Frame, nRows int, partCols []Series, outValues []any) error {
+	if nRows == 0 {
+		return nil
+	}
+	curKey := make([]byte, 0, 32)
+	nextKey := make([]byte, 0, 32)
+	var err error
+	curKey, err = composeCompositeKeyInto(curKey, partCols, 0)
+	if err != nil {
+		return fmt.Errorf("Over: partition key row 0: %w", err)
+	}
+
+	emit := func(start, end int) error {
+		partFrame := projected.slice(int64(start), int64(end))
+		miniResult, err := n.inner.Eval(partFrame)
+		if err != nil {
+			return fmt.Errorf("Over: eval partition [%d,%d): %w", start, end, err)
+		}
+		if miniResult.Len() != end-start {
+			return fmt.Errorf(
+				"Over: inner returned %d rows for a partition of %d — Over requires a shape-preserving inner",
+				miniResult.Len(), end-start)
+		}
+		return scatterPartitionByRange(miniResult, start, end, outValues)
+	}
+
+	start := 0
+	for row := 1; row < nRows; row++ {
+		nextKey, err = composeCompositeKeyInto(nextKey[:0], partCols, row)
+		if err != nil {
+			return fmt.Errorf("Over: partition key row %d: %w", row, err)
+		}
+		if bytesEqual(curKey, nextKey) {
+			continue
+		}
+		if err := emit(start, row); err != nil {
+			return err
+		}
+		start = row
+		curKey, nextKey = nextKey, curKey
+	}
+	return emit(start, nRows)
+}
+
+// scatterPartitionByRows writes partition results back to outValues
+// at the row indices in `rows`. Used by the hash-bucketed general
+// path.
+func scatterPartitionByRows(miniResult Series, rows []int, outValues []any) error {
+	for i, rowIdx := range rows {
+		null, err := isNullAtSeries(miniResult, i)
+		if err != nil {
+			return fmt.Errorf("Over: read partition row: %w", err)
+		}
+		if null {
+			outValues[rowIdx] = nil
+			continue
+		}
+		v, err := readScalarAt(miniResult, i)
+		if err != nil {
+			return fmt.Errorf("Over: read partition row: %w", err)
+		}
+		outValues[rowIdx] = v
+	}
+	return nil
+}
+
+// scatterPartitionByRange writes partition results back to outValues
+// at positions [start, end). Used by the aligned contiguous-range
+// path — cheaper than scatterPartitionByRows because we don't index
+// through a rows slice.
+func scatterPartitionByRange(miniResult Series, start, end int, outValues []any) error {
+	for i := range end - start {
+		null, err := isNullAtSeries(miniResult, i)
+		if err != nil {
+			return fmt.Errorf("Over: read partition row: %w", err)
+		}
+		if null {
+			outValues[start+i] = nil
+			continue
+		}
+		v, err := readScalarAt(miniResult, i)
+		if err != nil {
+			return fmt.Errorf("Over: read partition row: %w", err)
+		}
+		outValues[start+i] = v
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -420,41 +527,6 @@ func collectHashedPartitions(nRows int, partCols []Series) [][]int {
 		partitions[gid] = append(partitions[gid], row)
 	}
 	return partitions
-}
-
-// collectContiguousPartitions walks the input assuming rows are
-// contiguous by partition key (guaranteed by the aligned fast-path
-// gate). Each contiguous run becomes one entry in the returned slice
-// of row-index slices.
-func collectContiguousPartitions(nRows int, partCols []Series) [][]int {
-	if nRows == 0 {
-		return nil
-	}
-	partitions := [][]int{}
-	curKey := make([]byte, 0, 32)
-	nextKey := make([]byte, 0, 32)
-	curKey, _ = composeCompositeKeyInto(curKey, partCols, 0)
-	start := 0
-	for row := 1; row < nRows; row++ {
-		nextKey, _ = composeCompositeKeyInto(nextKey[:0], partCols, row)
-		if bytesEqual(curKey, nextKey) {
-			continue
-		}
-		partitions = append(partitions, rangeSlice(start, row))
-		start = row
-		curKey, nextKey = nextKey, curKey
-	}
-	partitions = append(partitions, rangeSlice(start, nRows))
-	return partitions
-}
-
-// rangeSlice returns []int{start, start+1, ..., end-1}.
-func rangeSlice(start, end int) []int {
-	out := make([]int, 0, end-start)
-	for i := start; i < end; i++ {
-		out = append(out, i)
-	}
-	return out
 }
 
 // buildOrderComparators returns a rowComparator per orderBy key,
