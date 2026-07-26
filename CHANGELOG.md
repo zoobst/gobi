@@ -5,6 +5,43 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.8]
+
+### Changed
+
+- **Streaming batch-transform ops now fuse.** Adjacent chains of
+  `filter` / `project` / `withColumn` / `drop` / `rename` / `explode`
+  streaming exec ops are coalesced by a post-Compile pass into a
+  single `fusedStreamExecOp` that runs one `batch → Frame → all ops
+  → Frame → batch` cycle per input batch, instead of the previous
+  N cycles (one per op). Non-fusable ops (limit, materialize, scan,
+  aggregate, join) are boundaries — fusion stops at them.
+
+  Each fusable exec op now implements the `frameApplier` interface
+  (single method: `ApplyToFrame(*Frame) (*Frame, error)`). The fusion
+  walker sits at the tail of `Compile` and rewrites the exec tree
+  bottom-up. Filter-in-the-middle-of-a-chain short-circuits the
+  remaining ops when the running Frame reaches 0 rows and pulls the
+  next input batch — matches pre-fusion filter behavior.
+
+### Performance
+
+- **Fused chained streaming ops — 22% fewer allocations.** Measured
+  on a 200k × 20-column Float64 input with a
+  `WithColumn.WithColumn.WithColumn.Filter` chain:
+
+  | Path     | ns/op | B/op     | allocs/op |
+  |----------|------:|---------:|----------:|
+  | Unfused  | 7.42ms | 165.9 MB |     4,029 |
+  | Fused    | 6.88ms | 165.8 MB |     3,156 |
+
+  Wall-time delta is 7% at 20 columns, scaling with column count
+  (each boundary conversion allocates one `arrow.Column` header per
+  column). At narrow frames (~2 columns) wall time is roughly flat
+  and only the 22% alloc reduction remains. Benchmarks landed as
+  `BenchmarkFusion_ChainedOps` vs `BenchmarkFusion_ChainedOpsUnfused`
+  (invokes the private `compileNode` bypassing the fusion pass).
+
 ## [v0.2.7]
 
 ### Added

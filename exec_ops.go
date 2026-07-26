@@ -96,6 +96,13 @@ func (e *filterExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 
 func (e *filterExecOp) Close() error { return e.input.Close() }
 
+// ApplyToFrame runs the filter against f without the batch↔Frame
+// bridging. Used by the fusedStreamExecOp path (adjacent streaming
+// batch-transform ops applied in one Frame conversion cycle).
+func (e *filterExecOp) ApplyToFrame(f *Frame) (*Frame, error) {
+	return f.FilterExpr(e.cond)
+}
+
 // -----------------------------------------------------------------------------
 // projectExec: applies a set of expressions to each batch.
 //
@@ -132,6 +139,11 @@ func (e *projectExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 }
 
 func (e *projectExecOp) Close() error { return e.input.Close() }
+
+// ApplyToFrame — see filterExecOp.ApplyToFrame.
+func (e *projectExecOp) ApplyToFrame(f *Frame) (*Frame, error) {
+	return executeSelect(f, e.exprs)
+}
 
 // -----------------------------------------------------------------------------
 // withColumnExec: adds or replaces one column per batch.
@@ -176,6 +188,16 @@ func (e *withColumnExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) 
 
 func (e *withColumnExecOp) Close() error { return e.input.Close() }
 
+// ApplyToFrame — see filterExecOp.ApplyToFrame. Also attaches the
+// captured input partition metadata before Eval, matching the
+// per-batch Next path.
+func (e *withColumnExecOp) ApplyToFrame(f *Frame) (*Frame, error) {
+	if e.inputMeta != nil {
+		f.WithPartitionMeta(e.inputMeta)
+	}
+	return f.WithColumnExpr(e.name, e.expr)
+}
+
 // -----------------------------------------------------------------------------
 // dropExec: removes one column per batch.
 // -----------------------------------------------------------------------------
@@ -209,6 +231,11 @@ func (e *dropExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 }
 
 func (e *dropExecOp) Close() error { return e.input.Close() }
+
+// ApplyToFrame — see filterExecOp.ApplyToFrame.
+func (e *dropExecOp) ApplyToFrame(f *Frame) (*Frame, error) {
+	return f.DropColumn(e.name)
+}
 
 // -----------------------------------------------------------------------------
 // renameExec: relabels one column per batch. Streaming — pass-through
@@ -244,6 +271,11 @@ func (e *renameExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 }
 
 func (e *renameExecOp) Close() error { return e.input.Close() }
+
+// ApplyToFrame — see filterExecOp.ApplyToFrame.
+func (e *renameExecOp) ApplyToFrame(f *Frame) (*Frame, error) {
+	return f.Rename(e.old, e.new)
+}
 
 // -----------------------------------------------------------------------------
 // explodeExec: per-batch multi-part → single-part expansion. Streams
@@ -284,6 +316,11 @@ func (e *explodeExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 }
 
 func (e *explodeExecOp) Close() error { return e.input.Close() }
+
+// ApplyToFrame — see filterExecOp.ApplyToFrame.
+func (e *explodeExecOp) ApplyToFrame(f *Frame) (*Frame, error) {
+	return f.Explode(e.name)
+}
 
 // -----------------------------------------------------------------------------
 // limitExec: caps the total row count across batches, short-circuits
@@ -412,6 +449,76 @@ func (e *materializeExecOp) materialize(ctx context.Context) error {
 func (e *materializeExecOp) Close() error {
 	return e.input.Close()
 }
+
+// -----------------------------------------------------------------------------
+// frameApplier + fusedStreamExecOp:
+//
+// A streaming batch-transform (filter / project / withColumn / drop /
+// rename / explode) does `batch → Frame → apply → Frame → batch` per
+// batch. Chained ops repeat the Frame↔batch conversion at each step,
+// each round trip allocating per-column arrow.Array + arrow.Column
+// headers plus a fresh arrow.RecordBatch.
+//
+// fusedStreamExecOp collapses adjacent frame-applier ops into one
+// batch conversion cycle: pull batch → convert once → apply all ops
+// on the running Frame → convert back once. Filter-in-the-middle
+// short-circuits the remaining ops for that batch when the Frame
+// reaches 0 rows.
+// -----------------------------------------------------------------------------
+
+// frameApplier is implemented by streaming batch-transform exec ops
+// that can be fused into fusedStreamExecOp. Each op transforms one
+// Frame into another with no cross-batch state.
+type frameApplier interface {
+	ExecOperator
+	ApplyToFrame(*Frame) (*Frame, error)
+}
+
+type fusedStreamExecOp struct {
+	input     ExecOperator
+	ops       []frameApplier
+	outSchema *arrow.Schema
+}
+
+func (e *fusedStreamExecOp) Schema() *arrow.Schema { return e.outSchema }
+
+func (e *fusedStreamExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		batch, err := e.input.Next(ctx)
+		if err != nil {
+			return nil, err
+		}
+		frame, err := batchToFrame(batch)
+		batch.Release()
+		if err != nil {
+			return nil, err
+		}
+		dropped := false
+		for _, op := range e.ops {
+			next, err := op.ApplyToFrame(frame)
+			if err != nil {
+				return nil, err
+			}
+			frame = next
+			if frame.NumRows() == 0 {
+				// Filter (or any op that produced no rows) — remaining
+				// ops would just produce more empty output. Pull the
+				// next batch instead.
+				dropped = true
+				break
+			}
+		}
+		if dropped {
+			continue
+		}
+		return frameToBatch(frame), nil
+	}
+}
+
+func (e *fusedStreamExecOp) Close() error { return e.input.Close() }
 
 // -----------------------------------------------------------------------------
 // scanFileExec: streams batches from a source-package callback API

@@ -21,6 +21,18 @@ import (
 // their goroutine on construction, so callers should always follow
 // Compile with Execute or the operator's Close to avoid leaks.
 func Compile(p LogicalPlan) (ExecOperator, error) {
+	op, err := compileNode(p)
+	if err != nil {
+		return nil, err
+	}
+	return fuseStreamChains(op), nil
+}
+
+// compileNode is the raw plan-to-exec translation. Compile wraps it
+// with fuseStreamChains, a post-pass that coalesces adjacent
+// streaming batch-transforms into a single fusedStreamExecOp — saves
+// one batch↔Frame conversion cycle per fused op.
+func compileNode(p LogicalPlan) (ExecOperator, error) {
 	if p == nil {
 		return nil, fmt.Errorf("gobi: Compile: nil plan")
 	}
@@ -35,7 +47,7 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		return &emptyExecOp{schema: n.Schema()}, nil
 
 	case *filterNode:
-		child, err := Compile(n.input)
+		child, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -54,7 +66,7 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		return &filterExecOp{input: child, cond: n.cond}, nil
 
 	case *projectNode:
-		child, err := Compile(n.input)
+		child, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -74,7 +86,7 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		return &projectExecOp{input: child, exprs: n.exprs, outSchema: n.outSchema}, nil
 
 	case *withColumnNode:
-		child, err := Compile(n.input)
+		child, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -108,14 +120,14 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		}, nil
 
 	case *dropNode:
-		child, err := Compile(n.input)
+		child, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
 		return &dropExecOp{input: child, name: n.name, outSchema: n.outSchema}, nil
 
 	case *limitNode:
-		child, err := Compile(n.input)
+		child, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -126,7 +138,7 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 	// still see a streaming source.
 
 	case *sortNode:
-		child, err := Compile(n.input)
+		child, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -138,7 +150,7 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		}, nil
 
 	case *aggregateNode:
-		child, err := Compile(n.input)
+		child, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -176,11 +188,11 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		}, nil
 
 	case *joinNode:
-		left, err := Compile(n.input)
+		left, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
-		right, err := Compile(n.right)
+		right, err := compileNode(n.right)
 		if err != nil {
 			return nil, err
 		}
@@ -233,7 +245,7 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		}, nil
 
 	case *tailNode:
-		child, err := Compile(n.input)
+		child, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -255,7 +267,7 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		// per-batch through explodeExecOp; output batches may exceed
 		// the batch-size soft cap when dense multi-part geometries or
 		// long lists arrive.
-		child, err := Compile(n.input)
+		child, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -268,7 +280,7 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 	case *renameNode:
 		// Rename is schema-only — a per-batch relabel, no buffering
 		// required. Streams like Filter / Project / Drop.
-		child, err := Compile(n.input)
+		child, err := compileNode(n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -284,7 +296,7 @@ func Compile(p LogicalPlan) (ExecOperator, error) {
 		// directly, no executor node needed. The metadata claim is
 		// consumed at plan time (by alignment predicates), not at
 		// runtime.
-		return Compile(n.input)
+		return compileNode(n.input)
 	}
 	return nil, fmt.Errorf("gobi: Compile: unknown plan node %T", p)
 }
@@ -368,4 +380,101 @@ func compileScanFile(n *scanFileNode) (ExecOperator, error) {
 		return nil, err
 	}
 	return newScanFrameExec(f, defaultBatchRows), nil
+}
+
+// fuseStreamChains walks the exec tree bottom-up and coalesces
+// adjacent streaming batch-transform ops (filter / project /
+// withColumn / drop / rename / explode) into a single
+// fusedStreamExecOp. Cuts one batch↔Frame conversion cycle per fused
+// op — meaningful on pipelines like
+// `.WithColumn(...).WithColumn(...).Filter(...)` that would otherwise
+// pay conversion overhead at each streaming boundary.
+//
+// Non-fusable ops (limit, materialize, scan, aggregate, join) are
+// walked into but not folded — the fusion stops at their boundaries.
+func fuseStreamChains(op ExecOperator) ExecOperator {
+	if op == nil {
+		return nil
+	}
+
+	// Recurse: fuse the subtree(s) first so we work bottom-up.
+	switch e := op.(type) {
+	case *filterExecOp:
+		e.input = fuseStreamChains(e.input)
+	case *projectExecOp:
+		e.input = fuseStreamChains(e.input)
+	case *withColumnExecOp:
+		e.input = fuseStreamChains(e.input)
+	case *dropExecOp:
+		e.input = fuseStreamChains(e.input)
+	case *renameExecOp:
+		e.input = fuseStreamChains(e.input)
+	case *explodeExecOp:
+		e.input = fuseStreamChains(e.input)
+	case *limitExecOp:
+		e.input = fuseStreamChains(e.input)
+	case *materializeExecOp:
+		e.input = fuseStreamChains(e.input)
+	case *fusedStreamExecOp:
+		e.input = fuseStreamChains(e.input)
+	case *streamingAggregateExec:
+		e.input = fuseStreamChains(e.input)
+	case *streamingJoinExec:
+		e.left = fuseStreamChains(e.left)
+		e.right = fuseStreamChains(e.right)
+	case *sortMergeJoinExec:
+		e.left = fuseStreamChains(e.left)
+		e.right = fuseStreamChains(e.right)
+	}
+
+	// Try to fuse op with its input. Only frameApplier-implementing
+	// ops can fuse — everything else is a boundary.
+	applier, ok := op.(frameApplier)
+	if !ok {
+		return op
+	}
+	childInput := frameApplierChild(op)
+	if childInput == nil {
+		return op
+	}
+
+	// Case 1: child is already a fusedStreamExecOp — append this op
+	// to its chain and rebind the output schema.
+	if fused, ok := childInput.(*fusedStreamExecOp); ok {
+		fused.ops = append(fused.ops, applier)
+		fused.outSchema = op.Schema()
+		return fused
+	}
+
+	// Case 2: child is another frameApplier — start a new chain of
+	// two ops with the grandchild as the fused op's input.
+	if childApplier, ok := childInput.(frameApplier); ok {
+		grandchild := frameApplierChild(childInput)
+		return &fusedStreamExecOp{
+			input:     grandchild,
+			ops:       []frameApplier{childApplier, applier},
+			outSchema: op.Schema(),
+		}
+	}
+	return op
+}
+
+// frameApplierChild returns the direct input of a frameApplier op, or
+// nil if op isn't one of the recognized batch-transform types.
+func frameApplierChild(op ExecOperator) ExecOperator {
+	switch e := op.(type) {
+	case *filterExecOp:
+		return e.input
+	case *projectExecOp:
+		return e.input
+	case *withColumnExecOp:
+		return e.input
+	case *dropExecOp:
+		return e.input
+	case *renameExecOp:
+		return e.input
+	case *explodeExecOp:
+		return e.input
+	}
+	return nil
 }

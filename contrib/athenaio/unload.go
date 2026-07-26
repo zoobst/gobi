@@ -456,6 +456,26 @@ func locationMatches(a, b string) bool {
 	return trim(a) == trim(b)
 }
 
+// openBucketFrame opens one s3:// URI, reads its parquet payload via
+// parquetio.ReadReader, and returns the resulting Frame. Extracted
+// so the per-bucket variants (UnloadAndReadBuckets, RawCTASBuckets)
+// can call it once per bucket without duplicating the S3-read plumbing.
+func (c *Client) openBucketFrame(ctx context.Context, uri string) (*gobi.Frame, error) {
+	bucket, key, err := parseS3URI(uri)
+	if err != nil {
+		return nil, err
+	}
+	ra, size, err := newS3ReaderAt(ctx, c.s3, bucket, key)
+	if err != nil {
+		return nil, err
+	}
+	f, err := parquetio.ReadReader(ra, size, nil)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", uri, err)
+	}
+	return f, nil
+}
+
 // readBucketFiles opens each s3:// URI in files, reads it via
 // parquetio.ReadReader, and concatenates the resulting Frames into
 // a single-chunk output Frame. First file's schema is authoritative.
@@ -470,17 +490,9 @@ func locationMatches(a, b string) bool {
 func (c *Client) readBucketFiles(ctx context.Context, files []string) (*gobi.Frame, error) {
 	frames := make([]*gobi.Frame, 0, len(files))
 	for _, uri := range files {
-		bucket, key, err := parseS3URI(uri)
+		f, err := c.openBucketFrame(ctx, uri)
 		if err != nil {
 			return nil, err
-		}
-		ra, size, err := newS3ReaderAt(ctx, c.s3, bucket, key)
-		if err != nil {
-			return nil, err
-		}
-		f, err := parquetio.ReadReader(ra, size, nil)
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", uri, err)
 		}
 		frames = append(frames, f)
 	}
@@ -514,4 +526,400 @@ func (c *Client) readBucketFiles(ctx context.Context, files []string) (*gobi.Fra
 		combined.Release()
 	}
 	return gobi.NewFrame(schema, outCols)
+}
+
+// -----------------------------------------------------------------------------
+// Per-bucket variants: UnloadAndReadBuckets + RawCTASBuckets
+//
+// The mainline UnloadAndRead / RawCTAS concatenate every bucket file
+// into one LazyFrame, forcing downstream callers back into a single-
+// plan execution — even when CTAS bucketing was set up expressly to
+// enable per-bucket parallelism. The per-bucket variants return one
+// LazyFrame per bucket file so callers can dispatch parallel per-
+// partition work (`errgroup.WithContext` + per-frame goroutine)
+// without reimplementing the S3-list-and-read plumbing.
+//
+// Each returned LazyFrame carries the same PartitionMetadata claim
+// as the mainline variant. Alignment holds within-bucket (same-K
+// rows are contained in a single bucket, per the bucketing invariant)
+// but NOT across bucket indices — bucket i on left and bucket i on
+// right of two separate UnloadAndReadBuckets calls are alignment-
+// compatible; bucket i on left and bucket j on right are not.
+// -----------------------------------------------------------------------------
+
+// BucketResult pairs a per-bucket LazyFrame with the S3 URI it was
+// read from. Returned by the *WithMetadata variants when the caller
+// wants per-bucket telemetry, logging, or correlation with Athena's
+// query stats. Frame may be nil for skipped/missing bucket indices
+// under strict PartitionBy+BucketCount contracts.
+type BucketResult struct {
+	// S3URI is the fully-qualified `s3://bucket/key` the frame was
+	// read from. Empty when Frame is nil.
+	S3URI string
+	// Frame is the per-bucket LazyFrame. Independently readable via
+	// Collect(); errors surface at Collect time on the specific
+	// frame that failed (sibling frames unaffected).
+	Frame *gobi.LazyFrame
+}
+
+// UnloadAndReadBuckets is the bucket-aware variant of UnloadAndRead.
+// Submits the same CTAS + verify + list flow, then returns one
+// *gobi.LazyFrame per bucket file — each independently readable, each
+// carrying the same PartitionMetadata claim. Callers can Collect them
+// in parallel goroutines to exploit CTAS bucket parallelism directly.
+//
+// Contract:
+//
+//   - spec.PartitionBy must be non-empty and spec.BucketCount > 0.
+//     Unbucketed CTAS output doesn't guarantee stable per-file
+//     semantics; callers who want that should use UnloadAndRead.
+//   - Returned slice length == spec.BucketCount. Empty bucket indices
+//     (skew — a bucket ends up with no rows and Athena writes no
+//     file) are represented by a nil slot at that index. Callers
+//     iterating with `for i, lf := range results` should nil-check.
+//   - Each LazyFrame's Collect() error is independent of siblings.
+//     A bad Parquet file on bucket 3 doesn't invalidate bucket 4.
+//   - Table cleanup lifecycle is unchanged from UnloadAndRead: one
+//     Glue-catalog entry per CTAS, tracked on the Client for Close.
+//
+// Ordering of the returned slice matches S3's ListObjectsV2 output
+// (lexicographic on key), which for Athena's bucket file naming
+// puts bucket_00000 first. Callers should not assume the ordering
+// carries semantic meaning beyond "bucket i in slice matches bucket
+// i in a peer call with the same spec".
+func (c *Client) UnloadAndReadBuckets(ctx context.Context, spec UnloadSpec) ([]*gobi.LazyFrame, error) {
+	if len(spec.PartitionBy) == 0 {
+		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets requires non-empty spec.PartitionBy")
+	}
+	if spec.BucketCount <= 0 {
+		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets requires spec.BucketCount > 0")
+	}
+	results, err := c.unloadAndReadBucketsWithMeta(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*gobi.LazyFrame, len(results))
+	for i, r := range results {
+		out[i] = r.Frame
+	}
+	return out, nil
+}
+
+// UnloadAndReadBucketsWithMetadata is the observability-friendly form
+// of UnloadAndReadBuckets — returns per-bucket S3 URIs alongside the
+// LazyFrames. Same contract otherwise.
+func (c *Client) UnloadAndReadBucketsWithMetadata(ctx context.Context, spec UnloadSpec) ([]BucketResult, error) {
+	if len(spec.PartitionBy) == 0 {
+		return nil, fmt.Errorf("athenaio: UnloadAndReadBucketsWithMetadata requires non-empty spec.PartitionBy")
+	}
+	if spec.BucketCount <= 0 {
+		return nil, fmt.Errorf("athenaio: UnloadAndReadBucketsWithMetadata requires spec.BucketCount > 0")
+	}
+	return c.unloadAndReadBucketsWithMeta(ctx, spec)
+}
+
+// unloadAndReadBucketsWithMeta is the shared implementation. Runs
+// the full UnloadAndRead composition + submit + verify flow, then
+// per-file constructs a LazyFrame with the same PartitionMetadata
+// claim as the mainline variant. Missing bucket indices become nil
+// slots.
+func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSpec) ([]BucketResult, error) {
+	start := time.Now()
+	if spec.ValidatePartitionCols {
+		cols, err := c.runPrepass(ctx, spec.SQL)
+		if err != nil {
+			return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets prepass: %w", err)
+		}
+		if err := verifyPartitionColsPresent(spec.PartitionBy, cols); err != nil {
+			return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets prepass: %w", err)
+		}
+	}
+
+	useHive := spec.TableFormat == FormatHive
+	if !useHive && c.getHiveFallbackOnly() {
+		useHive = true
+	}
+	composed, queryID, exec, err := c.tryCTAS(ctx, spec, useHive)
+	if err != nil {
+		if !useHive && spec.TableFormat != FormatIceberg && isIcebergNotSupportedErr(err) {
+			if c.warnLog != nil {
+				c.warnLog("athenaio: workgroup %s rejected Iceberg CTAS; falling back to Hive format", c.cfg.Workgroup)
+			}
+			c.setHiveFallbackOnly()
+			composed, queryID, exec, err = c.tryCTAS(ctx, spec, true)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	}
+
+	if err := c.verifyCTASOutput(ctx, composed, spec); err != nil {
+		c.registerTable(trackedTable{
+			Database:         c.cfg.Database,
+			Name:             composed.TableName,
+			Cleanup:          c.effectiveCleanup(spec),
+			Format:           composed.Format,
+			ExternalLocation: composed.ExternalLocation,
+		})
+		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s read-back verify: %w", queryID, err)
+	}
+	c.registerTable(trackedTable{
+		Database:         c.cfg.Database,
+		Name:             composed.TableName,
+		Cleanup:          c.effectiveCleanup(spec),
+		Format:           composed.Format,
+		ExternalLocation: composed.ExternalLocation,
+	})
+
+	files, err := listBucketFiles(ctx, c.s3, composed.ExternalLocation)
+	if err != nil {
+		return nil, err
+	}
+	// Empty bucket set is legitimate for skew-heavy inputs but is
+	// almost always a spec/data mismatch — flag it early.
+	if len(files) == 0 {
+		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: no result files under %s",
+			queryID, composed.ExternalLocation)
+	}
+
+	meta := &gobi.PartitionMetadata{
+		Columns:      append([]string(nil), spec.PartitionBy...),
+		HashFn:       hashTagFor(composed.Format),
+		SortedBy:     append([]gobi.SortKey(nil), spec.OrderBy...),
+		SortEnforced: composed.Format == FormatIceberg && len(spec.OrderBy) > 0,
+	}
+
+	// Build per-file LazyFrames. Missing bucket indices — where a
+	// bucket produced zero rows and Athena wrote no file — become
+	// nil slots so len(result) == BucketCount and index i maps to
+	// bucket i consistently across peer calls.
+	results := make([]BucketResult, spec.BucketCount)
+	if err := c.populateBucketResults(ctx, files, results, meta); err != nil {
+		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: %w", queryID, err)
+	}
+
+	// Register stats on every non-nil frame so per-bucket callers
+	// can look them up individually.
+	stats := QueryStats{
+		QueryExecutionID: queryID,
+		ResultPrefix:     composed.ExternalLocation,
+		ScannedBytes:     scannedBytes(exec),
+		EngineTime:       engineTime(exec),
+		TotalTime:        time.Since(start),
+	}
+	for _, r := range results {
+		if r.Frame != nil {
+			registerStats(r.Frame, stats)
+		}
+	}
+	return results, nil
+}
+
+// RawCTASBuckets is the bucket-aware variant of RawCTAS. Submits the
+// caller-composed CTAS SQL (which must already encode bucketing in
+// the DDL), verifies via Glue that the resulting table is bucketed
+// with `bucket_count > 0`, then returns one LazyFrame per bucket file.
+//
+// Contract:
+//
+//   - spec.SQL must contain bucketing DDL. athenaio verifies the
+//     Glue table's post-create bucket_count > 0; failure surfaces
+//     BEFORE any LazyFrame is constructed. Callers who want to
+//     bypass the check should use RawCTAS.
+//   - spec.Metadata (if set) is attached to each returned LazyFrame
+//     via WithPartitionAssertion — same claim per-bucket, matching
+//     the mainline RawCTAS shape.
+//   - Otherwise identical semantics to UnloadAndReadBuckets: per-file
+//     LazyFrames, nil slots for empty buckets when possible,
+//     independent Collect() errors.
+func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]BucketResult, error) {
+	if spec.SQL == "" {
+		return nil, fmt.Errorf("athenaio: RawCTASSpec.SQL is empty")
+	}
+	if spec.TableName == "" {
+		return nil, fmt.Errorf("athenaio: RawCTASSpec.TableName is required")
+	}
+	if spec.ExternalLocation == "" {
+		return nil, fmt.Errorf("athenaio: RawCTASSpec.ExternalLocation is required")
+	}
+	database := spec.Database
+	if database == "" {
+		database = c.cfg.Database
+	}
+	if database == "" {
+		return nil, fmt.Errorf("athenaio: RawCTASBuckets requires Database (in spec or Client config)")
+	}
+	cleanup := spec.Cleanup
+	if cleanup == CleanupInherit {
+		cleanup = c.cfg.Cleanup
+	}
+	start := time.Now()
+
+	queryID, err := c.submit(ctx, spec.SQL)
+	if err != nil {
+		return nil, fmt.Errorf("athenaio: RawCTASBuckets submit:\n---\n%s\n---\n%w", spec.SQL, err)
+	}
+	exec, err := c.pollUntilDone(ctx, queryID)
+	if err != nil {
+		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s failed:\n---\n%s\n---\n%w",
+			queryID, spec.SQL, err)
+	}
+
+	// Register the table for cleanup before the bucketing verification —
+	// otherwise an unbucketed table would be orphaned in Glue when we
+	// error out below.
+	c.registerTable(trackedTable{
+		Database:         database,
+		Name:             spec.TableName,
+		Cleanup:          cleanup,
+		Format:           FormatUnknown,
+		ExternalLocation: spec.ExternalLocation,
+	})
+
+	// Verify the table is actually bucketed. RawCTAS-side we don't
+	// compose the SQL so we can't know the bucket count without
+	// asking Glue. This check catches "caller forgot the bucketed_by
+	// clause" before any LazyFrame is handed back.
+	bucketCount, err := c.readGlueBucketCount(ctx, database, spec.TableName)
+	if err != nil {
+		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: verify bucketing: %w", queryID, err)
+	}
+	if bucketCount <= 0 {
+		return nil, fmt.Errorf(
+			"athenaio: RawCTASBuckets %s: table %s.%s is not bucketed (bucket_count=%d) — use RawCTAS for non-bucketed output",
+			queryID, database, spec.TableName, bucketCount)
+	}
+
+	files, err := listBucketFiles(ctx, c.s3, spec.ExternalLocation)
+	if err != nil {
+		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: no result files under %s",
+			queryID, spec.ExternalLocation)
+	}
+
+	results := make([]BucketResult, bucketCount)
+	if err := c.populateBucketResults(ctx, files, results, spec.Metadata); err != nil {
+		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
+	}
+	stats := QueryStats{
+		QueryExecutionID: queryID,
+		ResultPrefix:     spec.ExternalLocation,
+		ScannedBytes:     scannedBytes(exec),
+		EngineTime:       engineTime(exec),
+		TotalTime:        time.Since(start),
+	}
+	for _, r := range results {
+		if r.Frame != nil {
+			registerStats(r.Frame, stats)
+		}
+	}
+	return results, nil
+}
+
+// populateBucketResults reads each file into a Frame, wraps it in a
+// LazyFrame, optionally attaches PartitionMetadata, and installs it
+// at the appropriate slot in results.
+//
+// Slotting: file path suffix `bucket_NNNNN` (or Athena's naming
+// variant) is parsed to extract the bucket index; if parsing fails
+// (RawCTAS output without a matching name), files fill slots in
+// listing order. Missing bucket indices stay nil.
+func (c *Client) populateBucketResults(ctx context.Context, files []string, results []BucketResult, meta *gobi.PartitionMetadata) error {
+	nSlots := len(results)
+	for i, uri := range files {
+		frame, err := c.openBucketFrame(ctx, uri)
+		if err != nil {
+			return err
+		}
+		if meta != nil {
+			frame.WithPartitionMeta(meta)
+		}
+		lf := frame.Lazy()
+		if meta != nil {
+			asserted, err := lf.WithPartitionAssertion(meta)
+			if err != nil {
+				return fmt.Errorf("attach partition assertion for %s: %w", uri, err)
+			}
+			lf = asserted
+		}
+
+		// Prefer parsed bucket index; fall back to listing order for
+		// non-standard names. Out-of-range indices fall back too.
+		slot := bucketIndexFromURI(uri)
+		if slot < 0 || slot >= nSlots {
+			slot = i
+			if slot >= nSlots {
+				// More files than expected buckets — should not happen
+				// with a valid bucket_count check, but stay defensive.
+				return fmt.Errorf("athenaio: file %s exceeds expected bucket range [0,%d)", uri, nSlots)
+			}
+		}
+		if results[slot].Frame != nil {
+			// Two files claim the same slot — surface rather than
+			// silently overwrite. Only fires on Athena writer bugs
+			// or naming collisions.
+			return fmt.Errorf("athenaio: duplicate bucket slot %d: %s and %s",
+				slot, results[slot].S3URI, uri)
+		}
+		results[slot] = BucketResult{S3URI: uri, Frame: lf}
+	}
+	return nil
+}
+
+// bucketIndexFromURI extracts the bucket index from an Athena-shaped
+// output filename. Athena writes bucketed CTAS output with the bucket
+// index as a leading zero-padded numeric segment in the basename:
+//
+//   - Iceberg: `<external_location>/data/NNNNN-<part>-<uuid>.parquet`
+//     (leading `NNNNN` = bucket index).
+//   - Hive:    `<external_location>/NNNNNN_M.parquet`
+//     (leading `NNNNNN` = bucket index, `M` = write-attempt suffix).
+//
+// Returns -1 when the basename doesn't start with digits.
+func bucketIndexFromURI(uri string) int {
+	// Take the basename (portion after the last '/').
+	base := uri
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	// Walk forward, collect leading digits.
+	i := 0
+	for i < len(base) && base[i] >= '0' && base[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return -1
+	}
+	n := 0
+	for _, d := range base[:i] {
+		n = n*10 + int(d-'0')
+	}
+	return n
+}
+
+// readGlueBucketCount asks Glue for the bucket count on a table
+// produced by a Hive-style CTAS. StorageDescriptor.NumberOfBuckets
+// carries the count; 0 or absent means the table is not bucketed.
+// Used by RawCTASBuckets to catch "caller forgot bucketed_by" before
+// handing back LazyFrames.
+func (c *Client) readGlueBucketCount(ctx context.Context, database, tableName string) (int, error) {
+	out, err := c.glue.GetTable(ctx, &glue.GetTableInput{
+		DatabaseName: aws.String(database),
+		Name:         aws.String(tableName),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("GetTable %s.%s: %w", database, tableName, err)
+	}
+	if out.Table == nil {
+		return 0, fmt.Errorf("GetTable %s.%s: nil Table", database, tableName)
+	}
+	sd := out.Table.StorageDescriptor
+	if sd == nil {
+		return 0, nil
+	}
+	return int(sd.NumberOfBuckets), nil
 }
