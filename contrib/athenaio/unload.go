@@ -216,7 +216,12 @@ func (c *Client) RawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 	}
 	start := time.Now()
 
-	queryID, err := c.submit(ctx, spec.SQL)
+	// Steer the CTAS output via ResultConfiguration.OutputLocation
+	// (the caller-provided ExternalLocation). Any external_location
+	// clause the user embedded in spec.SQL still passes through
+	// verbatim — athenaio doesn't parse it — but OutputLocation is
+	// what a workgroup-enforced setup will honor.
+	queryID, err := c.submitTo(ctx, spec.SQL, spec.ExternalLocation)
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: RawCTAS submit:\n---\n%s\n---\n%w", spec.SQL, err)
 	}
@@ -291,7 +296,13 @@ func (c *Client) tryCTAS(ctx context.Context, spec UnloadSpec, useHive bool) (*c
 	if err != nil {
 		return nil, "", nil, err
 	}
-	queryID, err := c.submit(ctx, composed.SQL)
+	// Submit with the composed data location as OutputLocation —
+	// that's the sole knob for CTAS data placement now that the
+	// WITH-clause `external_location` / `location` properties are
+	// gone. Workgroups with EnforceWorkGroupConfiguration=true may
+	// still override this; resolveActualLocation surfaces the
+	// override to callers.
+	queryID, err := c.submitTo(ctx, composed.SQL, composed.ExternalLocation)
 	if err != nil {
 		return composed, "", nil, fmt.Errorf("athenaio: UnloadAndRead submit: composed SQL=%s: %w", composed.SQL, err)
 	}
@@ -824,7 +835,7 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 	}
 	start := time.Now()
 
-	queryID, err := c.submit(ctx, spec.SQL)
+	queryID, err := c.submitTo(ctx, spec.SQL, spec.ExternalLocation)
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: RawCTASBuckets submit:\n---\n%s\n---\n%w", spec.SQL, err)
 	}

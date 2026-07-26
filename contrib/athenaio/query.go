@@ -75,13 +75,30 @@ func (c *Client) RawQuery(ctx context.Context, sql string) (*gobi.LazyFrame, err
 	return lf, nil
 }
 
-// submit runs StartQueryExecution and returns the query ID.
+// submit runs StartQueryExecution against the Client's default
+// ResultLocation. Used for non-CTAS query paths (RawQuery prepass,
+// GetQueryResults-style manifest reads) that don't need a per-query
+// override.
 func (c *Client) submit(ctx context.Context, sql string) (string, error) {
+	return c.submitTo(ctx, sql, c.cfg.ResultLocation)
+}
+
+// submitTo runs StartQueryExecution with a caller-supplied
+// ResultConfiguration.OutputLocation. CTAS paths use this to steer
+// data files to their per-query external prefix — that hint replaces
+// the CTAS WITH-clause `external_location` / `location` property
+// dropped in v0.1.2. Workgroups with EnforceWorkGroupConfiguration=true
+// may still override this value; callers handle the fallout via
+// resolveActualLocation.
+func (c *Client) submitTo(ctx context.Context, sql, outputLocation string) (string, error) {
+	if outputLocation == "" {
+		outputLocation = c.cfg.ResultLocation
+	}
 	in := &athena.StartQueryExecutionInput{
 		QueryString: aws.String(sql),
 		WorkGroup:   aws.String(c.cfg.Workgroup),
 		ResultConfiguration: &athenatypes.ResultConfiguration{
-			OutputLocation: aws.String(c.cfg.ResultLocation),
+			OutputLocation: aws.String(outputLocation),
 		},
 	}
 	if c.cfg.Database != "" {

@@ -21,9 +21,14 @@ type composedCTAS struct {
 	// can identify + reap orphans.
 	TableName string
 
-	// ExternalLocation is the s3://... URI where CTAS writes the
-	// parquet data files. Derived from the Client's ResultLocation
-	// plus a query-scoped subdirectory.
+	// ExternalLocation is the s3://... URI athenaio wants CTAS to
+	// write data files to. Derived from the Client's ResultLocation
+	// plus a query-scoped subdirectory. Passed to
+	// StartQueryExecution's ResultConfiguration.OutputLocation
+	// (not baked into the CTAS SQL as a WITH-clause property) so
+	// workgroups with EnforceWorkGroupConfiguration=true either
+	// honor it via OutputLocation or override it, in which case
+	// resolveActualLocation reads the ground truth from Glue.
 	ExternalLocation string
 
 	// Format is the resolved table format (never FormatUnknown here —
@@ -115,11 +120,19 @@ func (c *Client) newTableIdentity() (tableName, externalLoc string, err error) {
 // composeIcebergSQL renders the Iceberg CTAS. Uses Iceberg-specific
 // properties (`table_type = 'ICEBERG'`, `partitioning = ARRAY['bucket(N, K)']`,
 // `sorted_by = ARRAY['col ASC/DESC']`). Requires Athena engine v3.
-func composeIcebergSQL(database, tableName, externalLoc string, spec UnloadSpec) string {
+//
+// The `location` / `external_location` clause is intentionally
+// absent: workgroups with EnforceWorkGroupConfiguration=true drop
+// those hints from the CTAS WITH clause and route writes to whatever
+// `ResultConfiguration.OutputLocation` says. athenaio submits the
+// composed SQL with OutputLocation set to composedCTAS.ExternalLocation
+// (see (*Client).submitTo), which the workgroup honors when possible
+// and the caller can still discover post-hoc via Glue's
+// StorageDescriptor.Location when it isn't.
+func composeIcebergSQL(database, tableName, _ string, spec UnloadSpec) string {
 	withParts := []string{
 		"table_type = 'ICEBERG'",
 		"format = 'PARQUET'",
-		fmt.Sprintf("location = '%s'", externalLoc),
 		fmt.Sprintf("partitioning = ARRAY[%s]", icebergBucketExpr(spec.PartitionBy, spec.BucketCount)),
 	}
 	if len(spec.OrderBy) > 0 {
@@ -135,8 +148,14 @@ func composeIcebergSQL(database, tableName, externalLoc string, spec UnloadSpec)
 }
 
 // composeHiveSQL renders the Hive CTAS. Uses Hive-specific
-// properties (`external_location`, `bucketed_by` + `bucket_count`
-// as separate props). Works on both engine v2 + v3 workgroups.
+// properties (`bucketed_by` + `bucket_count` as separate props).
+// Works on both engine v2 + v3 workgroups.
+//
+// The `external_location` property is intentionally absent — see the
+// composeIcebergSQL comment for the workgroup-enforcement rationale.
+// athenaio submits with ResultConfiguration.OutputLocation set to the
+// composed ExternalLocation so honoring workgroups still land data
+// under the athenaio-namespaced prefix.
 //
 // Hive's `sorted_by` is a table property hint only — the writer
 // doesn't enforce order. To actually get physically-sorted output,
@@ -146,10 +165,9 @@ func composeIcebergSQL(database, tableName, externalLoc string, spec UnloadSpec)
 // downstream operators (Over/Join/GroupBy fast paths) refuse to
 // trust hint-only sort claims. Users who need enforcement rely on
 // the ORDER BY wrapping directly or migrate to Iceberg.
-func composeHiveSQL(database, tableName, externalLoc string, spec UnloadSpec) string {
+func composeHiveSQL(database, tableName, _ string, spec UnloadSpec) string {
 	withParts := []string{
 		"format = 'PARQUET'",
-		fmt.Sprintf("external_location = '%s'", externalLoc),
 		fmt.Sprintf("bucketed_by = ARRAY[%s]", quotedIdentArray(spec.PartitionBy)),
 		fmt.Sprintf("bucket_count = %d", spec.BucketCount),
 	}

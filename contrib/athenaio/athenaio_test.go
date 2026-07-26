@@ -560,8 +560,9 @@ func TestUnloadAndRead_HappyPath(t *testing.T) {
 	// type, we can't override it. Use a wrapper mock.
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
-		onStart: func(sql string) {
-			tableName, location := extractCTASNameAndLocation(sql)
+		onStart: func(sql, outputLoc string) {
+			tableName := extractCTASName(sql)
+			location := outputLoc
 			// Populate S3 with bucket files under external_location.
 			bucket, keyPrefix, _ := parseS3URI(location)
 			_ = bucket
@@ -683,13 +684,17 @@ func TestUnloadAndRead_HappyPath(t *testing.T) {
 // how prepass tests inject a fixed projection schema.
 type mockCTASAthenaWithSideEffect struct {
 	inner       *mockCTASAthena
-	onStart     func(sql string)
+	onStart     func(sql, outputLoc string)
 	prepassCols []string
 }
 
 func (w *mockCTASAthenaWithSideEffect) StartQueryExecution(ctx context.Context, in *athena.StartQueryExecutionInput, opts ...func(*athena.Options)) (*athena.StartQueryExecutionOutput, error) {
 	if w.onStart != nil {
-		w.onStart(aws.ToString(in.QueryString))
+		var outputLoc string
+		if in.ResultConfiguration != nil && in.ResultConfiguration.OutputLocation != nil {
+			outputLoc = *in.ResultConfiguration.OutputLocation
+		}
+		w.onStart(aws.ToString(in.QueryString), outputLoc)
 	}
 	return w.inner.StartQueryExecution(ctx, in, opts...)
 }
@@ -720,39 +725,32 @@ func (w *mockCTASAthenaWithSideEffect) GetQueryResults(ctx context.Context, in *
 	}, nil
 }
 
-// extractCTASNameAndLocation pulls the auto-generated table name +
-// external_location out of a composed CTAS statement. Fragile shape-
-// match — good enough for the test since athenaio's composeCTAS
-// produces a stable format. Database-agnostic: matches `CREATE TABLE
-// "<db>"."<table>"` for any db identifier by finding the last dot
-// between double-quoted identifiers.
-func extractCTASNameAndLocation(sql string) (name, location string) {
-	// Table name: after `CREATE TABLE "<db>"."` and before the next
-	// closing `"`. Walk past "CREATE TABLE ", the db-quoted ident,
-	// the dot, and the opening quote of the table ident.
+// extractCTASName pulls the auto-generated table name out of a
+// composed CTAS statement. Fragile shape-match — good enough for
+// the test since athenaio's composeCTAS produces a stable format.
+// Database-agnostic: matches `CREATE TABLE "<db>"."<table>"` for
+// any db identifier.
+//
+// The location is no longer parsed from the SQL — since v0.1.2
+// athenaio drops the `location` / `external_location` WITH-clause
+// property and steers CTAS output via
+// ResultConfiguration.OutputLocation. Tests pick that up from the
+// StartQueryExecutionInput and pass it into onStart's outputLoc arg.
+func extractCTASName(sql string) string {
 	const create = `CREATE TABLE "`
 	if _, after, ok := strings.Cut(sql, create); ok {
 		rest := after
-		// Skip past db-name closing quote.
 		if j := strings.Index(rest, `".`); j >= 0 {
 			rest = rest[j+2:]
 			if strings.HasPrefix(rest, `"`) {
 				rest = rest[1:]
 				if before, _, ok0 := strings.Cut(rest, `"`); ok0 {
-					name = before
+					return before
 				}
 			}
 		}
 	}
-	// Location: after `location = '` up to the next `'`.
-	locMarker := `location = '`
-	if _, after, ok := strings.Cut(sql, locMarker); ok {
-		rest := after
-		if before, _, ok0 := strings.Cut(rest, `'`); ok0 {
-			location = before
-		}
-	}
-	return name, location
+	return ""
 }
 
 // TestUnloadAndRead_HiveHappyPath is the Hive-format counterpart to
@@ -768,8 +766,9 @@ func TestUnloadAndRead_HiveHappyPath(t *testing.T) {
 	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{}}
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
-		onStart: func(sql string) {
-			tableName, location := extractCTASNameAndLocation(sql)
+		onStart: func(sql, outputLoc string) {
+			tableName := extractCTASName(sql)
+			location := outputLoc
 			_, keyPrefix, _ := parseS3URI(location)
 			mockS.objects[keyPrefix+"data/00000-0.parquet"] = payload
 			// Hive table: no `table_type=ICEBERG` parameter.
@@ -849,7 +848,7 @@ func TestUnloadAndRead_IcebergToHiveFallback(t *testing.T) {
 	var warnCount int
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
-		onStart: func(sql string) {
+		onStart: func(sql, outputLoc string) {
 			atomic.AddInt32(&attemptCount, 1)
 			if strings.Contains(sql, "table_type = 'ICEBERG'") {
 				// Iceberg attempt: force the mock to return FAILED
@@ -865,7 +864,8 @@ func TestUnloadAndRead_IcebergToHiveFallback(t *testing.T) {
 			// S3/Glue mocks so verifyCTASOutput finds the table.
 			mockA.forceFailState = ""
 			mockA.forceFailReason = ""
-			tableName, location := extractCTASNameAndLocation(sql)
+			tableName := extractCTASName(sql)
+			location := outputLoc
 			_, keyPrefix, _ := parseS3URI(location)
 			mockS.objects[keyPrefix+"data/00000-0.parquet"] = payload
 			mockG.tables[glueTableKey{Database: "test_db", Name: tableName}] = &gluetypes.Table{
@@ -1040,8 +1040,8 @@ func TestUnloadAndRead_WorkgroupOverrideWarns(t *testing.T) {
 	// shape for workgroup-override workloads, not an error condition.
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
-		onStart: func(sql string) {
-			tableName, _ := extractCTASNameAndLocation(sql)
+		onStart: func(sql, _ string) {
+			tableName := extractCTASName(sql)
 			mockG.tables[glueTableKey{Database: "test_db", Name: tableName}] = &gluetypes.Table{
 				Name: aws.String(tableName),
 				Parameters: map[string]string{
@@ -1254,14 +1254,15 @@ func TestPrepass_AllColumnsPresent(t *testing.T) {
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner:       mockA,
 		prepassCols: []string{"id", "v"},
-		onStart: func(sql string) {
+		onStart: func(sql, outputLoc string) {
 			// Only fires on CTAS submit (SQL starts with CREATE);
 			// prepass SQL starts with SELECT and shouldn't populate
 			// mocks.
 			if !strings.HasPrefix(strings.TrimSpace(sql), "CREATE") {
 				return
 			}
-			tableName, location := extractCTASNameAndLocation(sql)
+			tableName := extractCTASName(sql)
+			location := outputLoc
 			bucket, keyPrefix, _ := parseS3URI(location)
 			_ = bucket
 			mockS.objects[keyPrefix+"data/00000-0.parquet"] = payload
@@ -1320,8 +1321,9 @@ func TestCleanupAll_DeletesS3Objects(t *testing.T) {
 	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{}}
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
-		onStart: func(sql string) {
-			tableName, location := extractCTASNameAndLocation(sql)
+		onStart: func(sql, outputLoc string) {
+			tableName := extractCTASName(sql)
+			location := outputLoc
 			_, keyPrefix, _ := parseS3URI(location)
 			mockS.objects[keyPrefix+"data/00000-0.parquet"] = payload
 			mockS.objects[keyPrefix+"data/00001-0.parquet"] = payload
@@ -1386,8 +1388,9 @@ func TestCleanupCatalogOnly_LeavesS3Alone(t *testing.T) {
 	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{}}
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
-		onStart: func(sql string) {
-			tableName, location := extractCTASNameAndLocation(sql)
+		onStart: func(sql, outputLoc string) {
+			tableName := extractCTASName(sql)
+			location := outputLoc
 			_, keyPrefix, _ := parseS3URI(location)
 			mockS.objects[keyPrefix+"data/00000-0.parquet"] = payload
 			mockG.tables[glueTableKey{Database: "db", Name: tableName}] = &gluetypes.Table{

@@ -34,8 +34,9 @@ func TestUnloadAndReadBuckets_HappyPath(t *testing.T) {
 
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
-		onStart: func(sql string) {
-			tableName, location := extractCTASNameAndLocation(sql)
+		onStart: func(sql, outputLoc string) {
+			tableName := extractCTASName(sql)
+			location := outputLoc
 			_, keyPrefix, _ := parseS3URI(location)
 			// Three bucket files. Iceberg-shape names carry the bucket
 			// index as the trailing zero-padded segment before ".parquet".
@@ -118,8 +119,9 @@ func TestUnloadAndReadBuckets_MissingBucketAsNil(t *testing.T) {
 
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
-		onStart: func(sql string) {
-			tableName, location := extractCTASNameAndLocation(sql)
+		onStart: func(sql, outputLoc string) {
+			tableName := extractCTASName(sql)
+			location := outputLoc
 			_, keyPrefix, _ := parseS3URI(location)
 			// Only buckets 0 and 2 have data — bucket 1 is empty
 			// (Athena wrote no file for it).
@@ -220,8 +222,9 @@ func TestUnloadAndReadBucketsWithMetadata_ReturnsPerBucketURIs(t *testing.T) {
 
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
-		onStart: func(sql string) {
-			tableName, location := extractCTASNameAndLocation(sql)
+		onStart: func(sql, outputLoc string) {
+			tableName := extractCTASName(sql)
+			location := outputLoc
 			_, keyPrefix, _ := parseS3URI(location)
 			mockS.objects[keyPrefix+"data/00000-0.parquet"] = payload
 			mockS.objects[keyPrefix+"data/00001-0.parquet"] = payload

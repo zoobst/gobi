@@ -9,6 +9,42 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.2]
+
+### Changed
+
+- **CTAS output location is now steered exclusively via
+  `ResultConfiguration.OutputLocation`; the CTAS WITH-clause
+  `external_location` / `location` property is no longer emitted.**
+  Workgroups with `EnforceWorkGroupConfiguration=true` strip the
+  WITH-clause hint anyway (that's the entire root cause of the
+  v0.1.1 workgroup-override bug), so relying on it was a coin flip:
+  honoring workgroups respected it, enforcing workgroups silently
+  dropped it. `OutputLocation` is the one knob Athena treats
+  consistently — honoring workgroups use it, enforcing workgroups
+  override it — and the v0.1.1 Glue `StorageDescriptor.Location`
+  lookup already reconciles the override case.
+
+  Implementation:
+
+  - `composeIcebergSQL` no longer emits `location = '...'`.
+  - `composeHiveSQL` no longer emits `external_location = '...'`.
+  - New `(*Client).submitTo(ctx, sql, outputLocation)` is the
+    per-query submit primitive; the old `submit` becomes a thin
+    wrapper that uses `c.cfg.ResultLocation`.
+  - `tryCTAS`, `RawCTAS`, `RawCTASBuckets` all use `submitTo` with
+    their per-CTAS `ExternalLocation` — that's the single
+    location signal now.
+  - `resolveActualLocation` from v0.1.1 still applies: Glue
+    remains the ground truth when `OutputLocation` gets overridden.
+
+  RawCTAS callers who currently embed `external_location` in their
+  SQL string keep working — athenaio doesn't parse RawCTAS SQL, so
+  the property passes through verbatim. The workgroup either
+  ignores it (managed) or honors it alongside `OutputLocation`
+  (open). Either way athenaio reads the actual location from Glue
+  before listing files.
+
 ## [v0.1.1]
 
 ### Fixed
