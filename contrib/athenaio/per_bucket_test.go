@@ -318,6 +318,10 @@ func TestRawCTASBuckets_HappyPath(t *testing.T) {
 			Name: aws.String("user-table"),
 			StorageDescriptor: &gluetypes.StorageDescriptor{
 				NumberOfBuckets: 3,
+				// resolveActualLocation reads this — must match
+				// caller ExternalLocation (or the workgroup-override
+				// warning path fires + we list an unrelated prefix).
+				Location: aws.String(external),
 			},
 		},
 	}}

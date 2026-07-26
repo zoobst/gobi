@@ -9,7 +9,42 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
-## [Unreleased]
+## [v0.1.1]
+
+### Fixed
+
+- **Workgroups with `EnforceWorkGroupConfiguration=true` silently
+  overrode `external_location`, causing every CTAS-based read to
+  error with "no result files under ...".** Affects `UnloadAndRead`,
+  `UnloadAndReadBuckets`, `RawCTAS`, `RawCTASBuckets` — all four
+  variants used the caller-composed `ExternalLocation` when listing
+  S3 result files, but the workgroup override made Athena write to
+  its own `ResultConfiguration.OutputLocation` instead. athenaio
+  then listed the composed prefix (empty) and errored.
+
+  Fix: after CTAS submit + poll succeeds, all four paths now call
+  the new `Client.resolveActualLocation` helper, which looks up the
+  ground-truth `StorageDescriptor.Location` from Glue and uses it
+  for `listBucketFiles`. When the actual location differs from the
+  composed one, athenaio invokes `ClientConfig.WarnLog` with a
+  message identifying the workgroup-override symptom, so subsequent
+  callers don't have to rediscover the root cause.
+
+  The old read-back verification's exact-match Location check
+  (`Location mismatch: got X, expected Y` — a hard error) is
+  softened to a presence check: verifyLocation now only errors when
+  `StorageDescriptor.Location` is absent. The mismatch case is the
+  legitimate workgroup-override shape, not a bug — enforcing exact
+  match was blocking every managed-workgroup deployment.
+
+  API-visible behavior change: `TestUnloadAndRead_ReadBackVerifyFailure`
+  → `TestUnloadAndRead_WorkgroupOverrideWarns`. Callers who
+  previously matched on the "Location mismatch" error string get a
+  clean "no result files under <actual location>" message instead,
+  which is more actionable — it names where athenaio actually
+  looked, so operators can inspect that S3 prefix directly.
+
+## [v0.1.0] — 2026-07-26
 
 ### Added
 

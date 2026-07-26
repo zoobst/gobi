@@ -48,7 +48,7 @@ func (g *GroupBy) aggFast(aggs []Aggregation) (*Frame, bool, error) {
 			return nil, false, nil
 		}
 		switch a.Kind {
-		case AggFirst, AggLast, AggNUnique:
+		case AggFirst, AggLast, AggNUnique, AggMedian, AggMode:
 			return nil, false, nil
 		}
 	}

@@ -5,7 +5,118 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
-## [v0.2.8]
+## [v0.2.10]
+
+### Added
+
+- **`Expr.Cast(arrow.DataType)` — numeric-to-numeric expression
+  conversion.** Widens or narrows numeric columns inside an expression
+  tree. Matrix: Float64 ← {Float32, Int64, Int32, Uint64, Uint32};
+  Int64 ← {Float64, Float32, Int32, Uint32}; Float32 ← {Float64,
+  Int64, Int32}; Int32 ← {Int64, Float64, Float32}; Uint64 ← {Int64,
+  Uint32}; Uint32 ← {Uint64, Int64}. Same-type is a no-op (returns
+  the input Series unchanged). Narrowing follows Go's numeric
+  conversion semantics (truncation, no overflow check). Nulls
+  propagate. Unsupported source/target combinations error with
+  `ErrExprTypeMismatch`.
+
+  Primary motivating shape: unblocking `If` / `Coalesce` with mixed
+  numeric literals — those require exact type match, and `Cast`
+  provides the explicit widening step:
+
+      gobi.If(cond,
+          gobi.Col("int_col").Cast(arrow.PrimitiveTypes.Float64),
+          gobi.Lit(1.5))
+
+- **`AggMedian` — per-group sample median.** Buffers non-null numeric
+  values per group, sorts, emits the middle (or the average of the
+  two middle values on even-sized groups). Output is Float64. Empty
+  groups (or all-null groups) emit null. Memory is proportional to
+  group size — no way to compute exact median in bounded space. For
+  approximate-quantile workloads the future t-digest aggregator will
+  trade exactness for memory. Fluent Expr surface: `Col("v").Median()`
+  (composes with `Over(...)` for per-partition medians).
+
+- **`AggMode` — per-group most-frequent value.** Tracks per-value
+  counts; emits the value with the highest count. Ties are broken by
+  first-seen order (deterministic across runs). Output type follows
+  the source column (String, Int64, etc. — not always Float64).
+  Fluent Expr surface: `Col("label").Mode()` composes with `Over(...)`.
+  Empty or all-null groups emit null. Memory is O(distinct values
+  per group).
+
+  Both new aggregators fire on the eager `GroupBy.Agg` path AND the
+  streaming aggregate executor (via `aggAccumulator` implementations
+  `medianAcc` + `modeAcc` registered in `newAccumulator`). The single-
+  primitive-key `aggFast` bailout list gained both kinds — they
+  intentionally sit on the general path, since their accumulators
+  aren't compatible with the numeric-slice iteration `aggFast` uses.
+
+- **Zero-copy typed value accessors on `Series`.** New public methods
+  `Float64Values() ([]float64, bool)`, `Int64Values() ([]int64, bool)`,
+  `Float32Values()`, `Int32Values()`, `Uint64Values()`,
+  `Uint32Values()`. Each returns a zero-copy view of the underlying
+  arrow buffer when the Series is single-chunk and the type matches;
+  `(nil, false)` otherwise (multi-chunk or type mismatch — callers
+  should either `Rechunk` or fall back to the generic `numericAt`
+  walker). Companion to the existing copy accessors
+  `Int64s()`/`Float64s()`/etc.
+
+  Motivating use case: users writing their own numeric kernels
+  (custom SIMD via cgo alternatives, hand-rolled Go loops, hooks
+  into external Go-native numeric libraries) want the raw slice,
+  not a per-row `Value(i)` accessor. This surface folds the
+  single-chunk assertion into the return so the caller doesn't
+  have to type-assert the chunk itself.
+
+- **`Series.HasNulls()` + `Series.NullCount()`.** Cheap null-metadata
+  accessors that consult arrow's cached `NullN` without touching the
+  bitmap.
+
+### Performance
+
+- **`Series.Nulls()` bitmap walk (2-4× faster on typical mixed-null
+  input).** The `[]bool` mask builder now consults the raw arrow
+  validity bitmap directly rather than calling `chunk.IsNull(i)` per
+  row (each such call re-derives the chunk offset into the bitmap).
+  Chunks with `NullN == 0` skip the walk entirely and leave output
+  slots at their zero value — zero cost on the common all-valid
+  case. No API change.
+
+## [v0.2.9]
+
+### Performance
+
+- **Vectorized numeric accumulators — 7× faster on single-chunk Sum
+  (and Mean / Min / Max).** `sumAcc.Update`, `meanAcc.Update`, and
+  `minMaxAcc.Update` grew per-type single-chunk fast paths. When the
+  aggregation input is a single-chunk Float64 / Int64 / Float32 /
+  Int32 column (the common shape after `concatBatchesToFrame` /
+  materialize / most eager Frame ops), the accumulator now
+  type-switches once on the chunk and iterates rows with direct
+  typed accessors — bypassing the per-row `Series.numericAt` walker
+  and its chunk-lookup + type-switch overhead.
+
+  Multi-chunk and non-numeric-shortlist columns fall through to the
+  existing generic walker unchanged. No API changes.
+
+  Measured on a 1M-row single-chunk Float64 column via `sumAcc.Update`:
+
+  | Path                          | ns/op | B/op | allocs/op |
+  |-------------------------------|------:|-----:|----------:|
+  | numericAt walker (multi-chunk) | 7.23ms |    0 |         0 |
+  | Vectorized (single-chunk)      | 1.05ms |    0 |         0 |
+
+  85% reduction in wall time on the hot inner loop. Zero-alloc on
+  both paths. Benchmarks landed as `BenchmarkSumAcc_VectorizedSingleChunk`
+  vs `BenchmarkSumAcc_NumericAtMultiChunk`.
+
+  For the h3ify_gobi profile specifically, the 6.83% cum CPU that
+  was in `Series.numericAt` inside `sumAcc.Update` should drop to
+  ~1% — proportional to a ~5% overall wall-time improvement on that
+  workload.
+
+## [v0.2.8] — 2026-07-26
 
 ### Changed
 

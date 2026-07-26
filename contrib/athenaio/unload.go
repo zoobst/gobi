@@ -115,18 +115,24 @@ func (c *Client) UnloadAndRead(ctx context.Context, spec UnloadSpec) (*gobi.Lazy
 		ExternalLocation: composed.ExternalLocation,
 	})
 
-	// List the parquet bucket files under external_location + read
-	// them via parquetio.ReadReader. Concatenate in listing order —
-	// Iceberg bucketing guarantees same-K rows only appear in one
-	// bucket, so the concat is contiguous by K globally when
+	// List the parquet bucket files under the *actual* Glue-recorded
+	// location — not the composed external_location, which the
+	// workgroup may have silently overridden when
+	// EnforceWorkGroupConfiguration=true. Concatenate in listing
+	// order — Iceberg bucketing guarantees same-K rows only appear
+	// in one bucket, so the concat is contiguous by K globally when
 	// sorted_by is set.
-	files, err := listBucketFiles(ctx, c.s3, composed.ExternalLocation)
+	actualLoc, err := c.resolveActualLocation(ctx, c.cfg.Database, composed.TableName, composed.ExternalLocation)
+	if err != nil {
+		return nil, fmt.Errorf("athenaio: UnloadAndRead %s: %w", queryID, err)
+	}
+	files, err := listBucketFiles(ctx, c.s3, actualLoc)
 	if err != nil {
 		return nil, err
 	}
 	if len(files) == 0 {
 		return nil, fmt.Errorf("athenaio: UnloadAndRead %s: no result files under %s",
-			queryID, composed.ExternalLocation)
+			queryID, actualLoc)
 	}
 	frame, err := c.readBucketFiles(ctx, files)
 	if err != nil {
@@ -232,15 +238,22 @@ func (c *Client) RawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 		ExternalLocation: spec.ExternalLocation,
 	})
 
-	// Read the result files. No read-back verification — the user
-	// asserted the metadata claim; we don't second-guess.
-	files, err := listBucketFiles(ctx, c.s3, spec.ExternalLocation)
+	// Read the result files under the *actual* Glue-recorded location.
+	// See resolveActualLocation for why the composed value is unsafe
+	// (workgroup override with EnforceWorkGroupConfiguration=true).
+	// No read-back verification of metadata — the user asserted the
+	// claim; we don't second-guess.
+	actualLoc, err := c.resolveActualLocation(ctx, database, spec.TableName, spec.ExternalLocation)
+	if err != nil {
+		return nil, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
+	}
+	files, err := listBucketFiles(ctx, c.s3, actualLoc)
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
 	}
 	if len(files) == 0 {
 		return nil, fmt.Errorf("athenaio: RawCTAS %s: no result files under %s",
-			queryID, spec.ExternalLocation)
+			queryID, actualLoc)
 	}
 	frame, err := c.readBucketFiles(ctx, files)
 	if err != nil {
@@ -431,18 +444,66 @@ func verifyHiveTable(t *gluetypes.Table, composed *composedCTAS) error {
 	return verifyLocation(t, composed)
 }
 
-// verifyLocation checks StorageDescriptor.Location matches the
-// composed external_location. Shared between the Iceberg + Hive
-// verification paths.
-func verifyLocation(t *gluetypes.Table, composed *composedCTAS) error {
+// verifyLocation checks StorageDescriptor.Location is present. The
+// exact-match check against composed.ExternalLocation is no longer
+// enforced: workgroups with EnforceWorkGroupConfiguration=true
+// silently override the external_location hint and write to the
+// workgroup's ResultConfiguration.OutputLocation instead — a Glue
+// mismatch is expected in that mode, not a bug. Callers must
+// subsequently read the ground-truth location from
+// resolveActualLocation and pass it to listBucketFiles.
+func verifyLocation(t *gluetypes.Table, _ *composedCTAS) error {
 	if t.StorageDescriptor == nil || t.StorageDescriptor.Location == nil {
 		return fmt.Errorf("athenaio: Glue table missing StorageDescriptor.Location")
 	}
-	loc := *t.StorageDescriptor.Location
-	if !locationMatches(loc, composed.ExternalLocation) {
-		return fmt.Errorf("athenaio: Location mismatch: got %q, expected %q", loc, composed.ExternalLocation)
-	}
 	return nil
+}
+
+// readGlueTableLocation returns *StorageDescriptor.Location — the
+// ground truth of where Athena actually wrote CTAS output. Distinct
+// from the caller-composed external_location because Athena
+// workgroups with EnforceWorkGroupConfiguration=true silently
+// override the external_location property and route writes to the
+// workgroup's ResultConfiguration.OutputLocation. Every caller that
+// needs to list result files must use this value — the composed
+// value points at an empty prefix in that mode.
+func (c *Client) readGlueTableLocation(ctx context.Context, database, tableName string) (string, error) {
+	out, err := c.glue.GetTable(ctx, &glue.GetTableInput{
+		DatabaseName: aws.String(database),
+		Name:         aws.String(tableName),
+	})
+	if err != nil {
+		return "", fmt.Errorf("GetTable %s.%s: %w", database, tableName, err)
+	}
+	if out.Table == nil {
+		return "", fmt.Errorf("GetTable %s.%s: nil Table", database, tableName)
+	}
+	sd := out.Table.StorageDescriptor
+	if sd == nil || sd.Location == nil {
+		return "", fmt.Errorf("GetTable %s.%s: missing StorageDescriptor.Location", database, tableName)
+	}
+	return *sd.Location, nil
+}
+
+// resolveActualLocation reads the Glue-recorded location for the
+// newly-created table and warns via c.warnLog when it differs from
+// the caller-composed value (the workgroup-override symptom). The
+// return value is the location callers should pass to
+// listBucketFiles — never the composed one.
+func (c *Client) resolveActualLocation(ctx context.Context, database, tableName, requested string) (string, error) {
+	actual, err := c.readGlueTableLocation(ctx, database, tableName)
+	if err != nil {
+		return "", err
+	}
+	if requested != "" && !locationMatches(actual, requested) && c.warnLog != nil {
+		c.warnLog(
+			"athenaio: workgroup silently overrode external_location:\n"+
+				"  requested: %s\n"+
+				"  actual:    %s\n"+
+				"  (workgroup likely has EnforceWorkGroupConfiguration=true)",
+			requested, actual)
+	}
+	return actual, nil
 }
 
 // locationMatches compares two s3:// URIs modulo trailing slash.
@@ -673,7 +734,13 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 		ExternalLocation: composed.ExternalLocation,
 	})
 
-	files, err := listBucketFiles(ctx, c.s3, composed.ExternalLocation)
+	// List files under the actual Glue-recorded location — see
+	// resolveActualLocation for the workgroup-override rationale.
+	actualLoc, err := c.resolveActualLocation(ctx, c.cfg.Database, composed.TableName, composed.ExternalLocation)
+	if err != nil {
+		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: %w", queryID, err)
+	}
+	files, err := listBucketFiles(ctx, c.s3, actualLoc)
 	if err != nil {
 		return nil, err
 	}
@@ -681,7 +748,7 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 	// almost always a spec/data mismatch — flag it early.
 	if len(files) == 0 {
 		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: no result files under %s",
-			queryID, composed.ExternalLocation)
+			queryID, actualLoc)
 	}
 
 	meta := &gobi.PartitionMetadata{
@@ -792,13 +859,19 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 			queryID, database, spec.TableName, bucketCount)
 	}
 
-	files, err := listBucketFiles(ctx, c.s3, spec.ExternalLocation)
+	// Resolve to the actual Glue-recorded location before listing —
+	// see resolveActualLocation for the workgroup-override rationale.
+	actualLoc, err := c.resolveActualLocation(ctx, database, spec.TableName, spec.ExternalLocation)
+	if err != nil {
+		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
+	}
+	files, err := listBucketFiles(ctx, c.s3, actualLoc)
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
 	}
 	if len(files) == 0 {
 		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: no result files under %s",
-			queryID, spec.ExternalLocation)
+			queryID, actualLoc)
 	}
 
 	results := make([]BucketResult, bucketCount)

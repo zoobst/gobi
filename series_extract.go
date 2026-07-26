@@ -166,6 +166,12 @@ func (s Series) Timestamps() ([]arrow.Timestamp, error) {
 //	    if nulls[i] { continue } // skip nulls
 //	    // ... use v
 //	}
+//
+// Fast path: chunks with no nulls (per arrow's cached NullN) skip the
+// bitmap walk entirely — leave those output slots at their zero
+// value. Chunks with nulls read the raw validity bitmap once per
+// row rather than the (offset-recomputing) IsNull call. Fully-null
+// Series still allocate the []bool.
 func (s Series) Nulls() []bool {
 	if s.col == nil {
 		return nil
@@ -174,8 +180,24 @@ func (s Series) Nulls() []bool {
 	idx := 0
 	for _, chunk := range s.col.Data().Chunks() {
 		n := chunk.Len()
+		if chunk.NullN() == 0 {
+			idx += n
+			continue
+		}
+		nulls := chunk.NullBitmapBytes()
+		if len(nulls) == 0 {
+			for i := range n {
+				if chunk.IsNull(i) {
+					out[idx+i] = true
+				}
+			}
+			idx += n
+			continue
+		}
+		off := chunk.Data().Offset()
 		for i := range n {
-			if chunk.IsNull(i) {
+			bit := off + i
+			if nulls[bit>>3]&(1<<uint(bit&7)) == 0 {
 				out[idx+i] = true
 			}
 		}

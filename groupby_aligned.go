@@ -200,7 +200,7 @@ func (g *GroupBy) buildAggBuilders(aggs []Aggregation, pool memory.Allocator) ([
 			}
 			continue
 		}
-		if a.Kind == AggFirst || a.Kind == AggLast {
+		if a.Kind == AggFirst || a.Kind == AggLast || a.Kind == AggMode {
 			src, err := g.frame.Column(a.Column)
 			if err != nil {
 				return nil, nil, err

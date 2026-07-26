@@ -640,7 +640,7 @@ func WriteFile(df *gobi.Frame, path string, opts *WriteOptions) error {
 			return fmt.Errorf("geojsonio: WriteFile: GeomCol %q not in frame", opts.GeomCol)
 		}
 	} else {
-		for i := 0; i < df.NumCols(); i++ {
+		for i := range df.NumCols() {
 			s, _ := df.ColumnAt(i)
 			if s.IsGeometry() {
 				geomIdx = i
@@ -739,7 +739,7 @@ func forEachFeature(df *gobi.Frame, geomIdx int, fn func(row int, featJSON []byt
 	// Pre-resolve series so per-row lookups don't repeat the
 	// name→column walk.
 	series := make([]gobi.Series, df.NumCols())
-	for i := 0; i < df.NumCols(); i++ {
+	for i := range df.NumCols() {
 		s, err := df.ColumnAt(i)
 		if err != nil {
 			return err

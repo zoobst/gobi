@@ -1004,14 +1004,21 @@ func TestUnloadAndRead_RejectsEmptyPartitionBy(t *testing.T) {
 	}
 }
 
-func TestUnloadAndRead_ReadBackVerifyFailure(t *testing.T) {
-	// Glue returns a table whose Location doesn't match the CTAS
-	// external_location — this simulates Athena silently rewriting
-	// the location. Verify should hard-error rather than proceed
-	// with a possibly-wrong PartitionMetadata claim.
+func TestUnloadAndRead_WorkgroupOverrideWarns(t *testing.T) {
+	// Glue returns a table whose Location doesn't match the composed
+	// external_location — this simulates a workgroup with
+	// EnforceWorkGroupConfiguration=true silently rewriting the
+	// location. Expected behavior: warn via ClientConfig.WarnLog,
+	// then list files under the *actual* Glue-recorded location.
+	// With no files pre-populated under that actual location, this
+	// surfaces as a clean "no result files" error — much better UX
+	// than the pre-fix "Location mismatch" hard-error (which blocked
+	// the caller from even attempting to read).
 	mockA := &mockCTASAthena{pollsBeforeDone: 0}
 	mockS := &mockS3{objects: map[string][]byte{}}
 	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{}}
+	var warnCount int
+	var lastWarn string
 	c, err := NewClient(ClientConfig{
 		Workgroup:      "wg",
 		ResultLocation: "s3://test-bucket/results",
@@ -1020,13 +1027,17 @@ func TestUnloadAndRead_ReadBackVerifyFailure(t *testing.T) {
 		S3:             mockS,
 		Glue:           mockG,
 		PollInterval:   1 * time.Millisecond,
+		WarnLog: func(format string, args ...any) {
+			warnCount++
+			lastWarn = fmt.Sprintf(format, args...)
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Wrapper installs a Glue entry with a Location that DOES NOT
-	// match the CTAS's external_location — verifyIcebergTable should
-	// reject.
+	// match the CTAS's external_location. This is now the expected
+	// shape for workgroup-override workloads, not an error condition.
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
 		onStart: func(sql string) {
@@ -1037,7 +1048,7 @@ func TestUnloadAndRead_ReadBackVerifyFailure(t *testing.T) {
 					"table_type": "ICEBERG",
 				},
 				StorageDescriptor: &gluetypes.StorageDescriptor{
-					// Wrong location on purpose.
+					// Actual workgroup-override target.
 					Location: aws.String("s3://wrong-bucket/somewhere/"),
 				},
 			}
@@ -1051,18 +1062,28 @@ func TestUnloadAndRead_ReadBackVerifyFailure(t *testing.T) {
 		BucketCount: 4,
 	})
 	if err == nil {
-		t.Fatal("mismatched Location should error")
+		t.Fatal("expected no-files error when actual location is empty")
 	}
-	if !strings.Contains(err.Error(), "Location mismatch") {
-		t.Errorf("error should name Location mismatch, got: %v", err)
+	if !strings.Contains(err.Error(), "no result files") {
+		t.Errorf("error should name missing result files, got: %v", err)
 	}
-	// Verify path registers the orphaned table for cleanup — Close
-	// must still find it and drop it via Glue.
+	// The error message must reference the actual location, so
+	// operators can see immediately where athenaio looked.
+	if !strings.Contains(err.Error(), "s3://wrong-bucket/somewhere/") {
+		t.Errorf("error should reference actual (Glue-recorded) location, got: %v", err)
+	}
+	if warnCount == 0 {
+		t.Errorf("expected workgroup-override warning; got none")
+	}
+	if !strings.Contains(lastWarn, "workgroup silently overrode external_location") {
+		t.Errorf("warn message should name the workgroup-override symptom, got: %s", lastWarn)
+	}
+	// Table is still registered for cleanup so Close can drop it.
 	c.mu.Lock()
 	trackedCount := len(c.createdTables)
 	c.mu.Unlock()
 	if trackedCount != 1 {
-		t.Errorf("failed-verify path should still register table, got %d tracked", trackedCount)
+		t.Errorf("failed-read path should still register table, got %d tracked", trackedCount)
 	}
 }
 
@@ -1082,10 +1103,17 @@ func TestRawCTAS_HappyPath(t *testing.T) {
 			"raw-ctas-outputs/user-table/data/00000-0.parquet": payload,
 		},
 	}
-	// mockGlue starts empty — RawCTAS doesn't verify via GetTable
-	// but Close's DeleteTable still fires.
+	// mockGlue carries the actual Glue-recorded location — RawCTAS
+	// reads it via resolveActualLocation before listing files, so
+	// this must be present (and match the caller's ExternalLocation
+	// to skip the workgroup-override warning path).
 	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{
-		{Database: "test_db", Name: "user-table"}: {Name: aws.String("user-table")},
+		{Database: "test_db", Name: "user-table"}: {
+			Name: aws.String("user-table"),
+			StorageDescriptor: &gluetypes.StorageDescriptor{
+				Location: aws.String(external),
+			},
+		},
 	}}
 
 	c, err := NewClient(ClientConfig{
@@ -1135,7 +1163,12 @@ func TestRawCTAS_NilMetadataStillWorks(t *testing.T) {
 		},
 	}
 	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{
-		{Database: "test_db", Name: "no-meta"}: {Name: aws.String("no-meta")},
+		{Database: "test_db", Name: "no-meta"}: {
+			Name: aws.String("no-meta"),
+			StorageDescriptor: &gluetypes.StorageDescriptor{
+				Location: aws.String("s3://test-bucket/raw-ctas/nometa/"),
+			},
+		},
 	}}
 	c, err := NewClient(ClientConfig{
 		Workgroup: "wg", ResultLocation: "s3://test-bucket/results/",

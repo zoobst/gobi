@@ -41,6 +41,17 @@ func (e Expr) MaxAgg() Expr { return Expr{node: &scalarAggNode{inner: e.node, ki
 // non-null values, broadcast to every input row. Output is Int64.
 func (e Expr) Count() Expr { return Expr{node: &scalarAggNode{inner: e.node, kind: AggCount}} }
 
+// Median returns an expression that evaluates to the sample median of
+// e's non-null numeric values, broadcast to every input row. Output
+// is Float64. Even-sized groups interpolate between the two middle
+// values.
+func (e Expr) Median() Expr { return Expr{node: &scalarAggNode{inner: e.node, kind: AggMedian}} }
+
+// Mode returns an expression that evaluates to the most-frequent
+// non-null value of e, broadcast to every input row. Ties are broken
+// by first-seen order. Output type matches the source column.
+func (e Expr) Mode() Expr { return Expr{node: &scalarAggNode{inner: e.node, kind: AggMode}} }
+
 // Over wraps an expression with partition keys.
 //
 // Two shapes are supported depending on the inner:
@@ -111,7 +122,14 @@ func (n *scalarAggNode) Eval(input *Frame) (Series, error) {
 		return Series{}, err
 	}
 	v := acc.Finalize()
-	return broadcastScalar(v, acc.OutputType(), input.NumRows(), n.kind.String())
+	// Mode preserves the source column's arrow type — override the
+	// accumulator's Float64 fallback OutputType. (Same pattern as
+	// First/Last, but those don't have Expr surface today.)
+	outType := acc.OutputType()
+	if n.kind == AggMode {
+		outType = col.DataType()
+	}
+	return broadcastScalar(v, outType, input.NumRows(), n.kind.String())
 }
 
 func (n *scalarAggNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
@@ -122,11 +140,15 @@ func (n *scalarAggNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 		return nil, err
 	}
 	// The accumulator's OutputType doesn't depend on input dtype for
-	// most kinds; Sum/Min/Max ignore it, Mean is always Float64,
-	// Count is always Int64.
-	_, err = n.inner.Type(schema)
+	// most kinds; Sum/Min/Max ignore it, Mean/Median are always
+	// Float64, Count is always Int64. Mode preserves the source
+	// column's arrow type.
+	innerType, err := n.inner.Type(schema)
 	if err != nil {
 		return nil, err
+	}
+	if n.kind == AggMode {
+		return innerType, nil
 	}
 	return acc.OutputType(), nil
 }
@@ -248,6 +270,9 @@ func (n *overNode) evalScalarAgg(input *Frame, agg *scalarAggNode) (Series, erro
 		groupVals[gid] = acc.Finalize()
 		if outType == nil {
 			outType = acc.OutputType()
+			if agg.kind == AggMode {
+				outType = col.DataType()
+			}
 		}
 	}
 	if outType == nil {
@@ -257,6 +282,9 @@ func (n *overNode) evalScalarAgg(input *Frame, agg *scalarAggNode) (Series, erro
 			return Series{}, err
 		}
 		outType = acc.OutputType()
+		if agg.kind == AggMode {
+			outType = col.DataType()
+		}
 	}
 
 	// Scatter per-row.

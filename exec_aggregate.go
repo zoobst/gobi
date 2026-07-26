@@ -711,6 +711,10 @@ func newAccumulator(a Aggregation) (aggAccumulator, error) {
 		return &stdVarAcc{wantStd: false}, nil
 	case AggNUnique:
 		return &nUniqueAcc{seen: make(map[string]struct{})}, nil
+	case AggMedian:
+		return &medianAcc{}, nil
+	case AggMode:
+		return &modeAcc{counts: make(map[string]int64)}, nil
 	}
 	return nil, fmt.Errorf("gobi: streaming aggregate: unknown Kind %d", a.Kind)
 }
@@ -919,6 +923,56 @@ type sumAcc struct {
 }
 
 func (a *sumAcc) Update(col Series, rows []int) error {
+	if col.col == nil {
+		return nil
+	}
+	// Single-chunk fast paths: type-switch once on the chunk and
+	// iterate rows with a direct typed accessor. Avoids the per-row
+	// interface dispatch + chunk-walker in numericAt, which the
+	// h3ify_gobi profile flagged as 6.83% cum CPU inside sumAcc.
+	chunks := col.col.Data().Chunks()
+	if len(chunks) == 1 {
+		switch arr := chunks[0].(type) {
+		case *array.Float64:
+			for _, row := range rows {
+				if arr.IsNull(row) {
+					continue
+				}
+				a.sum += arr.Value(row)
+				a.seen = true
+			}
+			return nil
+		case *array.Int64:
+			for _, row := range rows {
+				if arr.IsNull(row) {
+					continue
+				}
+				a.sum += float64(arr.Value(row))
+				a.seen = true
+			}
+			return nil
+		case *array.Float32:
+			for _, row := range rows {
+				if arr.IsNull(row) {
+					continue
+				}
+				a.sum += float64(arr.Value(row))
+				a.seen = true
+			}
+			return nil
+		case *array.Int32:
+			for _, row := range rows {
+				if arr.IsNull(row) {
+					continue
+				}
+				a.sum += float64(arr.Value(row))
+				a.seen = true
+			}
+			return nil
+		}
+	}
+	// Multi-chunk or non-numeric-shortlist column: fall back to the
+	// generic walker.
 	for _, row := range rows {
 		v, ok, err := col.numericAt(row)
 		if err != nil {
@@ -948,6 +1002,50 @@ type meanAcc struct {
 }
 
 func (a *meanAcc) Update(col Series, rows []int) error {
+	if col.col == nil {
+		return nil
+	}
+	chunks := col.col.Data().Chunks()
+	if len(chunks) == 1 {
+		switch arr := chunks[0].(type) {
+		case *array.Float64:
+			for _, row := range rows {
+				if arr.IsNull(row) {
+					continue
+				}
+				a.sum += arr.Value(row)
+				a.n++
+			}
+			return nil
+		case *array.Int64:
+			for _, row := range rows {
+				if arr.IsNull(row) {
+					continue
+				}
+				a.sum += float64(arr.Value(row))
+				a.n++
+			}
+			return nil
+		case *array.Float32:
+			for _, row := range rows {
+				if arr.IsNull(row) {
+					continue
+				}
+				a.sum += float64(arr.Value(row))
+				a.n++
+			}
+			return nil
+		case *array.Int32:
+			for _, row := range rows {
+				if arr.IsNull(row) {
+					continue
+				}
+				a.sum += float64(arr.Value(row))
+				a.n++
+			}
+			return nil
+		}
+	}
 	for _, row := range rows {
 		v, ok, err := col.numericAt(row)
 		if err != nil {
@@ -980,6 +1078,22 @@ type minMaxAcc struct {
 }
 
 func (a *minMaxAcc) Update(col Series, rows []int) error {
+	if col.col == nil {
+		return nil
+	}
+	chunks := col.col.Data().Chunks()
+	if len(chunks) == 1 {
+		switch arr := chunks[0].(type) {
+		case *array.Float64:
+			return a.updateFloat64(arr, rows)
+		case *array.Int64:
+			return a.updateInt64(arr, rows)
+		case *array.Float32:
+			return a.updateFloat32(arr, rows)
+		case *array.Int32:
+			return a.updateInt32(arr, rows)
+		}
+	}
 	for _, row := range rows {
 		v, ok, err := col.numericAt(row)
 		if err != nil {
@@ -988,16 +1102,59 @@ func (a *minMaxAcc) Update(col Series, rows []int) error {
 		if !ok {
 			continue
 		}
-		if !a.seen {
-			a.extreme = v
-			a.seen = true
+		a.update(v)
+	}
+	return nil
+}
+
+// update merges a single non-null value into the running extreme.
+// Inlined by the single-chunk fast paths and the generic fallback.
+func (a *minMaxAcc) update(v float64) {
+	if !a.seen {
+		a.extreme = v
+		a.seen = true
+		return
+	}
+	if a.isMin && v < a.extreme {
+		a.extreme = v
+	} else if !a.isMin && v > a.extreme {
+		a.extreme = v
+	}
+}
+
+func (a *minMaxAcc) updateFloat64(arr *array.Float64, rows []int) error {
+	for _, row := range rows {
+		if arr.IsNull(row) {
 			continue
 		}
-		if a.isMin && v < a.extreme {
-			a.extreme = v
-		} else if !a.isMin && v > a.extreme {
-			a.extreme = v
+		a.update(arr.Value(row))
+	}
+	return nil
+}
+func (a *minMaxAcc) updateInt64(arr *array.Int64, rows []int) error {
+	for _, row := range rows {
+		if arr.IsNull(row) {
+			continue
 		}
+		a.update(float64(arr.Value(row)))
+	}
+	return nil
+}
+func (a *minMaxAcc) updateFloat32(arr *array.Float32, rows []int) error {
+	for _, row := range rows {
+		if arr.IsNull(row) {
+			continue
+		}
+		a.update(float64(arr.Value(row)))
+	}
+	return nil
+}
+func (a *minMaxAcc) updateInt32(arr *array.Int32, rows []int) error {
+	for _, row := range rows {
+		if arr.IsNull(row) {
+			continue
+		}
+		a.update(float64(arr.Value(row)))
 	}
 	return nil
 }
@@ -1141,6 +1298,120 @@ func (a *nUniqueAcc) Update(col Series, rows []int) error {
 
 func (a *nUniqueAcc) Finalize() any             { return int64(len(a.seen)) }
 func (a *nUniqueAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes.Int64 }
+
+// medianAcc buffers every non-null numeric value in the group and
+// finalizes to the sample median (Float64). On even-sized groups
+// the two middle values are averaged; on odd-sized groups the
+// single middle value is returned. Empty groups (or all-null
+// groups) finalize to nil (null in output).
+//
+// Memory is O(rows-per-group) — no way to compute an exact median
+// in bounded space. For approximate-quantile workloads the future
+// t-digest aggregator will trade exactness for memory.
+type medianAcc struct {
+	values []float64
+}
+
+func (a *medianAcc) Update(col Series, rows []int) error {
+	for _, row := range rows {
+		v, ok, err := col.numericAt(row)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		a.values = append(a.values, v)
+	}
+	return nil
+}
+
+func (a *medianAcc) Finalize() any {
+	n := len(a.values)
+	if n == 0 {
+		return nil
+	}
+	sort.Float64s(a.values)
+	if n%2 == 1 {
+		return a.values[n/2]
+	}
+	return (a.values[n/2-1] + a.values[n/2]) / 2
+}
+func (a *medianAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes.Float64 }
+
+// modeAcc tracks per-value counts and finalizes to the most-frequent
+// non-null value. Ties are broken by first-seen order (deterministic
+// across runs on the same input). Empty groups or all-null groups
+// finalize to nil.
+//
+// The captured value's type follows the source column; the schema
+// declares that type at Compile time so buildResultBatch's builder
+// matches (same pattern as firstLastAcc).
+//
+// Memory is O(distinct-values-per-group) — no different from
+// nUniqueAcc in that respect.
+type modeAcc struct {
+	counts   map[string]int64
+	firstIdx map[string]int64
+	// Parallel arrays: values[i] is the first-seen scalar for the
+	// key whose encoded bytes hash-collided into counts[keys[i]].
+	// firstIdx[key] indexes into values.
+	values  []any
+	scratch []byte
+	nextIdx int64
+}
+
+func (a *modeAcc) Update(col Series, rows []int) error {
+	if a.firstIdx == nil {
+		a.firstIdx = make(map[string]int64)
+	}
+	for _, row := range rows {
+		null, err := isNullAtSeries(col, row)
+		if err != nil {
+			return err
+		}
+		if null {
+			continue
+		}
+		buf, err := keyOfAppend(a.scratch[:0], col, row)
+		if err != nil {
+			return err
+		}
+		a.scratch = buf
+		key := string(buf)
+		if _, ok := a.firstIdx[key]; !ok {
+			v, err := readScalarAt(col, row)
+			if err != nil {
+				return err
+			}
+			a.firstIdx[key] = a.nextIdx
+			a.values = append(a.values, v)
+			a.nextIdx++
+		}
+		a.counts[key]++
+	}
+	return nil
+}
+
+func (a *modeAcc) Finalize() any {
+	if len(a.counts) == 0 {
+		return nil
+	}
+	var bestCount int64 = -1
+	var bestIdx int64 = math.MaxInt64
+	for k, c := range a.counts {
+		idx := a.firstIdx[k]
+		if c > bestCount || (c == bestCount && idx < bestIdx) {
+			bestCount = c
+			bestIdx = idx
+		}
+	}
+	return a.values[bestIdx]
+}
+
+// OutputType is a fallback — the schema field type takes precedence
+// in buildResultBatch (mode preserves the source column type).
+func (a *modeAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes.Float64 }
 
 // isNullAtSeries: null-check for a row without knowing the column
 // type. Used by countAcc when the source is non-numeric (e.g.

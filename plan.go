@@ -301,11 +301,12 @@ func newAggregateNode(input LogicalPlan, keys []string, aggs []Aggregation) *agg
 	}
 
 	// Agg output columns. Count / NUnique → Int64 non-null;
-	// First / Last preserve the source column's arrow type; custom
-	// Aggregator uses its declared Type; everything else → Float64.
+	// First / Last / Mode preserve the source column's arrow type;
+	// custom Aggregator uses its declared Type; everything else →
+	// Float64.
 	for _, a := range aggs {
 		t := aggOutputType(a)
-		if a.Fn == nil && (a.Kind == AggFirst || a.Kind == AggLast) {
+		if a.Fn == nil && (a.Kind == AggFirst || a.Kind == AggLast || a.Kind == AggMode) {
 			if fm, ok := inSchema.FieldsByName(a.Column); ok && len(fm) > 0 {
 				t = fm[0].Type
 			}

@@ -33,6 +33,15 @@ const (
 	// AggNUnique: count of distinct non-null values per group. Output
 	// is Int64, always non-null (empty group counts as 0).
 	AggNUnique
+	// AggMedian: 50th-percentile value. Output is Float64 (Bessel-
+	// style interpolation between the two middle values on even
+	// group sizes). Empty groups emit null. Buffers all non-null
+	// values per group, so memory is proportional to input size.
+	AggMedian
+	// AggMode: most frequent non-null value. Output preserves the
+	// source column's arrow type. Ties broken by first-seen order.
+	// Empty groups (or all-null groups) emit null.
+	AggMode
 )
 
 func (k AggKind) String() string {
@@ -57,6 +66,10 @@ func (k AggKind) String() string {
 		return "var"
 	case AggNUnique:
 		return "n_unique"
+	case AggMedian:
+		return "median"
+	case AggMode:
+		return "mode"
 	default:
 		return "unknown"
 	}
@@ -282,10 +295,10 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 			}
 			continue
 		}
-		// First / Last preserve the source column's arrow type. We
-		// stand up a builder matching that type and let appendAgg
-		// route through the type-generic value writer.
-		if a.Kind == AggFirst || a.Kind == AggLast {
+		// First / Last / Mode preserve the source column's arrow
+		// type. We stand up a builder matching that type and let
+		// appendAgg route through the type-generic value writer.
+		if a.Kind == AggFirst || a.Kind == AggLast || a.Kind == AggMode {
 			src, err := g.frame.Column(a.Column)
 			if err != nil {
 				return nil, err
@@ -909,6 +922,95 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 		}
 		b.(*array.Int64Builder).Append(n)
 		return nil
+	}
+	// Median: buffer non-null numeric values, sort, emit the middle
+	// (or the average of the two middle values on even sizes).
+	// Output is Float64.
+	if agg.Kind == AggMedian {
+		s, err := g.frame.Column(agg.Column)
+		if err != nil {
+			return err
+		}
+		if !s.isNumeric() {
+			return fmt.Errorf("%w: %s", ErrNotNumeric, agg.Column)
+		}
+		fb := b.(*array.Float64Builder)
+		vals := make([]float64, 0, len(rows))
+		for _, row := range rows {
+			v, ok, err := s.numericAt(row)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			vals = append(vals, v)
+		}
+		if len(vals) == 0 {
+			fb.AppendNull()
+			return nil
+		}
+		sort.Float64s(vals)
+		n := len(vals)
+		if n%2 == 1 {
+			fb.Append(vals[n/2])
+		} else {
+			fb.Append((vals[n/2-1] + vals[n/2]) / 2)
+		}
+		return nil
+	}
+	// Mode: most-frequent non-null value; first-seen wins ties.
+	// Output type matches the source column, routed via
+	// appendCustomValue.
+	if agg.Kind == AggMode {
+		s, err := g.frame.Column(agg.Column)
+		if err != nil {
+			return err
+		}
+		counts := make(map[string]int64)
+		firstIdx := make(map[string]int)
+		var values []any
+		var scratch []byte
+		for _, row := range rows {
+			null, err := isNullAtSeries(s, row)
+			if err != nil {
+				return err
+			}
+			if null {
+				continue
+			}
+			buf, err := keyOfAppend(scratch[:0], s, row)
+			if err != nil {
+				return err
+			}
+			scratch = buf
+			key := string(buf)
+			if _, ok := firstIdx[key]; !ok {
+				v, err := readScalarAt(s, row)
+				if err != nil {
+					return err
+				}
+				firstIdx[key] = len(values)
+				values = append(values, v)
+			}
+			counts[key]++
+		}
+		if len(values) == 0 {
+			b.AppendNull()
+			return nil
+		}
+		var bestIdx int
+		var bestCount int64 = -1
+		bestFirstIdx := math.MaxInt
+		for k, c := range counts {
+			idx := firstIdx[k]
+			if c > bestCount || (c == bestCount && idx < bestFirstIdx) {
+				bestIdx = idx
+				bestCount = c
+				bestFirstIdx = idx
+			}
+		}
+		return appendCustomValue(b, values[bestIdx])
 	}
 	// First / Last: emit the first (or last) non-null value in the
 	// group in row order. Output type matches the source column, so
