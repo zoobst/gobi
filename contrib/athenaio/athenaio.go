@@ -359,6 +359,20 @@ type QueryStats struct {
 
 	// TotalTime includes queue wait.
 	TotalTime time.Duration
+
+	// RowCount is the total number of rows produced by the query.
+	// Populated on the CTAS paths (UnloadAndRead / UnloadAndReadBuckets
+	// / RawCTAS / RawCTASBuckets) by summing per-file row counts from
+	// the parquet footers read at open time — zero-data-page cost.
+	// Left at zero on RawQuery (Athena's GetQueryExecution doesn't
+	// expose output row count; callers who need it after RawQuery
+	// should count the returned Frame post-Collect).
+	//
+	// For the bucket variants, the value is the CTAS's total across
+	// every bucket — the same value is registered against every
+	// non-nil bucket's LazyFrame. Per-bucket counts are recoverable
+	// via Frame.NumRows() after Collect on that bucket's LazyFrame.
+	RowCount int64
 }
 
 // queryStateTerminal reports whether an Athena query state is a

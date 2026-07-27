@@ -168,6 +168,7 @@ func (c *Client) UnloadAndRead(ctx context.Context, spec UnloadSpec) (*gobi.Lazy
 		ScannedBytes:     scannedBytes(exec),
 		EngineTime:       engineTime(exec),
 		TotalTime:        time.Since(start),
+		RowCount:         int64(frame.NumRows()),
 	})
 	return asserted, nil
 }
@@ -281,6 +282,7 @@ func (c *Client) RawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 		ScannedBytes:     scannedBytes(exec),
 		EngineTime:       engineTime(exec),
 		TotalTime:        time.Since(start),
+		RowCount:         int64(frame.NumRows()),
 	})
 	return lf, nil
 }
@@ -774,18 +776,22 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 	// nil slots so len(result) == BucketCount and index i maps to
 	// bucket i consistently across peer calls.
 	results := make([]BucketResult, spec.BucketCount)
-	if err := c.populateBucketResults(ctx, files, results, meta); err != nil {
+	totalRows, err := c.populateBucketResults(ctx, files, results, meta)
+	if err != nil {
 		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: %w", queryID, err)
 	}
 
 	// Register stats on every non-nil frame so per-bucket callers
-	// can look them up individually.
+	// can look them up individually. RowCount is the CTAS-wide total
+	// (same value on every bucket's stats blob) — per-bucket sizes
+	// are recoverable via Frame.NumRows() after Collect.
 	stats := QueryStats{
 		QueryExecutionID: queryID,
 		ResultPrefix:     composed.ExternalLocation,
 		ScannedBytes:     scannedBytes(exec),
 		EngineTime:       engineTime(exec),
 		TotalTime:        time.Since(start),
+		RowCount:         totalRows,
 	}
 	for _, r := range results {
 		if r.Frame != nil {
@@ -886,7 +892,8 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 	}
 
 	results := make([]BucketResult, bucketCount)
-	if err := c.populateBucketResults(ctx, files, results, spec.Metadata); err != nil {
+	totalRows, err := c.populateBucketResults(ctx, files, results, spec.Metadata)
+	if err != nil {
 		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
 	}
 	stats := QueryStats{
@@ -895,6 +902,7 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 		ScannedBytes:     scannedBytes(exec),
 		EngineTime:       engineTime(exec),
 		TotalTime:        time.Since(start),
+		RowCount:         totalRows,
 	}
 	for _, r := range results {
 		if r.Frame != nil {
@@ -906,19 +914,24 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 
 // populateBucketResults reads each file into a Frame, wraps it in a
 // LazyFrame, optionally attaches PartitionMetadata, and installs it
-// at the appropriate slot in results.
+// at the appropriate slot in results. Returns the total row count
+// across all bucket files (sum of frame.NumRows() at open time —
+// derived from the parquet footer, no data-page cost beyond the
+// full read already happening for the LazyFrame wrap).
 //
 // Slotting: file path suffix `bucket_NNNNN` (or Athena's naming
 // variant) is parsed to extract the bucket index; if parsing fails
 // (RawCTAS output without a matching name), files fill slots in
 // listing order. Missing bucket indices stay nil.
-func (c *Client) populateBucketResults(ctx context.Context, files []string, results []BucketResult, meta *gobi.PartitionMetadata) error {
+func (c *Client) populateBucketResults(ctx context.Context, files []string, results []BucketResult, meta *gobi.PartitionMetadata) (int64, error) {
 	nSlots := len(results)
+	var totalRows int64
 	for i, uri := range files {
 		frame, err := c.openBucketFrame(ctx, uri)
 		if err != nil {
-			return err
+			return 0, err
 		}
+		totalRows += int64(frame.NumRows())
 		if meta != nil {
 			frame.WithPartitionMeta(meta)
 		}
@@ -926,7 +939,7 @@ func (c *Client) populateBucketResults(ctx context.Context, files []string, resu
 		if meta != nil {
 			asserted, err := lf.WithPartitionAssertion(meta)
 			if err != nil {
-				return fmt.Errorf("attach partition assertion for %s: %w", uri, err)
+				return 0, fmt.Errorf("attach partition assertion for %s: %w", uri, err)
 			}
 			lf = asserted
 		}
@@ -939,19 +952,19 @@ func (c *Client) populateBucketResults(ctx context.Context, files []string, resu
 			if slot >= nSlots {
 				// More files than expected buckets — should not happen
 				// with a valid bucket_count check, but stay defensive.
-				return fmt.Errorf("athenaio: file %s exceeds expected bucket range [0,%d)", uri, nSlots)
+				return 0, fmt.Errorf("athenaio: file %s exceeds expected bucket range [0,%d)", uri, nSlots)
 			}
 		}
 		if results[slot].Frame != nil {
 			// Two files claim the same slot — surface rather than
 			// silently overwrite. Only fires on Athena writer bugs
 			// or naming collisions.
-			return fmt.Errorf("athenaio: duplicate bucket slot %d: %s and %s",
+			return 0, fmt.Errorf("athenaio: duplicate bucket slot %d: %s and %s",
 				slot, results[slot].S3URI, uri)
 		}
 		results[slot] = BucketResult{S3URI: uri, Frame: lf}
 	}
-	return nil
+	return totalRows, nil
 }
 
 // bucketIndexFromURI extracts the bucket index from an Athena-shaped

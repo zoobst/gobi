@@ -9,6 +9,24 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.5]
+
+### Added
+
+- **`QueryStats.RowCount`** — total number of output rows produced
+  by the query. Populated on the CTAS paths (`UnloadAndRead`,
+  `UnloadAndReadBuckets`, `RawCTAS`, `RawCTASBuckets`) by summing
+  per-file row counts from parquet footers read at open time —
+  zero-data-page cost beyond the read already happening for the
+  returned LazyFrame. Left at zero on `RawQuery` (Athena's
+  `GetQueryExecution` doesn't expose output row count; call
+  `Frame.NumRows()` post-Collect there).
+
+  For the bucket variants the value is the CTAS-wide total (same
+  value registered against every non-nil bucket's LazyFrame); per-
+  bucket sizes are recoverable via `Frame.NumRows()` after
+  `Collect` on that bucket's LazyFrame.
+
 ## [v0.1.4]
 
 ### Fixed
