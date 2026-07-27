@@ -9,27 +9,36 @@ introduce breaking changes; check this file when upgrading.
 
 ### Fixed
 
-- **`LazyFrame.Collect()` now propagates `PartitionMetadata` onto
-  the returned Frame.** Previously the plan's alignment claim was
-  computed but dropped at the Execute boundary — a caller doing
-  `lf.Collect()` and then re-lifting via `frame.Lazy()` silently
-  lost the claim, forcing downstream `Over` / `GroupBy` / `Join`
-  onto the general (unaligned) path. `CollectRaw` (via
-  `collectPlan`) already propagated; this brings `Collect` into
-  agreement, matching the documented contract on
-  `Frame.PartitionMetadata`.
+- **`PartitionMetadata` now survives a Collect → re-lift boundary.**
+  Two-part fix; both were needed for the claim to actually reach
+  downstream ops.
+
+  1. `LazyFrame.Collect()` propagates the plan's `PartitionMetadata`
+     onto the returned Frame via `Frame.WithPartitionMeta`.
+     Previously the plan's alignment claim was computed but dropped
+     at the Execute boundary. `CollectRaw` (via `collectPlan`)
+     already did this; Collect now agrees.
+  2. `scanFrameNode.PartitionMetadata()` reads from the wrapped
+     Frame instead of returning nil. Comment predated Frames
+     carrying metadata — `Frame.partitionMeta` has existed since
+     v0.2.0. `frame.Lazy()` now yields a plan whose root scan
+     reports whatever claim the frame carries.
+
+  Without (2), (1) is a paper fix: the Frame carried the claim but
+  `frame.Lazy()` produced a plan with `PartitionMetadata() = nil`,
+  so downstream `Over` / `GroupBy` / `Join` still fell through to
+  the general (unaligned) paths. Both pieces landed together.
 
   Confirmed impact: a workload with 5 `Shift.Over("eid")` × 8
-  bucket workers was hitting the general Over path on every wall
-  because the claim was lost mid-pipeline —
+  bucket workers was hitting the general Over path on every wall —
   `collectHashedPartitions` at 14.7 GB flat alloc_space,
   `evalContiguous` (aligned) barely present at 1.4 GB cum. With
-  the claim propagated, the aligned path fires and the general-path
-  hash-partition build drops to near zero.
+  the claim actually flowing, the aligned path fires and the
+  general-path hash-partition build drops to near zero.
 
-  Callers who want to strip the claim (rare — mutating the frame
-  in ways that invalidate the partitioning) call
-  `f.WithPartitionMeta(nil)`.
+  Callers who want to strip a frame's claim (rare — mutating the
+  frame in ways that invalidate the partitioning) call
+  `f.WithPartitionMeta(nil)` before re-lifting.
 
 ## [v0.2.11]
 

@@ -120,6 +120,42 @@ func TestCollect_NoMetadataStillWorks(t *testing.T) {
 	}
 }
 
+// TestCollect_ReLiftInheritsMetadata — the end-to-end shape callers
+// actually exercise: Collect a LazyFrame with an assertion, re-lift
+// the returned Frame via .Lazy(), and confirm the new plan's root
+// scanFrameNode carries the assertion forward. Without this,
+// downstream Over/GroupBy/Join on the re-lifted plan fall through
+// to the general (unaligned) path even though the frame itself
+// carries the claim.
+func TestCollect_ReLiftInheritsMetadata(t *testing.T) {
+	f := simplePartitionedFrame(t)
+	meta := &PartitionMetadata{
+		Columns:      []string{"key"},
+		HashFn:       "test/identity/v1",
+		SortedBy:     []SortKey{{Column: "key"}},
+		SortEnforced: true,
+	}
+	lf, err := f.Lazy().WithPartitionAssertion(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collectOut, err := lf.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Re-lift and confirm the new plan's root node reports the claim.
+	// scanFrameNode.PartitionMetadata now reads from the wrapped Frame,
+	// so a frame with attached meta yields a plan with the claim.
+	relifted := collectOut.Lazy()
+	got := relifted.PartitionMetadata()
+	if got == nil {
+		t.Fatal("re-lifted LazyFrame lost the PartitionMetadata claim (scanFrameNode dropped it)")
+	}
+	if got.HashFn != meta.HashFn || !got.SortEnforced {
+		t.Errorf("re-lifted metadata drifted: %+v vs %+v", got, meta)
+	}
+}
+
 // TestCollect_MetadataAgreementAcrossCollectAndCollectRaw — a
 // documented invariant on Frame.PartitionMetadata says both entry
 // points behave the same. Lock that in.

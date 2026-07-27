@@ -73,11 +73,18 @@ func (n *scanFrameNode) String() string {
 	return fmt.Sprintf("Scan[frame](%d rows x %d cols)", rows, cols)
 }
 
-// Materialized in-memory frames make no partitioning claim by
-// default — the Frame type doesn't carry PartitionMetadata today.
-// Users who need a partition claim on an in-memory frame attach
-// one via LazyFrame.WithPartitionAssertion (step 3).
-func (n *scanFrameNode) PartitionMetadata() *PartitionMetadata { return nil }
+// The scan reports whatever partition claim the wrapped Frame is
+// carrying (attached via Frame.WithPartitionMeta or propagated
+// from a prior Collect). Nil = no claim, in which case the
+// downstream aligned fast paths fall through to their general
+// counterparts. Callers who want to override the frame's claim
+// use LazyFrame.WithPartitionAssertion.
+func (n *scanFrameNode) PartitionMetadata() *PartitionMetadata {
+	if n.frame == nil {
+		return nil
+	}
+	return n.frame.PartitionMetadata()
+}
 
 // -----------------------------------------------------------------------------
 // filterNode: keep rows where cond evaluates true
