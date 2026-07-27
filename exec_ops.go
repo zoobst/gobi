@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 
 	"github.com/apache/arrow-go/v18/arrow"
 )
@@ -11,22 +12,34 @@ import (
 // -----------------------------------------------------------------------------
 // scanFrameExec: leaf source over an in-memory *Frame.
 //
-// Splits the Frame into batches of at most defaultBatchRows rows.
+// Emits batches at chunk-aligned boundaries so every column's slice
+// stays inside a single underlying chunk — the invariant
+// frameToBatch enforces. batchRows caps the batch size; smaller
+// batches are emitted when a chunk boundary falls before the cap.
 // Zero-row Frames yield io.EOF immediately.
 // -----------------------------------------------------------------------------
 
 type scanFrameExec struct {
 	frame     *Frame
 	batchRows int
-	offset    int
-	closed    bool
+	// boundaries is a sorted list of row offsets where batches split.
+	// Constructed so that between any two adjacent entries every
+	// column's arrow.NewColumnSlice returns a single-chunk view (see
+	// chunkAlignedBoundaries). Empty when the Frame has zero rows.
+	boundaries []int64
+	idx        int
+	closed     bool
 }
 
 func newScanFrameExec(f *Frame, batchRows int) *scanFrameExec {
 	if batchRows <= 0 {
 		batchRows = defaultBatchRows
 	}
-	return &scanFrameExec{frame: f, batchRows: batchRows}
+	return &scanFrameExec{
+		frame:      f,
+		batchRows:  batchRows,
+		boundaries: chunkAlignedBoundaries(f, batchRows),
+	}
 }
 
 func (e *scanFrameExec) Schema() *arrow.Schema { return e.frame.Schema() }
@@ -38,19 +51,69 @@ func (e *scanFrameExec) Next(ctx context.Context) (arrow.RecordBatch, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	total := e.frame.NumRows()
-	if e.offset >= total {
+	if e.idx+1 >= len(e.boundaries) {
 		return nil, io.EOF
 	}
-	end := min(e.offset+e.batchRows, total)
-	slice := e.frame.slice(int64(e.offset), int64(end))
-	e.offset = end
+	start, end := e.boundaries[e.idx], e.boundaries[e.idx+1]
+	e.idx++
+	slice := e.frame.slice(start, end)
 	return frameToBatch(slice), nil
 }
 
 func (e *scanFrameExec) Close() error {
 	e.closed = true
 	return nil
+}
+
+// chunkAlignedBoundaries returns the sorted row offsets at which
+// scanFrameExec splits batches. The boundary set is the union of
+// every column's chunk-end offsets — guaranteeing that any adjacent
+// pair (a, b) sits entirely within one underlying chunk for every
+// column — plus batchRows-spaced cuts inserted into spans still
+// longer than the cap. Both 0 and totalRows are always present.
+//
+// This is the load-bearing invariant behind frameToBatch: because
+// (a, b) never crosses a chunk boundary in any column, the sliced
+// column collapses to a single chunk after arrow.NewColumnSlice,
+// and frameToBatch's chunks[0] read is the whole column.
+func chunkAlignedBoundaries(f *Frame, batchRows int) []int64 {
+	total := int64(f.NumRows())
+	if total == 0 {
+		return nil
+	}
+	seen := map[int64]struct{}{0: {}, total: {}}
+	for _, s := range f.series {
+		if s.col == nil {
+			continue
+		}
+		var off int64
+		for _, chunk := range s.col.Data().Chunks() {
+			off += int64(chunk.Len())
+			if off > 0 && off < total {
+				seen[off] = struct{}{}
+			}
+		}
+	}
+	ordered := make([]int64, 0, len(seen))
+	for k := range seen {
+		ordered = append(ordered, k)
+	}
+	slices.Sort(ordered)
+	if batchRows <= 0 {
+		return ordered
+	}
+	// Insert batchRows-spaced cuts into any remaining span > batchRows.
+	// A cut inside a single-chunk span keeps both halves single-chunk,
+	// so the invariant survives.
+	out := make([]int64, 0, len(ordered))
+	for i := range len(ordered) - 1 {
+		out = append(out, ordered[i])
+		for cut := ordered[i] + int64(batchRows); cut < ordered[i+1]; cut += int64(batchRows) {
+			out = append(out, cut)
+		}
+	}
+	out = append(out, ordered[len(ordered)-1])
+	return out
 }
 
 // -----------------------------------------------------------------------------

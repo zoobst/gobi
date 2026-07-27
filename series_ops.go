@@ -14,6 +14,12 @@ const (
 	opSub
 	opMul
 	opDiv
+	// Bitwise integer ops. Piggy-back on arithOp so the Int64 kernel
+	// dispatch tables extend cleanly; Float64 kernels reject these
+	// (bitwise on floats isn't a defined operation in gobi).
+	opBitAnd
+	opBitOr
+	opBitXor
 )
 
 const (
@@ -214,28 +220,16 @@ func arithF64F64(a, b []float64, aArr, bArr *array.Float64, op arithOp, name str
 	return buildFloat64Series(name, out, validity)
 }
 
-// arithI64I64 is the integer-integer batched kernel. Add/Sub/Mul produce
-// Int64; Div is never routed here (Div goes through the float64 kernel).
+// arithI64I64 is the integer-integer batched kernel. Add/Sub/Mul +
+// bitwise (BitAnd/BitOr/BitXor) produce Int64; Div is never routed
+// here (Div goes through the float64 kernel).
 func arithI64I64(a, b []int64, aArr, bArr *array.Int64, op arithOp, name string) Series {
 	n := len(a)
 	out := make([]int64, n)
 	aNulls := aArr.NullN() > 0
 	bNulls := bArr.NullN() > 0
 	if !aNulls && !bNulls {
-		switch op {
-		case opAdd:
-			for i := range n {
-				out[i] = a[i] + b[i]
-			}
-		case opSub:
-			for i := range n {
-				out[i] = a[i] - b[i]
-			}
-		case opMul:
-			for i := range n {
-				out[i] = a[i] * b[i]
-			}
-		}
+		applyI64Op(out, a, b, op)
 		return buildInt64Series(name, out, nil)
 	}
 	validity := make([]bool, n)
@@ -250,10 +244,48 @@ func arithI64I64(a, b []int64, aArr, bArr *array.Int64, op arithOp, name string)
 			out[i] = a[i] - b[i]
 		case opMul:
 			out[i] = a[i] * b[i]
+		case opBitAnd:
+			out[i] = a[i] & b[i]
+		case opBitOr:
+			out[i] = a[i] | b[i]
+		case opBitXor:
+			out[i] = a[i] ^ b[i]
 		}
 		validity[i] = true
 	}
 	return buildInt64Series(name, out, validity)
+}
+
+// applyI64Op runs op over the full slices, no null gating.
+// Extracted so both arithI64I64 and scalarI64 can share the
+// per-op switch shape.
+func applyI64Op(out, a, b []int64, op arithOp) {
+	switch op {
+	case opAdd:
+		for i := range out {
+			out[i] = a[i] + b[i]
+		}
+	case opSub:
+		for i := range out {
+			out[i] = a[i] - b[i]
+		}
+	case opMul:
+		for i := range out {
+			out[i] = a[i] * b[i]
+		}
+	case opBitAnd:
+		for i := range out {
+			out[i] = a[i] & b[i]
+		}
+	case opBitOr:
+		for i := range out {
+			out[i] = a[i] | b[i]
+		}
+	case opBitXor:
+		for i := range out {
+			out[i] = a[i] ^ b[i]
+		}
+	}
 }
 
 // arithSlow is the general per-row fallback for mixed-type or multi-chunk
@@ -356,6 +388,72 @@ func (s Series) scalar(v float64, op arithOp) (Series, error) {
 	return newSeriesFromArray(s.name, b.NewArray()), nil
 }
 
+// scalarI64 is the Int64-preserving scalar kernel. Used when the
+// input column is Int64 single-chunk and the scalar fits in int64.
+// Handles Add/Sub/Mul + bitwise BitAnd/BitOr/BitXor; Div isn't
+// routed here (Div always widens to Float64 per IEEE). Matches
+// Series.scalar's null-handling shape.
+func scalarI64(a []int64, arr *array.Int64, v int64, op arithOp, name string) Series {
+	n := len(a)
+	out := make([]int64, n)
+	if arr.NullN() == 0 {
+		applyI64OpScalar(out, a, v, op)
+		return buildInt64Series(name, out, nil)
+	}
+	validity := make([]bool, n)
+	for i := range n {
+		if arr.IsNull(i) {
+			continue
+		}
+		switch op {
+		case opAdd:
+			out[i] = a[i] + v
+		case opSub:
+			out[i] = a[i] - v
+		case opMul:
+			out[i] = a[i] * v
+		case opBitAnd:
+			out[i] = a[i] & v
+		case opBitOr:
+			out[i] = a[i] | v
+		case opBitXor:
+			out[i] = a[i] ^ v
+		}
+		validity[i] = true
+	}
+	return buildInt64Series(name, out, validity)
+}
+
+// applyI64OpScalar mirrors applyI64Op for the col-scalar shape.
+func applyI64OpScalar(out, a []int64, v int64, op arithOp) {
+	switch op {
+	case opAdd:
+		for i := range out {
+			out[i] = a[i] + v
+		}
+	case opSub:
+		for i := range out {
+			out[i] = a[i] - v
+		}
+	case opMul:
+		for i := range out {
+			out[i] = a[i] * v
+		}
+	case opBitAnd:
+		for i := range out {
+			out[i] = a[i] & v
+		}
+	case opBitOr:
+		for i := range out {
+			out[i] = a[i] | v
+		}
+	case opBitXor:
+		for i := range out {
+			out[i] = a[i] ^ v
+		}
+	}
+}
+
 func scalarF64(a []float64, arr *array.Float64, v float64, op arithOp, name string) Series {
 	n := len(a)
 	out := make([]float64, n)
@@ -409,7 +507,7 @@ func (s Series) Sum() (float64, error) {
 	}
 	// Slow path.
 	var total float64
-	for i := 0; i < s.Len(); i++ {
+	for i := range s.Len() {
 		v, ok, err := s.numericAt(i)
 		if err != nil {
 			return 0, err
@@ -464,7 +562,7 @@ func (s Series) Mean() (float64, error) {
 	}
 	var total float64
 	var n int
-	for i := 0; i < s.Len(); i++ {
+	for i := range s.Len() {
 		v, ok, err := s.numericAt(i)
 		if err != nil {
 			return 0, err
@@ -802,7 +900,7 @@ func cmpF64F64(a, b []float64, aArr, bArr *array.Float64, op cmpOp, name string)
 func (s Series) cmpSlow(o Series, op cmpOp) (Series, error) {
 	b := array.NewBooleanBuilder(memory.DefaultAllocator)
 	defer b.Release()
-	for i := 0; i < s.Len(); i++ {
+	for i := range s.Len() {
 		av, aok, err := s.numericAt(i)
 		if err != nil {
 			return Series{}, err

@@ -928,8 +928,9 @@ func (a *sumAcc) Update(col Series, rows []int) error {
 	}
 	// Single-chunk fast paths: type-switch once on the chunk and
 	// iterate rows with a direct typed accessor. Avoids the per-row
-	// interface dispatch + chunk-walker in numericAt, which the
-	// h3ify_gobi profile flagged as 6.83% cum CPU inside sumAcc.
+	// interface dispatch + chunk-walker in numericAt, which
+	// consistently shows up in profiles as one of the hottest spots
+	// on aggregation-heavy workloads.
 	chunks := col.col.Data().Chunks()
 	if len(chunks) == 1 {
 		switch arr := chunks[0].(type) {

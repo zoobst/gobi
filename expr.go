@@ -154,6 +154,23 @@ func (e Expr) Gt(o Expr) Expr { return binExpr(bopGt, e, o) }
 // Ge returns e >= o (Boolean result).
 func (e Expr) Ge(o Expr) Expr { return binExpr(bopGe, e, o) }
 
+// BitAnd returns the bitwise AND of two integer columns (or an
+// integer column and an integer literal). Both operands must be
+// integer-typed (Int32/Int64/Uint32/Uint64); errors at Type-check
+// time otherwise. Common shape: unpacking a packed-flags Int64
+// column into per-bit indicator columns, e.g.
+//
+//	Col("flags").BitAnd(Lit(int64(1 << 3))).Ne(Lit(int64(0)))
+func (e Expr) BitAnd(o Expr) Expr { return binExpr(bopBitAnd, e, o) }
+
+// BitOr returns the bitwise OR of two integer columns / literals.
+// Same type rules as BitAnd.
+func (e Expr) BitOr(o Expr) Expr { return binExpr(bopBitOr, e, o) }
+
+// BitXor returns the bitwise XOR of two integer columns / literals.
+// Same type rules as BitAnd.
+func (e Expr) BitXor(o Expr) Expr { return binExpr(bopBitXor, e, o) }
+
 // And returns e AND o. Both e and o must produce Boolean values.
 func (e Expr) And(o Expr) Expr { return binExpr(bopAnd, e, o) }
 
@@ -191,6 +208,13 @@ const (
 	bopGe
 	bopAnd
 	bopOr
+	// Bitwise integer operators. Distinct from bopAnd / bopOr (which
+	// are logical boolean ops) so promotion + kernel dispatch don't
+	// collide. Require both operands to be integer-typed; error on
+	// float or bool.
+	bopBitAnd
+	bopBitOr
+	bopBitXor
 )
 
 func (k binOpKind) String() string {
@@ -219,6 +243,12 @@ func (k binOpKind) String() string {
 		return "AND"
 	case bopOr:
 		return "OR"
+	case bopBitAnd:
+		return "&"
+	case bopBitOr:
+		return "|"
+	case bopBitXor:
+		return "^"
 	}
 	return fmt.Sprintf("op(%d)", k)
 }
@@ -226,6 +256,7 @@ func (k binOpKind) String() string {
 func (k binOpKind) isArithmetic() bool { return k <= bopDiv }
 func (k binOpKind) isComparison() bool { return k >= bopEq && k <= bopGe }
 func (k binOpKind) isLogical() bool    { return k == bopAnd || k == bopOr }
+func (k binOpKind) isBitwise() bool    { return k >= bopBitAnd && k <= bopBitXor }
 
 // binExpr is the shared constructor for BinaryOp-shaped Exprs.
 func binExpr(op binOpKind, l, r Expr) Expr {

@@ -73,6 +73,109 @@ introduce breaking changes; check this file when upgrading.
   accessors that consult arrow's cached `NullN` without touching the
   bitmap.
 
+- **Bitwise integer expressions: `Expr.BitAnd`, `Expr.BitOr`,
+  `Expr.BitXor`.** Distinct from the existing logical `And` / `Or`
+  (which operate on Boolean columns). Both operands must be
+  integer-typed (Int32/Int64/Uint32/Uint64); mixed-integer or
+  float/bool operands error at Type-check with
+  `ErrExprTypeMismatch`. Output type is Int64. Composes with
+  comparison + cast for flag-unpack patterns:
+
+      gobi.Col("flags").BitAnd(gobi.Lit(int64(1 << 3))).
+          Ne(gobi.Lit(int64(0))).
+          Cast(arrow.PrimitiveTypes.Int64)
+
+  Runtime dispatches to a new `scalarI64` bitwise path when the
+  RHS is a literal, and to the extended `arithI64I64` kernel for
+  col-vs-col. Both share the same op switch shape via the new
+  `applyI64Op` / `applyI64OpScalar` helpers.
+
+- **`Expr.UnixNano()` — Timestamp → Int64 nanoseconds (unit-
+  normalized).** Handles Second / Millisecond / Microsecond /
+  Nanosecond source units, always emitting Int64 nanoseconds.
+  Distinct from `Cast(Int64)` on a Timestamp — that returns the
+  raw underlying value in the source unit; `UnixNano` normalizes.
+  Errors at Type-check on non-Timestamp inputs. Composes with
+  arithmetic to derive time-delta expressions inline:
+
+      // hours-since-epoch as Float64
+      gobi.Col("ts").UnixNano().Cast(arrow.PrimitiveTypes.Float64).
+          Div(gobi.Lit(float64(time.Hour)))
+
+- **`Expr.Cast(Int64)` / `Cast(Float64)` now accept Timestamp
+  sources.** Emits the raw underlying epoch value in the source
+  column's `TimeUnit`. Together with `UnixNano()` gives callers
+  both "raw in source unit" and "normalized to nanoseconds" as
+  first-class options.
+
+- **`HaversineExpr(lat1, lon1, lat2, lon2 Expr, u geometry.Unit) Expr`
+  — great-circle distance between two lon/lat point columns.**
+  Composes with `Shift(1).Over(K)` for prev-row coordinate lookups,
+  so per-segment ground-track distance is expressible entirely in
+  LazyFrame land without a Custom ExprNode:
+
+      speedKMH := gobi.HaversineExpr(
+          gobi.Col("lat"), gobi.Col("lon"),
+          gobi.Col("lat").Shift(1).Over("eid"),
+          gobi.Col("lon").Shift(1).Over("eid"),
+          geometry.UnitKilometers,
+      ).Div(gobi.Col("delta_hours"))
+
+  All four operands must be Float64. Nulls propagate. Fast path
+  uses `Series.Float64Values` for zero-copy access and
+  `HasNulls`/`Nulls` to skip null-checks on all-valid inputs; a
+  multi-chunk fallback uses `Series.Float64s`. Internally routes to
+  `geometry.Haversine` for the scalar math — same accuracy, same
+  Earth-radius constant.
+
+### Fixed
+
+- **Arithmetic on integer columns with integer literals now preserves
+  Int64 at runtime.** `binOpNode.Type()` reported `Int64` for
+  `Int64Col.Add(Lit(int64(1)))` per `promoteNumeric`, but
+  `binOpNode.Eval` dispatched to `Series.AddScalar(float64)` which
+  unconditionally emitted Float64. The mismatch was latent on
+  single-chunk pipelines and surfaced as a `NewColumn: inconsistent
+  data type float64 vs int64` panic in `concatBatchesToFrame` the
+  moment a multi-chunk source Frame flowed through the executor.
+
+  Fix: `binOpNode.Eval` now routes `(IntCol op IntLit)` (op ∈
+  {Add, Sub, Mul, BitAnd, BitOr, BitXor}) through a new
+  `tryScalarIntFastPath` that calls the `scalarI64` kernel,
+  preserving the source column's Int64 dtype to match `Type()`.
+  Div still widens to Float64 per IEEE semantics (matching
+  `Series.Div`'s `wantFloat=true`), and `binOpNode.Type()` now
+  returns Float64 for Div explicitly so Div-in-schema and
+  Div-at-runtime agree.
+
+  `Series.AddScalar` / `SubScalar` / `MulScalar` / `DivScalar`
+  public contract is unchanged — they still emit Float64. The
+  integer-preserving path lives in the expression layer where the
+  literal's original dtype is visible.
+
+- **`scanFrameExec` panicked on multi-chunk input Frames.** The scan
+  split Frames into fixed `batchRows`-sized ranges and handed each
+  slice to `frameToBatch`, which grabbed `chunks[0]` and paired it
+  with `f.NumRows()` in `array.NewRecordBatch`. When the slice
+  straddled an underlying chunk boundary, arrow's `NewColumnSlice`
+  preserved the multi-chunk structure — `chunks[0]` returned only
+  the first sub-chunk while `NumRows()` still reported the whole
+  slice, and Arrow panicked with a row-count mismatch.
+
+  Fix: `scanFrameExec` now precomputes chunk-aligned boundaries at
+  construction (the union of every column's chunk-end offsets, plus
+  `batchRows`-spaced cuts inside any remaining large spans) and
+  emits one batch per adjacent pair. Every slice sits within a
+  single underlying chunk for every column, so `frameToBatch`'s
+  single-chunk assumption always holds. `batchRows` is now a cap,
+  not a fixed size — batches shrink when a chunk boundary falls
+  before the cap.
+
+  Also added a defensive `panic` in `frameToBatch` naming the
+  offending column when the invariant is ever violated in the
+  future (previously the failure surfaced as an opaque Arrow
+  runtime panic several stack frames away from the cause).
+
 ### Performance
 
 - **`Series.Nulls()` bitmap walk (2-4× faster on typical mixed-null
@@ -110,11 +213,6 @@ introduce breaking changes; check this file when upgrading.
   85% reduction in wall time on the hot inner loop. Zero-alloc on
   both paths. Benchmarks landed as `BenchmarkSumAcc_VectorizedSingleChunk`
   vs `BenchmarkSumAcc_NumericAtMultiChunk`.
-
-  For the h3ify_gobi profile specifically, the 6.83% cum CPU that
-  was in `Series.numericAt` inside `sumAcc.Update` should drop to
-  ~1% — proportional to a ~5% overall wall-time improvement on that
-  workload.
 
 ## [v0.2.8] — 2026-07-26
 

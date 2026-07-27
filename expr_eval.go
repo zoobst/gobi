@@ -191,7 +191,29 @@ func (n *binOpNode) Eval(input *Frame) (Series, error) {
 				if err != nil {
 					return Series{}, err
 				}
-				if s, ok, err := tryScalarFastPath(n.op, left, v); err != nil {
+				// Integer-preserving fast path: when the input column
+				// is Int64 single-chunk, the literal is a
+				// losslessly-representable int64, and the op isn't Div
+				// (which per IEEE widens), emit Int64 so binOpNode.Type()
+				// (Int64) matches the runtime output. Series-level
+				// AddScalar/SubScalar/MulScalar keep their public
+				// Float64-emitting contract; this routing lives in the
+				// expression layer where we know both the column dtype
+				// and the literal's original dtype.
+				if (n.op != bopDiv && isIntegerType(rlit.dtype)) || n.op.isBitwise() {
+					if s, ok, err := tryScalarIntFastPath(n.op, left, int64(v)); err != nil {
+						return Series{}, err
+					} else if ok {
+						return s, nil
+					}
+				}
+				// Bitwise ops don't have a float fallback — skip the
+				// float64 fast path. Non-integer inputs surface at
+				// Type() check time; here we just refuse to widen.
+				if n.op.isBitwise() {
+					// Fall through to general col-vs-col path with a
+					// literal broadcast on the right.
+				} else if s, ok, err := tryScalarFastPath(n.op, left, v); err != nil {
 					return Series{}, err
 				} else if ok {
 					return s, nil
@@ -211,6 +233,79 @@ func (n *binOpNode) Eval(input *Frame) (Series, error) {
 	return applyBinaryOp(n.op, left, right)
 }
 
+// tryScalarIntFastPath emits (col op int-literal) with Int64 output
+// preserved — only when the input is Int64 single-chunk. Returns
+// (_, false, nil) otherwise so the caller can fall back to the
+// float64 scalar path (which widens) or the general col-vs-col path.
+// Fires for non-Div arithmetic AND bitwise ops (which are defined
+// only for integer operands).
+func tryScalarIntFastPath(op binOpKind, left Series, v int64) (Series, bool, error) {
+	vals, arr, ok := left.singleI64()
+	if !ok {
+		return Series{}, false, nil
+	}
+	switch op {
+	case bopAdd:
+		return scalarI64(vals, arr, v, opAdd, left.name), true, nil
+	case bopSub:
+		return scalarI64(vals, arr, v, opSub, left.name), true, nil
+	case bopMul:
+		return scalarI64(vals, arr, v, opMul, left.name), true, nil
+	case bopBitAnd:
+		return scalarI64(vals, arr, v, opBitAnd, left.name), true, nil
+	case bopBitOr:
+		return scalarI64(vals, arr, v, opBitOr, left.name), true, nil
+	case bopBitXor:
+		return scalarI64(vals, arr, v, opBitXor, left.name), true, nil
+	}
+	return Series{}, false, nil
+}
+
+// isIntegerType reports whether dt is one of the integer arrow types
+// gobi's literals can carry. Used to decide whether an int-preserving
+// scalar path applies.
+func isIntegerType(dt arrow.DataType) bool {
+	if dt == nil {
+		return false
+	}
+	switch dt.ID() {
+	case arrow.INT32, arrow.INT64, arrow.UINT32, arrow.UINT64:
+		return true
+	}
+	return false
+}
+
+// bitwiseColCol dispatches (col & col), (col | col), (col ^ col) to
+// the Int64 kernel. Requires both operands be Int64-typed at
+// runtime — binOpNode.Type already gate-checked integer types at
+// Compile, but a mismatched pair reaching here (e.g. Int32) returns
+// a clear error rather than a panic.
+func bitwiseColCol(left, right Series, op binOpKind) (Series, error) {
+	if left.Len() != right.Len() {
+		return Series{}, fmt.Errorf("%w: %d vs %d",
+			ErrColumnLenMismatch, left.Len(), right.Len())
+	}
+	aVals, aArr, aOk := left.singleI64()
+	bVals, bArr, bOk := right.singleI64()
+	if !aOk || !bOk {
+		return Series{}, fmt.Errorf(
+			"%w: bitwise %s requires Int64 single-chunk operands (got %s and %s)",
+			ErrExprTypeMismatch, op, left.DataType(), right.DataType())
+	}
+	var kernelOp arithOp
+	switch op {
+	case bopBitAnd:
+		kernelOp = opBitAnd
+	case bopBitOr:
+		kernelOp = opBitOr
+	case bopBitXor:
+		kernelOp = opBitXor
+	default:
+		return Series{}, fmt.Errorf("%w: bitwiseColCol: op %s", ErrExprTypeMismatch, op)
+	}
+	return arithI64I64(aVals, bVals, aArr, bArr, kernelOp, left.Name()), nil
+}
+
 func (n *binOpNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 	lt, err := n.left.Type(schema)
 	if err != nil {
@@ -221,7 +316,26 @@ func (n *binOpNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 		return nil, err
 	}
 	switch {
+	case n.op.isBitwise():
+		// Bitwise ops are integer-only. Require both operands be
+		// Int32/Int64/Uint32/Uint64; error out on float/bool/string.
+		if !isIntegerType(lt) || !isIntegerType(rt) {
+			return nil, fmt.Errorf("%w: %s requires integer operands, got %s and %s",
+				ErrExprTypeMismatch, n.op, lt, rt)
+		}
+		// Output type: Int64 in all cases (matches scalarI64/
+		// arithI64I64 kernels).
+		return arrow.PrimitiveTypes.Int64, nil
 	case n.op.isArithmetic():
+		// Div always widens to Float64 per IEEE-754 division semantics
+		// (Series.Div passes wantFloat=true), even for Int64 / Int64.
+		// Every other arithmetic op honors promoteNumeric.
+		if n.op == bopDiv {
+			if _, err := promoteNumeric(lt, rt); err != nil {
+				return nil, err
+			}
+			return arrow.PrimitiveTypes.Float64, nil
+		}
 		return promoteNumeric(lt, rt)
 	case n.op.isComparison():
 		if _, err := promoteForComparison(lt, rt); err != nil {
@@ -297,6 +411,8 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 		return left.Mul(right)
 	case bopDiv:
 		return left.Div(right)
+	case bopBitAnd, bopBitOr, bopBitXor:
+		return bitwiseColCol(left, right, op)
 	case bopEq:
 		return left.Eq(right)
 	case bopNe:

@@ -153,6 +153,19 @@ func castToFloat64(s Series) (Series, error) {
 				}
 				b.Append(float64(arr.Value(i)))
 			}
+		case *array.Timestamp:
+			// Timestamp → Float64: emit the raw epoch value in the
+			// timestamp's declared unit (nanoseconds / microseconds /
+			// milliseconds / seconds). Callers that want a
+			// unit-normalized value should route via
+			// Expr.UnixNano().Cast(Float64) instead.
+			for i := range arr.Len() {
+				if arr.IsNull(i) {
+					b.AppendNull()
+					continue
+				}
+				b.Append(float64(arr.Value(i)))
+			}
 		default:
 			return Series{}, castUnsupportedErr(chunk.DataType(), arrow.PrimitiveTypes.Float64)
 		}
@@ -199,6 +212,17 @@ func castToInt64(s Series) (Series, error) {
 				b.Append(int64(arr.Value(i)))
 			}
 		case *array.Float32:
+			for i := range arr.Len() {
+				if arr.IsNull(i) {
+					b.AppendNull()
+					continue
+				}
+				b.Append(int64(arr.Value(i)))
+			}
+		case *array.Timestamp:
+			// Timestamp → Int64: emit the raw epoch value in the
+			// timestamp's declared unit. See castToFloat64's Timestamp
+			// arm for the unit-normalization note.
 			for i := range arr.Len() {
 				if arr.IsNull(i) {
 					b.AppendNull()

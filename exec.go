@@ -125,15 +125,27 @@ func concatBatchesToFrame(schema *arrow.Schema, batches []arrow.RecordBatch) (*F
 // eager engine (which speaks Frame) and the executor's batch bus.
 // -----------------------------------------------------------------------------
 
-// frameToBatch produces a RecordBatch view of f's columns. Assumes
-// each Series has a single chunk (which is true for Frames produced
-// by the eager engine's fast paths). The returned batch shares
-// buffers with f — do not release both.
+// frameToBatch produces a RecordBatch view of f's columns. Requires
+// each Series to carry exactly one chunk — a RecordBatch is a
+// single-array-per-column shape, so multi-chunk columns can't be
+// represented losslessly here. Callers that operate on user-built
+// Frames (scanFrameExec, notably) must emit batches at boundaries
+// where every column's slice reduces to a single underlying chunk;
+// see chunkAlignedBoundaries for the boundary-picking rule.
+//
+// The returned batch shares buffers with f — do not release both.
 func frameToBatch(f *Frame) arrow.RecordBatch {
 	schema := f.Schema()
 	arrs := make([]arrow.Array, f.NumCols())
 	for i, s := range f.series {
 		chunks := s.col.Data().Chunks()
+		if len(chunks) != 1 {
+			panic(fmt.Sprintf(
+				"gobi: frameToBatch: column %q has %d chunks; expected 1. "+
+					"This is a gobi bug — batch emission crossed a chunk boundary. "+
+					"Please file an issue with the pipeline shape.",
+				s.Name(), len(chunks)))
+		}
 		arrs[i] = chunks[0]
 		arrs[i].Retain() // NewRecord's contract requires a live ref
 	}
