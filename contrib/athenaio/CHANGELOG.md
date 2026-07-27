@@ -9,7 +9,32 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
-## [v0.1.2]
+## [v0.1.4]
+
+### Fixed
+
+- **`listBucketFiles` now normalizes trailing slash on the prefix
+  before calling `ListObjectsV2`.** Glue's
+  `StorageDescriptor.Location` for a CTAS-created table comes back
+  as `.../tables/<queryID>` — no trailing slash. S3's `Prefix`
+  parameter is a byte-prefix match with no path-boundary awareness,
+  so a listing at `.../tables/abc` also picks up sibling keys like
+  `.../tables/abc-extra/*` (and, more subtly, would leak keys from
+  any longer-UUID neighbor sharing the first N bytes). One-line
+  guard in `listBucketFiles` appends `/` when the prefix has a
+  non-empty path and doesn't already end in one — no-op on
+  already-slashed callers, and the empty-prefix (whole-bucket)
+  case skips the normalization to avoid a stray `//`.
+
+- **`isCTASDataKey` rejects `.csv`.** Athena writes a
+  `<queryID>-manifest.csv` adjacent to CTAS output (and query-
+  result CSVs live in the same neighborhood for non-CTAS queries).
+  A CSV is never a CTAS data payload; excluding the suffix wholesale
+  is defense-in-depth against Athena ever landing manifest CSVs
+  inside the data directory too. Test coverage extended to
+  `abc-manifest.csv` + `query-result.csv`.
+
+## [v0.1.3]
 
 ### Fixed
 
@@ -32,6 +57,8 @@ see [Versioning](#versioning) below.
   `parquetio.ReadReader` which fails loudly, so a stray file
   surfaces at read time with a clear parse error rather than
   silently vanishing at list time.
+
+## [v0.1.2]
 
 ### Changed
 

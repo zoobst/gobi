@@ -31,6 +31,12 @@ func TestIsCTASDataKey(t *testing.T) {
 		// Hive symlink manifest: rejected.
 		{"prefix/_symlink_format_manifest/manifest.csv", false},
 
+		// Athena manifest CSV sits adjacent to CTAS data — Athena
+		// writes `<queryID>-manifest.csv` next to output. CSV is
+		// never a CTAS data payload; reject the whole suffix.
+		{"gobi/x/abc-manifest.csv", false},
+		{"gobi/x/query-result.csv", false},
+
 		// Job-marker + checksum sidecar: rejected.
 		{"tables/abc/data/_SUCCESS", false},
 		{"tables/abc/data/_committed_1234", false},

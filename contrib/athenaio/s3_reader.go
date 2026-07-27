@@ -117,6 +117,14 @@ func listBucketFiles(ctx context.Context, api S3API, prefix string) ([]string, e
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: listBucketFiles: %w", err)
 	}
+	// Force trailing slash so ListObjectsV2 scopes to genuine
+	// children — e.g. prefix `tables/abc` would otherwise also
+	// match a sibling `tables/abc-extra/…`. No-op when the caller
+	// already supplied a slash; skipped for the empty-prefix case
+	// (whole-bucket listing) to avoid a `//` double slash.
+	if keyPrefix != "" && !strings.HasSuffix(keyPrefix, "/") {
+		keyPrefix += "/"
+	}
 	var out []string
 	var token *string
 	for {
@@ -169,10 +177,15 @@ func isCTASDataKey(key string) bool {
 	}
 	// Common non-data suffixes across Athena / Iceberg / Hive:
 	//   - .metadata.json / .avro   → Iceberg manifests
+	//   - .csv                     → Athena manifest CSVs, query
+	//                                result CSVs (e.g.
+	//                                `<queryID>-manifest.csv`);
+	//                                CSVs are never CTAS data files.
 	//   - .crc                     → Hadoop checksum sidecar
 	//   - _SUCCESS / _committed_*  → job-marker files
 	if strings.HasSuffix(key, ".metadata.json") ||
 		strings.HasSuffix(key, ".avro") ||
+		strings.HasSuffix(key, ".csv") ||
 		strings.HasSuffix(key, ".crc") ||
 		strings.HasSuffix(key, "/_SUCCESS") ||
 		strings.Contains(key, "/_committed_") ||
