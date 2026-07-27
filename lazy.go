@@ -292,11 +292,35 @@ func explainPlan(p LogicalPlan, sb *strings.Builder, depth int) {
 // This is where errors surface: bad expressions, type mismatches,
 // unknown columns, scan failures.
 func (lf *LazyFrame) Collect() (*Frame, error) {
-	op, err := Compile(Optimize(lf.plan))
+	plan := Optimize(lf.plan)
+	op, err := Compile(plan)
 	if err != nil {
 		return nil, err
 	}
-	return Execute(context.Background(), op)
+	f, err := Execute(context.Background(), op)
+	if err != nil {
+		return nil, err
+	}
+	// Propagate the plan-proved PartitionMetadata claim onto the
+	// returned Frame so downstream `frame.Lazy()` chains inherit the
+	// alignment context. Without this, Over / GroupBy / Join on the
+	// re-lifted LazyFrame fall through to the general (unaligned)
+	// path even though the plan already proved contiguity —
+	// silently pessimizing hot paths across a Collect boundary.
+	// CollectRaw's collectPlan already does the same (see
+	// PartitionMetadata's docstring); this brings Collect into
+	// agreement.
+	//
+	// Callers who want to strip the claim can call
+	// f.WithPartitionMeta(nil) — cheap opt-out for the rare case
+	// where the caller mutates the frame in ways that invalidate
+	// the claim before re-lifting.
+	if f != nil {
+		if meta := plan.PartitionMetadata(); meta != nil {
+			f.WithPartitionMeta(meta)
+		}
+	}
+	return f, nil
 }
 
 // CollectRaw skips both the optimizer AND the streaming executor,

@@ -35,20 +35,51 @@ built around a strongly-typed schema.
   multi-threaded across left rows, tunable via `Workers(n)`.
 - **DataFrame ops.** `Filter`, `Take`, `Head`, `Tail`, `SortBy`
   (multi-key stable, nulls-last), `WithColumn`, `DropColumn`,
-  `GroupBy(...).Agg(count/sum/mean/min/max)`, `Join`
-  (inner / left / right / full / semi / anti with coalesced keys),
-  `Explode`. Series arithmetic (Add/Sub/Mul/Div + scalar), comparisons,
-  aggregations — all with single-chunk bulk fast paths.
+  `SelectCols`, `Rename`, `Explode` (also as a `LazyFrame` streaming
+  step), `Join` (inner / left / right / full / semi / anti with
+  coalesced keys). `GroupBy(...).Agg(...)` with built-in kinds:
+  `Count`, `Sum`, `Mean`, `Min`, `Max`, `First`, `Last`, `NUnique`,
+  `Std`, `Var`, `Median`, `Mode`. Aggregations can carry a
+  per-aggregation `Filter Expr` for `SUM(x) FILTER (WHERE …)`-style
+  reductions. Series arithmetic, comparisons, aggregations — all
+  with single-chunk bulk fast paths and Int64-preserving scalar
+  arithmetic.
+- **Built-in collect-set aggregators.** `NewStringSetAggregator()`,
+  `NewInt64SetAggregator()`, `NewUint64SetAggregator()`,
+  `NewInt32SetAggregator()`, `NewUint32SetAggregator()` — distinct-
+  value roll-ups that emit `List<T>` per group and stream through
+  the aggregate executor via `IncrementalAggregator`.
 - **User-defined aggregations.** `type Aggregator interface { ... }`
-  plugs directly into `GroupBy.Agg` alongside the built-ins — mode,
-  percentile, weighted mean, H3-of-centroid, whatever you need,
-  without forking the package.
+  plugs directly into `GroupBy.Agg` alongside the built-ins. Opt
+  into the streaming aggregate executor by additionally implementing
+  `IncrementalAggregator` (`Clone` / `Update` / `Finalize`) — per-
+  batch state updates instead of a materialize-then-reduce pass.
 - **Expression IR.** `gobi.Col("price").Mul(gobi.Lit(1.08)).Gt(gobi.Lit(100))`
   builds a data tree, not a chain of already-executed calls.
-  `Frame.FilterExpr` and `Frame.WithColumnExpr` evaluate it; a
-  `Custom(node ExprNode)` escape hatch lets sibling packages (H3,
-  hashes, ML inference) plug in their own expression types alongside
-  the built-ins.
+  `Frame.FilterExpr` and `Frame.WithColumnExpr` evaluate it. The
+  built-in vocabulary covers arithmetic (`Add`/`Sub`/`Mul`/`Div`),
+  bitwise (`BitAnd`/`BitOr`/`BitXor`), comparisons, logical
+  (`And`/`Or`/`Not`), `IsNull`/`IsNotNull`, `Cast(dtype)` (numeric-
+  to-numeric + Timestamp source), `If`/`Coalesce`, `LitNull(dtype)`,
+  `LitEmptyList(elem)`, `ListLen`, `ListUnion`, `Shift(n)`,
+  window functions (`.Sum()/.Mean()/.Min()/.Max()/.Count()/.Median()/
+  .Mode().Over(cols...)` for scalar-agg-and-broadcast; shape-preserving
+  inners like `Shift(1).Over(K)` for prev-row-within-partition
+  patterns), `UnixNano()` (Timestamp → Int64 ns), and
+  `HaversineExpr(lat1, lon1, lat2, lon2, unit)` for great-circle
+  distance between two point columns. A `Custom(node ExprNode)`
+  escape hatch lets sibling packages (H3, hashes, ML inference)
+  plug in their own expression types alongside the built-ins.
+- **Alignment-aware fast paths.** `PartitionMetadata` claims
+  (attached via `LazyFrame.WithPartitionAssertion` or produced by
+  `contrib/athenaio` on Iceberg CTAS output) let `GroupBy`, `Over`,
+  and `Join` skip the hash-shuffle and linear-scan partition
+  boundaries directly. Runs 30-70% faster than the general path
+  when applicable; falls through automatically otherwise.
+- **List<T> and Struct columns.** First-class support end-to-end:
+  Explode expands list rows, `ListUnion` merges per-row, aggregations
+  can emit `List<T>` (see set aggregators above), and Struct-typed
+  builders round-trip through Frame → LazyFrame → Frame.
 - **LazyFrame + rule-based optimizer.** `df.Lazy()` and
   `parquetio.ScanFile(path)` build plan trees that don't execute
   until `.Collect()`. Nine rewrite rules run to a fixed point:
@@ -63,14 +94,18 @@ built around a strongly-typed schema.
 - **Parallel streaming executor.** `LazyFrame.Collect()` compiles
   the optimized plan to a tree of `ExecOperator`s that pull one
   record batch at a time — bounded memory regardless of source
-  size. Filter, Project, WithColumn, Drop, Limit, ScanFrame, and
-  ScanFile all stream natively. Aggregate (built-in Kinds) and
-  hash-join (Inner/Left/Semi/Anti) run as native streaming
-  operators too — no materialization step. Parquet scan
-  parallelizes across row-groups; the streaming hash aggregate
-  partitions rows across workers by key hash. Both scale to
-  `GOMAXPROCS` out of the box. `LazyFrame.ExplainPhysical()` prints
-  what strategy each node compiles to (worker counts included).
+  size. Filter, Project, WithColumn, Drop, Rename, Select, Explode,
+  Limit, ScanFrame, and ScanFile all stream natively. Adjacent
+  batch-transform ops are fused into a single per-batch pass by
+  the compiler (~22% fewer allocations on typical Filter → Project
+  → WithColumn chains). Aggregate (all built-in kinds + custom
+  `IncrementalAggregator`s) and hash-join (Inner/Left/Semi/Anti)
+  run as native streaming operators — no materialization step.
+  Parquet scan parallelizes across row-groups; the streaming hash
+  aggregate partitions rows across workers by key hash. Both scale
+  to `GOMAXPROCS` out of the box. `LazyFrame.ExplainPhysical()`
+  prints what strategy each node compiles to (worker counts
+  included).
 - **Datetime + timezone-aware ops.** `Timestamp[ns]` columns with
   optional IANA tz label. Component extractors, `AddDuration` /
   `DiffDuration`, comparisons, sub-day + calendar truncation.
@@ -311,6 +346,49 @@ big, _ := df.FilterExpr(
 )
 ```
 
+### Window functions
+
+`Over(partitionCols...)` runs either an aggregate (broadcast to every
+row in the partition) or a shape-preserving inner like `Shift(1)`
+(prev-row-within-partition). Both compose with the alignment
+fast paths when `PartitionMetadata` proves the frame is
+partition-contiguous.
+
+```go
+// Per-region total (broadcast). Same shape works for Mean / Min /
+// Max / Count / Median / Mode.
+df, _ := df.WithColumnExpr("region_total",
+    gobi.Col("sales").Sum().Over("region"),
+)
+
+// Previous row's timestamp within (eid) partition. First ping of
+// each entity emits null.
+df, _ := df.WithColumnExpr("prev_ts",
+    gobi.Col("ts").Shift(1).Over("eid"),
+)
+
+// Great-circle distance between successive pings, entirely in the
+// expression tree — no Custom ExprNode needed.
+df, _ := df.WithColumnExpr("step_km", gobi.HaversineExpr(
+    gobi.Col("lat"),
+    gobi.Col("lon"),
+    gobi.Col("lat").Shift(1).Over("eid"),
+    gobi.Col("lon").Shift(1).Over("eid"),
+    geometry.UnitKilometers,
+))
+```
+
+For flag-unpacking a packed Int64 into per-bit indicator columns:
+
+```go
+const FlagBogonIP = 1 << 3
+df, _ := df.WithColumnExpr("has_bogon_ip",
+    gobi.Col("flags").
+        BitAnd(gobi.Lit(int64(FlagBogonIP))).
+        Ne(gobi.Lit(int64(0))),
+)
+```
+
 ### Reproject
 
 ```go
@@ -404,6 +482,7 @@ _ = shpio.WriteFile(counties, "counties_out", nil)  // writes all four files
 | `.../gobi/pgio`           | **Beta.** PostgreSQL / PostGIS via `pgx/v5` — `ReadQuery`/`ReadTable`/`ScanTable` + `WriteTable` with `CopyFrom` bulk load. Integration tests are `//go:build integration`-gated; set `PGIO_TEST_DSN` and run against a live PostGIS to exercise them. |
 | `.../gobi/kmlio`          | Read / write KML (OGC 12-007r2) + KMZ (zipped KML). Placemarks + ExtendedData. `.kmz` extension auto-detected. |
 | `.../gobi/shpio`          | Read / write ESRI Shapefile (`.shp` + `.shx` + `.dbf` + optional `.prj`)                        |
+| `.../gobi/contrib/athenaio` | AWS Athena CTAS integration — `UnloadAndRead`, `UnloadAndReadBuckets`, `RawCTAS`, `RawCTASBuckets` return LazyFrames with `PartitionMetadata` claims that flow into gobi's aligned fast paths. Own `go.mod`; versions independently. |
 
 ## Geometry columns
 
@@ -462,6 +541,31 @@ usual. Mix custom + built-in aggregations in a single call. If the
 returned dynamic type doesn't match the declared `Type()`, `Agg`
 returns an error naming the offending aggregation rather than
 panicking.
+
+Opt into the streaming aggregate executor by additionally
+implementing `IncrementalAggregator`:
+
+```go
+type IncrementalAggregator interface {
+    Aggregator
+    // Clone returns a fresh instance with empty per-group state.
+    // Called once per group at first-touch; each group runs on its
+    // own clone, no cross-group state sharing.
+    Clone() IncrementalAggregator
+    // Update adds col[rows] to this instance's state. Called at
+    // most once per input batch per group. Additive — do not reset.
+    Update(col Series, rows []int) error
+    // Finalize returns the group's aggregated value. Called once
+    // per group after all Updates.
+    Finalize() any
+}
+```
+
+Plain `Aggregator`s still work — they route through the materializing
+fallback exactly as before. `IncrementalAggregator`s skip the
+materialize-then-reduce and process per batch, matching the built-in
+aggregators' streaming shape. The bundled set aggregators
+(`NewStringSetAggregator`, etc.) are the reference implementations.
 
 **3. Custom expression nodes via the `ExprNode` interface.**
 
