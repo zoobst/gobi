@@ -467,6 +467,14 @@ func (e *materializeExecOp) Next(ctx context.Context) (arrow.RecordBatch, error)
 		e.yielded = true
 	}
 	if e.out == nil || e.offset >= e.out.NumRows() {
+		// Streaming complete. Downstream batches already Retain the
+		// arrow columns they need via frameToBatch, so our reference
+		// to the full concat'd Frame is redundant now — drop it so
+		// the arrow buffers can be freed while the rest of the plan
+		// keeps running. Without this, a plan with N materialize
+		// walls pins N full-frame copies in memory for the entire
+		// Collect lifetime.
+		e.releaseOut()
 		return nil, io.EOF
 	}
 	end := min(e.offset+defaultBatchRows, e.out.NumRows())
@@ -502,6 +510,12 @@ func (e *materializeExecOp) materialize(ctx context.Context) error {
 		return err
 	}
 	out, err := e.compute(in)
+	// `in` is a fresh concat Frame — compute either builds a new
+	// Frame (in which case `in`'s columns are orphaned) or returns
+	// `in` itself. Release unconditionally; NewFrame retains the
+	// columns it keeps, so a same-column identity compute stays
+	// alive via `out`.
+	in.Release()
 	if err != nil {
 		return err
 	}
@@ -509,7 +523,23 @@ func (e *materializeExecOp) materialize(ctx context.Context) error {
 	return nil
 }
 
+// releaseOut drops the reference to the materialized Frame if it's
+// still alive. Idempotent — safe to call from both the EOF path in
+// Next and from Close.
+func (e *materializeExecOp) releaseOut() {
+	if e.out == nil {
+		return
+	}
+	e.out.Release()
+	e.out = nil
+}
+
 func (e *materializeExecOp) Close() error {
+	// Defensive release for the paths where Next never reached EOF
+	// (context cancel, downstream error, partial iteration). Next's
+	// EOF branch already dropped e.out to nil, so this is a no-op
+	// on the happy path.
+	e.releaseOut()
 	return e.input.Close()
 }
 

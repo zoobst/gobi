@@ -5,6 +5,35 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.11]
+
+### Fixed
+
+- **`materializeExecOp` retained its concatenated Frame for the
+  entire `Collect` lifetime.** After the materialize wall streamed
+  its output downstream (batch-by-batch via `frameToBatch`, which
+  `Retain`s each column it hands off), the op's own `e.out` pointer
+  never dropped its reference — arrow ref-counts stayed above zero,
+  the full-frame buffers stayed allocated, and every materialize
+  wall in the plan pinned an additional full-frame copy in memory
+  until the whole `Collect` returned.
+
+  Compounds on plans with multiple `Over` / `Shift.Over` /
+  `SortBy` walls: N walls × plan-width × row-count is the pinned
+  cost, and with parallel bucket execution it multiplies again by
+  the worker count. A real-world workload with ~8 materialize
+  points × ~1 GB per pinned frame × 8 parallel bucket workers
+  matched a ~58 GB observed peak — exactly the "direct-LazyFrame
+  path is worse than the old materialize-then-loop path" surprise.
+
+  Fix: `Next` releases `e.out` on the EOF path (downstream already
+  `Retain`ed what it kept, so the drop is safe); `Close` releases
+  defensively for cancelled / errored / partially-iterated plans.
+  Also releases the intermediate `in` Frame in `materialize`
+  immediately after `compute` returns — `NewFrame` retains what
+  it keeps, so identity-compute results stay alive via `out` while
+  the orphaned concat-frame columns get freed.
+
 ## [v0.2.10]
 
 ### Added
