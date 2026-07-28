@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 
 	// modernc.org/sqlite is a pure-Go SQLite driver; requires no cgo.
 	_ "modernc.org/sqlite"
@@ -81,6 +82,164 @@ func Open(path string) (*GeoPackage, error) {
 
 // Close releases the database handle.
 func (g *GeoPackage) Close() error { return g.db.Close() }
+
+// LayerNames returns the names of every registered feature table in
+// the file, in gpkg_geometry_columns order. Cheap — one metadata
+// query. Useful when the caller only needs a list to iterate over
+// (see also FeatureTables for the richer struct-per-layer shape).
+func (g *GeoPackage) LayerNames() ([]string, error) {
+	tables, err := g.FeatureTables()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, len(tables))
+	for i, t := range tables {
+		out[i] = t.Name
+	}
+	return out, nil
+}
+
+// SumColumn returns SUM(col) over every row of layer as a Float64.
+// Integer columns are promoted; TEXT and BLOB columns error at
+// SQLite (SUM on non-numeric values yields 0 or NULL depending on
+// content). Returns 0 when the layer has no rows or every value is
+// null.
+//
+// The whole computation runs inside SQLite — no WKB decode, no
+// Go-side row iteration, no builder allocations. Constant memory
+// regardless of layer size. Intended for the "rank layers by a
+// summary metric before deciding which to keep" pattern where the
+// geometry column is dead weight for the ranking step.
+//
+// Errors on unknown layer or column, or if the caller-supplied
+// name isn't a safe SQL identifier.
+func (g *GeoPackage) SumColumn(layer, col string) (float64, error) {
+	if !validSQLIdent(layer) {
+		return 0, fmt.Errorf("gpkg: SumColumn: layer %q is not a valid SQLite identifier", layer)
+	}
+	if !validSQLIdent(col) {
+		return 0, fmt.Errorf("gpkg: SumColumn: column %q is not a valid SQLite identifier", col)
+	}
+	// SQLite's legacy "double-quoted identifier falls back to string
+	// literal" behavior turns SUM("bogus_col") into SUM('bogus_col')
+	// silently, which coerces to 0 instead of raising. Verify the
+	// column exists first via PRAGMA table_info so the caller gets a
+	// clear error on typos rather than a bogus 0.
+	if err := requireColumn(g.db, layer, col); err != nil {
+		return 0, err
+	}
+	query := fmt.Sprintf("SELECT COALESCE(SUM(%s), 0) FROM %s",
+		quoteIdent(col), quoteIdent(layer))
+	var sum float64
+	if err := g.db.QueryRow(query).Scan(&sum); err != nil {
+		return 0, fmt.Errorf("gpkg: SumColumn(%s.%s): %w", layer, col, err)
+	}
+	return sum, nil
+}
+
+// MeanColumn returns AVG(col) over every non-null row of layer.
+// Empty or all-null layers return NaN (matching Series.Mean's
+// convention) rather than an error — cheap to check via
+// math.IsNaN. Integer columns promote to Float64.
+//
+// Same PRAGMA table_info gate as SumColumn: typos surface as
+// "column not found" instead of SQLite's silent 0.
+func (g *GeoPackage) MeanColumn(layer, col string) (float64, error) {
+	return g.scalarAgg("MeanColumn", "AVG", layer, col)
+}
+
+// MinColumn returns MIN(col) as Float64. Empty or all-null layers
+// return NaN (matching Series.Min). Integer columns promote.
+func (g *GeoPackage) MinColumn(layer, col string) (float64, error) {
+	return g.scalarAgg("MinColumn", "MIN", layer, col)
+}
+
+// MaxColumn returns MAX(col) as Float64. Empty or all-null layers
+// return NaN (matching Series.Max). Integer columns promote.
+func (g *GeoPackage) MaxColumn(layer, col string) (float64, error) {
+	return g.scalarAgg("MaxColumn", "MAX", layer, col)
+}
+
+// scalarAgg is the shared implementation for MeanColumn / MinColumn
+// / MaxColumn. Runs SELECT <aggFn>(col) FROM layer, treating NULL
+// (empty layer / all-null column) as NaN. aggFn is a fixed SQLite
+// aggregate keyword ("AVG", "MIN", "MAX") — never caller-supplied,
+// so no SQL-injection surface beyond what layer/col already have.
+func (g *GeoPackage) scalarAgg(caller, aggFn, layer, col string) (float64, error) {
+	if !validSQLIdent(layer) {
+		return 0, fmt.Errorf("gpkg: %s: layer %q is not a valid SQLite identifier", caller, layer)
+	}
+	if !validSQLIdent(col) {
+		return 0, fmt.Errorf("gpkg: %s: column %q is not a valid SQLite identifier", caller, col)
+	}
+	if err := requireColumn(g.db, layer, col); err != nil {
+		return 0, err
+	}
+	query := fmt.Sprintf("SELECT %s(%s) FROM %s",
+		aggFn, quoteIdent(col), quoteIdent(layer))
+	var v sql.NullFloat64
+	if err := g.db.QueryRow(query).Scan(&v); err != nil {
+		return 0, fmt.Errorf("gpkg: %s(%s.%s): %w", caller, layer, col, err)
+	}
+	if !v.Valid {
+		return math.NaN(), nil
+	}
+	return v.Float64, nil
+}
+
+// requireColumn returns an error unless col is one of the columns
+// declared on layer. Guards against SQLite's double-quoted-identifier
+// fallback (unknown quoted identifiers get reinterpreted as string
+// literals; a bare SUM(unknown) then returns 0 with no error).
+func requireColumn(db *sql.DB, layer, col string) error {
+	// PRAGMA table_info doesn't accept bound parameters, so the
+	// layer name has to be interpolated. Caller has already run it
+	// through validSQLIdent.
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, quoteIdent(layer)))
+	if err != nil {
+		return fmt.Errorf("gpkg: table_info(%s): %w", layer, err)
+	}
+	defer rows.Close()
+	found := false
+	tableHasAnyRows := false
+	for rows.Next() {
+		tableHasAnyRows = true
+		var cid int
+		var name, dtype string
+		var notnull, dflt, pk any
+		if err := rows.Scan(&cid, &name, &dtype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == col {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !tableHasAnyRows {
+		return fmt.Errorf("gpkg: layer %q not found", layer)
+	}
+	if !found {
+		return fmt.Errorf("gpkg: column %q not found in layer %q", col, layer)
+	}
+	return nil
+}
+
+// CountRows returns the number of rows in layer via SELECT COUNT(*).
+// Constant memory; no per-row work on the Go side. Errors on unknown
+// layer or an unsafe identifier.
+func (g *GeoPackage) CountRows(layer string) (int64, error) {
+	if !validSQLIdent(layer) {
+		return 0, fmt.Errorf("gpkg: CountRows: layer %q is not a valid SQLite identifier", layer)
+	}
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteIdent(layer))
+	var n int64
+	if err := g.db.QueryRow(query).Scan(&n); err != nil {
+		return 0, fmt.Errorf("gpkg: CountRows(%s): %w", layer, err)
+	}
+	return n, nil
+}
 
 // FeatureTables returns every registered feature table.
 func (g *GeoPackage) FeatureTables() ([]FeatureTable, error) {

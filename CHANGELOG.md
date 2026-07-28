@@ -7,6 +7,49 @@ introduce breaking changes; check this file when upgrading.
 
 ## [v0.2.12]
 
+### Added
+
+- **`(*GeoPackage)` scalar-aggregate helpers.** `LayerNames()`,
+  `CountRows(layer)`, `SumColumn(layer, col)`, `MeanColumn(...)`,
+  `MinColumn(...)`, `MaxColumn(...)`. Each runs a single scalar
+  SQL query — constant memory, no WKB decode, no Go-side row
+  iteration. Return types match `Series.Sum` / `Mean` / `Min` /
+  `Max` conventions: Sum returns 0 on empty (sum of nothing = 0);
+  Mean / Min / Max return NaN on empty or all-null (matching the
+  existing Series behavior — `math.IsNaN` to check). Integer
+  columns promote to Float64.
+
+  Motivating shape: "rank layers by a summary metric, keep top-N,
+  drop the rest" patterns previously had to materialize every
+  feature just to compute one number per layer. The new helpers
+  collapse that inner loop to a single scalar query per layer,
+  followed by `RemoveLayer` for the dropped ones. `LayerNames` is
+  the string-slice shortcut; `FeatureTables` is still there for
+  the richer per-layer struct.
+
+  All aggregate helpers guard against SQLite's "double-quoted
+  identifier falls back to string literal" quirk by verifying the
+  column exists via `PRAGMA table_info` before running the
+  aggregate — a typo yields a clean "column not found" error
+  instead of a silent 0.
+
+- **`gpkgio.RemoveLayer(path, layer)` + `(*GeoPackage).RemoveLayer`.**
+  Public primitive for dropping a single layer from a GeoPackage:
+  the feature table, its RTree shadow, and the gpkg_contents +
+  gpkg_geometry_columns metadata rows. Externally-installed
+  triggers (GDAL / QGIS) drop automatically via SQLite when the
+  feature table goes.
+
+  Previously only the internal `dropLayer` existed, wired into
+  `WriteFile(...)` via `WriteOptions.Replace=true`. Callers doing
+  in-place filter-and-rewrite or out-of-band cleanup had no way
+  to drop a specific layer without also writing a replacement.
+
+  Returns `ErrLayerNotFound` (a package sentinel wrapped via `%w`)
+  when the layer isn't in gpkg_contents — distinguishes "already
+  gone" from "file not a valid GeoPackage." Callers who want an
+  idempotent drop check via `errors.Is(err, gpkgio.ErrLayerNotFound)`.
+
 ### Fixed
 
 - **`PartitionMetadata` now survives a Collect → re-lift boundary.**

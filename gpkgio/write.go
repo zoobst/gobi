@@ -781,6 +781,78 @@ func registerLayerContents(db *sql.DB, layer string, srsID int32) error {
 	return err
 }
 
+// ErrLayerNotFound is returned by RemoveLayer when the requested
+// layer isn't registered in gpkg_contents. Distinguishes "already
+// gone" from "file not a valid GeoPackage" — the latter surfaces
+// as a SQLite error instead. Callers who want an idempotent drop
+// check via errors.Is(err, gpkgio.ErrLayerNotFound).
+var ErrLayerNotFound = fmt.Errorf("gpkg: layer not found")
+
+// RemoveLayer drops the named layer from the GeoPackage file at
+// path: the feature table, its RTree shadow (if any), and the
+// gpkg_contents / gpkg_geometry_columns metadata rows. If external
+// tooling (GDAL / QGIS) opened the file and installed additional
+// triggers against the feature table, SQLite drops them
+// automatically when the feature table is dropped.
+//
+// Errors with ErrLayerNotFound if the layer isn't present.
+// Package-level one-shot for callers who don't need a persistent
+// handle; the *GeoPackage.RemoveLayer method has identical
+// semantics when a handle is already open.
+//
+// Use case: overwriting a specific layer in a multi-layer
+// GeoPackage without touching the others (WriteFile with
+// Replace:true drops-then-writes but only the layer being
+// written; RemoveLayer is the standalone primitive for in-place
+// filter-and-rewrite or out-of-band cleanup).
+func RemoveLayer(path, layer string) error {
+	if layer == "" {
+		return fmt.Errorf("gpkg: RemoveLayer: layer name is required")
+	}
+	if !validSQLIdent(layer) {
+		return fmt.Errorf("gpkg: RemoveLayer: layer %q is not a valid SQLite identifier", layer)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	return removeLayerOnDB(db, layer)
+}
+
+// RemoveLayer drops layer from an already-open GeoPackage handle.
+// See the package-level RemoveLayer for details.
+func (g *GeoPackage) RemoveLayer(layer string) error {
+	if layer == "" {
+		return fmt.Errorf("gpkg: RemoveLayer: layer name is required")
+	}
+	if !validSQLIdent(layer) {
+		return fmt.Errorf("gpkg: RemoveLayer: layer %q is not a valid SQLite identifier", layer)
+	}
+	return removeLayerOnDB(g.db, layer)
+}
+
+// removeLayerOnDB is the shared implementation. Verifies the layer
+// is registered in gpkg_contents (returning ErrLayerNotFound if
+// not) before delegating to dropLayer for the actual demolition.
+func removeLayerOnDB(db *sql.DB, layer string) error {
+	var name string
+	err := db.QueryRow(
+		`SELECT table_name FROM gpkg_contents WHERE table_name = ?`,
+		layer).Scan(&name)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: %q", ErrLayerNotFound, layer)
+	}
+	if err != nil {
+		return fmt.Errorf("gpkg: RemoveLayer: check gpkg_contents: %w", err)
+	}
+	if err := dropLayer(db, layer); err != nil {
+		return fmt.Errorf("gpkg: RemoveLayer: %w", err)
+	}
+	return nil
+}
+
 // dropLayer removes every artifact of a previous layer with the
 // same name: the feature table, its RTree shadow table, and the
 // gpkg_contents / gpkg_geometry_columns rows. Gobi maintains the
