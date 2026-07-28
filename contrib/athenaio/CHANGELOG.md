@@ -9,6 +9,24 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.6]
+
+### Added
+
+- **`BucketResult.Size int64`** — per-bucket S3 object size in bytes,
+  captured directly from the `ListObjectsV2` response athenaio was
+  already making to enumerate the CTAS output files. Populated on
+  `UnloadAndReadBuckets` / `UnloadAndReadBucketsWithMetadata` /
+  `RawCTASBuckets`. Zero on nil-Frame slots (no file for that bucket).
+  Callers computing average file size should divide by the count of
+  non-nil `BucketResult`s, not `len(results)` — skew-empty buckets
+  otherwise pull the average down spuriously.
+
+  Removes the need for a per-file HEAD workaround. Real S3 always
+  returns `Size` on ListObjectsV2 Contents; the underlying
+  `listBucketFiles` helper now carries `bucketFileInfo{URI, Size}`
+  through to the populate step at zero extra cost.
+
 ## [v0.1.5]
 
 ### Added

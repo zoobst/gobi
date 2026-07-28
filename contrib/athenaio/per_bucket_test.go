@@ -264,6 +264,36 @@ func TestUnloadAndReadBucketsWithMetadata_ReturnsPerBucketURIs(t *testing.T) {
 		if !strings.HasPrefix(r.S3URI, "s3://") {
 			t.Errorf("bucket %d S3URI = %q, want s3:// prefix", i, r.S3URI)
 		}
+		// Size is captured from ListObjectsV2 and matches the mock's
+		// stored payload length. Real S3 returns Size unconditionally
+		// on ListObjectsV2 Contents entries.
+		if r.Size <= 0 {
+			t.Errorf("bucket %d Size = %d, want > 0", i, r.Size)
+		}
+		if r.Size != int64(len(payload)) {
+			t.Errorf("bucket %d Size = %d, want %d (fixture payload length)",
+				i, r.Size, len(payload))
+		}
+	}
+
+	// Compute the caller-side average, exercising the divide-by-
+	// non-nil pattern the doc-comment recommends.
+	var total int64
+	var populated int
+	for _, r := range results {
+		if r.Frame == nil {
+			continue
+		}
+		total += r.Size
+		populated++
+	}
+	if populated == 0 {
+		t.Fatal("no populated buckets — expected at least 1")
+	}
+	avg := total / int64(populated)
+	if avg != int64(len(payload)) {
+		t.Errorf("avg bucket size = %d, want %d (identical fixture payload)",
+			avg, len(payload))
 	}
 }
 

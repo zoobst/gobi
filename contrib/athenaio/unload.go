@@ -561,10 +561,10 @@ func (c *Client) openBucketFrame(ctx context.Context, uri string) (*gobi.Frame, 
 // streaming executor's frameToBatch reads only chunks[0] — a multi-
 // chunk Frame reaching Collect silently drops rows past the first
 // chunk.
-func (c *Client) readBucketFiles(ctx context.Context, files []string) (*gobi.Frame, error) {
+func (c *Client) readBucketFiles(ctx context.Context, files []bucketFileInfo) (*gobi.Frame, error) {
 	frames := make([]*gobi.Frame, 0, len(files))
-	for _, uri := range files {
-		f, err := c.openBucketFrame(ctx, uri)
+	for _, fi := range files {
+		f, err := c.openBucketFrame(ctx, fi.URI)
 		if err != nil {
 			return nil, err
 		}
@@ -634,6 +634,16 @@ type BucketResult struct {
 	// Collect(); errors surface at Collect time on the specific
 	// frame that failed (sibling frames unaffected).
 	Frame *gobi.LazyFrame
+	// Size is the S3 object size in bytes as reported by
+	// ListObjectsV2 at read time. Zero for nil-Frame slots (no file
+	// existed for that bucket). Useful for skew diagnostics and
+	// downstream cost estimation without a per-file HEAD call.
+	//
+	// Callers computing average file size across the returned slice
+	// should divide by the count of non-nil BucketResults, not by
+	// len(results) — skew-empty buckets pull the average down
+	// spuriously otherwise.
+	Size int64
 }
 
 // UnloadAndReadBuckets is the bucket-aware variant of UnloadAndRead.
@@ -923,11 +933,11 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 // variant) is parsed to extract the bucket index; if parsing fails
 // (RawCTAS output without a matching name), files fill slots in
 // listing order. Missing bucket indices stay nil.
-func (c *Client) populateBucketResults(ctx context.Context, files []string, results []BucketResult, meta *gobi.PartitionMetadata) (int64, error) {
+func (c *Client) populateBucketResults(ctx context.Context, files []bucketFileInfo, results []BucketResult, meta *gobi.PartitionMetadata) (int64, error) {
 	nSlots := len(results)
 	var totalRows int64
-	for i, uri := range files {
-		frame, err := c.openBucketFrame(ctx, uri)
+	for i, fi := range files {
+		frame, err := c.openBucketFrame(ctx, fi.URI)
 		if err != nil {
 			return 0, err
 		}
@@ -939,20 +949,20 @@ func (c *Client) populateBucketResults(ctx context.Context, files []string, resu
 		if meta != nil {
 			asserted, err := lf.WithPartitionAssertion(meta)
 			if err != nil {
-				return 0, fmt.Errorf("attach partition assertion for %s: %w", uri, err)
+				return 0, fmt.Errorf("attach partition assertion for %s: %w", fi.URI, err)
 			}
 			lf = asserted
 		}
 
 		// Prefer parsed bucket index; fall back to listing order for
 		// non-standard names. Out-of-range indices fall back too.
-		slot := bucketIndexFromURI(uri)
+		slot := bucketIndexFromURI(fi.URI)
 		if slot < 0 || slot >= nSlots {
 			slot = i
 			if slot >= nSlots {
 				// More files than expected buckets — should not happen
 				// with a valid bucket_count check, but stay defensive.
-				return 0, fmt.Errorf("athenaio: file %s exceeds expected bucket range [0,%d)", uri, nSlots)
+				return 0, fmt.Errorf("athenaio: file %s exceeds expected bucket range [0,%d)", fi.URI, nSlots)
 			}
 		}
 		if results[slot].Frame != nil {
@@ -960,9 +970,9 @@ func (c *Client) populateBucketResults(ctx context.Context, files []string, resu
 			// silently overwrite. Only fires on Athena writer bugs
 			// or naming collisions.
 			return 0, fmt.Errorf("athenaio: duplicate bucket slot %d: %s and %s",
-				slot, results[slot].S3URI, uri)
+				slot, results[slot].S3URI, fi.URI)
 		}
-		results[slot] = BucketResult{S3URI: uri, Frame: lf}
+		results[slot] = BucketResult{S3URI: fi.URI, Frame: lf, Size: fi.Size}
 	}
 	return totalRows, nil
 }

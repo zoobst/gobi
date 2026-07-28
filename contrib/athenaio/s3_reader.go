@@ -112,7 +112,7 @@ func (r *s3ReaderAt) ReadAt(p []byte, off int64) (int, error) {
 // Handles ListObjectsV2 pagination via ContinuationToken. Returns
 // results in the order ListObjectsV2 emits them (lexicographic by
 // key) so downstream concatenation is deterministic across runs.
-func listBucketFiles(ctx context.Context, api S3API, prefix string) ([]string, error) {
+func listBucketFiles(ctx context.Context, api S3API, prefix string) ([]bucketFileInfo, error) {
 	bucket, keyPrefix, err := parseS3URI(prefix)
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: listBucketFiles: %w", err)
@@ -125,7 +125,7 @@ func listBucketFiles(ctx context.Context, api S3API, prefix string) ([]string, e
 	if keyPrefix != "" && !strings.HasSuffix(keyPrefix, "/") {
 		keyPrefix += "/"
 	}
-	var out []string
+	var out []bucketFileInfo
 	var token *string
 	for {
 		resp, err := api.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -143,7 +143,14 @@ func listBucketFiles(ctx context.Context, api S3API, prefix string) ([]string, e
 			if !isCTASDataKey(*obj.Key) {
 				continue
 			}
-			out = append(out, fmt.Sprintf("s3://%s/%s", bucket, *obj.Key))
+			var size int64
+			if obj.Size != nil {
+				size = *obj.Size
+			}
+			out = append(out, bucketFileInfo{
+				URI:  fmt.Sprintf("s3://%s/%s", bucket, *obj.Key),
+				Size: size,
+			})
 		}
 		if resp.IsTruncated == nil || !*resp.IsTruncated {
 			break
@@ -151,6 +158,16 @@ func listBucketFiles(ctx context.Context, api S3API, prefix string) ([]string, e
 		token = resp.NextContinuationToken
 	}
 	return out, nil
+}
+
+// bucketFileInfo pairs an s3:// URI with its object size in bytes,
+// captured directly from the ListObjectsV2 response so callers don't
+// need a separate HEAD per file. Size is zero when the response
+// omitted it (rare — ListObjectsV2 populates Size on real S3, some
+// mocks don't).
+type bucketFileInfo struct {
+	URI  string
+	Size int64
 }
 
 // isCTASDataKey reports whether an S3 object key looks like a CTAS
