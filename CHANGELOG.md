@@ -5,6 +5,33 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.15]
+
+### Added
+
+- **`gpkgio.WriteMany(path, layers ...Layer) error`** — batch
+  multi-layer write on a single SQLite connection. Amortizes the
+  Open + WAL PRAGMA + application_id/user_version + metadata-table
+  scaffolding across the whole batch — the ~1-3ms of per-`WriteFile`
+  ceremony collapses to one pass regardless of layer count.
+
+  Semantically equivalent to N sequential `WriteFile` calls: each
+  layer's per-layer transaction is preserved (one bad layer doesn't
+  roll back siblings), each `Layer.Opts.Replace` is honored
+  independently, output files are byte-compatible with the
+  loop-of-WriteFile shape (regression-tested against a
+  side-by-side fixture).
+
+  Failure model: **first-error-wins**. Layers before the failing
+  one stay written; layers after aren't attempted; the returned
+  error wraps `WriteMany[<index>] layer %q` for pinpointing.
+  Empty layer slice is a legal no-op.
+
+  Refactor along the way: `WriteFile` now delegates to two internal
+  helpers (`openWriteDB` + `writeLayerToDB`) that both API entry
+  points share. No behavior change on the `WriteFile` side; just
+  factors the ceremony out so `WriteMany` can call it once.
+
 ## [v0.2.14]
 
 ### Added

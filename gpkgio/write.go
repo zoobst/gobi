@@ -171,12 +171,132 @@ func defaultWriteOptions(opts *WriteOptions) WriteOptions {
 // Batch inserts run in a single transaction of opts.BatchSize rows
 // each. Prepared statements are reused across the write.
 func WriteFile(df *gobi.Frame, path string, opts *WriteOptions) error {
+	db, err := openWriteDB(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return writeLayerToDB(db, df, opts)
+}
+
+// Layer pairs a Frame with its per-layer WriteOptions for the batch
+// WriteMany entry point. Opts must be non-nil and carry a valid
+// Layer name; every field the WriteFile signature accepts is
+// honored (GeomCol, Replace, SkipRTree, SRID, BatchSize, ...).
+type Layer struct {
+	Frame *gobi.Frame
+	Opts  *WriteOptions
+}
+
+// WriteMany writes N layers to a GeoPackage file under a single
+// SQLite connection, amortizing the PRAGMA setup + metadata-table
+// initialization + Open/Close overhead across the whole batch.
+// Semantically equivalent to calling WriteFile once per Layer with
+// the shared setup collapsed to one pass.
+//
+// Per-layer semantics match WriteFile exactly:
+//   - Opts.Layer required + validated as a SQLite identifier
+//   - Opts.Replace drops any pre-existing same-named layer via the
+//     internal dropLayer helper
+//   - Each layer's row inserts run in their own transaction
+//     (existing insertRows shape) — one bad layer doesn't roll back
+//     the layers written before it
+//
+// Failure model: **first-error-wins**. On the first per-layer
+// failure WriteMany returns immediately with the index and layer
+// name wrapped into the error. Layers before it stay written; layers
+// after it aren't attempted. Callers who want per-layer isolation
+// call WriteMany in slices of one, or catch the error and inspect
+// which layer failed.
+//
+// Empty layer slice is a no-op (returns nil without touching the
+// file). Duplicate layer names within the slice behave as if the
+// caller had run two WriteFile calls back-to-back: without Replace
+// on the second, layerExists errors; with Replace, the second
+// overwrites the first.
+//
+// Motivating shape: batch writers producing N per-partition layers
+// (typically 1K-10K in per-id aggregation pipelines) — the old
+// one-WriteFile-per-layer pattern paid ~1-3ms per layer of pure
+// SQLite ceremony that this API amortizes to one pass.
+func WriteMany(path string, layers ...Layer) error {
+	if len(layers) == 0 {
+		return nil
+	}
+	db, err := openWriteDB(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	for i, layer := range layers {
+		if err := writeLayerToDB(db, layer.Frame, layer.Opts); err != nil {
+			name := "<unnamed>"
+			if layer.Opts != nil {
+				name = layer.Opts.Layer
+			}
+			return fmt.Errorf("gpkg: WriteMany[%d] layer %q: %w", i, name, err)
+		}
+	}
+	return nil
+}
+
+// openWriteDB opens the sqlite file at path and applies the shared
+// setup steps every write path needs: WAL journal, GeoPackage
+// application_id + user_version stamps, and the metadata table
+// scaffolding. Callers close the returned handle.
+//
+// All PRAGMA + init operations are idempotent — safe to call on an
+// existing gpkg file. WriteFile calls this once per invocation;
+// WriteMany calls it once for the whole batch, which is the
+// motivating amortization: the per-layer setup cost (~1-3ms of
+// PRAGMA + CREATE TABLE IF NOT EXISTS + WAL flush on the first
+// write) is paid once instead of N times.
+func openWriteDB(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	// Serialize writes on a single connection. modernc.org/sqlite
+	// is fine with concurrent readers but writers on the same file
+	// must run one at a time; keeping the pool at 1 conn removes
+	// any ambiguity about which conn holds the transaction.
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("gpkg: enable WAL: %w", err)
+	}
+	// application_id + user_version are what makes the file
+	// recognizable as GeoPackage 1.3 by QGIS / GDAL / ogr2ogr.
+	// application_id = ASCII "GPKG" (0x47504B47) per spec §1.1.1.1;
+	// user_version = 10300 → GeoPackage 1.3.
+	if _, err := db.Exec(`PRAGMA application_id = 1196444487`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("gpkg: set application_id: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 10300`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("gpkg: set user_version: %w", err)
+	}
+	if err := initMetadataTables(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("gpkg: init metadata: %w", err)
+	}
+	return db, nil
+}
+
+// writeLayerToDB writes one layer into an already-opened + initialized
+// gpkg database. Shared implementation between WriteFile (one call)
+// and WriteMany (loop). Callers are responsible for opening the db
+// via openWriteDB — the PRAGMAs + metadata scaffolding this function
+// depends on live there.
+func writeLayerToDB(db *sql.DB, df *gobi.Frame, opts *WriteOptions) error {
 	o := defaultWriteOptions(opts)
 	if o.Layer == "" {
-		return fmt.Errorf("gpkg: WriteFile: Layer is required")
+		return fmt.Errorf("gpkg: Layer is required")
 	}
 	if !validSQLIdent(o.Layer) {
-		return fmt.Errorf("gpkg: WriteFile: Layer %q is not a valid SQLite identifier", o.Layer)
+		return fmt.Errorf("gpkg: Layer %q is not a valid SQLite identifier", o.Layer)
 	}
 
 	// Detect the geometry column if the caller didn't name one.
@@ -220,35 +340,6 @@ func WriteFile(df *gobi.Frame, path string, opts *WriteOptions) error {
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	// Serialize writes on a single connection. modernc.org/sqlite
-	// is fine with concurrent readers but writers on the same file
-	// must run one at a time; keeping the pool at 1 conn removes
-	// any ambiguity about which conn holds the transaction.
-	db.SetMaxOpenConns(1)
-
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
-		return fmt.Errorf("gpkg: enable WAL: %w", err)
-	}
-	// application_id + user_version are what makes the file
-	// recognizable as GeoPackage 1.3 by QGIS / GDAL / ogr2ogr.
-	// application_id = ASCII "GPKG" (0x47504B47) per spec §1.1.1.1;
-	// user_version = 10300 → GeoPackage 1.3.
-	if _, err := db.Exec(`PRAGMA application_id = 1196444487`); err != nil {
-		return fmt.Errorf("gpkg: set application_id: %w", err)
-	}
-	if _, err := db.Exec(`PRAGMA user_version = 10300`); err != nil {
-		return fmt.Errorf("gpkg: set user_version: %w", err)
-	}
-
-	if err := initMetadataTables(db); err != nil {
-		return fmt.Errorf("gpkg: init metadata: %w", err)
-	}
 	if err := registerSRS(db, o.SRID); err != nil {
 		return fmt.Errorf("gpkg: register srs: %w", err)
 	}
