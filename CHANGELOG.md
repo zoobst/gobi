@@ -5,7 +5,7 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
-## [v0.2.12]
+## [v0.2.14]
 
 ### Added
 
