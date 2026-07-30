@@ -9,6 +9,46 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.7]
+
+### Fixed
+
+- **`readBucketFiles` pinned every source Frame forever after concat.**
+  The internal helper that opens all bucket files, concatenates them
+  into a single-chunk Frame, and returns the result kept every input
+  `*gobi.Frame` alive in a local slice for the function's duration —
+  but never Released any of them. Every source parquet's arrow
+  columns stayed Retained for the caller's LazyFrame lifetime,
+  costing one full input Frame's worth of arrow memory per bucket.
+
+  On the 10-bucket UnloadAndRead workload that surfaced this, that
+  worked out to ~8 GB of pinned arrow buffers per call — the reader
+  leak the memory audit was chasing.
+
+  Fix: extracted the concat portion into `concatFramesSingleChunk`,
+  which consumes its input frames (defers a per-frame Release, so
+  both the happy path and the concat-error path clean up), and
+  Releases the intermediate `arrow.Chunked` after
+  `arrow.NewColumn` (the missing NewColumn/Release dance the
+  v0.2.19 audit had already closed at ~35 other sites but missed
+  here). Error paths in the openBucket loop also Release any
+  previously-loaded frames before returning.
+
+  New tests `TestConcatFramesSingleChunk_ReleasesInputs` and
+  `TestConcatFramesSingleChunk_ErrorPathReleasesInputs` guard both
+  paths under a `memory.CheckedAllocator` — any missed Release
+  fails the test with a stack trace pointing at the leak site.
+
+### Compatibility
+
+- Requires `github.com/zoobst/gobi` **v0.2.22** or newer. v0.2.22
+  fixed a systemic `frameToBatch` double-Retain that leaked one
+  refcount per column per batch across every gobi streaming
+  pipeline. athenaio's reader path exercises the streaming
+  executor heavily on the per-bucket variants
+  (`UnloadAndReadBuckets`), so pin gobi to ≥ v0.2.22 to avoid the
+  compounding leak.
+
 ## [v0.1.6]
 
 ### Added
