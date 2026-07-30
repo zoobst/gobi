@@ -14,7 +14,7 @@ var (
 // around a circle, for realistic WKB-decode benchmarking.
 func buildBenchPolygon(n int) Polygon {
 	pts := make([]Point, 0, n+1)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		θ := float64(i) * 2 * math.Pi / float64(n)
 		pts = append(pts, Point{X: 100 + 10*math.Cos(θ), Y: 50 + 10*math.Sin(θ)})
 	}
@@ -24,9 +24,9 @@ func buildBenchPolygon(n int) Polygon {
 
 func BenchmarkParseWKB_Point(b *testing.B) {
 	buf := WKB(Point{X: -73.9857, Y: 40.7484})
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		g, err := ParseWKB(buf)
 		if err != nil {
 			b.Fatal(err)
@@ -37,9 +37,9 @@ func BenchmarkParseWKB_Point(b *testing.B) {
 
 func BenchmarkParseWKB_Polygon100(b *testing.B) {
 	buf := WKB(buildBenchPolygon(100))
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		g, err := ParseWKB(buf)
 		if err != nil {
 			b.Fatal(err)
@@ -50,9 +50,9 @@ func BenchmarkParseWKB_Polygon100(b *testing.B) {
 
 func BenchmarkAppendWKB_Polygon100(b *testing.B) {
 	poly := buildBenchPolygon(100)
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		sinkBuf = WKB(poly)
 	}
 }

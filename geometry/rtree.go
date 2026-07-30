@@ -1,7 +1,6 @@
 package geometry
 
 import (
-	"container/heap"
 	"math"
 	"sort"
 )
@@ -108,17 +107,19 @@ func (t *RTree) SearchInto(buf []int32, q Bounds) []int32 {
 // Nearest returns the k item IDs whose bounding boxes are closest (by
 // squared Euclidean point-to-bbox distance) to (x, y), in ascending
 // distance order. Fewer than k IDs are returned if the tree is smaller.
+//
+// For the k=1 case, prefer NearestOne — same semantics but skips the
+// priority queue for a zero-allocation depth-first descent.
 func (t *RTree) Nearest(x, y float64, k int) []int32 {
 	if t.root < 0 || k <= 0 {
 		return nil
 	}
-	pq := &rtreeHeap{}
-	heap.Init(pq)
-	heap.Push(pq, rtreeQueue{node: t.root, dist: bboxDist(t.nodes[t.root].bounds, x, y)})
+	var pq rtreePQ
+	pq.push(rtreeQueue{node: t.root, dist: bboxDist(t.nodes[t.root].bounds, x, y)})
 
 	out := make([]int32, 0, k)
-	for pq.Len() > 0 && len(out) < k {
-		top := heap.Pop(pq).(rtreeQueue)
+	for len(pq) > 0 && len(out) < k {
+		top := pq.pop()
 		if top.isItem {
 			out = append(out, top.item)
 			continue
@@ -127,16 +128,100 @@ func (t *RTree) Nearest(x, y float64, k int) []int32 {
 		if n.isLeaf {
 			for i := range n.count {
 				id := t.itemIDs[n.first+i]
-				heap.Push(pq, rtreeQueue{isItem: true, item: id, dist: bboxDist(t.itemBounds[id], x, y)})
+				pq.push(rtreeQueue{isItem: true, item: id, dist: bboxDist(t.itemBounds[id], x, y)})
 			}
 		} else {
 			for i := range n.count {
 				child := t.childRefs[n.first+i]
-				heap.Push(pq, rtreeQueue{node: child, dist: bboxDist(t.nodes[child].bounds, x, y)})
+				pq.push(rtreeQueue{node: child, dist: bboxDist(t.nodes[child].bounds, x, y)})
 			}
 		}
 	}
 	return out
+}
+
+// NearestOne returns the ID of the item whose bounding box is
+// closest to (x, y) by squared Euclidean point-to-bbox distance.
+// ok=false when the tree is empty. Semantically equivalent to
+// Nearest(x, y, 1)[0] but with zero allocations — depth-first
+// descent with a running best-so-far distance + bbox pruning
+// replaces the general k>1 path's priority queue.
+//
+// Callers doing a single-nearest lookup at high frequency (e.g.
+// snap-to-graph, per-point classification) should prefer this over
+// Nearest(x, y, 1). At 1M+ calls per request the alloc + boxing
+// savings dominate the CPU profile.
+func (t *RTree) NearestOne(x, y float64) (id int32, ok bool) {
+	if t.root < 0 {
+		return 0, false
+	}
+	best := rtreeNearestState{dist: math.Inf(1), id: -1}
+	t.nearestOneDescend(t.root, x, y, &best)
+	return best.id, best.id >= 0
+}
+
+type rtreeNearestState struct {
+	dist float64
+	id   int32
+}
+
+// nearestOneDescend walks the subtree rooted at nodeIdx, updating
+// best in place. Prunes any subtree whose bounding-box distance
+// already exceeds the running best. Children are visited in
+// ascending bbox-distance order so the tightest bound is found
+// early — subsequent siblings that can't improve get pruned by the
+// early-exit break at the loop tail.
+//
+// Recursion depth is O(log_M(N)) — for RTreeNodeSize=16 and even a
+// billion items that's about 8. Well within Go's default goroutine
+// stack; no risk of blow-up.
+func (t *RTree) nearestOneDescend(nodeIdx int32, x, y float64, best *rtreeNearestState) {
+	n := t.nodes[nodeIdx]
+	if bboxDist(n.bounds, x, y) >= best.dist {
+		return
+	}
+	if n.isLeaf {
+		for i := range n.count {
+			id := t.itemIDs[n.first+i]
+			d := bboxDist(t.itemBounds[id], x, y)
+			if d < best.dist {
+				best.dist = d
+				best.id = id
+			}
+		}
+		return
+	}
+	// Order children by ascending bbox distance for aggressive
+	// pruning. Fixed-size stack buffer sized to the max fan-out —
+	// zero heap allocation. Insertion sort on ≤16 elements beats
+	// the general sort's setup cost.
+	var buf [RTreeNodeSize]struct {
+		child int32
+		dist  float64
+	}
+	for i := range n.count {
+		c := t.childRefs[n.first+i]
+		buf[i].child = c
+		buf[i].dist = bboxDist(t.nodes[c].bounds, x, y)
+	}
+	entries := buf[:n.count]
+	for i := 1; i < len(entries); i++ {
+		cur := entries[i]
+		j := i
+		for j > 0 && entries[j-1].dist > cur.dist {
+			entries[j] = entries[j-1]
+			j--
+		}
+		entries[j] = cur
+	}
+	for _, e := range entries {
+		// Remaining children are further away than any that
+		// couldn't improve, so all of them prune. Stop here.
+		if e.dist >= best.dist {
+			break
+		}
+		t.nearestOneDescend(e.child, x, y, best)
+	}
 }
 
 // --- build ---
@@ -243,16 +328,56 @@ type rtreeQueue struct {
 	dist   float64
 }
 
-type rtreeHeap []rtreeQueue
+// rtreePQ is a min-heap of rtreeQueue entries ordered by dist,
+// hand-rolled instead of using container/heap so Push/Pop don't
+// box each entry through the `any` interface. Every heap.Push in
+// the old shape was a heap allocation for the boxed rtreeQueue
+// (24-byte struct doesn't fit in an interface word); the direct-
+// typed shape here does the swap-in-place min-heap dance without
+// any allocation beyond the slice's own growth.
+type rtreePQ []rtreeQueue
 
-func (h rtreeHeap) Len() int           { return len(h) }
-func (h rtreeHeap) Less(i, j int) bool { return h[i].dist < h[j].dist }
-func (h rtreeHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *rtreeHeap) Push(x any)        { *h = append(*h, x.(rtreeQueue)) }
-func (h *rtreeHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
+func (h *rtreePQ) push(v rtreeQueue) {
+	*h = append(*h, v)
+	// Sift up from the last position.
+	i := len(*h) - 1
+	slice := *h
+	for i > 0 {
+		parent := (i - 1) / 2
+		if slice[parent].dist <= slice[i].dist {
+			break
+		}
+		slice[parent], slice[i] = slice[i], slice[parent]
+		i = parent
+	}
+}
+
+func (h *rtreePQ) pop() rtreeQueue {
+	slice := *h
+	n := len(slice)
+	top := slice[0]
+	slice[0] = slice[n-1]
+	*h = slice[:n-1]
+	// Sift down from the root.
+	if len(*h) > 1 {
+		slice = *h
+		i := 0
+		for {
+			left := 2*i + 1
+			right := 2*i + 2
+			smallest := i
+			if left < len(slice) && slice[left].dist < slice[smallest].dist {
+				smallest = left
+			}
+			if right < len(slice) && slice[right].dist < slice[smallest].dist {
+				smallest = right
+			}
+			if smallest == i {
+				break
+			}
+			slice[i], slice[smallest] = slice[smallest], slice[i]
+			i = smallest
+		}
+	}
+	return top
 }

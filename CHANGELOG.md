@@ -5,6 +5,46 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.17]
+
+### Added
+
+- **`(*geometry.RTree).NearestOne(x, y float64) (id int32, ok bool)`** —
+  zero-allocation single-nearest fast path. Depth-first descent
+  with a running best-so-far distance + bbox pruning; children
+  ordered by ascending bbox distance so the tightest bound gets
+  found early and prunes remaining siblings hard. No priority
+  queue; recursion depth is O(log_M(N)) which for RTreeNodeSize=16
+  handles a billion items in ~8 levels.
+
+  Motivating shape: high-frequency single-nearest lookups (snap-
+  to-graph, per-point classification, road-network path finding)
+  at 1M+ calls per request. `Nearest(x, y, 1)` on the same shape
+  was allocating ~8.6 slice-grow heap objects per call from the
+  priority queue plumbing.
+
+  Measured on Apple M3 Pro, 100k-item tree × 10k queries per iter:
+
+  | Path                          | ns/query | allocs/query |
+  |-------------------------------|---------:|-------------:|
+  | `NearestOne`                  |      942 |            0 |
+  | `Nearest(x, y, 1)`            |    2,153 |          8.6 |
+
+  2.3× faster wall time; zero allocations vs 4,962 B/query. Callers
+  doing single-nearest lookups at scale should migrate — the
+  general `Nearest(k)` path remains for k>1.
+
+### Changed
+
+- **`Nearest`'s internal priority queue is now hand-rolled, not
+  `container/heap`.** The `heap.Push(pq, entry)` / `heap.Pop()`
+  interface API boxed every rtreeQueue struct (24 bytes, doesn't
+  fit in an interface word — one heap alloc per push). Replaced
+  with a directly-typed `rtreePQ` (min-heap of `[]rtreeQueue`) with
+  private `push` / `pop` methods that do the sift-up / sift-down
+  in place. Same complexity, no boxing, no per-op alloc beyond the
+  slice's own capacity growth. No API change on `Nearest`.
+
 ## [v0.2.16]
 
 ### Changed (breaking)
