@@ -582,13 +582,16 @@ func broadcastLiteral(value any, dtype arrow.DataType, n int) (Series, error) {
 }
 
 // arrayToSeries wraps a fresh arrow.Array in a Series named name. The
-// Array is Released here — the returned Series owns its buffers via
-// the Chunked+Column path.
+// Array and intermediate Chunked are Released here — the returned
+// Series owns its buffers solely via the Column, which held the last
+// live reference after NewColumn's internal Retain.
 func arrayToSeries(_ memory.Allocator, name string, dtype arrow.DataType, arr arrow.Array) (Series, error) {
-	defer arr.Release()
 	field := arrow.Field{Name: name, Type: dtype, Nullable: true}
 	chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
-	return NewSeries(arrow.NewColumn(field, chunked)), nil
+	col := arrow.NewColumn(field, chunked)
+	arr.Release()     // NewChunked retained; drop caller's transferred ref
+	chunked.Release() // NewColumn retained; drop our constructor ref
+	return NewSeries(col), nil
 }
 
 // renameSeries returns a Series identical to s but under a new name.

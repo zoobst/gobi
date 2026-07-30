@@ -377,6 +377,7 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 	for i, a := range arrays {
 		chunked := arrow.NewChunked(a.DataType(), []arrow.Array{a})
 		cols[i] = *arrow.NewColumn(fields[i], chunked)
+		chunked.Release()
 	}
 	return NewFrame(schema, cols)
 }

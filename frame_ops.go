@@ -61,6 +61,8 @@ func (f *Frame) take(indexes []int) (*Frame, error) {
 		}
 		chunked := arrow.NewChunked(newArr.DataType(), []arrow.Array{newArr})
 		cols[i] = *arrow.NewColumn(s.field, chunked)
+		newArr.Release()
+		chunked.Release()
 	}
 	return NewFrame(f.schema, cols)
 }

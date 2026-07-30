@@ -113,6 +113,7 @@ func (s Series) Unique() (Series, error) {
 	chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 	arr.Release()
 	col := arrow.NewColumn(s.field, chunked)
+	chunked.Release()
 	return NewSeries(col), nil
 }
 

@@ -1042,10 +1042,15 @@ func buildBoolSeries(name string, vals []bool, validity []bool) Series {
 
 // newSeriesFromArray wraps an arrow.Array in a Series with the given name.
 // The returned Series takes ownership of arr — callers should not release
-// it themselves.
+// it themselves. The intermediate Chunked and the caller-transferred arr
+// reference are both Released here; only the Column-held reference (via
+// NewColumn's internal Retain) survives past return, so arr and chunked
+// each reach refcount=1 owned by the returned Series.
 func newSeriesFromArray(name string, arr arrow.Array) Series {
 	field := arrow.Field{Name: name, Type: arr.DataType(), Nullable: true}
 	chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 	col := arrow.NewColumn(field, chunked)
+	arr.Release()     // NewChunked retained; drop caller's transferred ref
+	chunked.Release() // NewColumn retained; drop our constructor ref
 	return Series{name: name, field: field, col: col}
 }

@@ -115,6 +115,7 @@ func concatBatchesToFrame(schema *arrow.Schema, batches []arrow.RecordBatch) (*F
 		chunked := arrow.NewChunked(combined.DataType(), []arrow.Array{combined})
 		outCols[i] = *arrow.NewColumn(field, chunked)
 		combined.Release()
+		chunked.Release()
 	}
 	return NewFrame(schema, outCols)
 }

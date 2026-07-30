@@ -182,13 +182,17 @@ func (f *Frame) Pivot(index, columns, values string, agg AggKind) (*Frame, error
 	fields = append(fields, arrow.Field{Name: index, Type: idxFieldType, Nullable: false})
 	idxArr := idxBuilder.NewArray()
 	defer idxArr.Release()
-	cols = append(cols, *arrow.NewColumn(fields[0], arrow.NewChunked(idxFieldType, []arrow.Array{idxArr})))
+	idxChunked := arrow.NewChunked(idxFieldType, []arrow.Array{idxArr})
+	cols = append(cols, *arrow.NewColumn(fields[0], idxChunked))
+	idxChunked.Release()
 	for i, h := range headers {
 		fld := arrow.Field{Name: h, Type: valOutType, Nullable: aggOutputNullable(Aggregation{Kind: agg})}
 		fields = append(fields, fld)
 		a := valBuilders[i].NewArray()
 		defer a.Release()
-		cols = append(cols, *arrow.NewColumn(fld, arrow.NewChunked(valOutType, []arrow.Array{a})))
+		valChunked := arrow.NewChunked(valOutType, []arrow.Array{a})
+		cols = append(cols, *arrow.NewColumn(fld, valChunked))
+		valChunked.Release()
 	}
 	schema := arrow.NewSchema(fields, nil)
 	return NewFrame(schema, cols)

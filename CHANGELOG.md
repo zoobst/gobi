@@ -5,6 +5,50 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.18]
+
+### Fixed
+
+- **Arrow reference-count hygiene audit.** Systematic sweep of every
+  `arrow.NewChunked` / `arrow.NewColumn` construction site in gobi
+  core + IO codecs (csvio, geojsonio, shpio, kmlio) added the missing
+  `chunked.Release()` calls that pair with `NewColumn`'s internal
+  Retain. Same story for the intermediate `arr` from `builder.NewArray()`
+  when the caller was passing it into `NewChunked` — now Released
+  after NewChunked's own Retain runs.
+
+  Under gobi's default `memory.GoAllocator` these were latent
+  refcount leaks masked by Go's GC — no observable memory-growth
+  regression. Under a CGo-backed allocator (which nothing in the
+  codebase uses today but a downstream might), every fix here
+  converts an actual per-call byte leak into a clean drop. Ships as
+  hygiene regardless: refcount balance is the honest contract the
+  Arrow model asks for, and future allocator swaps stop being
+  hazardous.
+
+  Fix pattern (applied ~15 sites):
+
+      // Before
+      chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
+      col := arrow.NewColumn(field, chunked)
+      // (chunked leaks its constructor ref)
+
+      // After
+      chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
+      col := arrow.NewColumn(field, chunked)
+      chunked.Release()
+
+  Shared helpers (`arrayToSeries`, `newSeriesFromArray`,
+  `buildSeries`) now do both the transferred-array Release and the
+  intermediate-chunked Release inline, so every caller through
+  those paths inherits the fix without local changes. Direct
+  `NewChunked` sites in `groupby.go`, `groupby_aligned.go`,
+  `groupby_fast.go`, `join.go`, `sjoin.go`, `frame_ops.go`,
+  `exec.go`, `explode.go`, `points.go`, `series_shift.go`,
+  `series_geom.go`, `resample.go`, `setops.go`, `unique.go`,
+  `lazy.go`, `pivot.go`, `csvio/csvio.go`, `shpio/shp.go`,
+  `kmlio/kmlio.go`, `geojsonio/frame.go` all updated in place.
+
 ## [v0.2.17]
 
 ### Added

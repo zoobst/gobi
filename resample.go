@@ -137,9 +137,11 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 	cols := make([]arrow.Column, len(fields))
 	tsChunked := arrow.NewChunked(tsArr.DataType(), []arrow.Array{tsArr})
 	cols[0] = *arrow.NewColumn(fields[0], tsChunked)
+	tsChunked.Release()
 	for i, a := range aggArrs {
 		c := arrow.NewChunked(a.DataType(), []arrow.Array{a})
 		cols[i+1] = *arrow.NewColumn(fields[i+1], c)
+		c.Release()
 	}
 	return NewFrame(schema, cols)
 }

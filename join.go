@@ -250,6 +250,7 @@ func (f *Frame) buildLeftOnlyOutput(leftIdxs []int) (*Frame, error) {
 		chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 		outFields = append(outFields, s.field)
 		outColumns = append(outColumns, *arrow.NewColumn(s.field, chunked))
+		chunked.Release()
 	}
 	schema := arrow.NewSchema(outFields, nil)
 	return NewFrame(schema, outColumns)
@@ -295,6 +296,7 @@ func (f *Frame) buildTwoSidedOutput(right *Frame, leftKey, rightKey string,
 		chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 		outFields = append(outFields, s.field)
 		outColumns = append(outColumns, *arrow.NewColumn(s.field, chunked))
+		chunked.Release()
 	}
 
 	for _, s := range right.series {
@@ -313,6 +315,7 @@ func (f *Frame) buildTwoSidedOutput(right *Frame, leftKey, rightKey string,
 		chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 		outFields = append(outFields, field)
 		outColumns = append(outColumns, *arrow.NewColumn(field, chunked))
+		chunked.Release()
 	}
 
 	schema := arrow.NewSchema(outFields, nil)

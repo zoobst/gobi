@@ -377,9 +377,11 @@ func finishAggFrame(keyField arrow.Field, keyArr arrow.Array, aggFields []arrow.
 	cols := make([]arrow.Column, len(fields))
 	chunked := arrow.NewChunked(keyArr.DataType(), []arrow.Array{keyArr})
 	cols[0] = *arrow.NewColumn(fields[0], chunked)
+	chunked.Release()
 	for i, a := range aggArrs {
 		c := arrow.NewChunked(a.DataType(), []arrow.Array{a})
 		cols[i+1] = *arrow.NewColumn(fields[i+1], c)
+		c.Release()
 	}
 	f, err := NewFrame(schema, cols)
 	if err != nil {

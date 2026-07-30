@@ -77,9 +77,11 @@ func (s Series) GeomCentroid() (Series, error) {
 	}
 
 	arr := b.NewArray()
+	defer arr.Release()
 	field := GeometryField(s.name+"_centroid", epsg)
 	chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 	col := arrow.NewColumn(field, chunked)
+	chunked.Release()
 	return Series{name: field.Name, field: field, col: col}, nil
 }
 
@@ -136,6 +138,7 @@ func (s Series) GeomBounds() (*Frame, error) {
 	for i, a := range arrs {
 		chunked := arrow.NewChunked(a.DataType(), []arrow.Array{a})
 		cols[i] = *arrow.NewColumn(fields[i], chunked)
+		chunked.Release()
 	}
 	return NewFrame(schema, cols)
 }

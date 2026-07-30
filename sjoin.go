@@ -249,6 +249,7 @@ func assembleJoinedFrame(f, right *Frame, leftIdxs, rightIdxs []int, rightGeomCo
 		chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 		outFields = append(outFields, s.field)
 		outColumns = append(outColumns, *arrow.NewColumn(s.field, chunked))
+		chunked.Release()
 	}
 
 	// Right columns via take (skip the join geometry column).
@@ -268,6 +269,7 @@ func assembleJoinedFrame(f, right *Frame, leftIdxs, rightIdxs []int, rightGeomCo
 		chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 		outFields = append(outFields, field)
 		outColumns = append(outColumns, *arrow.NewColumn(field, chunked))
+		chunked.Release()
 	}
 
 	schema := arrow.NewSchema(outFields, nil)

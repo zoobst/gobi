@@ -62,6 +62,7 @@ func (s Series) Shift(n int) (Series, error) {
 	f := s.field
 	f.Nullable = true
 	col := arrow.NewColumn(f, chunked)
+	chunked.Release()
 	return NewSeries(col), nil
 }
 

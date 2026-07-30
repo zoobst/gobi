@@ -72,7 +72,9 @@ func PointsFromXY(x, y Series, crs int32) (Series, error) {
 	defer arr.Release()
 	field := GeometryField("geometry", crs)
 	chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
-	return NewSeries(arrow.NewColumn(field, chunked)), nil
+	col := arrow.NewColumn(field, chunked)
+	chunked.Release()
+	return NewSeries(col), nil
 }
 
 // PointsFromXYZ is the 3D variant of PointsFromXY. z must be numeric
@@ -124,5 +126,7 @@ func PointsFromXYZ(x, y, z Series, crs int32) (Series, error) {
 	defer arr.Release()
 	field := GeometryField("geometry", crs)
 	chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
-	return NewSeries(arrow.NewColumn(field, chunked)), nil
+	col := arrow.NewColumn(field, chunked)
+	chunked.Release()
+	return NewSeries(col), nil
 }

@@ -110,6 +110,7 @@ func (f *Frame) explodeGeometry(s Series, geomCol string) (*Frame, error) {
 			chunked := arrow.NewChunked(componentArr.DataType(), []arrow.Array{componentArr})
 			outFields = append(outFields, colS.field)
 			outCols = append(outCols, *arrow.NewColumn(colS.field, chunked))
+			chunked.Release()
 			continue
 		}
 		arr, err := takeArray(pool, colS, parentIdx)
@@ -120,6 +121,7 @@ func (f *Frame) explodeGeometry(s Series, geomCol string) (*Frame, error) {
 		chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 		outFields = append(outFields, colS.field)
 		outCols = append(outCols, *arrow.NewColumn(colS.field, chunked))
+		chunked.Release()
 	}
 
 	schema := arrow.NewSchema(outFields, nil)
@@ -194,6 +196,7 @@ func (f *Frame) explodeList(s Series, listCol string) (*Frame, error) {
 			chunked := arrow.NewChunked(elemArr.DataType(), []arrow.Array{elemArr})
 			outFields = append(outFields, elemField)
 			outCols = append(outCols, *arrow.NewColumn(elemField, chunked))
+			chunked.Release()
 			continue
 		}
 		arr, err := takeArray(pool, colS, parentIdx)
@@ -204,6 +207,7 @@ func (f *Frame) explodeList(s Series, listCol string) (*Frame, error) {
 		chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 		outFields = append(outFields, colS.field)
 		outCols = append(outCols, *arrow.NewColumn(colS.field, chunked))
+		chunked.Release()
 	}
 
 	schema := arrow.NewSchema(outFields, nil)

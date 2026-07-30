@@ -145,6 +145,7 @@ func ReadFile(base string, opts *ReadOptions) (*gobi.Frame, error) {
 	for i, a := range arrs {
 		chunked := arrow.NewChunked(a.DataType(), []arrow.Array{a})
 		cols[i] = *arrow.NewColumn(fields[i], chunked)
+		chunked.Release()
 	}
 	return gobi.NewFrame(schema, cols)
 }

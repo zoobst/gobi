@@ -450,10 +450,14 @@ func (b *featureBatch) materialize(opts *ReadOptions) (*gobi.Frame, error) {
 	geomArr := geomB.NewArray()
 	defer geomArr.Release()
 	cols := make([]arrow.Column, 0, len(keyOrder)+1)
-	cols = append(cols, *arrow.NewColumn(fields[0], arrow.NewChunked(geomArr.DataType(), []arrow.Array{geomArr})))
+	geomChunked := arrow.NewChunked(geomArr.DataType(), []arrow.Array{geomArr})
+	cols = append(cols, *arrow.NewColumn(fields[0], geomChunked))
+	geomChunked.Release()
 	for i, bldr := range propBuilders {
 		arr := bldr.NewArray()
-		cols = append(cols, *arrow.NewColumn(fields[i+1], arrow.NewChunked(arr.DataType(), []arrow.Array{arr})))
+		chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
+		cols = append(cols, *arrow.NewColumn(fields[i+1], chunked))
+		chunked.Release()
 		arr.Release()
 	}
 	return gobi.NewFrame(schema, cols)
@@ -595,9 +599,11 @@ func emptyFrameWithSchema(schema *arrow.Schema) (*gobi.Frame, error) {
 	defer geomB.Release()
 	arr := geomB.NewArray()
 	defer arr.Release()
+	chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
 	cols := []arrow.Column{
-		*arrow.NewColumn(schema.Field(0), arrow.NewChunked(arr.DataType(), []arrow.Array{arr})),
+		*arrow.NewColumn(schema.Field(0), chunked),
 	}
+	chunked.Release()
 	return gobi.NewFrame(schema, cols)
 }
 

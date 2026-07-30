@@ -279,6 +279,7 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 	for i, a := range outArrs {
 		chunked := arrow.NewChunked(a.DataType(), []arrow.Array{a})
 		cols[i] = *arrow.NewColumn(outFields[i], chunked)
+		chunked.Release()
 	}
 	return gobi.NewFrame(outSchema, cols)
 }

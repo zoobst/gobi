@@ -480,6 +480,8 @@ func emptyFrame(schema *arrow.Schema) (*Frame, error) {
 		arr := b.NewArray()
 		chunked := arrow.NewChunked(f.Type, []arrow.Array{arr})
 		cols[i] = *arrow.NewColumn(f, chunked)
+		arr.Release()
+		chunked.Release()
 	}
 	return NewFrame(schema, cols)
 }
