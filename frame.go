@@ -47,11 +47,20 @@ func NewFrame(schema *arrow.Schema, cols []arrow.Column) (*Frame, error) {
 	return &Frame{schema: schema, series: series}, nil
 }
 
-// NewFrameFromTable adopts the columns of t.
+// NewFrameFromTable wraps an arrow.Table as a Frame. Each column's
+// underlying Chunked is Retained so the Frame owns its own refs
+// independent of t — callers are expected to Release t after this
+// returns (arrow.Table's usual ownership contract). Without the
+// Retain here, the Frame would share t's Chunked pointers without
+// an ownership increment, and either the Frame's buffers would be
+// use-after-freed when the caller Released t, or the Table's refs
+// would leak if the caller didn't.
 func NewFrameFromTable(t arrow.Table) *Frame {
 	series := make([]Series, t.NumCols())
 	for i := range t.NumCols() {
-		series[i] = NewSeries(t.Column(int(i)))
+		c := t.Column(int(i))
+		c.Data().Retain()
+		series[i] = NewSeries(c)
 	}
 	return &Frame{schema: t.Schema(), series: series}
 }
@@ -212,8 +221,14 @@ func (f *Frame) Geometry(colName string, row int) (any, error) {
 	return s.Geometry(row)
 }
 
-// Table returns an arrow.Table view of the frame. The returned table shares
-// buffers with the frame — releasing one releases the other.
+// Table returns an arrow.Table view of the frame. The returned Table
+// carries its own reference on each column's Chunked (arrow.NewTable
+// Retains internally), so the Frame and the Table are independent
+// owners of the underlying buffers — Release each once when done.
+// Callers who pass the Table to a consumer that iterates it (e.g.
+// parquet WriteTable) should Release the Table after the consumer
+// returns; failing to do so leaks the Table's Retained refs and
+// pins the Frame's buffers even after the Frame goes out of scope.
 func (f *Frame) Table() arrow.Table {
 	cols := make([]arrow.Column, len(f.series))
 	for i, s := range f.series {

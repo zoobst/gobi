@@ -385,6 +385,7 @@ func ReadFile(path string, opts *ReadOptions) (*gobi.Frame, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer table.Release() // frameFromTable Retains what the Frame keeps
 	return frameFromTable(table, rc.geoRaw)
 }
 
@@ -454,6 +455,7 @@ func ReadReader(r io.ReaderAt, size int64, opts *ReadOptions) (*gobi.Frame, erro
 	if err != nil {
 		return nil, err
 	}
+	defer table.Release() // frameFromTable Retains what the Frame keeps
 	return frameFromTable(table, rc.geoRaw)
 }
 
@@ -605,10 +607,18 @@ func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 	if err != nil {
 		return err
 	}
-	if err := writer.WriteTable(f.Table(), int64(f.NumRows())); err != nil {
+	// f.Table() Retains each column (NewTable's contract). Release
+	// the transient Table view after WriteTable consumes it —
+	// otherwise the per-column ref stays live for the lifetime of
+	// f, effectively doubling f's memory footprint until it's
+	// eventually collected.
+	tbl := f.Table()
+	if err := writer.WriteTable(tbl, int64(f.NumRows())); err != nil {
+		tbl.Release()
 		_ = writer.Close()
 		return err
 	}
+	tbl.Release()
 	if meta != nil {
 		blob, err := marshalGeoMeta(meta)
 		if err != nil {
@@ -797,6 +807,14 @@ func chunkRows(opts *ReadOptions) int64 {
 
 // frameFromTable wraps table's columns in a Frame, attaching the geo
 // metadata blob to the schema if present.
+//
+// Retains each column's Chunked so the Frame owns its own ref — the
+// caller is expected to `table.Release()` after this returns (see
+// ReadFile / ReadReader). Without the Retain here, the copied Column
+// values share the Table's Chunked pointers without an ownership
+// increment, and either (a) never get freed if the Table's Release
+// isn't called, or (b) double-decrement when both Table.Release and
+// Frame.Release run against the same underlying Chunked.
 func frameFromTable(table arrow.Table, geoRaw string) (*gobi.Frame, error) {
 	schema := table.Schema()
 	if geoRaw != "" {
@@ -808,7 +826,9 @@ func frameFromTable(table arrow.Table, geoRaw string) (*gobi.Frame, error) {
 	}
 	cols := make([]arrow.Column, table.NumCols())
 	for i := int64(0); i < table.NumCols(); i++ {
-		cols[i] = *table.Column(int(i))
+		c := *table.Column(int(i))
+		c.Data().Retain() // Frame gets its own ref on the Chunked.
+		cols[i] = c
 	}
 	return gobi.NewFrame(schema, cols)
 }

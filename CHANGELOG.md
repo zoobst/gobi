@@ -5,6 +5,57 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.20]
+
+### Fixed
+
+- **`parquetio.ReadFile` and `parquetio.ReadReader` leaked the
+  `arrow.Table` from `pqarrow.FileReader.ReadRowGroups`.**
+  `frameFromTable` copied Column values into the returned Frame
+  without incrementing the underlying `*Chunked` refcount, and
+  neither caller ever called `table.Release()` — so the Table's
+  refs stayed at 1 indefinitely (arrays never freed) while the
+  Frame borrowed the same pointers. On multi-GB parquet reads at
+  high call frequency (per-bucket athenaio flows, snap-to-graph
+  reads) the pinned arrow buffers accumulated per call.
+
+  Fix: `frameFromTable` now
+  Retains each column's Chunked so the Frame owns its own ref,
+  and both callers `defer table.Release()` immediately after the
+  `ReadRowGroups` call succeeds. Net refcount balance:
+  Table.Release drops Table's ownership; Frame retains via the
+  explicit `c.Data().Retain()`; Frame.Release eventually decrements
+  to zero.
+
+  `ReadFileChunksFunc` and `ReadReaderChunksFunc` are unaffected —
+  they route through `frameFromRecord`, which already uses
+  `arrow.NewColumnFromArr` (Retains per array internally), and the
+  record reader is `defer rr.Release()`'d.
+
+- **`gobi.NewFrameFromTable` had the same shape leak as
+  `frameFromTable`.** Copied Column values into the returned Frame
+  without Retaining, so callers who Released the source Table
+  triggered use-after-free on the Frame's buffers, and callers who
+  didn't leaked the Table's refs. Fix: `NewFrameFromTable` now
+  Retains each column's Chunked; callers manage the source Table
+  independently, as arrow's ownership contract expects.
+
+- **`parquetio.WriteFile` leaked the transient `arrow.Table` from
+  `frame.Table()`.** `frame.Table()` produces a Table with each
+  column Retained (arrow.NewTable's internal Retain); the previous
+  code passed this to `writer.WriteTable(...)` and never Released
+  it, so every parquet write pinned one extra ref on every column
+  of the source Frame — effectively doubling the source Frame's
+  memory footprint until Frame collection ran. Same bug in
+  `experiments/gpkg_to_geoparquet/main.go`. Fix: capture the Table
+  in a variable, `Release()` on both success and error paths.
+
+- **`Frame.Table()` doc comment was actively wrong.** Claimed
+  "releasing one releases the other" — the reality is the two are
+  independent ref-holders (NewTable Retains, so Frame and Table
+  each Release once). Corrected the docstring so callers stop
+  building on the false invariant.
+
 ## [v0.2.19]
 
 ### Added
