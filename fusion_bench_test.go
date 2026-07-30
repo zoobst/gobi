@@ -18,9 +18,9 @@ func chainedOpBenchFrame(b testing.TB, nRows, nCols int) *Frame {
 	pool := memory.DefaultAllocator
 	fields := make([]arrow.Field, nCols)
 	arrs := make([]arrow.Array, nCols)
-	for c := 0; c < nCols; c++ {
+	for c := range nCols {
 		fb := array.NewFloat64Builder(pool)
-		for i := 0; i < nRows; i++ {
+		for i := range nRows {
 			fb.Append(float64(i + c))
 		}
 		arrs[c] = fb.NewArray()
@@ -69,8 +69,8 @@ func BenchmarkFusion_ChainedOps(b *testing.B) {
 	f := chainedOpBenchFrame(b, 200_000, 20)
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		op, err := Compile(Optimize(f.Lazy().
 			WithColumn("a", Col("c0").Add(Lit(1.0))).
 			WithColumn("b", Col("c1").Mul(Lit(2.0))).
@@ -95,8 +95,8 @@ func BenchmarkFusion_ChainedOpsUnfused(b *testing.B) {
 	f := chainedOpBenchFrame(b, 200_000, 20)
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		op, err := compileNode(Optimize(f.Lazy().
 			WithColumn("a", Col("c0").Add(Lit(1.0))).
 			WithColumn("b", Col("c1").Mul(Lit(2.0))).

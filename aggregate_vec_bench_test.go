@@ -23,9 +23,9 @@ func vecAggFrame(b testing.TB, nGroups, rowsPerGroup int) *Frame {
 	defer regionB.Release()
 	valueB := array.NewFloat64Builder(pool)
 	defer valueB.Release()
-	for g := 0; g < nGroups; g++ {
+	for g := range nGroups {
 		region := fmt.Sprintf("g%06d", g)
-		for r := 0; r < rowsPerGroup; r++ {
+		for r := range rowsPerGroup {
 			regionB.Append(region)
 			valueB.Append(float64(r + 1))
 		}
@@ -61,8 +61,8 @@ func BenchmarkAggregate_SumFloat64(b *testing.B) {
 	f := vecAggFrame(b, 100, 1000) // 100k rows, 100 groups
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		op, err := Compile(Optimize(f.Lazy().
 			GroupBy("region").
 			Agg(Aggregation{Column: "value", Kind: AggSum, Alias: "sum_v"}).
@@ -84,8 +84,8 @@ func BenchmarkAggregate_MeanFloat64(b *testing.B) {
 	f := vecAggFrame(b, 100, 1000)
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		op, err := Compile(Optimize(f.Lazy().
 			GroupBy("region").
 			Agg(Aggregation{Column: "value", Kind: AggMean, Alias: "mean_v"}).
@@ -106,8 +106,8 @@ func BenchmarkAggregate_MinMaxFloat64(b *testing.B) {
 	f := vecAggFrame(b, 100, 1000)
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		op, err := Compile(Optimize(f.Lazy().
 			GroupBy("region").
 			Agg(
@@ -133,7 +133,7 @@ func singleChunkFloat64Series(b testing.TB, n int) Series {
 	pool := memory.DefaultAllocator
 	fb := array.NewFloat64Builder(pool)
 	defer fb.Release()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		fb.Append(float64(i))
 	}
 	arr := fb.NewArray()
@@ -152,7 +152,7 @@ func multiChunkFloat64Series(b testing.TB, n int) Series {
 	half := n / 2
 	fb1 := array.NewFloat64Builder(pool)
 	defer fb1.Release()
-	for i := 0; i < half; i++ {
+	for i := range half {
 		fb1.Append(float64(i))
 	}
 	fb2 := array.NewFloat64Builder(pool)
@@ -178,8 +178,8 @@ func BenchmarkSumAcc_VectorizedSingleChunk(b *testing.B) {
 		rows[i] = i
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		acc := &sumAcc{}
 		if err := acc.Update(s, rows); err != nil {
 			b.Fatal(err)
@@ -197,8 +197,8 @@ func BenchmarkSumAcc_NumericAtMultiChunk(b *testing.B) {
 		rows[i] = i
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		acc := &sumAcc{}
 		if err := acc.Update(s, rows); err != nil {
 			b.Fatal(err)

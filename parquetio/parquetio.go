@@ -691,7 +691,9 @@ func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOpt
 		pool = memory.DefaultAllocator
 	}
 
-	pf, err := file.NewParquetReader(rs)
+	rp := parquet.NewReaderProperties(pool)
+	rp.PageStreamingEnabled = true
+	pf, err := file.NewParquetReader(rs, file.WithReadProps(rp))
 	if err != nil {
 		_ = closer.Close()
 		return nil, err
@@ -705,8 +707,9 @@ func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOpt
 	}
 
 	fr, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{
-		Parallel:  true,
-		BatchSize: chunkRows(opts),
+		Parallel:           true,
+		BatchSize:          chunkRows(opts),
+		PreAllocBinaryData: true,
 	}, pool)
 	if err != nil {
 		_ = pf.Close()

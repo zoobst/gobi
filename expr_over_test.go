@@ -348,8 +348,8 @@ func TestOver_FastPathRejectsWrongSortPrefix(t *testing.T) {
 func BenchmarkOver_UnalignedHashMap(b *testing.B) {
 	f := sortedOverFrame(b, 100, 1000) // 100 groups × 1000 rows = 100k rows
 	expr := Col("v").Sum().Over("group")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		_, err := f.WithColumnExpr("gsum", expr)
 		if err != nil {
 			b.Fatal(err)
@@ -364,8 +364,8 @@ func BenchmarkOver_AlignedFastPath(b *testing.B) {
 	f := sortedOverFrame(b, 100, 1000)
 	f.WithPartitionMeta(alignedSortedMeta())
 	expr := Col("v").Sum().Over("group")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		_, err := f.WithColumnExpr("gsum", expr)
 		if err != nil {
 			b.Fatal(err)

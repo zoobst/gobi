@@ -27,11 +27,11 @@ func sortedGroupByFrame(t testing.TB, nRegions, nIDs, rowsPerGroup int) *Frame {
 	vb := array.NewInt64Builder(pool)
 	defer vb.Release()
 
-	for reg := 0; reg < nRegions; reg++ {
+	for reg := range nRegions {
 		rn := fmt.Sprintf("r%03d", reg)
-		for id := 0; id < nIDs; id++ {
+		for id := range nIDs {
 			in := fmt.Sprintf("id%06d", id)
-			for r := 0; r < rowsPerGroup; r++ {
+			for r := range rowsPerGroup {
 				rb.Append(rn)
 				ib.Append(in)
 				vb.Append(int64(reg*nIDs*rowsPerGroup + id*rowsPerGroup + r))
@@ -257,8 +257,8 @@ func TestGroupByAligned_EmptyFrame(t *testing.T) {
 func BenchmarkGroupByAligned(b *testing.B) {
 	f := sortedGroupByFrame(b, 10, 100, 100)
 	f.WithPartitionMeta(alignedGroupByMeta())
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		gb, err := f.GroupBy("region", "id")
 		if err != nil {
 			b.Fatal(err)
@@ -276,8 +276,8 @@ func BenchmarkGroupByAligned(b *testing.B) {
 func BenchmarkGroupByUnaligned(b *testing.B) {
 	f := sortedGroupByFrame(b, 10, 100, 100)
 	// Deliberately no WithPartitionMeta call — hash-map path runs.
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		gb, err := f.GroupBy("region", "id")
 		if err != nil {
 			b.Fatal(err)

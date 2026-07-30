@@ -24,7 +24,7 @@ func sortedJoinFrame(t testing.TB, nRows int, valColName string) *Frame {
 
 	// Each key appears twice (2 rows per key → tests the cross-product
 	// path). Keys ascending so rows are contiguous by key.
-	for i := 0; i < nRows; i++ {
+	for i := range nRows {
 		keyB.Append(int64(i / 2))
 		valB.Append(float64(i) * 1.5)
 	}
@@ -257,7 +257,7 @@ func unalignedJoinFrame(t testing.TB, nRows int, valColName string) *Frame {
 	// so no valid alignment claim would hold. Simple bit-reverse-ish
 	// shuffle: each key at position i × prime mod nRows.
 	prime := int64(7919)
-	for i := 0; i < nRows; i++ {
+	for i := range nRows {
 		pos := (int64(i) * prime) % int64(nRows)
 		keyB.Append(pos / 2)
 		valB.Append(float64(pos) * 1.5)
@@ -290,8 +290,8 @@ func unalignedJoinFrame(t testing.TB, nRows int, valColName string) *Frame {
 func BenchmarkJoin_HashUnaligned(b *testing.B) {
 	left := unalignedJoinFrame(b, 10_000, "l_val")
 	right := unalignedJoinFrame(b, 10_000, "r_val")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		lf := left.Lazy().Join(right.Lazy(), "key", "key", JoinInner)
 		out, err := lf.Collect()
 		if err != nil {
@@ -308,8 +308,8 @@ func BenchmarkJoin_HashUnaligned(b *testing.B) {
 func BenchmarkJoin_MergeAligned(b *testing.B) {
 	left := sortedJoinFrame(b, 10_000, "l_val")
 	right := sortedJoinFrame(b, 10_000, "r_val")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		lLazy, _ := left.Lazy().WithPartitionAssertion(alignedIcebergMeta())
 		rLazy, _ := right.Lazy().WithPartitionAssertion(alignedIcebergMeta())
 		lf := lLazy.Join(rLazy, "key", "key", JoinInner)
@@ -334,8 +334,8 @@ func BenchmarkJoin_MergeAligned(b *testing.B) {
 func BenchmarkJoin_HashMultiProbeBatch(b *testing.B) {
 	left := unalignedJoinFrame(b, 200_000, "l_val")
 	right := unalignedJoinFrame(b, 100_000, "r_val")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		lf := left.Lazy().Join(right.Lazy(), "key", "key", JoinInner)
 		out, err := lf.Collect()
 		if err != nil {

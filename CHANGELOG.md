@@ -5,6 +5,59 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.21]
+
+### Changed
+
+- **Bumped `github.com/apache/arrow-go/v18` from v18.6.0 to v18.7.0.**
+  All tests pass unchanged. Free wins delivered by the upgrade
+  (no gobi code change required):
+  - `pqarrow.ReadRowGroups` now caps `batchSize` to
+    `NextPowerOf2(nrows)`, so small row groups no longer allocate
+    buffers sized for the default `Props.BatchSize` — relevant for
+    the 50-row-group GeoParquet experiment.
+  - `columnChunkReader.Close()` nils `curPage`/`rdr` fields before
+    Release, closing a double-release window on error paths.
+  - `Data.SetDictionary` releases the old dictionary before
+    installing the new one — was leaking on re-set.
+  - Comparison kernel bounds fix: arrays smaller than 8 elements
+    no longer read past their end.
+  - ByteArray statistics min/max are now copied instead of
+    aliased, closing a use-after-free.
+  - `RecordReader.Read`'s batch is capped to actual row count.
+  - `ReserveData(0)` no-alloc — cheap hot-path win.
+  - zstd writes get `WithAllLitEntropyCompression(true)` — tighter
+    output on all-literal blocks.
+  - Parquet writer's magic-header path now returns errors instead
+    of panicking (via `NewParquetWriterWithError`, used internally
+    by `pqarrow.NewFileWriter`).
+
+  Transitive bumps that came along: `thrift 0.22 → 0.24`,
+  `grpc 1.80 → 1.82`, `golang.org/x/net 0.52 → 0.55`,
+  `klauspost/compress 1.18.5 → 1.19`, `modernc.org/sqlite
+  1.49.1 → 1.53.0` (carrying `modernc.org/libc 1.72 → 1.73.4`).
+  None break API.
+
+### Performance
+
+- **`parquetio` now sets `PreAllocBinaryData: true` on
+  `pqarrow.ArrowReadProperties`.** New in arrow-go v18.7.0. The
+  reader pre-sizes each row group's BinaryBuilder data buffer
+  from the column chunk's `TotalUncompressedSize` and `NumRows`
+  metadata, eliminating the O(log n) realloc-and-copy cycles that
+  dominated WKB geometry column reads. Zero downside for narrow
+  columns — the metadata is already fetched during footer parsing.
+
+- **`parquetio` now sets `PageStreamingEnabled: true` on the
+  `parquet.ReaderProperties` passed to `file.NewParquetReader`.**
+  Also new in v18.7.0. Eligible pages (PLAIN-encoded V1/V2 data
+  pages larger than 1 MiB, using UNCOMPRESSED/GZIP/BROTLI/ZSTD)
+  are decoded incrementally into a `min(1 MiB, page-size)` rolling
+  buffer instead of materializing the whole uncompressed page.
+  Pages ≤1 MiB continue on the old whole-page path (streaming
+  would only add overhead). Peak memory drops on files with wide
+  row groups; decoded values are identical.
+
 ## [v0.2.20]
 
 ### Fixed
