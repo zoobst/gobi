@@ -9,7 +9,7 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
-## [v0.1.7]
+## [v0.1.8]
 
 ### Fixed
 
