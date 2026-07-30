@@ -360,16 +360,13 @@ func (n *listContainsNode) String() string {
 // Shared helpers
 // -----------------------------------------------------------------------------
 
-// buildSeries wraps a freshly-built arrow.Array in a Series. The Array
-// is Released after being installed into a chunked column, so the
-// caller shouldn't touch it after this returns.
+// buildSeries wraps a freshly-built arrow.Array in a Series with a
+// caller-supplied dtype (which may differ from arr.DataType() in
+// rare cases — e.g. declaring a stricter list-element type than
+// what the array carries). Thin wrapper over SeriesFromArray.
 func buildSeries(name string, dtype arrow.DataType, arr arrow.Array) Series {
-	field := arrow.Field{Name: name, Type: dtype, Nullable: true}
-	chunked := arrow.NewChunked(dtype, []arrow.Array{arr})
-	col := arrow.NewColumn(field, chunked)
-	arr.Release()
-	chunked.Release()
-	return NewSeries(col)
+	return SeriesFromArray(
+		arrow.Field{Name: name, Type: dtype, Nullable: true}, arr)
 }
 
 // arrayValueEquals reports whether arr[idx] equals elem, using

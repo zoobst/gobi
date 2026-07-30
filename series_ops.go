@@ -1040,17 +1040,13 @@ func buildBoolSeries(name string, vals []bool, validity []bool) Series {
 	return newSeriesFromArray(name, b.NewArray())
 }
 
-// newSeriesFromArray wraps an arrow.Array in a Series with the given name.
-// The returned Series takes ownership of arr — callers should not release
-// it themselves. The intermediate Chunked and the caller-transferred arr
-// reference are both Released here; only the Column-held reference (via
-// NewColumn's internal Retain) survives past return, so arr and chunked
-// each reach refcount=1 owned by the returned Series.
+// newSeriesFromArray wraps an arrow.Array in a Series with the given
+// name. The returned Series takes ownership of arr — callers should not
+// release it themselves. Thin wrapper over SeriesFromArray that
+// synthesizes a nullable field from the array's dtype; use
+// SeriesFromArray directly when a custom field is needed (e.g.
+// geometry-tagged fields).
 func newSeriesFromArray(name string, arr arrow.Array) Series {
-	field := arrow.Field{Name: name, Type: arr.DataType(), Nullable: true}
-	chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
-	col := arrow.NewColumn(field, chunked)
-	arr.Release()     // NewChunked retained; drop caller's transferred ref
-	chunked.Release() // NewColumn retained; drop our constructor ref
-	return Series{name: name, field: field, col: col}
+	return SeriesFromArray(
+		arrow.Field{Name: name, Type: arr.DataType(), Nullable: true}, arr)
 }

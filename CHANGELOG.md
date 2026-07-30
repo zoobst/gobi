@@ -5,6 +5,38 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.19]
+
+### Added
+
+- **`gobi.SeriesFromArray(field arrow.Field, arr arrow.Array) Series`** —
+  public helper for wrapping a freshly-built arrow.Array in a Series
+  with a caller-supplied field. Handles the full ref-count dance
+  (Chunked construction + retain balancing + Column construction +
+  release of intermediates) so downstream code doesn't have to
+  hand-roll the ceremony. Motivating shape: sibling packages
+  building custom column types (geometry, hash, ML feature) that
+  previously wrote:
+
+      chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
+      col := arrow.NewColumn(field, chunked)
+      arr.Release()
+      chunked.Release()
+      return gobi.NewSeries(col)
+
+  Collapse to:
+
+      return gobi.SeriesFromArray(field, arr)
+
+  Same ref-count semantics either way. Callers transfer ownership
+  of arr into the function (do NOT `arr.Release()` afterward);
+  returned Series owns the underlying buffers via its Column
+  reference.
+
+  Internal helpers `arrayToSeries`, `newSeriesFromArray`, and
+  `buildSeries` now delegate to this one canonical implementation
+  — every ref-count bug fix lives in exactly one place.
+
 ## [v0.2.18]
 
 ### Fixed

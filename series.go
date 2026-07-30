@@ -26,6 +26,43 @@ func NewSeries(col *arrow.Column) Series {
 	return Series{name: col.Name(), field: col.Field(), col: col}
 }
 
+// SeriesFromArray wraps a freshly-built arrow.Array in a Series with
+// the given field. Handles the full ref-count dance so callers don't
+// have to hand-roll it:
+//
+//   - `arr.Release()` is called inline after the wrapping. Callers
+//     transfer their ref on arr into this function and must NOT
+//     release it themselves. The Arrow Chunked constructed here
+//     retained arr internally, so arr's buffer survives on the
+//     Chunked-held reference.
+//   - The intermediate Chunked's constructor reference is also
+//     released here (NewColumn retained it separately). After return,
+//     only the Column-held reference to the Chunked is alive.
+//
+// End state: `arr.refCount == 1` (owned by Chunked) and
+// `chunked.refCount == 1` (owned by Column). No leaks, no
+// double-frees.
+//
+// Motivating shape: sibling packages that build custom column types
+// (geometry columns, hash columns, ML feature columns) previously
+// had to write the Chunked+NewColumn ceremony inline and remember
+// the two `.Release()` calls that pair with NewChunked's and
+// NewColumn's internal retains. This helper folds all of that into
+// one function so downstream code becomes:
+//
+//	arr := b.NewArray()
+//	series := gobi.SeriesFromArray(
+//	    gobi.GeometryField("points", 4326), arr)
+//
+// Instead of the 5-line hand-rolled equivalent.
+func SeriesFromArray(field arrow.Field, arr arrow.Array) Series {
+	chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
+	col := arrow.NewColumn(field, chunked)
+	arr.Release()
+	chunked.Release()
+	return Series{name: field.Name, field: field, col: col}
+}
+
 // Name returns the column name.
 func (s Series) Name() string { return s.name }
 
