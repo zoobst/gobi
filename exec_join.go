@@ -71,17 +71,22 @@ func (e *streamingJoinExec) Next(ctx context.Context) (arrow.RecordBatch, error)
 		// original bug this exec was accidentally hitting.
 		lKey, err := probeFrame.Column(e.leftKey)
 		if err != nil {
+			probeFrame.Release()
 			return nil, err
 		}
 		joined, err := probeFrame.joinHashRightWithIndex(
 			e.buildFrame, e.leftKey, e.rightKey, lKey, e.rightKeyS, e.kind, e.rightIndex)
+		probeFrame.Release()
 		if err != nil {
 			return nil, err
 		}
 		if joined.NumRows() == 0 {
+			joined.Release()
 			continue
 		}
-		return frameToBatch(joined), nil
+		out := frameToBatch(joined)
+		joined.Release()
+		return out, nil
 	}
 }
 
@@ -124,6 +129,14 @@ func (e *streamingJoinExec) Close() error {
 	_ = e.left.Close()
 	if !e.built {
 		_ = e.right.Close()
+	}
+	// Drop the materialized build side so its arrow columns can be
+	// freed. Without this, every streaming join pins the entire
+	// right-side Frame for the plan's lifetime — a straight leak on
+	// long-lived executors that touch a join.
+	if e.buildFrame != nil {
+		e.buildFrame.Release()
+		e.buildFrame = nil
 	}
 	return nil
 }

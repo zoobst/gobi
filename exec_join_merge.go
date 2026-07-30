@@ -62,9 +62,12 @@ func (e *sortMergeJoinExec) Next(ctx context.Context) (arrow.RecordBatch, error)
 		return nil, err
 	}
 	if joined.NumRows() == 0 {
+		joined.Release()
 		return nil, io.EOF
 	}
-	return frameToBatch(joined), nil
+	out := frameToBatch(joined)
+	joined.Release()
+	return out, nil
 }
 
 func (e *sortMergeJoinExec) materializeInputs(ctx context.Context) error {
@@ -95,6 +98,17 @@ func (e *sortMergeJoinExec) Close() error {
 	if e.probeFrame == nil {
 		_ = e.left.Close()
 		_ = e.right.Close()
+	}
+	// Drop both materialized sides so their arrow columns can be
+	// freed. Without this, every completed sort-merge join pins both
+	// input Frames for the plan's lifetime.
+	if e.probeFrame != nil {
+		e.probeFrame.Release()
+		e.probeFrame = nil
+	}
+	if e.buildFrame != nil {
+		e.buildFrame.Release()
+		e.buildFrame = nil
 	}
 	return nil
 }

@@ -134,7 +134,12 @@ func concatBatchesToFrame(schema *arrow.Schema, batches []arrow.RecordBatch) (*F
 // where every column's slice reduces to a single underlying chunk;
 // see chunkAlignedBoundaries for the boundary-picking rule.
 //
-// The returned batch shares buffers with f — do not release both.
+// The returned batch owns an independent Retain on each column's
+// underlying arrow.Array (via array.NewRecordBatch's internal Retain).
+// The source Frame f is unchanged and still owns its own refs — both
+// batch.Release AND f.Release must run to drive the array refcount to
+// zero. Callers that don't need f past this point should Release f
+// after the call.
 func frameToBatch(f *Frame) arrow.RecordBatch {
 	schema := f.Schema()
 	arrs := make([]arrow.Array, f.NumCols())
@@ -148,8 +153,13 @@ func frameToBatch(f *Frame) arrow.RecordBatch {
 				s.Name(), len(chunks)))
 		}
 		arrs[i] = chunks[0]
-		arrs[i].Retain() // NewRecord's contract requires a live ref
 	}
+	// array.NewRecordBatch Retains each column internally; no explicit
+	// Retain here. An earlier version of this function added its own
+	// arrs[i].Retain() on top, which permanently leaked one refcount
+	// per column per call across every streaming pipeline (v0.2.9
+	// through v0.2.21). Recovered on the order of GB per Collect of a
+	// long-running batch loop.
 	return array.NewRecordBatch(schema, arrs, int64(f.NumRows()))
 }
 

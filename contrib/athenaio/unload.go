@@ -566,6 +566,9 @@ func (c *Client) readBucketFiles(ctx context.Context, files []bucketFileInfo) (*
 	for _, fi := range files {
 		f, err := c.openBucketFrame(ctx, fi.URI)
 		if err != nil {
+			for _, prev := range frames {
+				prev.Release()
+			}
 			return nil, err
 		}
 		frames = append(frames, f)
@@ -573,13 +576,35 @@ func (c *Client) readBucketFiles(ctx context.Context, files []bucketFileInfo) (*
 	if len(frames) == 1 {
 		return frames[0], nil
 	}
+	return concatFramesSingleChunk(frames, memory.DefaultAllocator)
+}
 
-	// Merge per-column single-chunk arrays across frames via
-	// array.Concatenate. Schema is shared — take it from the first
-	// frame.
+// concatFramesSingleChunk consumes frames — Releases every input Frame
+// as part of building the output — and returns a single Frame whose
+// per-column data is one array.Concatenate of the inputs. All input
+// frames must share the same schema. First frame's schema is
+// authoritative.
+//
+// Ownership: on return (both success AND error) every input Frame has
+// been Released exactly once. Callers must not use frames after the
+// call. array.Concatenate copies the data into new buffers, so the
+// output Frame's arrow arrays are independent of the inputs — dropping
+// the sources immediately is safe and prevents the multi-GB reader
+// leak that surfaced on multi-bucket UnloadAndRead workloads.
+//
+// Uses single-chunk output rather than gobi.Concat (which produces
+// multi-chunk columns) because the streaming executor's frameToBatch
+// reads only chunks[0]; a multi-chunk Frame reaching Collect silently
+// drops rows past the first chunk.
+func concatFramesSingleChunk(frames []*gobi.Frame, pool memory.Allocator) (*gobi.Frame, error) {
+	defer func() {
+		for _, f := range frames {
+			f.Release()
+		}
+	}()
+
 	schema := frames[0].Schema()
 	numCols := len(schema.Fields())
-	pool := memory.DefaultAllocator
 	outCols := make([]arrow.Column, numCols)
 	for ci := range numCols {
 		chunks := make([]arrow.Array, 0, len(frames))
@@ -598,6 +623,7 @@ func (c *Client) readBucketFiles(ctx context.Context, files []bucketFileInfo) (*
 		chunked := arrow.NewChunked(combined.DataType(), []arrow.Array{combined})
 		outCols[ci] = *arrow.NewColumn(field, chunked)
 		combined.Release()
+		chunked.Release()
 	}
 	return gobi.NewFrame(schema, outCols)
 }

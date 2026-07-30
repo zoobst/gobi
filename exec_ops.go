@@ -57,7 +57,9 @@ func (e *scanFrameExec) Next(ctx context.Context) (arrow.RecordBatch, error) {
 	start, end := e.boundaries[e.idx], e.boundaries[e.idx+1]
 	e.idx++
 	slice := e.frame.slice(start, end)
-	return frameToBatch(slice), nil
+	batch := frameToBatch(slice)
+	slice.Release()
+	return batch, nil
 }
 
 func (e *scanFrameExec) Close() error {
@@ -147,13 +149,17 @@ func (e *filterExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 			return nil, err
 		}
 		filtered, err := frame.FilterExpr(e.cond)
+		frame.Release()
 		if err != nil {
 			return nil, err
 		}
 		if filtered.NumRows() == 0 {
+			filtered.Release()
 			continue // pull the next batch
 		}
-		return frameToBatch(filtered), nil
+		out := frameToBatch(filtered)
+		filtered.Release()
+		return out, nil
 	}
 }
 
@@ -195,10 +201,13 @@ func (e *projectExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 		return nil, err
 	}
 	projected, err := executeSelect(frame, e.exprs)
+	frame.Release()
 	if err != nil {
 		return nil, err
 	}
-	return frameToBatch(projected), nil
+	out := frameToBatch(projected)
+	projected.Release()
+	return out, nil
 }
 
 func (e *projectExecOp) Close() error { return e.input.Close() }
@@ -243,10 +252,13 @@ func (e *withColumnExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) 
 		frame.WithPartitionMeta(e.inputMeta)
 	}
 	out, err := frame.WithColumnExpr(e.name, e.expr)
+	frame.Release()
 	if err != nil {
 		return nil, err
 	}
-	return frameToBatch(out), nil
+	batchOut := frameToBatch(out)
+	out.Release()
+	return batchOut, nil
 }
 
 func (e *withColumnExecOp) Close() error { return e.input.Close() }
@@ -287,10 +299,13 @@ func (e *dropExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 		return nil, err
 	}
 	out, err := frame.DropColumn(e.name)
+	frame.Release()
 	if err != nil {
 		return nil, err
 	}
-	return frameToBatch(out), nil
+	batchOut := frameToBatch(out)
+	out.Release()
+	return batchOut, nil
 }
 
 func (e *dropExecOp) Close() error { return e.input.Close() }
@@ -328,9 +343,18 @@ func (e *renameExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 	}
 	out, err := frame.Rename(e.old, e.new)
 	if err != nil {
+		frame.Release()
 		return nil, err
 	}
-	return frameToBatch(out), nil
+	// Rename short-circuits to f itself on old == new. Avoid a
+	// double-Release in that case by only Releasing frame when it's
+	// a distinct Frame from out.
+	if out != frame {
+		frame.Release()
+	}
+	batchOut := frameToBatch(out)
+	out.Release()
+	return batchOut, nil
 }
 
 func (e *renameExecOp) Close() error { return e.input.Close() }
@@ -372,10 +396,13 @@ func (e *explodeExecOp) Next(ctx context.Context) (arrow.RecordBatch, error) {
 		return nil, err
 	}
 	out, err := frame.Explode(e.name)
+	frame.Release()
 	if err != nil {
 		return nil, err
 	}
-	return frameToBatch(out), nil
+	batchOut := frameToBatch(out)
+	out.Release()
+	return batchOut, nil
 }
 
 func (e *explodeExecOp) Close() error { return e.input.Close() }
@@ -480,7 +507,9 @@ func (e *materializeExecOp) Next(ctx context.Context) (arrow.RecordBatch, error)
 	end := min(e.offset+defaultBatchRows, e.out.NumRows())
 	slice := e.out.slice(int64(e.offset), int64(end))
 	e.offset = end
-	return frameToBatch(slice), nil
+	batch := frameToBatch(slice)
+	slice.Release()
+	return batch, nil
 }
 
 func (e *materializeExecOp) materialize(ctx context.Context) error {
@@ -593,7 +622,15 @@ func (e *fusedStreamExecOp) Next(ctx context.Context) (arrow.RecordBatch, error)
 		for _, op := range e.ops {
 			next, err := op.ApplyToFrame(frame)
 			if err != nil {
+				frame.Release()
 				return nil, err
+			}
+			// Each ApplyToFrame produces a new Frame (Filter/With/Drop
+			// all go through Take or NewSeries). Release the prior
+			// frame's refs before overwriting; without this, every
+			// fused-op link leaks the intermediate frame's columns.
+			if next != frame {
+				frame.Release()
 			}
 			frame = next
 			if frame.NumRows() == 0 {
@@ -605,9 +642,12 @@ func (e *fusedStreamExecOp) Next(ctx context.Context) (arrow.RecordBatch, error)
 			}
 		}
 		if dropped {
+			frame.Release()
 			continue
 		}
-		return frameToBatch(frame), nil
+		out := frameToBatch(frame)
+		frame.Release()
+		return out, nil
 	}
 }
 
@@ -656,16 +696,12 @@ func newScanFileExec(schema *arrow.Schema, fn func(cb func(*Frame) error) error)
 	go func() {
 		defer close(e.batches)
 		err := fn(func(f *Frame) error {
-			// Callers retain the batch's arrow buffers past the
-			// callback's return — the source package's contract
-			// says the Frame is released when the callback returns,
-			// so we bump the ref count to keep it alive on the
-			// consumer side.
-			f.Retain()
+			// frameToBatch installs an independent Retain on each
+			// column via NewRecordBatch, so the batch's array refs
+			// survive the source Frame's Release when the callback
+			// returns. No extra f.Retain()/f.Release() dance needed
+			// here — see exec.go frameToBatch docstring.
 			batch := frameToBatch(f)
-			// Release our extra ref: frameToBatch retained the
-			// arrays it wrapped, so the batch owns them now.
-			f.Release()
 			select {
 			case e.batches <- batch:
 				return nil

@@ -5,6 +5,90 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.22]
+
+### Fixed
+
+- **`frameToBatch` double-Retained every column, systemically.**
+  The exec.go bridge between `*Frame` and `arrow.RecordBatch` called
+  `arrs[i].Retain()` on top of `array.NewRecordBatch`'s internal
+  Retain — the comment claimed "NewRecord's contract requires a live
+  ref" but arrow-go's `NewRecordBatch` already Retains each column
+  itself (verified against v18.4.1 through v18.7.0). Result: every
+  batch produced by frameToBatch leaked exactly one refcount per
+  column. Because frameToBatch is on every hot path in the streaming
+  executor (filter, project, withColumn, drop, rename, explode,
+  streaming/sort-merge join, materialize wall, fused streaming, scan
+  file, scan Frame) this compounded across every batch of every
+  Collect. Present since v0.2.9 when the streaming executor landed.
+  Fix: rely solely on NewRecordBatch's Retain. Refcount-balance test
+  proves the invariant: `TestFrameToBatch_RefcountBalanced`.
+
+- **Streaming exec ops orphaned every intermediate Frame.** Every
+  op that ran `batchToFrame(batch)` → compute → `frameToBatch(out)`
+  dropped both the input Frame and the output Frame on the floor
+  without Release. In isolation each Frame's ref chain was only kept
+  alive by Go GC (GoAllocator's `Free` is a no-op), but for
+  streaming pipelines that produce many batches through fresh
+  arrays (FilterExpr's Take, executeSelect's per-batch column
+  construction) this pinned every batch's arrays until process
+  exit. Fix: every op releases the intermediate `frame` after the
+  compute, the derived Frame after the frameToBatch conversion, and
+  the fused-streaming path releases the running Frame between
+  ApplyToFrame links. Rename's identity short-circuit is handled
+  via pointer equality to avoid a double-Release. New tests:
+  `TestScanFrameExec_ReleasesSliceFrames`,
+  `TestFilterExec_ReleasesIntermediateFrames`,
+  `TestProjectExec_ReleasesIntermediateFrames`,
+  `TestWithColumnExec_ReleasesIntermediateFrames`,
+  `TestLazy_FilterSelect_RefcountBalanced`.
+
+- **`streamingJoinExec.Close` and `sortMergeJoinExec.Close` leaked
+  the materialized build side.** Both ops call `Execute` on the
+  right subtree once and stash the resulting Frame for the plan's
+  lifetime, but Close never Released it. Every completed join
+  pinned one full right-side (or both sides, for sort-merge) Frame
+  for the entire Collect. Fix: Close now Releases the materialized
+  Frames and nils the fields. Idempotent — safe against double-close.
+
+- **`athenaio.readBucketFiles` pinned every source Frame forever.**
+  The `frames` slice accumulated one `*gobi.Frame` per bucket file
+  and returned without Releasing any of them. For a 10-bucket
+  UnloadAndRead at ~800 MB per bucket, that's ~8 GB of arrow buffers
+  pinned per call. The concat path also missed a `chunked.Release()`
+  after `arrow.NewColumn(field, chunked)` — the same NewColumn/
+  Release dance the v0.2.19 audit had closed at ~35 other sites.
+  Fix: extracted the concat portion into `concatFramesSingleChunk`
+  which consumes its input frames (Releases them via `defer`) and
+  Releases the intermediate chunked. Error paths in the openBucket
+  loop also Release previously-loaded frames. New tests:
+  `TestConcatFramesSingleChunk_ReleasesInputs` and its error-path
+  counterpart guard both the happy path and the schema-mismatch
+  path against future regressions.
+
+- **`scanFileExec` had an unnecessary `f.Retain()`/`f.Release()`
+  dance around frameToBatch.** With frameToBatch's over-Retain fix,
+  `array.NewRecordBatch`'s internal Retain already gives the batch
+  an independent ref on each column, so the callback's Frame can
+  Release freely after the callback returns without invalidating
+  the batch. The dance was harmless but obscured the ownership
+  model. Removed; comment updated to point at the frameToBatch
+  docstring.
+
+### Added
+
+- **`gobi/exec_refcount_test.go`** — CheckedAllocator-backed tests
+  that catch refcount imbalance in the streaming executor. Runs
+  each op (filter, project, withColumn) plus the full
+  `Filter → Select → Collect` lazy pipeline under a checked pool
+  and asserts `pool.AssertSize(t, 0)` — any leaked buffer surfaces
+  with a stack trace pointing at the site that failed to Release.
+  Would have caught the double-Retain the day it was written.
+
+- **`contrib/athenaio/unload_refcount_test.go`** — same pattern for
+  the concat portion of readBucketFiles. Two tests: happy path and
+  error path (schema mismatch), both under CheckedAllocator.
+
 ## [v0.2.21]
 
 ### Changed
