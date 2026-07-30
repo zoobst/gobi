@@ -12,6 +12,9 @@ import (
 	"github.com/zoobst/gobi/geometry"
 )
 
+// haversineFrame builds a Frame with four Float64 columns (lat1,
+// lon1, lat2, lon2) from paired slices. The fixture the new
+// PointExpr-shaped HaversineExpr consumes.
 func haversineFrame(t testing.TB, lat1, lon1, lat2, lon2 []float64) *Frame {
 	t.Helper()
 	pool := memory.DefaultAllocator
@@ -40,28 +43,26 @@ func haversineFrame(t testing.TB, lat1, lon1, lat2, lon2 []float64) *Frame {
 		arrowCols[i] = *arrow.NewColumn(fields[i],
 			arrow.NewChunked(a.DataType(), []arrow.Array{a}))
 	}
-	schema := arrow.NewSchema(fields, nil)
-	f, err := NewFrame(schema, arrowCols)
+	f, err := NewFrame(arrow.NewSchema(fields, nil), arrowCols)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return f
 }
 
-// TestHaversineExpr_Basic — NYC → London distance, ~5570 km. Verifies
-// the expression yields the same value as calling geometry.Haversine
-// directly with the same inputs.
+// TestHaversineExpr_Basic — NYC → London ~5570 km. Verifies the
+// expression matches the scalar geometry.Haversine bit-for-bit
+// (same math kernel, hoisted constant).
 func TestHaversineExpr_Basic(t *testing.T) {
-	// NYC (40.7484, -73.9857) → London (51.5074, -0.1276).
 	f := haversineFrame(t,
-		[]float64{40.7484},
-		[]float64{-73.9857},
-		[]float64{51.5074},
-		[]float64{-0.1276},
+		[]float64{40.7484}, []float64{-73.9857}, // NYC
+		[]float64{51.5074}, []float64{-0.1276},  // London
 	)
-	out, err := f.WithColumnExpr("dist_km",
-		HaversineExpr(Col("lat1"), Col("lon1"), Col("lat2"), Col("lon2"),
-			geometry.UnitKilometers))
+	out, err := f.WithColumnExpr("dist_km", HaversineExpr(
+		PointExpr{Lat: Col("lat1"), Lon: Col("lon1")},
+		PointExpr{Lat: Col("lat2"), Lon: Col("lon2")},
+		geometry.UnitKilometers,
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,52 +71,53 @@ func TestHaversineExpr_Basic(t *testing.T) {
 		t.Fatalf("dtype = %s, want FLOAT64", col.DataType())
 	}
 	got := col.col.Data().Chunks()[0].(*array.Float64).Value(0)
-	want, err := geometry.Haversine(-73.9857, 40.7484, -0.1276, 51.5074, geometry.UnitKilometers)
+	want, err := geometry.Haversine(
+		geometry.Point{X: -73.9857, Y: 40.7484},
+		geometry.Point{X: -0.1276, Y: 51.5074},
+		geometry.UnitKilometers,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if math.Abs(got-want) > 1e-9 {
 		t.Errorf("dist = %v, want %v (scalar geometry.Haversine)", got, want)
 	}
-	// Sanity check the magnitude — NYC → London is around 5570 km.
 	if got < 5000 || got > 6000 {
 		t.Errorf("dist %v km out of expected NYC→London range", got)
 	}
 }
 
 // TestHaversineExpr_VectorizedMultiRow — several rows in one Eval,
-// zero nulls, checks the tight fast path.
+// zero nulls, hits the tight zero-copy fast path.
 func TestHaversineExpr_VectorizedMultiRow(t *testing.T) {
-	// Three pairs — pole to equator, one degree east, and NYC → LA.
 	f := haversineFrame(t,
 		[]float64{90, 0, 40.7484},
 		[]float64{0, 0, -73.9857},
 		[]float64{0, 0, 34.0522},
 		[]float64{0, 1, -118.2437},
 	)
-	out, err := f.WithColumnExpr("d",
-		HaversineExpr(Col("lat1"), Col("lon1"), Col("lat2"), Col("lon2"),
-			geometry.UnitKilometers))
+	out, err := f.WithColumnExpr("d", HaversineExpr(
+		PointExpr{Lat: Col("lat1"), Lon: Col("lon1")},
+		PointExpr{Lat: Col("lat2"), Lon: Col("lon2")},
+		geometry.UnitKilometers,
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
 	arr := out.mustCol("d").col.Data().Chunks()[0].(*array.Float64)
-	// Pole to equator is a quarter of Earth's circumference ≈ 10007 km.
 	if arr.Value(0) < 9900 || arr.Value(0) > 10100 {
 		t.Errorf("pole→equator = %v km, want ~10007", arr.Value(0))
 	}
-	// One degree of longitude at the equator ≈ 111 km.
 	if arr.Value(1) < 110 || arr.Value(1) > 112 {
 		t.Errorf("one-deg-east = %v km, want ~111", arr.Value(1))
 	}
-	// NYC → LA ≈ 3936 km.
 	if arr.Value(2) < 3900 || arr.Value(2) > 4000 {
 		t.Errorf("NYC→LA = %v km, want ~3936", arr.Value(2))
 	}
 }
 
 // TestHaversineExpr_NullPropagation — a null in any of the four
-// inputs zeroes the output row.
+// underlying operand columns produces a null output row.
 func TestHaversineExpr_NullPropagation(t *testing.T) {
 	pool := memory.DefaultAllocator
 	lat1B := array.NewFloat64Builder(pool)
@@ -151,9 +153,11 @@ func TestHaversineExpr_NullPropagation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := f.WithColumnExpr("d",
-		HaversineExpr(Col("lat1"), Col("lon1"), Col("lat2"), Col("lon2"),
-			geometry.UnitKilometers))
+	out, err := f.WithColumnExpr("d", HaversineExpr(
+		PointExpr{Lat: Col("lat1"), Lon: Col("lon1")},
+		PointExpr{Lat: Col("lat2"), Lon: Col("lon2")},
+		geometry.UnitKilometers,
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,9 +203,11 @@ func TestHaversineExpr_RejectsNonFloat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.WithColumnExpr("d",
-		HaversineExpr(Col("lat1"), Col("lon1"), Col("lat2"), Col("lon2"),
-			geometry.UnitKilometers))
+	_, err = f.WithColumnExpr("d", HaversineExpr(
+		PointExpr{Lat: Col("lat1"), Lon: Col("lon1")},
+		PointExpr{Lat: Col("lat2"), Lon: Col("lon2")},
+		geometry.UnitKilometers,
+	))
 	if err == nil {
 		t.Fatal("expected error for Int64 lat1")
 	}

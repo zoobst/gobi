@@ -5,6 +5,98 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.2.16]
+
+### Changed (breaking)
+
+- **`geometry.Haversine` and `geometry.Euclidean` now take `Point`
+  arguments instead of separate coordinate floats.** Aligns the
+  scalar signatures with `HaversineBatch` and `Point.Distance`, so
+  callers holding geometry types can pass them directly without
+  decomposing into parallel lat/lon slices at every call site.
+
+  Migration:
+
+      // Before
+      d, err := geometry.Haversine(a.X, a.Y, b.X, b.Y, geometry.UnitKilometers)
+      d, err := geometry.Euclidean(a.X, a.Y, b.X, b.Y, geometry.UnitMeters)
+
+      // After
+      d, err := geometry.Haversine(a, b, geometry.UnitKilometers)
+      d, err := geometry.Euclidean(a, b, geometry.UnitMeters)
+
+  Semantics unchanged: same math, same Earth-radius constant, same
+  unit conversion table. `Point.Z` and `Point.CRSValue` are ignored
+  (both functions have always been pure lon/lat / planar math);
+  callers who need CRS-aware dispatch should keep using
+  `Point.Distance` which picks Haversine vs Euclidean based on the
+  Point's CRS.
+
+- **`HaversineExpr` now takes two `PointExpr` values instead of
+  four positional `Expr` arguments.** `PointExpr{Lat, Lon Expr}` is
+  a named-field wrapper — the two coordinate components can't be
+  accidentally swapped at the call site, killing the classic
+  lat/lon-vs-lon/lat footgun the old signature enabled.
+
+  Migration:
+
+      // Before
+      HaversineExpr(
+          Col("lat"), Col("lon"),
+          Col("lat").Shift(1).Over("eid"),
+          Col("lon").Shift(1).Over("eid"),
+          geometry.UnitKilometers,
+      )
+
+      // After
+      HaversineExpr(
+          PointExpr{Lat: Col("lat"), Lon: Col("lon")},
+          PointExpr{
+              Lat: Col("lat").Shift(1).Over("eid"),
+              Lon: Col("lon").Shift(1).Over("eid"),
+          },
+          geometry.UnitKilometers,
+      )
+
+  Internals unchanged: still four Float64 columns under the hood
+  with zero-copy `Float64Values()` fast path on single-chunk input
+  and hoisted scale constant. `PointExpr` is a value-type wrapper,
+  not an ExprNode — it doesn't compose with arithmetic combinators
+  (there's no sensible arithmetic on coordinate pairs at the Expr
+  layer).
+
+- **`geometry.MetersPerUnit(u Unit) (float64, error)` exported.**
+  The scale-factor lookup table (`km → 1000`, `mi → 1609.344`, etc.)
+  is now a public helper so callers building their own bulk
+  distance kernels can hoist the constant outside a hot loop
+  instead of paying a per-call `metersPerUnit` lookup. Formerly the
+  unexported `metersPerUnit`; the unexported alias is kept so
+  internal call sites don't churn.
+
+### Added
+
+- **`geometry.HaversineBatch(from, to []Point, u Unit) ([]float64, error)`.**
+  Bulk-loop-optimized great-circle distance over paired point
+  slices. Semantically equivalent to calling scalar `Haversine`
+  per row, but the unit conversion + Earth-radius constant +
+  degree-to-radian factor are hoisted out of the inner loop, and
+  the per-call error-check overhead is amortized across the batch.
+
+  Measured on Apple M3 Pro, N=10k point pairs, warm cache:
+  235 µs/op batch vs 307 µs/op scalar-loop — **~30% faster**,
+  identical allocation profile (one output `[]float64`). No SIMD;
+  the win is entirely scalar loop scaffolding + constant hoisting.
+
+  Signature takes `[]Point` so callers already holding geometry
+  types can call it directly without decomposing into parallel
+  lat/lon slices. CRS is not consulted (Haversine is a pure lon/lat
+  sphere computation — points in a projected CRS give nonsensical
+  distances; convert to WGS84 first).
+
+  Returns a flat `[]float64` — the shape a downstream SIMD kernel
+  or arrow buffer wants. Groundwork for a future SIMD-vectorized
+  trig kernel once Go's `simd` package stabilizes trig support.
+
 ## [v0.2.15]
 
 ### Added

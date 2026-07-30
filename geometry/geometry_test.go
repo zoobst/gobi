@@ -146,7 +146,11 @@ func TestWKT_WKB_CrossParse(t *testing.T) {
 
 func TestHaversine_NYCToLondon(t *testing.T) {
 	// Known reference: ~5570 km between NYC and London
-	d, err := Haversine(-73.9857, 40.7484, -0.1276, 51.5074, UnitKilometers)
+	d, err := Haversine(
+		Point{X: -73.9857, Y: 40.7484},
+		Point{X: -0.1276, Y: 51.5074},
+		UnitKilometers,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,8 +158,8 @@ func TestHaversine_NYCToLondon(t *testing.T) {
 }
 
 func TestHaversine_UnitConsistency(t *testing.T) {
-	km, _ := Haversine(0, 0, 1, 0, UnitKilometers)
-	mi, _ := Haversine(0, 0, 1, 0, UnitMiles)
+	km, _ := Haversine(Point{X: 0, Y: 0}, Point{X: 1, Y: 0}, UnitKilometers)
+	mi, _ := Haversine(Point{X: 0, Y: 0}, Point{X: 1, Y: 0}, UnitMiles)
 	approx(t, km/mi, 1.609344, 1e-6, "km/mi ratio")
 }
 

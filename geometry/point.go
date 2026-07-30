@@ -98,9 +98,9 @@ func (p Point) Distance(o Point, u Unit) (float64, error) {
 		return 0, ErrCRSMismatch
 	}
 	if p.CRSValue.Projected {
-		return Euclidean(p.X, p.Y, o.X, o.Y, u)
+		return Euclidean(p, o, u)
 	}
-	return Haversine(p.X, p.Y, o.X, o.Y, u)
+	return Haversine(p, o, u)
 }
 
 // Distance3D returns the 3D Euclidean distance from p to o, treating Z as
