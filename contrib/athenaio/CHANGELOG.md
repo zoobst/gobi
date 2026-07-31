@@ -13,6 +13,38 @@ see [Versioning](#versioning) below.
 
 ### Fixed
 
+- **The `statsRegistry` global map pinned every LazyFrame — and
+  transitively every source Frame + arrow column beneath it — for
+  the process's lifetime.** `registerStats` keyed on `*gobi.LazyFrame`,
+  and Go maps hold a strong reference to any pointer-typed key. So
+  every athenaio-produced LazyFrame stayed alive in the registry
+  even after the caller dropped it, keeping its `scanFrameNode.frame`
+  and all its arrow buffers Retain'd indefinitely.
+
+  For long-lived clients running many `UnloadAndRead` / `RawCTAS` /
+  `RawQuery` calls against multi-GB result sets, that added up to
+  multi-GB of leaked arrow memory that no amount of caller-side
+  `ClearStats` discipline could reliably reclaim — the docstring's
+  "small memory leak" was multiple orders of magnitude off.
+
+  Fix: switched the registry key to `uintptr` (the LazyFrame's raw
+  address as an opaque integer, invisible to the GC), and installed
+  a `runtime.AddCleanup` on each registered lf that removes the map
+  entry when GC finds lf unreachable. Unlike `SetFinalizer`,
+  `AddCleanup` does not pin its target, so the LazyFrame becomes
+  collectable as soon as the caller drops it.
+
+  `ClearStats(lf)` remains available for callers that want
+  deterministic map-entry removal before GC. `StatsFor(lf)`
+  semantics unchanged.
+
+  New test `TestStatsRegistry_DoesNotPinLazyFrame` registers 8
+  LazyFrames, drops every Go reference, forces GC + polls for
+  cleanup callbacks, and asserts every one of the recorded uintptr
+  keys drained from the registry. Verified to fail on the pre-fix
+  pointer-keyed map (all 8 entries stay pinned) and pass on the
+  new uintptr-keyed map + AddCleanup.
+
 - **`readBucketFiles` pinned every source Frame forever after concat.**
   The internal helper that opens all bucket files, concatenates them
   into a single-chunk Frame, and returns the result kept every input

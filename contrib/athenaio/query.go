@@ -3,8 +3,10 @@ package athenaio
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/athena"
@@ -198,38 +200,64 @@ func engineTime(exec *athenatypes.QueryExecution) time.Duration {
 // produced by the RawQuery / UnloadAndRead call that created it.
 // Retrieved via StatsFor(lf).
 //
-// Implementation: a package-scope map keyed by LazyFrame pointer.
-// Entries are held indefinitely — trade a small memory leak for API
-// simplicity. Users who care can call ClearStats(lf) when done.
+// Implementation: a package-scope map keyed by the LazyFrame's raw
+// address (uintptr, not *gobi.LazyFrame). Using the pointer as a Go
+// map key would keep every athenaio-produced LazyFrame — and
+// transitively its entire source Frame, arrow columns, and buffers —
+// alive for the process's lifetime, since the map holds a strong
+// reference to any pointer-typed key. That was the multi-GB reader
+// leak surfacing on long-lived clients that ran many UnloadAndRead
+// calls.
+//
+// uintptr keys are opaque integers as far as the garbage collector
+// is concerned, so they don't pin lf. A `runtime.AddCleanup` on lf
+// removes its map entry when the caller drops the LazyFrame,
+// making lf and its source Frame eligible for collection.
+//
+// ClearStats remains available for callers that want deterministic
+// cleanup before GC gets to it.
 // -----------------------------------------------------------------------------
 
 var (
 	statsMu       sync.RWMutex
-	statsRegistry = map[*gobi.LazyFrame]QueryStats{}
+	statsRegistry = map[uintptr]QueryStats{}
 )
 
-// registerStats stashes stats for lf.
+// registerStats stashes stats for lf. The map entry auto-drops when
+// lf becomes unreachable — the map key is a raw address (no GC
+// reference), and runtime.AddCleanup fires the delete when GC finds
+// lf otherwise unreferenced.
 func registerStats(lf *gobi.LazyFrame, stats QueryStats) {
+	key := uintptr(unsafe.Pointer(lf))
 	statsMu.Lock()
-	statsRegistry[lf] = stats
+	statsRegistry[key] = stats
 	statsMu.Unlock()
+	runtime.AddCleanup(lf, func(k uintptr) {
+		statsMu.Lock()
+		delete(statsRegistry, k)
+		statsMu.Unlock()
+	}, key)
 }
 
 // StatsFor returns the QueryStats associated with lf, or the zero
 // value + false if no stats are known (lf wasn't produced by an
 // athenaio call, or ClearStats was invoked).
 func StatsFor(lf *gobi.LazyFrame) (QueryStats, bool) {
+	key := uintptr(unsafe.Pointer(lf))
 	statsMu.RLock()
-	stats, ok := statsRegistry[lf]
+	stats, ok := statsRegistry[key]
 	statsMu.RUnlock()
 	return stats, ok
 }
 
-// ClearStats drops the QueryStats entry for lf. Optional cleanup —
-// entries are otherwise kept until process exit.
+// ClearStats drops the QueryStats entry for lf. Optional — the
+// runtime cleanup attached in registerStats will do the same once
+// GC finds lf unreachable. Callers that want the map entry gone
+// deterministically (before GC runs) can invoke this directly.
 func ClearStats(lf *gobi.LazyFrame) {
+	key := uintptr(unsafe.Pointer(lf))
 	statsMu.Lock()
-	delete(statsRegistry, lf)
+	delete(statsRegistry, key)
 	statsMu.Unlock()
 }
 
