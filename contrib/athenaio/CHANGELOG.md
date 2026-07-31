@@ -9,7 +9,7 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
-## [v0.1.8]
+## [v0.1.9]
 
 ### Fixed
 
@@ -44,6 +44,10 @@ see [Versioning](#versioning) below.
   keys drained from the registry. Verified to fail on the pre-fix
   pointer-keyed map (all 8 entries stay pinned) and pass on the
   new uintptr-keyed map + AddCleanup.
+
+## [v0.1.8]
+
+### Fixed
 
 - **`readBucketFiles` pinned every source Frame forever after concat.**
   The internal helper that opens all bucket files, concatenates them
