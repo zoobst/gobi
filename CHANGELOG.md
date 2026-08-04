@@ -5,6 +5,57 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.1]
+
+### Added
+
+- **First-class `Circle` type + least-squares fit** in
+  `geometry/circle.go`. Circle is a lightweight utility value (not
+  a Geometry — OGC SFA has no encoding for circles, so forcing it
+  into the Geometry interface would break every io format):
+
+  ```go
+  type Circle struct {
+      Center Point
+      Radius float64  // in Center's CRS linear unit
+  }
+
+  c, residuals, err := geometry.FitCircle(points, geometry.CircleFitOptions{})
+  c.Contains(p)           // bool
+  c.Distance(p)           // signed: negative inside, positive outside
+  c.Area()                // πr²
+  c.Circumference()       // 2πr
+  c.Boundary(64)          // closed Polygon (65 vertices, CCW)
+  c.BoundaryLine(64)      // open LineString (64 vertices)
+  ```
+
+  Two fit methods, selected via `CircleFitOptions.Method`:
+  - **Taubin (default)** — Chernov's algebraic fit with a Newton
+    step on the characteristic cubic. Unbiased when the point cloud
+    covers only a partial arc of the true circle (the common
+    real-world case: sensor sweeps, orbit tracks, anchorage
+    circles). Preferred.
+  - **Kasa** — plain algebraic. Faster (no root-find), but biased
+    toward smaller radii on partial-arc inputs. Use when speed
+    dominates and inputs span most of the circumference.
+
+  Test corpus: perfect circle (both methods bit-exact), noisy 90°
+  arc (Taubin beats Kasa on radius error — this is why Taubin is
+  the default), collinear degenerate returns `ErrCircleFit`, <3
+  points errors, CRS propagates from input.
+
+- **Series-level Circle ops** in `series_geom_circle.go`:
+  - `Series.GeomCircleContains(c) Series` — Boolean per row. Points
+    tested directly; non-Point rows tested via their centroid. Null
+    rows pass through as null.
+  - `Series.GeomDistanceToCircle(c, unit) Series` — Float64 per
+    row, signed distance to boundary (negative inside).
+  - `Series.GeomFitCircle(opts) Circle` — aggregate fit across
+    every non-null row's representative point.
+
+  All follow the established `series_geom_*.go` Arrow-refcount
+  discipline.
+
 ## [v0.3.0]
 
 ### Added
