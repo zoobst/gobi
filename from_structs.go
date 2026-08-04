@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -12,6 +13,97 @@ import (
 
 	"github.com/zoobst/gobi/geometry"
 )
+
+// StructOption tunes FromStructs / ToStructs behavior. Passed as
+// variadic arguments to keep the call site clean when no options are
+// needed.
+type StructOption func(*structOpts)
+
+// structOpts holds resolved struct-tag options for one FromStructs /
+// ToStructs invocation.
+type structOpts struct {
+	// tagFormat is the primary struct-tag namespace to look up per
+	// field. e.g. "parquet" → resolve names / options from
+	// `parquet:"col,opt"`. Empty string means "no format-specific
+	// tag; use the fallback chain directly."
+	tagFormat string
+}
+
+// StructTagFormat sets the primary struct-tag namespace to consult
+// when resolving column names and per-field options. If a field has
+// no tag under this namespace, resolution falls back through:
+//
+//	gobi:"..."  — universal namespace, works for every io
+//	csv:"..."   — legacy tag kept working for backward compat
+//	<field name> — final fallback
+//
+// A tag value of "-" (in whichever namespace matches first) skips the
+// field entirely. Multi-part tag values (`format:"name,opt1,opt2"`)
+// use the first comma-separated element as the column name.
+//
+// Example usage:
+//
+//	frame, _ := gobi.FromStructs(rows, gobi.StructTagFormat("parquet"))
+//
+// Per-io convenience wrappers (parquetio.WriteStructs, etc.) pass
+// their own format automatically.
+func StructTagFormat(format string) StructOption {
+	return func(o *structOpts) { o.tagFormat = format }
+}
+
+// resolveStructOpts materializes the options bag from variadic args.
+func resolveStructOpts(opts []StructOption) *structOpts {
+	o := &structOpts{}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
+}
+
+// ResolveFieldName returns the column name to use for sf under the
+// given io-format tag namespace, with a fallback chain to `gobi:`,
+// `csv:` (legacy), and finally the field's Go name. skip is true when
+// the tag value is exactly "-", meaning the field should be omitted
+// from the output entirely.
+//
+// io-package convenience wrappers (parquetio.WriteStructs, csvio, etc.)
+// use this to keep tag resolution consistent with FromStructs /
+// ToStructs. Pass "" as format to skip the per-io namespace lookup.
+func ResolveFieldName(sf reflect.StructField, format string) (name string, skip bool) {
+	tags := make([]string, 0, 3)
+	if format != "" {
+		tags = append(tags, format)
+	}
+	tags = append(tags, "gobi", "csv")
+	for _, tag := range tags {
+		v := sf.Tag.Get(tag)
+		if v == "" {
+			continue
+		}
+		primary := v
+		if i := strings.IndexByte(v, ','); i >= 0 {
+			primary = v[:i]
+		}
+		if primary == "-" {
+			return "", true
+		}
+		if primary != "" {
+			return primary, false
+		}
+	}
+	return sf.Name, false
+}
+
+// resolveFieldName is the unexported internal wrapper — takes an opts
+// struct instead of a raw format string so planStructFields doesn't
+// leak the option type across the call.
+func resolveFieldName(sf reflect.StructField, o *structOpts) (name string, skip bool) {
+	format := ""
+	if o != nil {
+		format = o.tagFormat
+	}
+	return ResolveFieldName(sf, format)
+}
 
 // ErrUnsupportedStructField is returned when FromStructs / ToStructs
 // encounters a struct field type it can't map to an arrow column.
@@ -23,9 +115,16 @@ var ErrUnsupportedStructField = errors.New("gobi: unsupported struct field type"
 // order follows struct-field declaration order; unexported fields
 // are ignored.
 //
-// Struct-tag conventions (shared with csvio):
+// Struct-tag conventions:
 //
-//	csv:"col"           override the column name (default: field name)
+//	<format>:"col"      override the column name for the io format
+//	                    passed via StructTagFormat (e.g. parquet:"col");
+//	                    highest-priority name source when opts include
+//	                    StructTagFormat("<format>").
+//	gobi:"col"          universal name override, applied for every
+//	                    io format when no format-specific tag matches.
+//	csv:"col"           legacy fallback name override.
+//	<tag>:"-"           skip this field entirely.
 //	geom:"true"         geometry column — see below for value handling
 //	time:"2006-01-02"   parse string field as time.Time using the layout;
 //	                    ignored for time.Time-typed fields
@@ -50,13 +149,13 @@ var ErrUnsupportedStructField = errors.New("gobi: unsupported struct field type"
 //	[]byte           (arrow Binary)
 //	time.Time        (arrow Timestamp[ns])
 //	*T of any above  (nullable)
-func FromStructs[T any](rows []T) (*Frame, error) {
+func FromStructs[T any](rows []T, opts ...StructOption) (*Frame, error) {
 	var zero T
 	tp := reflect.TypeOf(zero)
 	if tp.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("%w: T must be a struct, got %s", ErrUnsupportedStructField, tp.Kind())
 	}
-	plan, err := planStructFields(tp)
+	plan, err := planStructFields(tp, resolveStructOpts(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +218,7 @@ func FromStructs[T any](rows []T) (*Frame, error) {
 // written back to a string field tagged `geom:"true"` (emits WKT
 // via geometry.WKT()) or a []byte field tagged `geom:"true"` (raw
 // WKB pass-through).
-func ToStructs[T any](f *Frame) ([]T, error) {
+func ToStructs[T any](f *Frame, opts ...StructOption) ([]T, error) {
 	if f == nil {
 		return nil, fmt.Errorf("gobi: ToStructs: nil frame")
 	}
@@ -128,7 +227,7 @@ func ToStructs[T any](f *Frame) ([]T, error) {
 	if tp.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("%w: T must be a struct, got %s", ErrUnsupportedStructField, tp.Kind())
 	}
-	plan, err := planStructFields(tp)
+	plan, err := planStructFields(tp, resolveStructOpts(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -199,8 +298,9 @@ func (p structFieldPlan) arrowField() arrow.Field {
 }
 
 // planStructFields reflects on tp and builds one structFieldPlan per
-// exported field.
-func planStructFields(tp reflect.Type) ([]structFieldPlan, error) {
+// exported field. o controls which struct-tag namespaces are consulted
+// for column names — see resolveFieldName for the resolution order.
+func planStructFields(tp reflect.Type, o *structOpts) ([]structFieldPlan, error) {
 	timeType := reflect.TypeFor[time.Time]()
 	out := make([]structFieldPlan, 0, tp.NumField())
 	for i := 0; i < tp.NumField(); i++ {
@@ -208,9 +308,9 @@ func planStructFields(tp reflect.Type) ([]structFieldPlan, error) {
 		if !sf.IsExported() {
 			continue
 		}
-		name := sf.Tag.Get("csv")
-		if name == "" {
-			name = sf.Name
+		name, skip := resolveFieldName(sf, o)
+		if skip {
+			continue
 		}
 		ft := sf.Type
 		isPtr := ft.Kind() == reflect.Ptr

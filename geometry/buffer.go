@@ -4,14 +4,15 @@
 // geometry. This file supports positive (outward) buffers for Point,
 // LineString, and Polygon using rounded joins/caps. Negative (inward)
 // buffers and self-overlapping outputs from concave input rings are not
-// simplified here — that would require a polygon union/clipping engine,
-// which is intentionally out of scope.
+// simplified here. Composing Buffer with Union / Difference (see
+// clip.go, v0.3.0) is the intended follow-up for those cases.
 
 package geometry
 
 import (
 	"fmt"
 	"math"
+	"slices"
 )
 
 // DefaultBufferSegments is the number of straight segments used to
@@ -19,12 +20,32 @@ import (
 // specify one.
 const DefaultBufferSegments = 32
 
+// BufferStyle picks the shape of Buffer's caps and joins.
+type BufferStyle uint8
+
+const (
+	// BufferRound emits rounded caps (semicircles) and rounded convex
+	// joins. Matches shapely's cap_style=round + join_style=round.
+	// Default (zero value).
+	BufferRound BufferStyle = iota
+	// BufferSquare emits square outputs: Point becomes an
+	// axis-aligned square of half-width = distance; LineString gets
+	// flat caps extended by distance and mitre joins; Polygon gets
+	// mitre (sharp) joins. Matches shapely's cap_style=square +
+	// join_style=mitre. Faster than BufferRound and produces fewer
+	// vertices, but strongly-concave inputs may need clamping.
+	BufferSquare
+)
+
 // BufferOptions configures Buffer behavior.
 type BufferOptions struct {
 	// Segments controls the number of straight edges used to approximate a
-	// full circle. Higher = smoother, larger output. 0 falls back to
-	// DefaultBufferSegments.
+	// full circle in BufferRound style. Higher = smoother, larger output.
+	// 0 falls back to DefaultBufferSegments. Ignored when Style is
+	// BufferSquare.
 	Segments int
+	// Style picks between rounded and square outputs. See BufferStyle.
+	Style BufferStyle
 }
 
 func (o BufferOptions) segments() int {
@@ -35,7 +56,8 @@ func (o BufferOptions) segments() int {
 }
 
 // Buffer returns a polygon (or MultiPolygon-shaped result) approximating
-// the set of points within distance of g, using rounded joins and caps.
+// the set of points within distance of g. The Style option in opts
+// picks between rounded (default) and square caps/joins.
 //
 // Only positive distances are supported. Passing distance <= 0 returns
 // (nil, error). Buffering Polygon inputs assumes the input's exterior ring
@@ -46,33 +68,247 @@ func Buffer(g Geometry, distance float64, opts BufferOptions) (Geometry, error) 
 		return nil, fmt.Errorf("buffer: distance must be > 0, got %v", distance)
 	}
 	segments := opts.segments()
+	square := opts.Style == BufferSquare
+	pointBuf := func(p Point) Polygon {
+		if square {
+			return p.bufferSquare(distance)
+		}
+		return p.Buffer(distance, segments)
+	}
+	lineBuf := func(l LineString) Polygon {
+		if square {
+			return l.bufferSquare(distance)
+		}
+		return l.Buffer(distance, segments)
+	}
+	polyBuf := func(p Polygon) Polygon {
+		if square {
+			return p.bufferSquare(distance)
+		}
+		return p.Buffer(distance, segments)
+	}
 	switch t := g.(type) {
 	case Point:
-		return t.Buffer(distance, segments), nil
+		return pointBuf(t), nil
 	case LineString:
-		return t.Buffer(distance, segments), nil
+		return lineBuf(t), nil
 	case Polygon:
-		return t.Buffer(distance, segments), nil
+		return polyBuf(t), nil
 	case MultiPoint:
 		polys := make([]Polygon, len(t.Points))
 		for i, p := range t.Points {
-			polys[i] = p.Buffer(distance, segments)
+			polys[i] = pointBuf(p)
 		}
 		return MultiPolygon{Polygons: polys, CRSValue: t.CRSValue}, nil
 	case MultiLineString:
 		polys := make([]Polygon, len(t.Lines))
 		for i, l := range t.Lines {
-			polys[i] = l.Buffer(distance, segments)
+			polys[i] = lineBuf(l)
 		}
 		return MultiPolygon{Polygons: polys, CRSValue: t.CRSValue}, nil
 	case MultiPolygon:
 		polys := make([]Polygon, len(t.Polygons))
 		for i, p := range t.Polygons {
-			polys[i] = p.Buffer(distance, segments)
+			polys[i] = polyBuf(p)
 		}
 		return MultiPolygon{Polygons: polys, CRSValue: t.CRSValue}, nil
 	}
 	return nil, fmt.Errorf("buffer: unsupported type %T", g)
+}
+
+// bufferSquare emits an axis-aligned square of half-width = distance
+// centered on p. This is the Square-style analogue of p.Buffer.
+func (p Point) bufferSquare(distance float64) Polygon {
+	ring := []Point{
+		{X: p.X - distance, Y: p.Y - distance, CRSValue: p.CRSValue},
+		{X: p.X + distance, Y: p.Y - distance, CRSValue: p.CRSValue},
+		{X: p.X + distance, Y: p.Y + distance, CRSValue: p.CRSValue},
+		{X: p.X - distance, Y: p.Y + distance, CRSValue: p.CRSValue},
+		{X: p.X - distance, Y: p.Y - distance, CRSValue: p.CRSValue},
+	}
+	return Polygon{Rings: [][]Point{ring}, CRSValue: p.CRSValue}
+}
+
+// bufferSquare emits a thick-line polygon with flat caps extended by
+// distance beyond each endpoint (matching shapely's cap_style=square)
+// and mitre joins at internal vertices. On a 2-point line, this is
+// exactly a rectangle rotated to align with the segment.
+func (l LineString) bufferSquare(distance float64) Polygon {
+	if len(l.Points) < 2 {
+		if len(l.Points) == 1 {
+			return l.Points[0].bufferSquare(distance)
+		}
+		return Polygon{CRSValue: l.CRSValue}
+	}
+	// Right side (perpendicular +1) and left side (perpendicular -1)
+	// offsets along the line, with square end-cap extensions.
+	right := squareSideOffset(l.Points, distance, +1)
+	left := squareSideOffset(l.Points, distance, -1)
+	// Compose into a closed ring: right forward, extend end cap, left
+	// reversed, extend start cap.
+	ring := make([]Point, 0, len(right)+len(left)+4)
+	// Extend the right-side first point BACKWARD by distance along the
+	// heading to produce a square start cap.
+	first, next := l.Points[0], l.Points[1]
+	startCapDir := unitVec(first, next)
+	// The start of the "right" side, pulled back along -startCapDir.
+	rStart := Point{
+		X:        right[0].X - distance*startCapDir.X,
+		Y:        right[0].Y - distance*startCapDir.Y,
+		CRSValue: l.CRSValue,
+	}
+	// Extend the right-side last point FORWARD by distance along the
+	// heading of the last segment.
+	last, prev := l.Points[len(l.Points)-1], l.Points[len(l.Points)-2]
+	endCapDir := unitVec(prev, last)
+	rEnd := Point{
+		X:        right[len(right)-1].X + distance*endCapDir.X,
+		Y:        right[len(right)-1].Y + distance*endCapDir.Y,
+		CRSValue: l.CRSValue,
+	}
+	lStart := Point{
+		X:        left[0].X - distance*startCapDir.X,
+		Y:        left[0].Y - distance*startCapDir.Y,
+		CRSValue: l.CRSValue,
+	}
+	lEnd := Point{
+		X:        left[len(left)-1].X + distance*endCapDir.X,
+		Y:        left[len(left)-1].Y + distance*endCapDir.Y,
+		CRSValue: l.CRSValue,
+	}
+	ring = append(ring, rStart)
+	ring = append(ring, right...)
+	ring = append(ring, rEnd)
+	ring = append(ring, lEnd)
+	for i := len(left) - 1; i >= 0; i-- {
+		ring = append(ring, left[i])
+	}
+	ring = append(ring, lStart)
+	ring = append(ring, rStart) // close
+	return Polygon{Rings: [][]Point{ring}, CRSValue: l.CRSValue}
+}
+
+// bufferSquare emits an outward-offset polygon with mitre joins at
+// vertices — sharp corners rather than rounded arcs. Faster and
+// simpler than rounded-Buffer; strongly-concave inputs may produce
+// self-intersecting output (same caveat as rounded Polygon buffer).
+func (p Polygon) bufferSquare(distance float64) Polygon {
+	if len(p.Rings) == 0 || len(p.Rings[0]) < 3 {
+		return Polygon{CRSValue: p.CRSValue}
+	}
+	ext := closedRing(p.Rings[0])
+	side := 1
+	if ringIsCW(ext) {
+		side = -1
+	}
+	outer := mitreOffsetClosedRing(ext, distance, side)
+	if len(outer) > 0 && outer[0] != outer[len(outer)-1] {
+		outer = append(outer, outer[0])
+	}
+	rings := [][]Point{outer}
+	for _, h := range p.Rings[1:] {
+		hh := closedRing(h)
+		holeSide := -1
+		if ringIsCW(hh) {
+			holeSide = 1
+		}
+		offset := mitreOffsetClosedRing(hh, distance, holeSide)
+		if len(offset) < 4 {
+			continue
+		}
+		if offset[0] != offset[len(offset)-1] {
+			offset = append(offset, offset[0])
+		}
+		rings = append(rings, offset)
+	}
+	return Polygon{Rings: rings, CRSValue: p.CRSValue}
+}
+
+// unitVec returns the unit vector from a to b (as a Point-shaped pair).
+// If a == b, returns zero vector.
+func unitVec(a, b Point) Point {
+	dx, dy := b.X-a.X, b.Y-a.Y
+	n := math.Sqrt(dx*dx + dy*dy)
+	if n == 0 {
+		return Point{}
+	}
+	return Point{X: dx / n, Y: dy / n}
+}
+
+// squareSideOffset walks pts and emits offset points on side (+1 = right,
+// -1 = left of direction of travel). No arcs at internal vertices — mitre
+// joins by extending the two perpendicular half-planes and intersecting.
+func squareSideOffset(pts []Point, distance float64, side int) []Point {
+	n := len(pts)
+	out := make([]Point, 0, n)
+	// First point: perpendicular offset from the first segment.
+	nx0, ny0 := unitNormal(pts[0], pts[1], side)
+	out = append(out, Point{X: pts[0].X + distance*nx0, Y: pts[0].Y + distance*ny0, CRSValue: pts[0].CRSValue})
+	// Internal vertices: mitre — intersect the two offset lines meeting
+	// at this vertex.
+	for i := 1; i < n-1; i++ {
+		nxIn, nyIn := unitNormal(pts[i-1], pts[i], side)
+		nxOut, nyOut := unitNormal(pts[i], pts[i+1], side)
+		// Offset-line points and directions.
+		p1 := Point{X: pts[i-1].X + distance*nxIn, Y: pts[i-1].Y + distance*nyIn}
+		d1 := unitVec(pts[i-1], pts[i])
+		p2 := Point{X: pts[i+1].X + distance*nxOut, Y: pts[i+1].Y + distance*nyOut}
+		d2 := unitVec(pts[i+1], pts[i]) // reversed so both lines "point into" the corner
+		d2.X, d2.Y = -d2.X, -d2.Y
+		x, y, ok := intersectLines(p1, d1, p2, d2)
+		if !ok {
+			// Parallel — fall back to perpendicular offset.
+			out = append(out, Point{X: pts[i].X + distance*nxIn, Y: pts[i].Y + distance*nyIn, CRSValue: pts[i].CRSValue})
+			continue
+		}
+		out = append(out, Point{X: x, Y: y, CRSValue: pts[i].CRSValue})
+	}
+	// Last point: perpendicular offset from the last segment.
+	nxN, nyN := unitNormal(pts[n-2], pts[n-1], side)
+	out = append(out, Point{X: pts[n-1].X + distance*nxN, Y: pts[n-1].Y + distance*nyN, CRSValue: pts[n-1].CRSValue})
+	return out
+}
+
+// mitreOffsetClosedRing offsets a CLOSED ring outward (side controls the
+// direction) with mitre joins at every vertex. Assumes ring is closed
+// (first == last).
+func mitreOffsetClosedRing(ring []Point, distance float64, side int) []Point {
+	n := len(ring) - 1 // last is a duplicate of first
+	if n < 3 {
+		return nil
+	}
+	out := make([]Point, 0, n)
+	for i := range n {
+		prev := ring[(i-1+n)%n]
+		cur := ring[i]
+		next := ring[(i+1)%n]
+		nxIn, nyIn := unitNormal(prev, cur, side)
+		nxOut, nyOut := unitNormal(cur, next, side)
+		p1 := Point{X: prev.X + distance*nxIn, Y: prev.Y + distance*nyIn}
+		d1 := unitVec(prev, cur)
+		p2 := Point{X: next.X + distance*nxOut, Y: next.Y + distance*nyOut}
+		d2 := unitVec(next, cur)
+		d2.X, d2.Y = -d2.X, -d2.Y
+		x, y, ok := intersectLines(p1, d1, p2, d2)
+		if !ok {
+			out = append(out, Point{X: cur.X + distance*nxIn, Y: cur.Y + distance*nyIn, CRSValue: cur.CRSValue})
+			continue
+		}
+		out = append(out, Point{X: x, Y: y, CRSValue: cur.CRSValue})
+	}
+	return out
+}
+
+// intersectLines returns the intersection of the infinite lines through
+// p1 (direction d1) and p2 (direction d2). ok is false if the lines are
+// parallel.
+func intersectLines(p1, d1, p2, d2 Point) (x, y float64, ok bool) {
+	det := d1.X*d2.Y - d1.Y*d2.X
+	if math.Abs(det) < 1e-15 {
+		return 0, 0, false
+	}
+	t := ((p2.X-p1.X)*d2.Y - (p2.Y-p1.Y)*d2.X) / det
+	return p1.X + t*d1.X, p1.Y + t*d1.Y, true
 }
 
 // Buffer returns a circular polygon of radius distance centered on p,
@@ -83,7 +319,7 @@ func (p Point) Buffer(distance float64, segments int) Polygon {
 		segments = DefaultBufferSegments
 	}
 	ring := make([]Point, segments+1)
-	for i := 0; i < segments; i++ {
+	for i := range segments {
 		theta := 2 * math.Pi * float64(i) / float64(segments)
 		ring[i] = Point{
 			X:        p.X + distance*math.Cos(theta),
@@ -128,8 +364,8 @@ func (l LineString) Buffer(distance float64, segments int) Polygon {
 	ring = append(ring, arcAround(end, endHeading-math.Pi/2, endHeading+math.Pi/2, distance, arcSegs, l.CRSValue)...)
 
 	// Reversed left side.
-	for i := len(left) - 1; i >= 0; i-- {
-		ring = append(ring, left[i])
+	for _, l := range slices.Backward(left) {
+		ring = append(ring, l)
 	}
 
 	// Start cap around the first vertex.
@@ -280,7 +516,7 @@ func offsetClosedRing(pts []Point, distance float64, side, arcSegs int) []Point 
 		return nil
 	}
 	out := make([]Point, 0, n*(arcSegs+2))
-	for i := 0; i < n; i++ {
+	for i := range n {
 		prev := uniq[(i-1+n)%n]
 		cur := uniq[i]
 		next := uniq[(i+1)%n]
@@ -393,7 +629,7 @@ func arcAround(center Point, startAng, endAng, radius float64, segments int, crs
 // ringIsCW reports whether the closed ring is clockwise (signed area < 0).
 func ringIsCW(ring []Point) bool {
 	var a float64
-	for i := 0; i < len(ring)-1; i++ {
+	for i := range len(ring) - 1 {
 		a += ring[i].X*ring[i+1].Y - ring[i+1].X*ring[i].Y
 	}
 	return a < 0

@@ -95,8 +95,24 @@ func TestBuildGeoParquetMetadata_CRSNon4326(t *testing.T) {
 	if col.CRS == nil {
 		t.Fatal("expected non-nil CRS for EPSG:3857")
 	}
-	if id, ok := col.CRS["id"].(map[string]any); !ok || id["code"] != int32(3857) {
-		t.Errorf("crs id = %v", col.CRS["id"])
+	// PROJJSON is parsed from JSON so `code` is decoded as float64. Compare
+	// the numeric value, not the Go representation.
+	id, ok := col.CRS["id"].(map[string]any)
+	if !ok {
+		t.Fatalf("crs id has type %T, want map[string]any", col.CRS["id"])
+	}
+	codeNum, ok := id["code"].(float64)
+	if !ok || codeNum != 3857 {
+		t.Errorf("crs id.code = %v (%T), want 3857", id["code"], id["code"])
+	}
+	// Also verify canonical PROJJSON fields — required for pyproj to
+	// reconstruct the CRS. Prior versions of crsPROJJSON emitted only
+	// $schema/type/id, which pyproj rejected with "Missing base_crs".
+	if _, ok := col.CRS["base_crs"]; !ok {
+		t.Error("PROJJSON should include base_crs for a projected CRS")
+	}
+	if _, ok := col.CRS["conversion"]; !ok {
+		t.Error("PROJJSON should include conversion for a projected CRS")
 	}
 }
 

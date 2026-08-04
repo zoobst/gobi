@@ -5,6 +5,244 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.0]
+
+### Added
+
+- **Polygon boolean ops** in `geometry/`:
+  - `Clip(subject, mask)` (intersection),
+  - `Union(a, b)`,
+  - `Difference(a, b)`,
+  - `SymDifference(a, b)`,
+  - `Boolean(a, b, op, opts ClipOptions)` (shared entry point),
+  - `Dissolve(geoms []Geometry)` — collection reducer using
+    spatially-sorted divide-and-conquer merge (like shapely's
+    `unary_union`).
+
+  Implementation is a from-scratch Martinez-Rueda sweepline (event
+  queue + status structure + subdivision + inOut classification +
+  contour reconnection with hole nesting via PIP + area sort). Pure
+  Go — no cgo, no GEOS, no libproj. Events pooled via `sync.Pool`
+  so the M-cell hot loop drops per-call allocations.
+
+  A **Sutherland-Hodgman fast path** dispatches automatically when
+  both operands are single-ring convex Polygons and the op is
+  intersection (`BenchmarkClip_ConvexFastPath` runs at 998 ns/op /
+  7 allocs vs the general sweep's 4258 ns/op / 33 allocs).
+
+  Accepted inputs: `Polygon`, `MultiPolygon`. Requires a projected
+  CRS on both sides (`ErrGeographicCRS` on geographic input).
+  Configurable relative tolerance via `ClipOptions.Tolerance`;
+  default (`1e-10`) is chosen for coastal-scale UTM coordinates.
+
+- **Series-level polygon boolean ops** in `series_geom_clip.go`:
+  `Series.GeomClip(mask)`, `Series.GeomUnion(other)`,
+  `Series.GeomDifference(other)`, `Series.GeomSymDifference(other)`,
+  `Series.GeomDissolve()`, `Series.GeomEstimateUTMCRS()` (aggregate
+  UTM zone lookup — matches geopandas's `GeoDataFrame.estimate_utm_crs`),
+  and `Series.GeomToCRS(target)` (row-wise reprojection).
+
+- **Series batch spatial predicates**: `Series.GeomIntersects`,
+  `.GeomContains`, `.GeomWithin`, `.GeomDisjoint`, `.GeomTouches`,
+  `.GeomOverlaps`, `.GeomCrosses` — all return a Boolean Series,
+  nulls pass through. Match geopandas's `GeoSeries.<predicate>`
+  semantics.
+
+- **Series row-wise transforms**: `Series.GeomBuffer(distance, opts)`,
+  `Series.GeomSimplify(tolerance)`, `Series.GeomConvexHull()`,
+  `Series.GeomEnvelope()`. All produce a new geometry Series with the
+  input's CRS metadata.
+
+- **Series row-wise metric**: `Series.GeomDistance(other, unit)` —
+  min Euclidean distance from each row's geometry to `other`, in the
+  requested unit.
+
+- **Series introspection**: `Series.GeomIsEmpty()`,
+  `Series.GeomIsValid()` (Boolean), `Series.GeomType()` (String).
+  Validity checks include: line ≥ 2 points with no consecutive
+  duplicates, polygon rings ≥ 3 unique vertices with no self-
+  intersection (subset of OGC's full rules; sufficient for
+  "safe-to-feed-to-Boolean/Buffer" filtering).
+
+- **Antimeridian handling** for geographic-CRS inputs:
+  - `geometry.CrossesAntimeridian(g)` — detects |Δlon| > 180° on
+    any adjacent-vertex pair.
+  - `geometry.AntimeridianCrossings(g)` — returns (±180, lat)
+    crossing points.
+  - `geometry.SplitAtAntimeridian(g)` — splits crossing
+    LineString/Polygon/Multi geometries at ±180° via linear-lon
+    interpolation.
+  - `Series.GeomCrossesAntimeridian()` and
+    `Series.GeomSplitAtAntimeridian()` — Series wrappers.
+  - **`EstimateUTMCRS` now returns `ErrAntimeridianCrossing`** on
+    crossing input instead of silently picking the wrong zone
+    (previously a Fiji-shaped `[178, -178]` bounds landed on UTM
+    31N over Africa).
+
+- **Square-style Buffer**: new `BufferOptions.Style` field:
+  - `BufferRound` (default, existing behavior) — semicircle caps
+    + rounded joins.
+  - `BufferSquare` — Point emits an axis-aligned square of
+    half-width = distance; LineString gets flat/extended caps +
+    mitre joins; Polygon gets mitre corners. Matches shapely's
+    `cap_style=square` + `join_style=mitre`. Faster and produces
+    fewer vertices — a 1024-segment round buffer emits 1025
+    vertices; the square variant emits 5.
+
+- **Per-io struct-tag namespaces on FromStructs / ToStructs.** New
+  `StructOption` type with `StructTagFormat(format)` picks the
+  primary tag namespace for a call. Resolution fallback:
+  format-tag → `gobi:` → `csv:` (legacy) → field name. A tag value
+  of `"-"` in any consulted namespace skips the field entirely.
+  Exported helper `gobi.ResolveFieldName(sf, format)` for io
+  packages that build their own struct convenience wrappers.
+  Backward compatible: existing callers with only `csv:"..."` tags
+  see identical output.
+
+- **Struct-direct read/write wrappers across every io package.**
+  Each package exposes typed convenience methods that route
+  through `gobi.FromStructs` / `gobi.ToStructs` with the
+  package-specific tag namespace:
+
+  | Package | Namespace | Read | Write |
+  |---|---|---|---|
+  | parquetio | `parquet:` | `ReadStructs[T]` | `WriteStructs[T]` |
+  | csvio | `csv:` | `ReadStructs[T]` / `ReadStructsReader[T]` | — (read-only pkg) |
+  | geojsonio | `geojson:` | `ReadStructs[T]` | `WriteStructs[T]` |
+  | gpkgio | `gpkg:` | `ReadStructs[T]` | `WriteStructs[T]` |
+  | shpio | `shp:` | `ReadStructs[T]` | `WriteStructs[T]` |
+  | kmlio | `kml:` | `ReadStructs[T]` | `WriteStructs[T]` |
+  | pgio | `pgio:` | `ReadStructsQuery[T]` / `ReadStructsTable[T]` | `WriteStructsTable[T]` |
+
+  Each wrapper is ~10 lines of glue calling
+  `gobi.StructTagFormat("<namespace>")` so the namespaced tag wins
+  over `gobi:` / `csv:` / field name. Same struct can carry
+  different names per format (shp's 10-char DBF alias,
+  `parquet:"-"` to omit from parquet only, etc.). Round-trip tests
+  in each package's `structs_test.go`. pgio's is guarded by the
+  existing `integration` build tag.
+
+### Changed
+
+- `geometry/buffer.go` no longer names polygon Union/Clipping as
+  out-of-scope — the sweep engine shipped in this release.
+  Negative buffers and self-intersecting positive buffers on
+  concave inputs remain unaddressed and will be handled in a
+  follow-up that composes `Union` over the offset outputs.
+
+### Fixed
+
+- **Slow-path Clip mis-classified coincident edges when subject
+  and clipping-in-MultiPolygon-wrap represented the same polygon.**
+  The general Martinez-Rueda path chose sameTransition vs
+  differentTransition by comparing the two coincident partners'
+  `inOut` values — but `inOut` is derived from sweep-line state at
+  insertion time, and the two partners are inserted against
+  different predecessors. On identical CCW octagons, five of eight
+  edges survived; the result was a half-octagon with area 141
+  instead of 283. Fix: added `polyForward` (a stable per-event
+  flag set at enqueue time, recording whether the LEFT sweep event
+  corresponds to the ring-order start of that edge) and switched
+  `handleOverlap`'s different-role branch to compare polyForward
+  instead of inOut. Regressions in
+  `geometry/clip_multipoly_dup_test.go`.
+
+- **Hole/exterior misclassification on Dissolve outputs with many
+  overlapping intermediate regions.** The contour reconnection used
+  to derive each ring's `isHole` flag from a `prevInRes` chain —
+  which tracks *sweep-line adjacency*, not geometric enclosure. On
+  a Dissolve intermediate with densely-nested overlapping regions
+  the chain misclassified rings, producing outputs that either
+  dropped area or double-counted it. The bundled bench showed a
+  13% area disagreement vs geopandas at N=500 heavily-overlapping
+  polygons, with an inverse sign flip at intermediate N counts
+  (61% under-report at N=250, 14% over-report at N=500).
+
+  Fix: replaced the `prevInRes`-chain classifier with
+  `classifyHolesByContainment`, which sorts rings by absolute
+  planar area descending and PIP-tests each ring's first vertex
+  against every strictly-larger candidate. All prefix sizes now
+  match geopandas to at least 8 significant figures. See
+  `benchmarks/gobi/dissolve_bisect.go` for the diagnostic that
+  found this.
+
+- **GeoParquet PROJJSON emission** now embeds canonical PROJJSON
+  extracted from pyproj for every supported projected CRS
+  (EPSG:3857 + WGS 84 / UTM zones 32601–32660 and 32701–32760).
+  The previous minimal blob was rejected by pyproj with "Missing
+  base_crs", so `geopandas.read_parquet` on gobi-written
+  projected-CRS files failed. Data lives in
+  `geometry/projjson_data.json` and is bundled at compile time via
+  `//go:embed`. Verified end-to-end: gobi writes EPSG:32611 →
+  geopandas reads it → CRS round-trips as `WGS 84 / UTM zone 11N`.
+
+### Correctness (validation)
+
+**Bit-exact parity with geopandas** on the bundled two-way bench.
+Every op — Clip, Union, Difference, Dissolve, Reproject — reports
+0.0000% relative area spread against geopandas at least 8
+significant figures. Signature parity on EstimateUTMCRS (returned
+EPSG) matches exactly.
+
+**polyclip-go known-bugs regression tests.** polyclip-go's README
+calls out two open issues; both are permanent regression tests in
+`geometry/clip_polyclip_regressions_test.go` using the exact
+inputs from the upstream issues. Both cases: gobi produces the
+correct answer where polyclip-go is documented to fail.
+- polyclip-go issue #3 (Union of four touching rectangles):
+  polyclip returns area 3, gobi returns 4 (correct).
+- polyclip-go issue #8 (Intersection of a 227-point inner polygon
+  fully inside a 27-point outer, in WGS84 coordinates around LA):
+  polyclip returns empty, gobi returns the inner polygon.
+
+### Performance (500 heavily-overlapping polygons, Apple M3 Pro)
+
+Bundled bench pipeline: `EstimateUTMCRS → ToCRS → boolean ops` on
+500 WGS84 subject polygons clustered around Los Angeles.
+
+**Where gobi wins:**
+- **EstimateUTMCRS: ~83× faster than geopandas** (0.38 ms vs 31.8
+  ms). gobi's implementation is direct arithmetic on bounds + a
+  WGS84 → zone lookup; pyproj routes through the general PROJ4
+  pipeline.
+- **Reproject (WGS84 → UTM 11N): ~10× faster than geopandas**
+  (2.2 ms vs 21.0 ms). gobi uses ellipsoidal Redfearn formulas
+  inline; pyproj/PROJ4 handles the fully general case and pays
+  for it. Output areas match to 8 significant figures.
+- **Dissolve** (after the divide-and-conquer merge switch): ~45 ms
+  for 500 heavily-overlapping polygons (505 MiB allocations, 114
+  GCs) — down from an earlier linear-fold implementation at 1130
+  ms / 13.7 GiB / 2740 GCs (**26× faster, 27× less allocation**).
+  Within ~1.3× of shapely on this op instead of 38× away.
+- **Single-shot Clip / Difference / Union wall time is
+  competitive with geopandas** — gobi is 1.02× slower on Clip,
+  1.23× faster on Difference, 1.44× faster on Union at the
+  benchmark's 32-vertex-per-polygon size.
+
+**Bench harness**: `benchmarks/gobi/gobi_clip_bench.go` +
+`benchmarks/python/geopandas_clip_bench.py` consume the same
+`clip_subject.parquet` + `clip_mask.parquet` fixtures.
+`benchmarks/python/compare_clip_parity.py` runs the automated
+two-way diff (exits non-zero on >2% area disagreement).
+Gobi-side benchmarks include pprof CPU + heap profiles plus
+periodic MemStats snapshots so allocation trends are visible
+without a profiler.
+
+### Known limitations
+
+- **Antimeridian split**: holes that themselves cross the
+  antimeridian are dropped rather than split. Ring crossings > 2
+  collapse to a single ring per side rather than potentially
+  disjoint rings.
+- **Numeric epsilon**: default `1e-10` relative tolerance suits
+  UTM-scale (~1e6 m). At larger magnitudes (geocentric coordinates
+  or exotic projections) callers should supply an explicit
+  `ClipOptions.Tolerance`.
+- **Constant-factor sweep tuning** (event-queue heap-vs-slice
+  choice, status-structure allocation reuse, sorted-slice `insert`
+  copy loop) is on the follow-up list but not urgent given the
+  overall performance parity.
+
 ## [v0.2.22]
 
 ### Fixed

@@ -44,6 +44,9 @@ func (l LineString) EstimateUTMCRS() (CRS, error) {
 	if b.Empty() {
 		return CRS{}, ErrEmptyGeometry
 	}
+	if CrossesAntimeridian(l) {
+		return CRS{}, ErrAntimeridianCrossing
+	}
 	return estimateUTMFromXY((b.MinX+b.MaxX)/2, (b.MinY+b.MaxY)/2, l.CRSValue)
 }
 

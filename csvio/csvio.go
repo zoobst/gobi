@@ -559,9 +559,9 @@ func planStruct[T any](crsHint int32) ([]columnPlan, error) {
 		if !sf.IsExported() {
 			continue
 		}
-		name := sf.Tag.Get("csv")
-		if name == "" {
-			name = sf.Name
+		name, skip := gobi.ResolveFieldName(sf, "csv")
+		if skip {
+			continue
 		}
 		if sf.Tag.Get("geom") == "true" {
 			// Read as String, emit as Binary WKB tagged with the geometry

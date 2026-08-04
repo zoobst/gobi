@@ -230,6 +230,26 @@ func UTMEpsgFor(lon, lat float64) int32 {
 	return int32(32700 + zone)
 }
 
+// estimateUTMForGeometry resolves the UTM CRS covering g. Rejects g
+// with ErrAntimeridianCrossing when g is in a geographic CRS and any
+// pair of adjacent vertices spans |Δlon| > 180° — the bounds-center
+// approach would silently pick the wrong zone in that case. Callers
+// with antimeridian-crossing geographic input should route through
+// SplitAtAntimeridian first and estimate per component.
+func estimateUTMForGeometry(g Geometry) (CRS, error) {
+	if g == nil {
+		return CRS{}, ErrEmptyGeometry
+	}
+	if CrossesAntimeridian(g) {
+		return CRS{}, ErrAntimeridianCrossing
+	}
+	b := g.Bounds()
+	if b.Empty() {
+		return CRS{}, ErrEmptyGeometry
+	}
+	return estimateUTMFromXY((b.MinX+b.MaxX)/2, (b.MinY+b.MaxY)/2, g.CRS())
+}
+
 // estimateUTMFromXY resolves the UTM CRS covering (x, y) as expressed in the
 // given source CRS. If crs is projected, the point is first inverse-projected
 // to WGS84 to pick the zone.

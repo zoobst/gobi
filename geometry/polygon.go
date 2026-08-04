@@ -62,6 +62,9 @@ func (p Polygon) EstimateUTMCRS() (CRS, error) {
 	if len(p.Rings) == 0 || len(p.Rings[0]) == 0 {
 		return CRS{}, ErrEmptyGeometry
 	}
+	if CrossesAntimeridian(p) {
+		return CRS{}, ErrAntimeridianCrossing
+	}
 	c := p.Centroid()
 	return estimateUTMFromXY(c.X, c.Y, p.CRSValue)
 }

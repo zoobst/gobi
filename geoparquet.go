@@ -101,21 +101,26 @@ func describeGeometryColumn(s Series) (GeoParquetColumnMeta, error) {
 	return col, nil
 }
 
-// crsPROJJSON returns a minimal PROJJSON-shaped map for the given EPSG code.
-// EPSG:4326 returns nil, which the GeoParquet spec treats as "OGC:CRS84
-// implicit" — a common interop shortcut.
+// crsPROJJSON returns a canonical PROJJSON object for the given EPSG code,
+// suitable for embedding in a GeoParquet "geo" metadata blob. Returns nil
+// for:
+//
+//   - EPSG 0 (unset) or 4326 (WGS84): the GeoParquet spec treats a null
+//     crs as OGC:CRS84 implicit, matching what geographic-CRS data
+//     already means.
+//   - EPSG codes gobi doesn't have PROJJSON tables for. Downstream
+//     readers will treat these files as CRS-unknown, which is closer
+//     to correct than emitting invalid PROJJSON that pyproj rejects.
+//
+// The canonical PROJJSON comes from pyproj at authoring time and is
+// embedded in [geometry/projjson_data.json] — that guarantees
+// bit-compatible round-trips through geopandas without shipping a
+// hand-rolled minimal blob that pyproj won't parse.
 func crsPROJJSON(epsg int32) map[string]any {
 	if epsg == 0 || epsg == 4326 {
 		return nil
 	}
-	return map[string]any{
-		"$schema": "https://proj.org/schemas/v0.5/projjson.schema.json",
-		"type":    "GeographicCRS",
-		"id": map[string]any{
-			"authority": "EPSG",
-			"code":      epsg,
-		},
-	}
+	return geometry.PROJJSONFor(epsg)
 }
 
 func sortedKeys(m map[string]struct{}) []string {

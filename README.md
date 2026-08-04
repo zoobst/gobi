@@ -19,7 +19,22 @@ built around a strongly-typed schema.
   codes 1..7 for 2D, 1001..1007 for XYZ).
 - **Real spatial operations.** Area, length, centroid (every geometry
   type), convex hull, containment, `Simplify` (Douglas-Peucker), `Buffer`
-  with rounded joins and caps, `EstimateUTMCRS` on every type.
+  with rounded OR square joins/caps, `EstimateUTMCRS` on every type,
+  full topological predicates (`Intersects` / `Contains` / `Within` /
+  `Touches` / `Overlaps` / `Crosses` / `Disjoint`).
+- **Polygon boolean ops.** Pure-Go Martinez-Rueda sweepline:
+  `Clip` / `Union` / `Difference` / `SymDifference` and a
+  `Dissolve(geoms)` collection reducer using spatially-sorted
+  divide-and-conquer merge (like shapely's `unary_union`). Bit-exact
+  parity with geopandas verified on a 500-polygon benchmark; a
+  Sutherland-Hodgman fast path takes over when both operands are
+  convex (4× faster than the general sweep).
+- **Antimeridian handling.** `CrossesAntimeridian(g)` detects
+  ±180°-crossing geographic-CRS input; `SplitAtAntimeridian(g)`
+  splits it into per-side components via linear-lon interpolation.
+  `EstimateUTMCRS` refuses crossing input with a clear error rather
+  than silently returning the wrong zone (a Fiji-shaped bbox
+  `[178, -178]` used to pick UTM 31N over Africa).
 - **Geometry constructors from columns.** `PointsFromXY(x, y, crs)`
   and `PointsFromXYZ(x, y, z, crs)` build a WKB geometry Series
   directly from numeric coordinate columns — modeled on
@@ -114,15 +129,22 @@ built around a strongly-typed schema.
   `Series.RollingSum` / `Mean` / `Min` / `Max` / `Count`.
 - **Multi-format I/O.** Every format has `ReadFile` / `WriteFile` at
   Frame level plus a `ScanFile` LazyFrame entry point where the
-  underlying source supports it. Formats: CSV (with `.gz` / `.zst`
-  / `.bz2` auto-detect), Parquet with proper GeoParquet 1.1
-  metadata (snappy / gzip / brotli / zstd / lz4), full RFC 7946
-  GeoJSON (every geometry type + XYZ, `.geojsonl` streaming), OGC
-  GeoPackage 1.3 (SQLite, RTree spatial index, spec-compliant
-  metadata), PostgreSQL / PostGIS (via `pgx/v5`, native `CopyFrom`
-  bulk load), **KML + KMZ read/write** (zipped KML auto-detected
-  by `.kmz` extension), and **Shapefile read/write** (`.shp` +
-  `.shx` + `.dbf` + optional `.prj`).
+  underlying source supports it, and every format also has
+  struct-direct `ReadStructs[T]` / `WriteStructs[T]` wrappers with
+  a per-format struct-tag namespace — `parquet:` / `csv:` /
+  `geojson:` / `gpkg:` / `shp:` / `kml:` / `pgio:` — so the same
+  Go type can carry different column names per format (shp's
+  10-char DBF alias, `parquet:"-"` to omit from parquet only,
+  etc.). Formats: CSV (with `.gz` / `.zst` / `.bz2` auto-detect),
+  Parquet with proper GeoParquet 1.1 metadata (snappy / gzip /
+  brotli / zstd / lz4, canonical PROJJSON for EPSG:3857 + all 120
+  UTM zones), full RFC 7946 GeoJSON (every geometry type + XYZ,
+  `.geojsonl` streaming), OGC GeoPackage 1.3 (SQLite, RTree
+  spatial index, spec-compliant metadata), PostgreSQL / PostGIS
+  (via `pgx/v5`, native `CopyFrom` bulk load), **KML + KMZ
+  read/write** (zipped KML auto-detected by `.kmz` extension), and
+  **Shapefile read/write** (`.shp` + `.shx` + `.dbf` + optional
+  `.prj`).
 - **Streaming readers.** `csvio.ReadFileChunksFunc` and
   `parquetio.ReadFileChunksFunc` yield one Frame per record batch
   (~64k rows), releasing arrow buffers after each callback. Peak
@@ -401,9 +423,88 @@ proj,  _ := p.ToCRS(utm)       // coordinates now in meters
 
 ```go
 poly := geometry.SimplePolygon(points, geometry.PseudoMercator)
-buffered := poly.Buffer(100, 32) // 100-unit buffer, 32-segment circle approx
-simpler  := poly.Simplify(5.0)   // Douglas-Peucker at 5-unit tolerance
+
+// Rounded (semicircle caps, rounded joins) — the default.
+rounded, _ := geometry.Buffer(poly, 100, geometry.BufferOptions{Segments: 32})
+
+// Square-style buffer: flat/extended caps, mitre joins. Faster and
+// produces fewer vertices (5 instead of 33 for a Point).
+square, _ := geometry.Buffer(poly, 100, geometry.BufferOptions{
+    Style: geometry.BufferSquare,
+})
+
+simpler := poly.Simplify(5.0) // Douglas-Peucker at 5-unit tolerance
 ```
+
+### Polygon boolean ops (Clip / Union / Dissolve)
+
+```go
+subject := geometry.SimplePolygon(subjectPts, geometry.PseudoMercator)
+mask    := geometry.SimplePolygon(maskPts, geometry.PseudoMercator)
+
+// Row-scalar ops on a whole geometry Series.
+gs, _ := df.Column("geom")
+clipped,    _ := gs.GeomClip(mask)         // intersection per row
+unioned,    _ := gs.GeomUnion(mask)
+diffed,     _ := gs.GeomDifference(mask)
+
+// Dissolve every row's polygon into a single geometry (like
+// shapely's unary_union — divide-and-conquer merge, bit-exact
+// against geopandas on the bundled 500-polygon bench).
+merged, _ := gs.GeomDissolve()
+
+// Or reach the raw ops directly on a Geometry.
+inter, _ := geometry.Clip(subject, mask)
+uni,   _ := geometry.Union(subject, mask)
+```
+
+### Antimeridian split
+
+```go
+// A geographic-CRS polygon spanning ±180° confuses every naive
+// cartesian primitive. Detect + split it into per-side components
+// before feeding it downstream.
+poly := geometry.SimplePolygon([]geometry.Point{
+    {X: 170, Y: -10}, {X: -170, Y: -10},
+    {X: -170, Y: 10}, {X: 170, Y: 10}, {X: 170, Y: -10},
+}, geometry.WGS84)
+
+if geometry.CrossesAntimeridian(poly) {
+    split, _ := geometry.SplitAtAntimeridian(poly)
+    // split is a MultiPolygon with one component in [170,180] and
+    // another in [-180,-170]; each has valid, non-crossing bounds.
+}
+```
+
+### Struct-direct io
+
+Every io package has a struct-direct wrapper that uses per-format
+struct tags — `parquet:` for parquet, `shp:` for shapefile,
+`geojson:` for GeoJSON, etc. Resolution falls back to a universal
+`gobi:` tag when the format-specific one is absent, then to `csv:`
+(legacy), then to the Go field name. `format:"-"` skips a field.
+
+```go
+type Feature struct {
+    ID         int64   `parquet:"id" shp:"OBJECTID"` // per-format aliases
+    Name       string  `gobi:"name"`                 // shared across formats
+    Population float64 `shp:"POP10"`                 // 10-char DBF alias
+    Notes      string  `parquet:"-"`                 // omit from parquet
+    Geometry   []byte  `geom:"true"`                 // geometry marker
+}
+
+// Read a slice of structs directly — no Frame boilerplate.
+rows, err := parquetio.ReadStructs[Feature]("in.parquet", nil)
+
+// Write the same slice out as a shapefile — column names come from
+// the shp: tags automatically.
+err = shpio.WriteStructs(rows, "out", nil)
+```
+
+The same shape works for `csvio.ReadStructs`,
+`geojsonio.ReadStructs` / `WriteStructs`, `gpkgio.ReadStructs` /
+`WriteStructs`, `kmlio.ReadStructs` / `WriteStructs`, and
+`pgio.ReadStructsQuery` / `ReadStructsTable` / `WriteStructsTable`.
 
 ### R-tree
 
@@ -648,9 +749,11 @@ the parallelism you expected.
 - **Pure Go, no cgo.** GDAL, GEOS, libproj, and other C libraries are
   intentionally off the table. This keeps `go build` clean across every
   platform Go targets and avoids the LGPL/toolchain overhead. The trade:
-  no File Geodatabase support, no polygon Union/Intersection/Difference
-  (would require a Vatti / Martinez-Rueda hand-roll), no PROJ-grade
-  reprojection beyond WGS84 / Web Mercator / UTM.
+  no File Geodatabase support and no PROJ-grade reprojection beyond
+  WGS84 / Web Mercator / UTM. Polygon boolean ops (Clip / Union /
+  Difference / SymDifference / Dissolve) DO ship — as a pure-Go
+  Martinez-Rueda sweepline — but complex-projection pairs like
+  Albers ↔ Lambert still require an external tool.
 
 ## Performance
 

@@ -30,6 +30,9 @@ func (m MultiPolygon) EstimateUTMCRS() (CRS, error) {
 	if b.Empty() {
 		return CRS{}, ErrEmptyGeometry
 	}
+	if CrossesAntimeridian(m) {
+		return CRS{}, ErrAntimeridianCrossing
+	}
 	return estimateUTMFromXY((b.MinX+b.MaxX)/2, (b.MinY+b.MaxY)/2, m.CRSValue)
 }
 
