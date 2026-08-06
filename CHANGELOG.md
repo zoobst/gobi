@@ -5,6 +5,112 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.3]
+
+### Added
+
+- **First-class `Ellipse` type** in `geometry/ellipse.go`. Companion
+  to Circle (same "lightweight value, deliberately NOT a Geometry —
+  OGC has no ellipse encoding" shape). Two constructors, standard
+  methods, closed-form Ramanujan circumference:
+
+  ```go
+  type Ellipse struct {
+      Center   Point
+      SemiA    float64 // "first" semi-axis, along +X in local frame
+      SemiB    float64 // "second" semi-axis, along +Y in local frame
+      Rotation float64 // CCW radians from +X axis
+  }
+
+  e := geometry.NewEllipse(center, semiA, semiB, rotation)
+  e, err := geometry.EllipseFromFoci(f1, f2, majorAxis)  // classic definition
+
+  e.Contains(p)               // (x'/a)² + (y'/b)² ≤ 1 in local frame
+  e.Area()                    // πab (exact)
+  e.Circumference()           // Ramanujan II approximation
+  e.Bounds()                  // axis-aligned bbox of rotated ellipse
+  e.Boundary(n) Polygon       // closed CCW n-gon
+  e.BoundaryLine(n) LineString
+  ```
+
+  `EllipseFromFoci` validates that `majorAxis >= |f1 - f2|` (returns
+  `ErrEllipseFromFoci` otherwise — the two foci must fit inside the
+  would-be ellipse) and handles the coincident-foci case as a
+  circle. Rotation aligns with the f1→f2 direction; SemiB is
+  perpendicular; center is the midpoint of the foci.
+
+  Ramanujan II circumference: `π(a+b)(1 + 3h/(10 + √(4-3h)))` where
+  `h = ((a-b)/(a+b))²`. Exact for the circle case (h=0); ~1e-9
+  relative on moderate eccentricity (2:1 axis ratio); degrades to
+  ~1e-4 at extreme eccentricity. No closed-form solution exists —
+  the exact perimeter is an incomplete elliptic integral of the
+  second kind.
+
+  Bounds derived from the parametric extremum:
+  `x_half = √(a²cos²θ + b²sin²θ)`, `y_half = √(a²sin²θ + b²cos²θ)`.
+
+  Test corpus: axis-aligned Contains at boundary + diagonal
+  outside; 90°-rotated Contains verifying axis swap; area /
+  circumference agreement vs analytic; bounds for axis-aligned +
+  rotated; Boundary output vertex count / closure / on-ellipse
+  invariant; EllipseFromFoci for axis-aligned + rotated + coincident
+  (circle) + too-small majorAxis + non-positive majorAxis.
+
+- **Series-level Ellipse containment** in
+  `series_geom_ellipse.go`: `Series.GeomEllipseContains(e) Series`
+  — Boolean per row, matching the shape of GeomCircleContains.
+  Points tested directly; non-Point rows tested via their centroid.
+  Null rows pass through as null.
+
+- **Two-circle intersection + lens polygon** in
+  `geometry/circle_intersect.go`. Analytic — no sweep-line involved,
+  no dependency on the Martinez-Rueda machinery — since a two-arc
+  intersection has a closed-form solution:
+
+  ```go
+  // Zero, one, or two boundary crossing points. One point =
+  // externally or internally tangent; zero = disjoint, nested, or
+  // concentric.
+  pts := geometry.CircleIntersectionPoints(c1, c2)
+
+  // The overlap region as a Polygon, sampled arcSegments per arc.
+  // ~2·arcSegments vertices, wound CCW, CRS inherited from c1.
+  lens := geometry.LensPolygon(c1, c2, arcSegments)
+  ```
+
+  Intersection points computed from the standard chord-midpoint
+  construction: project c2's center onto the line from c1's center,
+  the chord's perpendicular half-length falls out of Pythagoras.
+  Tangent cases clip `h² < 0` to zero to survive float64 noise near
+  the tangent — otherwise a ULP of round-off would return zero
+  points instead of one.
+
+  Lens sampling: sample each arc between the two intersection
+  points, picking the arc direction that passes *through* the other
+  circle's center (that's the arc bounding the overlap region).
+  Direction picking normalizes the CCW sweep between endpoints into
+  `[0, 2π)`; if the "through" angle lies in that CCW range, sweep
+  CCW, otherwise sweep CW. Endpoints are forced bit-exact
+  post-sample so downstream Clip / topology code sees coincident
+  vertices as coincident. Ring is post-checked and reversed if the
+  reconstruction happened to come out CW — cheap and preserves area.
+
+  Special cases handled directly (never reach the arc sampler):
+  disjoint → empty Polygon; nested → smaller circle's Boundary;
+  tangent → empty Polygon (zero-area lens indistinguishable from
+  empty for consumers).
+
+  Test corpus: overlap (two points at expected coords), disjoint,
+  nested (both argument orders), external + internal tangent
+  (single-point return), concentric (nil), CRS propagation, lens
+  area against the analytic formula
+  `r₁²·acos(...) + r₂²·acos(...) − ½·√((-d+r₁+r₂)(d+r₁-r₂)(d-r₁+r₂)(d+r₁+r₂))`
+  for equal + unequal radii within 1e-3 rel err at 128–256
+  segments/arc, disjoint + tangent → empty polygon, nested → smaller
+  circle boundary (order-independent), CCW winding invariant (both
+  argument orders), closed ring, vertex count = ~2·arcSegments,
+  default-segments fallback.
+
 ## [v0.3.2]
 
 ### Added
