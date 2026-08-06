@@ -5,6 +5,55 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.2]
+
+### Added
+
+- **Great-circle sampling + densification** in
+  `geometry/geodesic.go`. Complements existing Haversine (distance
+  only) and pairs with Simplify / the antimeridian-split path —
+  polylines can now be densified along their geodesic before
+  splitting at ±180°, avoiding the "New York → Tokyo drawn as a
+  straight cartesian line through the middle of the Pacific"
+  failure mode:
+
+  ```go
+  // n points along the great-circle arc from a to b, inclusive
+  // of both endpoints. Requires geographic CRS on both sides.
+  samples, err := geometry.SampleGeodesic(a, b, n)
+
+  // Replace each segment of a LineString with its geodesic
+  // densification at ≤ stepMeters spacing (uses mean Earth radius).
+  dense, err := geometry.DensifyGeodesic(line, stepMeters)
+  ```
+
+  Implementation: standard spherical linear interpolation (slerp)
+  on unit-sphere vectors — ~30 lines of math, no ellipsoidal
+  corrections (matches the sphere assumption used by Haversine).
+  Antipodal inputs return `ErrAntipodalPoints` (great circle
+  isn't unique through antipodes); coincident inputs return the
+  point replicated; projected-CRS inputs return
+  `ErrGeodesicRequiresGeographic`. Endpoints are preserved
+  bit-exact via a post-slerp overwrite (float64 lat/lon
+  reconstruction can drift by a ULP otherwise).
+
+  Test corpus covers endpoint preservation, midpoint correctness
+  on an equatorial arc, the "NYC↔Tokyo great-circle midpoint sits
+  in the Arctic" case, arc-length agreement with Haversine within
+  1e-4, coincident + antipodal + projected-CRS + n<2 error paths,
+  and the multi-segment "no duplicated joints" invariant for
+  DensifyGeodesic.
+
+- **Series wrapper** in `series_geom_geodesic.go`:
+  `Series.GeomDensifyGeodesic(stepMeters)` — row-wise geodesic
+  densification over a LineString column. Non-LineString rows pass
+  through unchanged (Point / MultiPoint / Polygon don't have
+  "segments" in the geodesic sense — callers wanting polygon-ring
+  densification can extract rings, densify each as a LineString,
+  and rebuild). Null rows stay null; projected-CRS Series return
+  `ErrGeodesicRequiresGeographic` up front rather than after
+  per-row parse.
+
 ## [v0.3.1]
 
 ### Added
