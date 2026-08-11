@@ -5,6 +5,226 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.4]
+
+### Added
+
+- **Spatial predicates as `Expr`-form operators** in `expr_geom.go`.
+  `GeomIntersects`, `GeomContains`, `GeomWithin`, `GeomDisjoint` now
+  exist as fluent methods on `Expr`, so a spatial filter composes into
+  the same `LazyFrame.Filter(...)` chain as scalar predicates:
+
+  ```go
+  lf.Filter(
+      gobi.Col("level").Eq(gobi.Lit(1.0)).
+          And(gobi.Col("geometry").GeomIntersects(gobi.Lit(aoi))),
+  ).Collect()
+  ```
+
+  The right-hand side accepts either a `Lit(geom)` constant (fast
+  path — reuses the tested `Series.GeomIntersects` driver, so bbox
+  short-circuit and null propagation carry over unchanged) or another
+  geometry-column expression (new capability — pair-wise per-row
+  `geometry.Test`, not available at the Series level today).
+
+  Under the hood, a new `literalGeomNode` gives geometry literals
+  their own expression-tree node — separate from the scalar
+  `literalNode` — so a future optimizer can inspect a constant
+  geometry's bbox to prune GeoParquet row groups. `Lit(v)` routes any
+  value implementing `geometry.Geometry` through `LitGeom` so callers
+  don't need a separate constructor for the common shape.
+
+  Null semantics match Polars: any null operand (left null, right
+  null, or `Lit(nil)`) yields a null output row rather than false.
+
+  Test corpus: constant-right for all four predicates, column-right
+  intersects with null-propagation on both sides, the motivation's
+  compound `level == 1 AND intersects(aoi)` filter running end-to-end
+  through `LazyFrame.Collect`, `Lit(polygon)` routing to
+  `literalGeomNode`, degenerate `LitGeom(nil)` producing all-null
+  output, and the `ExprNode` reflection surface (Children / Type /
+  String) that tree walkers depend on.
+
+  Full predicate surface exposed in this release (see below).
+  `GeomDWithin(other, distance)` — the spatial-join operator — is
+  the natural next PR, blocked on a `geometry.MinDistance(a, b)`
+  primitive.
+
+- **Three more spatial predicates as `Expr`-form operators** —
+  `GeomTouches`, `GeomCrosses`, `GeomOverlaps` — completing the
+  four-plus-three surface flagged in the design proposal. Same
+  executor path as `GeomIntersects`: constant-right fast path reuses
+  the Series driver, column-right runs pair-wise `geometry.Test`,
+  nulls propagate from either side.
+
+  `geometry.Predicate` grew three enum values (`PredTouches`,
+  `PredCrosses`, `PredOverlaps`) so `geometry.Test(pred, a, b)`
+  dispatches to the existing `Touches` / `Crosses` / `Overlaps`
+  primitives with no closure-per-op indirection at the executor.
+
+- **GeoParquet 1.1 row-group bbox pushdown**. The design's
+  transformative payoff. Writer-side, `gobi.WithBboxCoveringColumns`
+  augments every write with per-row bbox columns
+  (`<geom>_bbox_xmin` / `_ymin` / `_xmax` / `_ymax`) and declares
+  them under `columns[geom].covering.bbox` in the geo metadata —
+  standard GeoParquet 1.1 covering-columns spec, so pyogrio /
+  geopandas / DuckDB spatial read them idiomatically too. Reader
+  side, the existing `CanPossiblyMatch` walker grew a case for
+  `*geomPredicateNode`: when the right operand is a `literalGeomNode`,
+  look up min/max stats on the four covering columns and skip row
+  groups whose bbox is disjoint from the constant's bbox.
+  `parquetio.ReadOptions.Predicate` (already `gobi.Expr`) accepts
+  spatial predicates now; the `parquetio.ScanFile(path).Filter(pred)`
+  lazy shape gets it via the optimizer's `PushPredicateToScan` rule,
+  no caller plumbing required.
+
+  New API surface introduced in this feature — see the "Changed
+  (post-review)" block below for the round-2 additions that pair
+  with the pushdown: `ReadOptions.IncludeCoveringColumns`,
+  `WriteOptions.SkipBboxCovering`, `geometry.PredDisjoint`,
+  `geometry.PlanarRingArea`. `LitGeom` and the seven `Expr.Geom*`
+  builders land under this same v0.3.4 tag from the earlier bullet.
+
+  Predicates supported for pruning: Intersects / Contains / Overlaps
+  / Touches / Crosses (all require bbox overlap as a necessary
+  condition) plus Within (same necessary condition) plus Disjoint
+  (skips when the row group is provably inside the constant).
+  Column-right or nested predicates pass through as "possibly
+  matches" — never wrongly prune.
+
+  Verified via `parquetio/spatial_pushdown_test.go`: a two-cluster
+  corpus written into two row groups; an AOI covering only cluster A
+  returns exactly A's rows (cluster B's row group is skipped); an
+  AOI covering both returns all rows; covering columns land in the
+  output schema; concave (L-shaped) Disjoint literal preserves the
+  row group its bbox contains (correctness case for the review-fix
+  below); rectangular Disjoint literal prunes cleanly.
+
+### Changed (post-review)
+
+Nine items from two rounds of v0.3.4 code review, addressed before
+tagging. First five are the round-1 items (correctness + UX shape);
+the next four are round-2 (nits + bugs surfaced during lazy-path
+conversion).
+
+- **Disjoint pruning correctness**: the naive rule "row group inside
+  lit's bbox → no row is disjoint" is only sound when lit's polygon
+  area equals its bbox area (a filled rectangle). For concave / holed
+  / country-boundary literals, a row inside lit's bbox but outside
+  lit's shape IS genuinely disjoint, and the naive prune would
+  silently drop it. Gated on `litIsBboxRectangle` — the common
+  AOI-rectangle case still prunes, everything else keeps the row
+  group and falls back to per-row filtering. Aligns with gobi's
+  hard rule: silent-wrong is worse than doing extra work.
+
+- **`geometry.PredDisjoint` enum value** replaces the previous
+  `PredIntersects` + `invert=true` side-channel on
+  `geomPredicateNode`. `n.pred` is now the single source of truth
+  for which predicate applies. `geometry.Test(pred, a, b)`
+  dispatches Disjoint directly as `!Intersects(a, b)`; the executor
+  drops its post-invert logic; output-column naming drops its
+  invert-flag override. Less state, fewer coupling surfaces.
+
+- **`ReadOptions.IncludeCoveringColumns`** (default false).
+  Preserves the `WriteFile(f)` ↔ `ReadFile(path)` round-trip
+  contract: the bbox covering columns land in the *file* (for
+  pruning) but stay hidden from the returned frame unless the
+  caller opts in. Round-trip tests read back with the same column
+  count they wrote. The columns are still used for row-group
+  skipping regardless of the flag.
+
+- **`WriteOptions.SkipBboxCovering`** (default false). Opt-out for
+  workloads where the writer's extra scan + 32 bytes/row aren't
+  worth the read-side benefit — tiny frames, streaming append
+  loops, or targets whose consumer doesn't do row-group pruning.
+
+- **`LitGeom` is now a predicate-only marker.** The old
+  `literalGeomNode.Eval` path materialized N copies of the WKB blob
+  as an Arrow Binary column (Arrow's monotonic-offsets constraint
+  gives no cheap "N rows point at one buffer" form). Non-predicate
+  positions (Select / WithColumn) now error at Eval with a message
+  pointing to the workaround (build the broadcast column outside
+  the Expr layer). Mirrors GeoPandas' approach — the constant lives
+  as a Python-object scalar and never becomes a column. The
+  constant-right predicate fast path detects the marker before Eval
+  runs, so the common shape is unaffected.
+
+- **Pushdown idempotency fix** in the parquetio
+  `WithPredicatePushdown` callback. The optimizer runs a fixed-point
+  loop; the callback was rebuilding a fresh `ScanFile` with the
+  predicate AND-ed onto `opts.Predicate` on every pass, producing an
+  exponentially-nested `(P AND P AND P …)` chain 30+ deep by the
+  iteration cap. Fixed by walking the current `opts.Predicate` tree
+  for structural equality (via `Expr.String()`) and returning nil
+  (`= "no change"`) when the incoming pred is already applied. Only
+  surfaced during the lazy-path conversion of the `gshhs_query`
+  demo — the eager `ReadFile(path, {Predicate: p})` path never
+  exercised the optimizer.
+
+- **Schema/runtime alignment for hidden covering columns** in
+  `parquetio.ReadSchema`. `ReadSchema` returned the full file
+  schema (including the 4 bbox covering columns), but
+  `frameFromRecord` returned batches with those columns dropped
+  when `IncludeCoveringColumns` was false. The scan node's declared
+  `Schema()` (from `ReadSchema`) then disagreed with the batches
+  actually flowing through the executor, and downstream operators
+  walked column indices into the wrong types — the `utf8 vs
+  float64` concat panic. Fixed by applying the same
+  covering-column projection in `ReadSchema` so plan schema and
+  runtime frames stay in agreement. Same reachability caveat:
+  eager path never triggered this.
+
+- **`geometry.PlanarRingArea`** exported (was internal
+  `planarRingArea`). Deduplicated `predicate_stats.go`'s local
+  shoelace implementation — the invariant "planar area of a ring"
+  now lives in one place. Callers wanting spherical geographic area
+  should still use `Polygon.Area(u Unit)`; `PlanarRingArea` is
+  planar-only and CRS-agnostic.
+
+- **Doc + test polish** from the round-2 review: refreshed the
+  Disjoint-branch docstring in `canMatchGeomPredicate` (it still
+  described the pre-fix `invert=true` shape); tightened the concave
+  Disjoint test to prove upper-right cluster IDs specifically
+  survive (`>= 200 rows` alone would have passed a bug that kept
+  both row groups); annotated the empty-bounds branch to cover both
+  the nil-literal and empty-Polygon degenerate cases; noted the
+  rectangle check's representation-strictness; documented
+  `coveringColumnNames`'s deliberate error-swallowing behavior on
+  malformed geo metadata.
+
+### Benchmarks
+
+- **`BenchmarkSpatialFilter_*`** in `expr_geom_bench_test.go` —
+  synthetic 5000-polygon corpus, three shapes:
+
+  | Pattern                              | ns/op    | B/op    | allocs/op |
+  |--------------------------------------|---------:|--------:|----------:|
+  | Compound Expr (v0.3.4, one shot)     |  867,854 | 2.44 MB |    20,175 |
+  | Two-phase eager (cached + Series op) |  401,204 | 1.22 MB |    10,086 |
+  | Cached scalar + Expr geom filter     |  410,708 | 1.23 MB |    10,159 |
+
+  Takeaway: routing through the Expr executor costs essentially
+  nothing (411μs vs 401μs, within 2.5%). The 2× cost of the
+  compound one-shot comes entirely from re-scanning the scalar
+  predicate each iteration.
+
+- **`BenchmarkSpatialPushdown_ClusteredFile`** in
+  `parquetio/spatial_pushdown_bench_test.go` — 10k-polygon two-cluster
+  parquet, two row groups, AOI over cluster A only:
+
+  | Read                          | ns/op   | B/op    | allocs/op |
+  |-------------------------------|--------:|--------:|----------:|
+  | No predicate (both groups)    | 931,492 | 5.09 MB |     1,170 |
+  | With predicate (1 group skip) | 598,045 | 2.49 MB |     1,080 |
+
+  **1.56× faster read, 51% less memory** when pushdown prunes a
+  row group. Practical benefit scales with how spatially-clustered
+  the row groups are: files sorted by Hilbert / R-tree ordering see
+  the full effect; files in insertion order (a raw SHP → parquet
+  dump) see modest gains because continent-spanning polygons leak
+  their bboxes into every row group. Spatial-sort is a v0.3.5+
+  candidate.
+
 ## [v0.3.3]
 
 ### Added

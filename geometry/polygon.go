@@ -284,6 +284,19 @@ func closedRing(r []Point) []Point {
 	return out
 }
 
+// PlanarRingArea returns the planar (unsigned) area of a ring via
+// the shoelace formula. Independent of CRS — callers that need the
+// spherical-area interpretation for geographic coordinates should
+// use Polygon.Area with a Unit instead. Exposed so downstream
+// packages (predicate stats, buffer heuristics) can compute planar
+// areas without re-implementing the shoelace loop.
+//
+// Rings that aren't explicitly closed (first vertex != last vertex)
+// are treated as if the caller had appended the first vertex again.
+func PlanarRingArea(ring []Point) float64 {
+	return planarRingArea(ring)
+}
+
 func planarRingArea(ring []Point) float64 {
 	if len(ring) < 3 {
 		return 0

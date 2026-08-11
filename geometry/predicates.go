@@ -10,6 +10,22 @@ const (
 	PredContains
 	// PredWithin: a lies fully within b (equivalent to Contains(b, a)).
 	PredWithin
+	// PredTouches: a and b share boundary points but no interior
+	// points. Matches DE-9IM T*F**F*** / F*T**F*** / F**T*F***.
+	PredTouches
+	// PredCrosses: a and b share some but not all interior points and
+	// the dimension of the intersection is less than max(dim(a), dim(b)).
+	// Typical shape: LineString × Polygon or LineString × LineString
+	// with mixed dimensions.
+	PredCrosses
+	// PredOverlaps: a and b share some interior points, neither
+	// contains the other, and both are of the same dimension.
+	PredOverlaps
+	// PredDisjoint: a and b share no point. Exactly the negation of
+	// PredIntersects; kept as its own value so downstream code
+	// dispatches on n.pred alone rather than an "intersects + invert"
+	// side-channel (which is easy to trip on when adding new logic).
+	PredDisjoint
 )
 
 func (p Predicate) String() string {
@@ -20,6 +36,14 @@ func (p Predicate) String() string {
 		return "contains"
 	case PredWithin:
 		return "within"
+	case PredTouches:
+		return "touches"
+	case PredCrosses:
+		return "crosses"
+	case PredOverlaps:
+		return "overlaps"
+	case PredDisjoint:
+		return "disjoint"
 	default:
 		return "unknown"
 	}
@@ -34,6 +58,14 @@ func Test(pred Predicate, a, b Geometry) bool {
 		return Contains(a, b)
 	case PredWithin:
 		return Contains(b, a)
+	case PredTouches:
+		return Touches(a, b)
+	case PredCrosses:
+		return Crosses(a, b)
+	case PredOverlaps:
+		return Overlaps(a, b)
+	case PredDisjoint:
+		return !Intersects(a, b)
 	default:
 		return false
 	}

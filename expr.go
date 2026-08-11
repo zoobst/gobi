@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/apache/arrow-go/v18/arrow"
+
+	"github.com/zoobst/gobi/geometry"
 )
 
 // Expr is an expression tree — a value that describes a computation
@@ -83,10 +85,17 @@ func Col(name string) Expr {
 //	float32, float64    → Float64
 //	string              → String
 //
+// Values implementing geometry.Geometry (Point, LineString, Polygon,
+// etc.) route to LitGeom, so `Lit(aoi).GeomIntersects(...)` composes
+// with the spatial-predicate builders without a separate constructor.
+//
 // Other Go types return an Expr whose Eval reports a type-inference
 // error. For a typed-null literal (e.g. a null-of-type-String column),
 // use LitNull.
 func Lit(v any) Expr {
+	if g, ok := v.(geometry.Geometry); ok {
+		return LitGeom(g)
+	}
 	return Expr{node: newLiteralNode(v)}
 }
 

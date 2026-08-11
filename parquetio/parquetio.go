@@ -125,6 +125,21 @@ type ReadOptions struct {
 	// scan flows through the Layer 6 executor via ScanFile +
 	// LazyFrame.Collect.
 	ScanWorkers int
+
+	// IncludeCoveringColumns, when true, returns the GeoParquet 1.1
+	// bounding-box covering columns (typically named
+	// <geom>_bbox_xmin/_ymin/_xmax/_ymax) in the output frame.
+	//
+	// Default false — the covering columns exist for row-group
+	// pruning at read time and aren't meaningful to callers doing
+	// analysis on the returned frame. Preserves the WriteFile ↔
+	// ReadFile round-trip contract: a frame written by gobi reads
+	// back with the same visible columns.
+	//
+	// The bbox columns are still USED for pruning regardless of
+	// this flag; setting it only controls whether they're visible
+	// in the output frame.
+	IncludeCoveringColumns bool
 }
 
 // WriteOptions controls parquet write behavior. A nil pointer is
@@ -167,6 +182,23 @@ type WriteOptions struct {
 	// (0.05). Lower FPP → larger filter on disk; reasonable range
 	// 0.01–0.1. Ignored when BloomFilterColumns is empty.
 	BloomFilterFPP float64
+
+	// SkipBboxCovering disables the GeoParquet 1.1 covering-bbox
+	// column emission that otherwise runs on every write with a
+	// geometry column.
+	//
+	// Default false (bbox columns are emitted) — matches the
+	// pushdown story: readers with a spatial predicate hint prune
+	// row groups without decoding WKB.
+	//
+	// Set true when the write cost matters more than the read cost:
+	// tiny frames where the extra scan doubles write latency,
+	// streaming append loops where footprint is more important
+	// than random-access reads, or when writing to a target whose
+	// consumer doesn't do row-group pruning anyway. The extra scan
+	// is O(N) with one WKB parse per row and adds 32 bytes/row
+	// (4 × Float64) to file size.
+	SkipBboxCovering bool
 }
 
 // ParseCodec resolves a codec by name (case-insensitive). Empty and "none"
@@ -242,11 +274,63 @@ func ReadSchema(path string, opts *ReadOptions) (*arrow.Schema, error) {
 		arrowSchema = arrow.NewSchema(projected, schemaMetadataPtr(arrowSchema))
 	}
 
+	// Drop GeoParquet 1.1 covering-bbox columns unless the caller
+	// opted in — must match the streaming path's hideCovering
+	// projection, otherwise plan.Schema() (from here) and the
+	// runtime batches (from frameFromRecord) disagree and downstream
+	// operators walk the wrong column indices.
+	if opts == nil || !opts.IncludeCoveringColumns {
+		hidden := coveringColumnNames(rc.geoRaw, true)
+		if len(hidden) > 0 {
+			kept := make([]arrow.Field, 0, len(arrowSchema.Fields()))
+			for _, f := range arrowSchema.Fields() {
+				if _, drop := hidden[f.Name]; drop {
+					continue
+				}
+				kept = append(kept, f)
+			}
+			arrowSchema = arrow.NewSchema(kept, schemaMetadataPtr(arrowSchema))
+		}
+	}
+
 	// Attach the "geo" key if the file carried one.
 	if rc.geoRaw != "" {
 		return attachGeoKey(arrowSchema, rc.geoRaw)
 	}
 	return arrowSchema, nil
+}
+
+// exprAlreadyApplied reports whether pred appears anywhere in the
+// current predicate tree — including as an AND-child, an OR-child,
+// or nested deeper. Idempotency guard for the ScanFile pushdown
+// callback: the optimizer's fixed-point loop re-fires the pushdown
+// rule until no plan changes, and without this check we'd AND the
+// same pred onto opts.Predicate every pass.
+//
+// Uses Expr.String() equality — a plan's string form is deterministic
+// for a given tree, and the pushdown callback only compares plans it
+// itself would have produced, so structural drift isn't a risk here.
+func exprAlreadyApplied(current, pred gobi.Expr) bool {
+	if current.Node() == nil || pred.Node() == nil {
+		return false
+	}
+	target := pred.String()
+	return exprContainsString(current, target)
+}
+
+func exprContainsString(e gobi.Expr, target string) bool {
+	if e.Node() == nil {
+		return false
+	}
+	if e.String() == target {
+		return true
+	}
+	for _, child := range e.Node().Children() {
+		if exprContainsString(child, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // ScanFile returns a LazyFrame anchored at a parquet scan. No data
@@ -316,6 +400,15 @@ func ScanFile(path string, opts *ReadOptions) *gobi.LazyFrame {
 		// Layered atop any existing predicate via AND — a caller-
 		// supplied Predicate stays applied, and the optimizer's
 		// contribution is added on top.
+		//
+		// Return nil (== "no change") when the incoming pred is
+		// already applied. Without this idempotency check, the
+		// optimizer's fixed-point loop re-pushes the same predicate
+		// every pass and builds up an exponentially-nested chain of
+		// (P AND P AND P ...) — 30+ deep by the iteration cap.
+		if opts != nil && exprAlreadyApplied(opts.Predicate, pred) {
+			return nil
+		}
 		var newOpts ReadOptions
 		if opts != nil {
 			newOpts = *opts
@@ -386,7 +479,7 @@ func ReadFile(path string, opts *ReadOptions) (*gobi.Frame, error) {
 		return nil, err
 	}
 	defer table.Release() // frameFromTable Retains what the Frame keeps
-	return frameFromTable(table, rc.geoRaw)
+	return frameFromTable(table, rc.geoRaw, rc.hideCovering)
 }
 
 // ReadFileChunksFunc streams path as record-batch-sized Frames. fn is
@@ -416,7 +509,7 @@ func ReadFileChunksFunc(path string, opts *ReadOptions, fn func(*gobi.Frame) err
 
 	for rr.Next() {
 		rec := rr.RecordBatch()
-		frame, err := frameFromRecord(rec, rc.geoRaw)
+		frame, err := frameFromRecord(rec, rc.geoRaw, rc.hideCovering)
 		if err != nil {
 			return err
 		}
@@ -456,7 +549,7 @@ func ReadReader(r io.ReaderAt, size int64, opts *ReadOptions) (*gobi.Frame, erro
 		return nil, err
 	}
 	defer table.Release() // frameFromTable Retains what the Frame keeps
-	return frameFromTable(table, rc.geoRaw)
+	return frameFromTable(table, rc.geoRaw, rc.hideCovering)
 }
 
 // ReadReaderChunksFunc is the io.ReaderAt-backed counterpart to
@@ -481,7 +574,7 @@ func ReadReaderChunksFunc(r io.ReaderAt, size int64, opts *ReadOptions, fn func(
 
 	for rr.Next() {
 		rec := rr.RecordBatch()
-		frame, err := frameFromRecord(rec, rc.geoRaw)
+		frame, err := frameFromRecord(rec, rc.geoRaw, rc.hideCovering)
 		if err != nil {
 			return err
 		}
@@ -574,10 +667,27 @@ func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 	if err != nil {
 		return err
 	}
-	meta, err := gobi.BuildGeoParquetMetadata(f)
+	// Augment f with per-row bbox covering columns for every geometry
+	// column so downstream readers can prune row groups via
+	// parquet-native min/max stats. Skipped when opts.SkipBboxCovering
+	// is set — some workloads (tiny frames, streaming appends) don't
+	// want the extra scan + 32 bytes/row. Returns f untouched (with a
+	// balancing Retain) when f has no geometry columns.
+	var (
+		augmented *gobi.Frame
+		meta      *gobi.GeoParquetMetadata
+	)
+	if opts.SkipBboxCovering {
+		augmented = f
+		augmented.Retain()
+		meta, err = gobi.BuildGeoParquetMetadata(f)
+	} else {
+		augmented, meta, err = gobi.WithBboxCoveringColumns(f)
+	}
 	if err != nil {
 		return err
 	}
+	defer augmented.Release()
 
 	out, err := os.Create(path)
 	if err != nil {
@@ -599,7 +709,7 @@ func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 	}
 
 	writer, err := pqarrow.NewFileWriter(
-		f.Schema(),
+		augmented.Schema(),
 		out,
 		parquet.NewWriterProperties(writerProps...),
 		pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()),
@@ -612,8 +722,8 @@ func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 	// otherwise the per-column ref stays live for the lifetime of
 	// f, effectively doubling f's memory footprint until it's
 	// eventually collected.
-	tbl := f.Table()
-	if err := writer.WriteTable(tbl, int64(f.NumRows())); err != nil {
+	tbl := augmented.Table()
+	if err := writer.WriteTable(tbl, int64(augmented.NumRows())); err != nil {
 		tbl.Release()
 		_ = writer.Close()
 		return err
@@ -655,6 +765,12 @@ type readerContext struct {
 	colIndices  []int
 	rowGroups   []int
 	geoRaw      string
+	// hideCovering: opts.IncludeCoveringColumns was false → the
+	// output Frame should drop bbox covering columns declared in
+	// geoRaw. The columns are still read from parquet (needed for
+	// row-group pruning stats) — the flag only controls Frame
+	// projection. See ReadOptions.IncludeCoveringColumns.
+	hideCovering bool
 }
 
 func (rc *readerContext) close() {
@@ -751,12 +867,13 @@ func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOpt
 	rowGroups = filterRowGroupsByPredicate(pf, opts.Predicate, rowGroups)
 
 	return &readerContext{
-		closer:      closer,
-		parquetFile: pf,
-		reader:      fr,
-		colIndices:  colIndices,
-		rowGroups:   rowGroups,
-		geoRaw:      geoRaw,
+		closer:       closer,
+		parquetFile:  pf,
+		reader:       fr,
+		colIndices:   colIndices,
+		rowGroups:    rowGroups,
+		geoRaw:       geoRaw,
+		hideCovering: !opts.IncludeCoveringColumns,
 	}, nil
 }
 
@@ -809,16 +926,21 @@ func chunkRows(opts *ReadOptions) int64 {
 // -----------------------------------------------------------------------------
 
 // frameFromTable wraps table's columns in a Frame, attaching the geo
-// metadata blob to the schema if present.
+// metadata blob to the schema if present. When hideCovering is true,
+// the GeoParquet 1.1 covering-bbox columns declared in geoRaw are
+// dropped from the returned frame — preserving the WriteFile ↔
+// ReadFile round-trip contract (the bbox columns still exist in the
+// file and are used by predicate pushdown before this call runs).
 //
-// Retains each column's Chunked so the Frame owns its own ref — the
-// caller is expected to `table.Release()` after this returns (see
-// ReadFile / ReadReader). Without the Retain here, the copied Column
-// values share the Table's Chunked pointers without an ownership
-// increment, and either (a) never get freed if the Table's Release
-// isn't called, or (b) double-decrement when both Table.Release and
-// Frame.Release run against the same underlying Chunked.
-func frameFromTable(table arrow.Table, geoRaw string) (*gobi.Frame, error) {
+// Retains each kept column's Chunked so the Frame owns its own ref
+// — the caller is expected to `table.Release()` after this returns
+// (see ReadFile / ReadReader). Without the Retain here, the copied
+// Column values share the Table's Chunked pointers without an
+// ownership increment, and either (a) never get freed if the Table's
+// Release isn't called, or (b) double-decrement when both
+// Table.Release and Frame.Release run against the same underlying
+// Chunked.
+func frameFromTable(table arrow.Table, geoRaw string, hideCovering bool) (*gobi.Frame, error) {
 	schema := table.Schema()
 	if geoRaw != "" {
 		var err error
@@ -827,19 +949,27 @@ func frameFromTable(table arrow.Table, geoRaw string) (*gobi.Frame, error) {
 			return nil, err
 		}
 	}
-	cols := make([]arrow.Column, table.NumCols())
+	hidden := coveringColumnNames(geoRaw, hideCovering)
+	keptFields := make([]arrow.Field, 0, table.NumCols())
+	keptCols := make([]arrow.Column, 0, table.NumCols())
 	for i := int64(0); i < table.NumCols(); i++ {
 		c := *table.Column(int(i))
+		if _, drop := hidden[c.Name()]; drop {
+			continue
+		}
 		c.Data().Retain() // Frame gets its own ref on the Chunked.
-		cols[i] = c
+		keptFields = append(keptFields, schema.Field(int(i)))
+		keptCols = append(keptCols, c)
 	}
-	return gobi.NewFrame(schema, cols)
+	outSchema := arrow.NewSchema(keptFields, schemaMetadataPtr(schema))
+	return gobi.NewFrame(outSchema, keptCols)
 }
 
 // frameFromRecord wraps one record batch's arrays in a Frame. Uses
 // arrow.NewColumnFromArr, which Retains each array once — so the Frame
 // owns its refs and the source record can be Released independently.
-func frameFromRecord(rec arrow.RecordBatch, geoRaw string) (*gobi.Frame, error) {
+// Honors hideCovering the same way as frameFromTable.
+func frameFromRecord(rec arrow.RecordBatch, geoRaw string, hideCovering bool) (*gobi.Frame, error) {
 	schema := rec.Schema()
 	if geoRaw != "" {
 		var err error
@@ -848,12 +978,60 @@ func frameFromRecord(rec arrow.RecordBatch, geoRaw string) (*gobi.Frame, error) 
 			return nil, err
 		}
 	}
+	hidden := coveringColumnNames(geoRaw, hideCovering)
 	n := int(rec.NumCols())
-	cols := make([]arrow.Column, n)
+	keptFields := make([]arrow.Field, 0, n)
+	keptCols := make([]arrow.Column, 0, n)
 	for i := range n {
-		cols[i] = arrow.NewColumnFromArr(schema.Field(i), rec.Column(i))
+		field := schema.Field(i)
+		if _, drop := hidden[field.Name]; drop {
+			continue
+		}
+		keptFields = append(keptFields, field)
+		keptCols = append(keptCols, arrow.NewColumnFromArr(field, rec.Column(i)))
 	}
-	return gobi.NewFrame(schema, cols)
+	outSchema := arrow.NewSchema(keptFields, schemaMetadataPtr(schema))
+	return gobi.NewFrame(outSchema, keptCols)
+}
+
+// coveringColumnNames returns the set of GeoParquet 1.1 covering-bbox
+// column names declared in geoRaw, or an empty map when hideCovering
+// is false / geoRaw is empty / no covering entries are present. Used
+// by frameFromTable / frameFromRecord to skip these columns in the
+// output frame while still keeping them available on disk for
+// row-group pruning.
+func coveringColumnNames(geoRaw string, hideCovering bool) map[string]struct{} {
+	if !hideCovering || geoRaw == "" {
+		return nil
+	}
+	// Malformed geoRaw (hand-written / third-party writer bug) is
+	// swallowed deliberately: this function's failure mode should be
+	// "leave every column visible" rather than "fail the read." The
+	// bbox columns will surface in the output frame, which is at
+	// worst a UX blemish, whereas failing the read blocks the whole
+	// pipeline for a metadata problem that's tangential to the data.
+	// A stricter caller can call gobi.ParseGeoParquetMetadata directly
+	// via the schema's "geo" key and report the error themselves.
+	meta, err := gobi.ParseGeoParquetMetadata(geoRaw)
+	if err != nil || meta == nil {
+		return nil
+	}
+	out := map[string]struct{}{}
+	for _, cm := range meta.Columns {
+		if cm.Covering == nil || cm.Covering.Bbox == nil {
+			continue
+		}
+		bb := cm.Covering.Bbox
+		for _, path := range [][]string{bb.Xmin, bb.Ymin, bb.Xmax, bb.Ymax} {
+			// Flat covering: single-element path is the top-level
+			// column name. Nested (struct-field) paths aren't
+			// hideable at the Frame level today — leave them visible.
+			if len(path) == 1 {
+				out[path[0]] = struct{}{}
+			}
+		}
+	}
+	return out
 }
 
 // marshalGeoMeta serializes the metadata blob. Kept here (rather than

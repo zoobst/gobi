@@ -1,5 +1,11 @@
 package gobi
 
+import (
+	"math"
+
+	"github.com/zoobst/gobi/geometry"
+)
+
 // Stats reports column-level bounds used by CanPossiblyMatch to
 // prove predicates unsatisfiable over a data range (typically a
 // parquet row-group). Implementations are supplied by source
@@ -64,8 +70,211 @@ func canMatchNode(n ExprNode, s Stats) bool {
 		return true
 	case *aliasNode:
 		return canMatchNode(n.inner, s)
+	case *geomPredicateNode:
+		return canMatchGeomPredicate(n, s)
 	}
 	// notNode, custom nodes, arithmetic — bail conservatively.
+	return true
+}
+
+// canMatchGeomPredicate handles a spatial predicate against a row
+// group's covering-column stats. Only the constant-right case
+// (literalGeomNode on right) is prunable; column-right expressions
+// don't have a static bbox to compare against and pass through as
+// "possibly matches."
+//
+// Supported predicates:
+//
+//   - Intersects / Contains / Overlaps / Touches / Crosses: skip
+//     when the constant's bbox is fully disjoint from the row
+//     group's covering bbox range.
+//   - Within: same bbox-overlap necessary condition (a row's shape
+//     must at least reach the constant's bbox to be inside it).
+//   - Disjoint: same "row group inside constant's bbox" containment
+//     rule as the naive prune — BUT only when the constant is a
+//     proven axis-aligned rectangle (bbox area == shape area). For
+//     concave / holed literals a row sitting in the bbox-hole is
+//     genuinely disjoint from the shape, and pruning would silently
+//     drop it. See litIsBboxRectangle.
+//
+// Any statistic missing → conservative "possibly matches."
+func canMatchGeomPredicate(n *geomPredicateNode, s Stats) bool {
+	lg, litGeom := extractGeomLit(n)
+	if !litGeom {
+		return true // column-right or nested — can't prune
+	}
+	geomCol, ok := extractGeomColRef(n)
+	if !ok {
+		return true // both sides literals, or nested structure
+	}
+	rgBounds, ok := coveringBounds(s, geomCol.name)
+	if !ok {
+		return true // no covering columns → file didn't opt into pushdown
+	}
+	litBounds := lg.value.Bounds()
+	if litBounds.Empty() {
+		// Fires for two shapes: (a) the nil-literal case, and (b) a
+		// non-nil literal whose geometry has empty bounds (an empty
+		// Polygon, an empty GeometryCollection). Both are degenerate.
+		// Keep the row group either way — case (a) hits the
+		// executor's constant-null short-circuit (all-null output),
+		// case (b) reaches the per-row loop which will report the
+		// predicate as false for every row. Silent-pruning would be
+		// wrong for (b): it'd claim "no row possibly matches" when
+		// the executor has a well-defined false answer to give.
+		return true
+	}
+
+	switch {
+	case n.pred == geometry.PredDisjoint:
+		// Disjoint: pruning here is unsound in general. The tempting
+		// rule "row group is fully inside lit's bbox → no row is
+		// disjoint from lit" only holds when lit's bbox equals lit's
+		// actual shape (a filled rectangle). For a concave polygon
+		// (an L-shape, an annulus, a country boundary), a row whose
+		// geometry sits inside lit's bbox but outside lit's polygon
+		// IS disjoint — and pruning it would silently drop a real
+		// match. Silent-wrong is the failure mode gobi trades OOM
+		// for; we don't cross that line for a niche predicate.
+		//
+		// Only prune when lit is a proven rectangle (its polygon area
+		// equals its bbox area within a small tolerance). This still
+		// catches the common AOI-rectangle case that users of
+		// GeomDisjoint most often build.
+		if !litIsBboxRectangle(lg.value) {
+			return true
+		}
+		if litBounds.MinX <= rgBounds.MinX && litBounds.MinY <= rgBounds.MinY &&
+			litBounds.MaxX >= rgBounds.MaxX && litBounds.MaxY >= rgBounds.MaxY {
+			return false
+		}
+		return true
+	case n.pred == geometry.PredWithin:
+		// Within: row's bbox must be inside the constant's bbox.
+		// Prune only when the row group's minimum extent is already
+		// bigger than the constant — i.e. the smallest x-span in the
+		// group exceeds the constant's, which we can't tell from
+		// min/max stats alone. Conservative: allow bbox-overlap
+		// filter (necessary but not sufficient).
+		return bboxesOverlap(litBounds, rgBounds)
+	default:
+		// Intersects / Contains / Overlaps / Touches / Crosses all
+		// require bbox intersection as a necessary condition.
+		return bboxesOverlap(litBounds, rgBounds)
+	}
+}
+
+// litIsBboxRectangle reports whether g's planar polygon area is
+// indistinguishable from its bbox area — i.e. g is a filled
+// axis-aligned rectangle with no holes. Used to gate Disjoint
+// pruning to the shapes where litBounds ⊇ rgBounds is actually
+// sufficient to prove "no row is disjoint."
+//
+// Uses a planar shoelace (not Polygon.Area, which special-cases
+// geographic CRS as a spherical integral — that would mismatch the
+// bbox area's planar-degrees² scale and produce false negatives
+// on WGS84 AOI rectangles). Relative tolerance of 1e-9 against
+// the bbox area so float64 vertex rounding doesn't downgrade a
+// legitimate rectangle to non-rectangular. Non-polygon geometries
+// return false (nothing to prune conservatively).
+func litIsBboxRectangle(g geometry.Geometry) bool {
+	poly, ok := g.(geometry.Polygon)
+	if !ok {
+		return false
+	}
+	// Representation-strict: a Polygon whose exterior happens to be a
+	// rectangle but that carries any holes fails this check even if
+	// the holes are trivially empty. Same for a polygon that stores
+	// its exterior in Rings[1] with an empty Rings[0]. That's fine —
+	// the rectangle test is a fast-path guard for the AOI-rectangle
+	// case; non-canonical shapes fall through to the conservative
+	// "keep the row group" branch.
+	if len(poly.Rings) != 1 {
+		return false
+	}
+	b := poly.Bounds()
+	if b.Empty() {
+		return false
+	}
+	bboxArea := (b.MaxX - b.MinX) * (b.MaxY - b.MinY)
+	if bboxArea <= 0 {
+		return false
+	}
+	polyArea := geometry.PlanarRingArea(poly.Rings[0])
+	return math.Abs(polyArea-bboxArea)/bboxArea < 1e-9
+}
+
+// extractGeomLit returns the literalGeomNode operand and true if
+// exactly one of n's operands is a geometry literal. Also handles
+// aliased forms.
+func extractGeomLit(n *geomPredicateNode) (*literalGeomNode, bool) {
+	if lg, ok := unwrapAlias(n.right).(*literalGeomNode); ok {
+		return lg, true
+	}
+	if lg, ok := unwrapAlias(n.left).(*literalGeomNode); ok {
+		return lg, true
+	}
+	return nil, false
+}
+
+// extractGeomColRef returns the column-ref operand and true if
+// exactly one operand is a bare column reference. The other operand
+// must be the literal (checked separately).
+func extractGeomColRef(n *geomPredicateNode) (*colRefNode, bool) {
+	if c, ok := unwrapAlias(n.left).(*colRefNode); ok {
+		return c, true
+	}
+	if c, ok := unwrapAlias(n.right).(*colRefNode); ok {
+		return c, true
+	}
+	return nil, false
+}
+
+func unwrapAlias(n ExprNode) ExprNode {
+	for {
+		if a, ok := n.(*aliasNode); ok {
+			n = a.inner
+			continue
+		}
+		return n
+	}
+}
+
+// coveringBounds reads the covering-column min/max stats for a
+// geometry column named geomName. Returns ok=false if any of the
+// four covering columns lacks stats — the caller falls back to
+// "possibly matches."
+func coveringBounds(s Stats, geomName string) (geometry.Bounds, bool) {
+	xminCol, yminCol, xmaxCol, ymaxCol := BboxColumnNames(geomName)
+	// Row-group xmin/ymin comes from the covering column's MIN;
+	// xmax/ymax from the covering column's MAX. The other stat
+	// (min of xmax, max of xmin) is irrelevant for bbox overlap.
+	xminV, _, ok1 := s.MinMax(xminCol)
+	yminV, _, ok2 := s.MinMax(yminCol)
+	_, xmaxV, ok3 := s.MinMax(xmaxCol)
+	_, ymaxV, ok4 := s.MinMax(ymaxCol)
+	if !ok1 || !ok2 || !ok3 || !ok4 {
+		return geometry.Bounds{}, false
+	}
+	xmin, ok1 := toFloat64(xminV)
+	ymin, ok2 := toFloat64(yminV)
+	xmax, ok3 := toFloat64(xmaxV)
+	ymax, ok4 := toFloat64(ymaxV)
+	if !ok1 || !ok2 || !ok3 || !ok4 {
+		return geometry.Bounds{}, false
+	}
+	return geometry.Bounds{MinX: xmin, MinY: ymin, MaxX: xmax, MaxY: ymax}, true
+}
+
+// bboxesOverlap reports whether two axis-aligned bboxes share any
+// point. Closed intervals — touching edges count.
+func bboxesOverlap(a, b geometry.Bounds) bool {
+	if a.MinX > b.MaxX || b.MinX > a.MaxX {
+		return false
+	}
+	if a.MinY > b.MaxY || b.MinY > a.MaxY {
+		return false
+	}
 	return true
 }
 

@@ -3,9 +3,11 @@ package gobi
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/zoobst/gobi/geometry"
 )
@@ -31,6 +33,46 @@ type GeoParquetColumnMeta struct {
 	GeometryTypes []string       `json:"geometry_types"`
 	CRS           map[string]any `json:"crs,omitempty"`
 	Bbox          []float64      `json:"bbox,omitempty"`
+
+	// Covering names the per-row bounding-box columns that a reader
+	// can use for row-group pruning without decoding WKB. Populated
+	// by parquetio.WriteFile when it emits companion bbox columns
+	// (see BboxCoveringSuffixes). Follows the GeoParquet 1.1
+	// "covering.bbox" spec:
+	//
+	//	{"xmin": ["<col>"], "ymin": ["<col>"], "xmax": ["<col>"], "ymax": ["<col>"]}
+	//
+	// A single-element path array means "top-level column with this
+	// name" — gobi's flat-column approach — but consumers that
+	// support nested struct-covering (geopandas, DuckDB spatial) read
+	// it identically.
+	Covering *GeoParquetCovering `json:"covering,omitempty"`
+}
+
+// GeoParquetCovering describes how to compute a row's bounding box
+// from other columns in the same file. Only the bbox variant is
+// used today.
+type GeoParquetCovering struct {
+	Bbox *GeoParquetBboxCovering `json:"bbox,omitempty"`
+}
+
+// GeoParquetBboxCovering names the four columns holding per-row
+// bbox coordinates. Each is a path array (typically single-element
+// for flat top-level columns).
+type GeoParquetBboxCovering struct {
+	Xmin []string `json:"xmin"`
+	Ymin []string `json:"ymin"`
+	Xmax []string `json:"xmax"`
+	Ymax []string `json:"ymax"`
+}
+
+// BboxColumnNames returns the four flat column names gobi uses to
+// hold per-row bbox coordinates for a geometry column named
+// geomName. Kept in one place so writer, reader, and predicate
+// pushdown agree on the naming convention.
+func BboxColumnNames(geomName string) (xmin, ymin, xmax, ymax string) {
+	base := geomName + "_bbox_"
+	return base + "xmin", base + "ymin", base + "xmax", base + "ymax"
 }
 
 // BuildGeoParquetMetadata scans f and produces a GeoParquet metadata blob
@@ -59,6 +101,151 @@ func BuildGeoParquetMetadata(f *Frame) (*GeoParquetMetadata, error) {
 		return nil, nil // no geometry columns; not a GeoParquet file
 	}
 	return meta, nil
+}
+
+// WithBboxCoveringColumns returns a copy of f augmented with four
+// Float64 columns per geometry column (xmin/ymin/xmax/ymax) plus a
+// GeoParquetMetadata whose per-column Covering references them.
+// This is the write-side half of predicate pushdown: readers use
+// the covering columns' parquet-native min/max row-group statistics
+// to skip whole row groups whose bboxes are disjoint from a
+// spatial-predicate constant.
+//
+// Empty/null geometry rows produce NaN bbox values, which parquet
+// stats treat as "outside the min/max range" — safe (we err on
+// keeping the row group) rather than incorrectly proving disjointness.
+//
+// The returned frame retains its own reference to every column
+// (original + new); callers own the Release, symmetric with
+// NewFrame.
+func WithBboxCoveringColumns(f *Frame) (*Frame, *GeoParquetMetadata, error) {
+	meta, err := BuildGeoParquetMetadata(f)
+	if err != nil {
+		return nil, nil, err
+	}
+	if meta == nil {
+		// No geometry columns → nothing to augment.
+		f.Retain()
+		return f, nil, nil
+	}
+	pool := memory.DefaultAllocator
+
+	origFields := f.Schema().Fields()
+	newFields := make([]arrow.Field, 0, len(origFields)+4*len(meta.Columns))
+	newFields = append(newFields, origFields...)
+
+	newCols := make([]arrow.Column, 0, len(origFields)+4*len(meta.Columns))
+	for _, s := range f.series {
+		newCols = append(newCols, *arrow.NewColumn(s.field, s.col.Data()))
+	}
+	// arrow.NewColumn Retains each ChunkedArray; on error we Release
+	// everything so we don't leak. Track our progress separately.
+	rollback := func() {
+		for _, c := range newCols {
+			c.Release()
+		}
+	}
+
+	for _, s := range f.series {
+		if !s.IsGeometry() {
+			continue
+		}
+		xminName, yminName, xmaxName, ymaxName := BboxColumnNames(s.name)
+		xmin, ymin, xmax, ymax, err := computeBboxColumns(pool, s)
+		if err != nil {
+			rollback()
+			return nil, nil, fmt.Errorf("compute bbox for %q: %w", s.name, err)
+		}
+		for _, bc := range []struct {
+			name string
+			arr  arrow.Array
+		}{
+			{xminName, xmin},
+			{yminName, ymin},
+			{xmaxName, xmax},
+			{ymaxName, ymax},
+		} {
+			field := arrow.Field{Name: bc.name, Type: arrow.PrimitiveTypes.Float64, Nullable: false}
+			newFields = append(newFields, field)
+			chunked := arrow.NewChunked(field.Type, []arrow.Array{bc.arr})
+			newCols = append(newCols, *arrow.NewColumn(field, chunked))
+			chunked.Release()
+			bc.arr.Release()
+		}
+
+		cm := meta.Columns[s.name]
+		cm.Covering = &GeoParquetCovering{
+			Bbox: &GeoParquetBboxCovering{
+				Xmin: []string{xminName},
+				Ymin: []string{yminName},
+				Xmax: []string{xmaxName},
+				Ymax: []string{ymaxName},
+			},
+		}
+		meta.Columns[s.name] = cm
+	}
+
+	augSchema := arrow.NewSchema(newFields, schemaMetadataPtr(f.Schema()))
+	out, err := NewFrame(augSchema, newCols)
+	if err != nil {
+		rollback()
+		return nil, nil, err
+	}
+	// NewFrame takes ownership of every column in newCols — the
+	// returned Frame's Release will call Release on each. Do NOT run
+	// rollback() here; that would double-release and leave the
+	// underlying Chunked at refcount 0 by the time WriteTable sees it.
+	return out, meta, nil
+}
+
+// computeBboxColumns walks s once and emits four aligned Float64
+// arrays (xmin, ymin, xmax, ymax) — one entry per row. Null and
+// empty geometries produce NaN so parquet stats surface them as
+// "no useful range" rather than a lie about the row's coordinates.
+func computeBboxColumns(pool memory.Allocator, s Series) (xmin, ymin, xmax, ymax arrow.Array, err error) {
+	xminB := array.NewFloat64Builder(pool)
+	defer xminB.Release()
+	yminB := array.NewFloat64Builder(pool)
+	defer yminB.Release()
+	xmaxB := array.NewFloat64Builder(pool)
+	defer xmaxB.Release()
+	ymaxB := array.NewFloat64Builder(pool)
+	defer ymaxB.Release()
+
+	nan := math.NaN()
+	for _, chunk := range s.col.Data().Chunks() {
+		bin, ok := chunk.(*array.Binary)
+		if !ok {
+			return nil, nil, nil, nil, fmt.Errorf("%w: expected Binary, got %T",
+				ErrColumnTypeMismatch, chunk)
+		}
+		for i := range bin.Len() {
+			if bin.IsNull(i) {
+				xminB.Append(nan)
+				yminB.Append(nan)
+				xmaxB.Append(nan)
+				ymaxB.Append(nan)
+				continue
+			}
+			g, perr := geometry.ParseWKB(bin.Value(i))
+			if perr != nil {
+				return nil, nil, nil, nil, perr
+			}
+			b := g.Bounds()
+			if b.Empty() {
+				xminB.Append(nan)
+				yminB.Append(nan)
+				xmaxB.Append(nan)
+				ymaxB.Append(nan)
+				continue
+			}
+			xminB.Append(b.MinX)
+			yminB.Append(b.MinY)
+			xmaxB.Append(b.MaxX)
+			ymaxB.Append(b.MaxY)
+		}
+	}
+	return xminB.NewArray(), yminB.NewArray(), xmaxB.NewArray(), ymaxB.NewArray(), nil
 }
 
 func describeGeometryColumn(s Series) (GeoParquetColumnMeta, error) {
