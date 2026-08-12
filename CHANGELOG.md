@@ -5,6 +5,147 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.6]
+
+### Added
+
+- **String operations** — 13 row-wise string ops on Arrow String
+  columns, at both the Series and Expr layers. Composes with
+  LazyFrame.Filter / WithColumn / Select the same way the
+  numeric and spatial ops do. All null-propagating.
+
+  Case / trim / length:
+  - `StrLower` / `StrUpper` — Unicode-aware case conversion
+  - `StrTrim` — strip whitespace both ends (`strings.TrimSpace`)
+  - `StrTrimLeft(cutset)` / `StrTrimRight(cutset)` — cutset-based
+  - `StrLen` — Unicode codepoint count (not byte length)
+
+  Predicates (Boolean output):
+  - `StrContains(substr)` — literal substring match
+  - `StrStartsWith(prefix)` / `StrEndsWith(suffix)`
+  - `StrRegexMatch(pattern)` — RE2 semantics, pattern compiled once
+
+  Transforms (String output):
+  - `StrReplace(old, new)` — literal replace all
+  - `StrRegexReplace(pattern, replacement)` — RE2, capture-group
+    references (`$1`, `$2`, `${name}`) supported
+  - `StrSlice(start, end)` — substring by codepoint index with
+    Python-style negative indexing (end=0 → "to end", out-of-range
+    clamps)
+  - `StrConcat(suffix)` — append a constant suffix to every value
+
+  Example (case-insensitive substring filter):
+
+  ```go
+  lf.Filter(gobi.Col("city").StrLower().StrContains("angeles")).Collect()
+  ```
+
+  Under the hood: shared `strMapString` / `strMapInt64` /
+  `strMapBool` drivers walk each chunk once, apply a Go stdlib
+  string function per row, emit a new column. Regex patterns
+  compile once, not per row.
+
+- **Datetime operations** — 13 row-wise datetime ops at the Expr
+  layer, delegating to Series-level methods (9 extractors already
+  existed in `series_time.go`; this release adds the missing
+  `Nanosecond` / `DateTruncate` / `DateFormat` at the Series layer
+  and lifts all of them to Expr).
+
+  Extractors (Int64 output, timezone-aware):
+  - `Year`, `Month`, `Day`, `Hour`, `Minute`, `Second`,
+    `Nanosecond`, `Weekday`, `DayOfYear`
+
+  Transforms:
+  - `DateTruncate(unit)` — calendar-aware for `year` / `month` /
+    `day` (start-of-year at 00:00:00 in the value's timezone) and
+    wall-clock aligned for `hour` / `minute` / `second`.
+  - `DateFormat(layout)` — Go time layout, empty → RFC3339
+  - `AddDuration(d)` / `SubDuration(d)` — Timestamp arithmetic
+    preserving the source column's TimeUnit and TimeZone
+
+  Example (rows in Q4 of 2026):
+
+  ```go
+  lf.Filter(
+      gobi.Col("ts").Year().Eq(gobi.Lit(int64(2026))).
+          And(gobi.Col("ts").Month().Ge(gobi.Lit(int64(10)))),
+  ).Collect()
+  ```
+
+### Changed (post-review)
+
+Six items from two rounds of v0.3.6 code review, addressed before
+tagging. First five landed together; the sixth (sub-unit precision
+rounding) came from a follow-up round after the type-preservation
+fix landed.
+
+- **`AddDuration` / `SubDuration` / `TruncateTo` / `TruncateToCalendar`
+  now genuinely preserve the source column's TimeUnit and TimeZone.**
+  Previously all four routed through an internal
+  `buildTimestampNsSeries` helper that hardcoded
+  `{Unit: Nanosecond, TimeZone: ""}` — so a `Timestamp[ms,
+  "America/New_York"]` source became `Timestamp[ns]` with an empty
+  TZ tag, and the plan-declared schema (which claimed preservation)
+  disagreed with runtime output. New `buildTimestampSeriesLike`
+  helper inherits the source type. Regression coverage: two tests
+  build a `Millisecond`-unit source and a `America/New_York`-tagged
+  source, run each transform, and assert both the type and the row
+  values.
+
+- **Regex patterns on `Expr.StrRegexMatch` / `Expr.StrRegexReplace`
+  compile once at Expr-build time**, not per batch at Eval.
+  `strOpNode` caches the `*regexp.Regexp` alongside any
+  `regexp.Compile` error; the error surfaces at Type() / Eval() —
+  matches the deferred-error style of `LitNull` on unsupported
+  types. Streaming Filter chains that scan many parquet row groups
+  now pay one compile, not N.
+
+- **`Series.StrReplace` renamed parameters** from `(old, new string)`
+  to `(find, replacement string)`. Old form was legal Go but shadowed
+  the built-in `new` inside the function body — a future intra-
+  function `new(T)` call would silently pick up the shadow. Public
+  API impact is nil (positional args; identifier names aren't part
+  of the signature).
+
+- **Awkward error messages** — `Str%s` and `dt %s` prefixes on
+  nil-inner / type-mismatch paths produced strings like
+  `"gobi: Strlower on nil inner expression"`. Renamed to
+  `"gobi: str.%s"` / `"gobi: dt.%s"` — matches the `strOp.String()`
+  / `dtOp.String()` snake-case rendering used everywhere else.
+
+- **Reference to a nonexistent pairwise `Expr.StrConcat(other Expr)`**
+  removed from the `Series.StrConcat` docstring. The pairwise
+  variant is a v0.3.7 candidate (needs a new binary-op node
+  shape since `strOpNode` only carries one inner).
+
+- **Sub-unit precision rescaling in `buildTimestampSeriesLike` now
+  uses round-half-away-from-zero, not Go's default truncation
+  toward zero.** The type-preservation fix landed with an integer
+  `/` division on the ns → source-unit rescale, which quietly
+  produces asymmetric error direction across the epoch: a
+  post-1970 `AddDuration(500ns)` on a `Timestamp[us]` source rounds
+  DOWN (toward zero, magnitude decreases) while the same operation
+  on a pre-1970 source rounds UP (also toward zero, but magnitude
+  decreases in the negative direction). New `roundedDivTimestamp`
+  helper rounds symmetrically. Regression tests: unit tests over
+  the ±half / ±just-under-half / ±exact-multiple cases, plus an
+  integration test that adds 500ns to a Timestamp[us] value on
+  both sides of the epoch and asserts both rounded away from
+  zero. Precision loss is still intrinsic to storing sub-unit
+  deltas — the fix guarantees the rounding direction is
+  consistent regardless of sign.
+
+### Notes
+
+- **General-purpose dataframe posture.** v0.3.6 is the first
+  release where gobi's non-geospatial surface is broad enough to
+  recommend as a general-purpose Go dataframe library, not just a
+  geospatial one. String ops, datetime extractors, and the
+  existing LazyFrame optimizer + Parquet / CSV / Postgres I/O
+  give a Go team the "read → transform → aggregate → write"
+  pipeline they'd otherwise reach for Polars-via-CGo or
+  DuckDB-embedded to get.
+
 ## [v0.3.5]
 
 ### Added

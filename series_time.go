@@ -181,7 +181,7 @@ func (s Series) WithTimezone(tz string) (Series, error) {
 	defer b.Release()
 	vals := tsChunk.TimestampValues()
 	validity := make([]bool, tsChunk.Len())
-	for i := 0; i < tsChunk.Len(); i++ {
+	for i := range tsChunk.Len() {
 		validity[i] = !tsChunk.IsNull(i)
 	}
 	b.AppendValues(vals, validity)
@@ -357,14 +357,16 @@ func (s Series) timeExtract(suffix string, fn func(time.Time) int64) (Series, er
 // Duration arithmetic
 // -----------------------------------------------------------------------------
 
-// AddDuration returns a new Timestamp[ns] Series with d added to each row.
-// Nulls propagate.
+// AddDuration returns a Timestamp Series with d added to each row.
+// Output inherits the source column's TimeUnit and TimeZone —
+// downstream operators reading the plan-declared schema stay in
+// sync with the runtime column. Nulls propagate.
 func (s Series) AddDuration(d time.Duration) (Series, error) {
 	return s.shiftDuration(d, s.name)
 }
 
-// SubDuration returns a new Timestamp[ns] Series with d subtracted from
-// each row.
+// SubDuration returns a Timestamp Series with d subtracted from
+// each row. Same TimeUnit / TimeZone preservation as AddDuration.
 func (s Series) SubDuration(d time.Duration) (Series, error) {
 	return s.shiftDuration(-d, s.name)
 }
@@ -399,7 +401,7 @@ func (s Series) shiftDuration(d time.Duration, outName string) (Series, error) {
 			validity[i] = true
 		}
 	}
-	return buildTimestampNsSeries(outName, outVals, validity), nil
+	return buildTimestampSeriesLike(s, outName, outVals, validity), nil
 }
 
 // DiffDuration returns an Int64 Series whose row i is
@@ -576,7 +578,7 @@ func (s Series) TruncateTo(unit TimeUnit) (Series, error) {
 			validity[i] = true
 		}
 	}
-	return buildTimestampNsSeries(s.name, outVals, validity), nil
+	return buildTimestampSeriesLike(s, s.name, outVals, validity), nil
 }
 
 // TruncateToCalendar truncates each row to a calendar boundary (week,
@@ -631,7 +633,7 @@ func (s Series) TruncateToCalendar(unit CalendarUnit) (Series, error) {
 			validity[i] = true
 		}
 	}
-	return buildTimestampNsSeries(s.name, outVals, validity), nil
+	return buildTimestampSeriesLike(s, s.name, outVals, validity), nil
 }
 
 func unitDuration(u TimeUnit) (time.Duration, error) {
@@ -660,6 +662,13 @@ func unitDuration(u TimeUnit) (time.Duration, error) {
 
 // buildTimestampNsSeries wraps a []arrow.Timestamp with the given
 // validity into a Timestamp[ns] Series. A nil validity means all valid.
+//
+// Use this ONLY for producers that legitimately emit ns-only output
+// (e.g. NewTimestampSeries, which takes user-supplied time.Time
+// values). Operators that transform an existing Timestamp column
+// should use buildTimestampSeriesLike instead — that variant
+// preserves the source column's TimeUnit + TimeZone, which
+// downstream operators depend on for schema alignment.
 func buildTimestampNsSeries(name string, vals []arrow.Timestamp, validity []bool) Series {
 	pool := memory.DefaultAllocator
 	tsType := &arrow.TimestampType{Unit: arrow.Nanosecond}
@@ -667,6 +676,77 @@ func buildTimestampNsSeries(name string, vals []arrow.Timestamp, validity []bool
 	defer b.Release()
 	b.AppendValues(vals, validity)
 	return newSeriesFromArray(name, b.NewArray())
+}
+
+// buildTimestampSeriesLike wraps nanosecond-scaled arrow.Timestamp
+// values into a Series that inherits src's TimestampType (Unit +
+// TimeZone). Values are re-scaled from ns down to src's Unit
+// before writing — callers pass ns to keep the arithmetic uniform
+// with time.Time.UnixNano().
+//
+// For non-Timestamp sources (Date32 / Date64), falls back to
+// Timestamp[ns] with no TimeZone — matches the previous behavior
+// of buildTimestampNsSeries and avoids the caller having to
+// special-case those input types.
+//
+// This is the correct helper for Add/Sub/Truncate-shaped
+// operators that need "output looks like input" schema preservation.
+func buildTimestampSeriesLike(src Series, name string, nanoVals []arrow.Timestamp, validity []bool) Series {
+	tsType, ok := src.DataType().(*arrow.TimestampType)
+	if !ok {
+		// Date32 / Date64 source (or anything else IsDateTime
+		// covers): drop back to Timestamp[ns] since there's no
+		// source Unit / TimeZone to preserve.
+		return buildTimestampNsSeries(name, nanoVals, validity)
+	}
+	pool := memory.DefaultAllocator
+	b := array.NewTimestampBuilder(pool, tsType)
+	defer b.Release()
+	if tsType.Unit == arrow.Nanosecond {
+		// Fast path: no rescaling needed.
+		b.AppendValues(nanoVals, validity)
+		return newSeriesFromArray(name, b.NewArray())
+	}
+	div := arrow.Timestamp(unitToNanos(tsType.Unit))
+	scaled := make([]arrow.Timestamp, len(nanoVals))
+	for i, v := range nanoVals {
+		scaled[i] = roundedDivTimestamp(v, div)
+	}
+	b.AppendValues(scaled, validity)
+	return newSeriesFromArray(name, b.NewArray())
+}
+
+// roundedDivTimestamp rescales a nanosecond-valued Timestamp v
+// down to a coarser unit (div = nanoseconds-per-unit, always
+// positive) using round-half-away-from-zero. Symmetric across
+// positive and negative v — critical because Go's `/` truncates
+// toward zero, which would leave pre-1970 timestamps rounded
+// UP (toward zero) and post-1970 timestamps rounded DOWN
+// (toward zero), asymmetric error direction on sub-unit deltas.
+//
+// Example: rescaling ±1_000_500 ns to μs with plain `/` gives
+// ±1000 (both drop the fractional 0.5 μs toward zero). With
+// round-half-away, both round to ±1001 — same magnitude of
+// rounding error in both directions.
+//
+// Precision loss on a sub-unit delta (e.g. AddDuration(500ns) on
+// a Timestamp[us] source) is intrinsic to storing the result in
+// the source's unit and can't be avoided without widening the
+// output type. What this function guarantees is that the error
+// is symmetric.
+func roundedDivTimestamp(v, div arrow.Timestamp) arrow.Timestamp {
+	q := v / div
+	r := v % div
+	// Round-half-away-from-zero: bump the quotient away from zero
+	// when the remainder is at least half the divisor (in absolute
+	// magnitude, matching the sign of v).
+	switch {
+	case r*2 >= div:
+		q++
+	case r*2 <= -div:
+		q--
+	}
+	return q
 }
 
 // NewTimestampSeries builds a Timestamp[ns] Series from the given
