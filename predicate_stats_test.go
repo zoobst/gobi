@@ -120,8 +120,8 @@ func TestCanPossiblyMatch_UnknownColumnConservative(t *testing.T) {
 func TestCanPossiblyMatch_NoBoundsConservative(t *testing.T) {
 	// Column exists but stats.MinMax returns ok=false → conservative.
 	s := &fakeStats{
-		minV: map[string]any{}, // no minmax entries
-		maxV: map[string]any{},
+		minV:  map[string]any{}, // no minmax entries
+		maxV:  map[string]any{},
 		nulls: map[string]int64{},
 		total: 50,
 	}

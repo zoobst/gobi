@@ -7,8 +7,8 @@ import (
 )
 
 func TestSampleGeodesic_EndpointsPreserved(t *testing.T) {
-	a := Point{X: -73.9857, Y: 40.7484, CRSValue: WGS84}     // NYC-ish
-	b := Point{X: 139.6503, Y: 35.6762, CRSValue: WGS84}     // Tokyo-ish
+	a := Point{X: -73.9857, Y: 40.7484, CRSValue: WGS84} // NYC-ish
+	b := Point{X: 139.6503, Y: 35.6762, CRSValue: WGS84} // Tokyo-ish
 	got, err := SampleGeodesic(a, b, 64)
 	if err != nil {
 		t.Fatalf("SampleGeodesic: %v", err)

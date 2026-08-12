@@ -400,8 +400,8 @@ func TestWithPartitionAssertion_RejectedWidening(t *testing.T) {
 	src := icebergMeta()
 
 	cases := []struct {
-		name      string
-		assertion *PartitionMetadata
+		name       string
+		assertion  *PartitionMetadata
 		wantSubstr string
 	}{
 		{

@@ -104,8 +104,8 @@ func TestSJoin_Intersects_PointsInPolygons(t *testing.T) {
 	regions := polygonsFrame(t,
 		[]string{"NW", "NE", "faraway"},
 		[]geometry.Polygon{
-			unitSquare(-5, 5, 5),   // NW: covers x in [-10, 0], y in [0, 10]
-			unitSquare(5, 5, 5),    // NE: covers x in [0, 10],  y in [0, 10]
+			unitSquare(-5, 5, 5), // NW: covers x in [-10, 0], y in [0, 10]
+			unitSquare(5, 5, 5),  // NE: covers x in [0, 10],  y in [0, 10]
 			unitSquare(1000, 0, 1),
 		},
 	)

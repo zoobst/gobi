@@ -143,7 +143,9 @@ func TestExprToSQL_Rejects_UntranslatableNodes(t *testing.T) {
 // just needs to satisfy the interface.
 type fakeCustomNode struct{}
 
-func (fakeCustomNode) Eval(*Frame) (Series, error)                  { return Series{}, nil }
-func (fakeCustomNode) Type(*arrow.Schema) (arrow.DataType, error)   { return arrow.FixedWidthTypes.Boolean, nil }
-func (fakeCustomNode) Children() []Expr                             { return nil }
-func (fakeCustomNode) String() string                               { return "custom" }
+func (fakeCustomNode) Eval(*Frame) (Series, error) { return Series{}, nil }
+func (fakeCustomNode) Type(*arrow.Schema) (arrow.DataType, error) {
+	return arrow.FixedWidthTypes.Boolean, nil
+}
+func (fakeCustomNode) Children() []Expr { return nil }
+func (fakeCustomNode) String() string   { return "custom" }

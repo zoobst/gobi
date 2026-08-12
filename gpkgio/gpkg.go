@@ -58,7 +58,7 @@ var ErrInvalidHeader = errors.New("gpkg: invalid geometry header")
 type FeatureTable struct {
 	Name     string
 	GeomCol  string
-	SRID    int32
+	SRID     int32
 	GeomType string
 }
 

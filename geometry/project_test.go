@@ -34,7 +34,7 @@ func TestMercatorLatClamp(t *testing.T) {
 
 func TestUTMZoneFor(t *testing.T) {
 	cases := []struct {
-		lon float64
+		lon  float64
 		want int
 	}{
 		{-180, 1},
@@ -65,11 +65,11 @@ func TestUTMEpsgFor_HemisphereSelection(t *testing.T) {
 func TestUTMRoundTrip(t *testing.T) {
 	// Multiple points across the globe. UTM should round-trip to sub-cm.
 	pts := []struct{ lon, lat float64 }{
-		{-73.9857, 40.7484},   // NYC (zone 18N)
-		{151.2093, -33.8688},  // Sydney (zone 56S)
-		{2.3522, 48.8566},     // Paris (zone 31N)
-		{139.6503, 35.6762},   // Tokyo (zone 54N)
-		{-58.3816, -34.6037},  // Buenos Aires (zone 21S)
+		{-73.9857, 40.7484},  // NYC (zone 18N)
+		{151.2093, -33.8688}, // Sydney (zone 56S)
+		{2.3522, 48.8566},    // Paris (zone 31N)
+		{139.6503, 35.6762},  // Tokyo (zone 54N)
+		{-58.3816, -34.6037}, // Buenos Aires (zone 21S)
 	}
 	for _, p := range pts {
 		epsg := UTMEpsgFor(p.lon, p.lat)

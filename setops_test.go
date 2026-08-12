@@ -41,8 +41,8 @@ func buildSetOpFixture(t *testing.T) (*Frame, *Frame) {
 		}
 		return f
 	}
-	left := build([]int64{1, 2, 3, 2}, []string{"a", "b", "c", "b"})    // 4 rows, (2,"b") is dup
-	right := build([]int64{2, 3, 4}, []string{"b", "c", "d"})           // 3 rows, disjoint from row 0
+	left := build([]int64{1, 2, 3, 2}, []string{"a", "b", "c", "b"}) // 4 rows, (2,"b") is dup
+	right := build([]int64{2, 3, 4}, []string{"b", "c", "d"})        // 3 rows, disjoint from row 0
 	return left, right
 }
 

@@ -127,7 +127,7 @@ type colWriter struct {
 // filled in. Never mutates the caller's struct.
 func defaultWriteOptions(opts *WriteOptions) WriteOptions {
 	out := WriteOptions{
-		SRID:     4326,
+		SRID:      4326,
 		BatchSize: 1000,
 	}
 	if opts != nil {

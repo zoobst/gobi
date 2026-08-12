@@ -12,10 +12,10 @@ type shpStructRow struct {
 	// shp tag aliases to 10-char-safe DBF field names. DBF stores
 	// numeric fields as float64 regardless of source Go type, so we
 	// use float64 here for a clean round-trip.
-	ID          float64 `shp:"OBJECTID"`
-	Name        string  `shp:"NAME"`
-	Population  float64 `shp:"POP10" gobi:"pop_generic"` // shp: wins over gobi:
-	Skip        string  `shp:"-"`                        // omitted
+	ID         float64 `shp:"OBJECTID"`
+	Name       string  `shp:"NAME"`
+	Population float64 `shp:"POP10" gobi:"pop_generic"` // shp: wins over gobi:
+	Skip       string  `shp:"-"`                        // omitted
 	// Geometry stored as WKB string round-trippable via gobi.
 	Geom string `shp:"geometry" geom:"true"`
 }

@@ -56,7 +56,7 @@ func haversineFrame(t testing.TB, lat1, lon1, lat2, lon2 []float64) *Frame {
 func TestHaversineExpr_Basic(t *testing.T) {
 	f := haversineFrame(t,
 		[]float64{40.7484}, []float64{-73.9857}, // NYC
-		[]float64{51.5074}, []float64{-0.1276},  // London
+		[]float64{51.5074}, []float64{-0.1276}, // London
 	)
 	out, err := f.WithColumnExpr("dist_km", HaversineExpr(
 		PointExpr{Lat: Col("lat1"), Lon: Col("lon1")},

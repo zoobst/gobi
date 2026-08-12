@@ -8,10 +8,10 @@ import (
 )
 
 type csvStructRow struct {
-	ID     int64  `csv:"id"`
-	Name   string `csv:"name" gobi:"name_fallback"`
+	ID       int64  `csv:"id"`
+	Name     string `csv:"name" gobi:"name_fallback"`
 	Fallback string `gobi:"fallback"` // no csv tag → gobi wins
-	Skip   string `csv:"-"`         // omitted
+	Skip     string `csv:"-"`         // omitted
 }
 
 func TestCSVReadStructs_Roundtrip(t *testing.T) {

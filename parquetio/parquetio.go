@@ -199,6 +199,28 @@ type WriteOptions struct {
 	// is O(N) with one WKB parse per row and adds 32 bytes/row
 	// (4 × Float64) to file size.
 	SkipBboxCovering bool
+
+	// HilbertSort opts into spatial pre-sorting: before writing,
+	// gobi reorders rows by the Hilbert-curve index of each row's
+	// primary-geometry centroid so that per-row-group bboxes cluster
+	// tightly in space. This is what turns the v0.3.4 row-group
+	// pushdown from a synthetic-benchmark curiosity into a real-
+	// world speedup: an AOI-shaped predicate can skip most of the
+	// file when row groups are spatially local.
+	//
+	// Default false — spatial sort touches every row (O(N log N))
+	// and adds noticeable write latency on large frames. Set true
+	// for query-heavy files where the file is written once and
+	// scanned many times with AOI-style predicates. Files in
+	// insertion order (a raw shp→parquet dump, an append log) see
+	// little to no pushdown benefit without it.
+	//
+	// Sort key is the CENTROID of the primary geometry column
+	// (matches how GeoParquet 1.1's covering bbox is computed).
+	// Files with multiple geometry columns sort by the first one
+	// declared as "primary" in the geo metadata. Ignored on frames
+	// that don't have a geometry column.
+	HilbertSort bool
 }
 
 // ParseCodec resolves a codec by name (case-insensitive). Empty and "none"
@@ -667,21 +689,63 @@ func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 	if err != nil {
 		return err
 	}
-	// Augment f with per-row bbox covering columns for every geometry
-	// column so downstream readers can prune row groups via
-	// parquet-native min/max stats. Skipped when opts.SkipBboxCovering
-	// is set — some workloads (tiny frames, streaming appends) don't
-	// want the extra scan + 32 bytes/row. Returns f untouched (with a
-	// balancing Retain) when f has no geometry columns.
+	// Route the write through one of three paths depending on
+	// HilbertSort / SkipBboxCovering. The fused path is the sweet
+	// spot for HilbertSort=true: sort + bbox-covering augmentation
+	// share a single WKB parse pass instead of walking every row
+	// twice.
 	var (
 		augmented *gobi.Frame
 		meta      *gobi.GeoParquetMetadata
 	)
-	if opts.SkipBboxCovering {
-		augmented = f
-		augmented.Retain()
+	switch {
+	case opts.HilbertSort && !opts.SkipBboxCovering:
+		// Fused single-pass: sort + augment share one WKB scan for
+		// the primary geometry column.
+		if primary := primaryGeometryColumn(f); primary != "" {
+			augmented, meta, err = gobi.HilbertSortWithCovering(f, primary)
+		} else {
+			// No geometry column → HilbertSort is a no-op; fall
+			// through to the normal augment path.
+			augmented, meta, err = gobi.WithBboxCoveringColumns(f)
+		}
+	case opts.HilbertSort && opts.SkipBboxCovering:
+		// Sort but skip augmentation. Two-step form is unavoidable
+		// (there's no augmentation to fuse with).
+		//
+		// Refcount discipline: Retain() runs only AFTER
+		// BuildGeoParquetMetadata succeeds. A metadata error before
+		// the Retain leaves nothing to leak; after would leak the
+		// extra ref (the defer at the bottom only fires when we
+		// reach the code after the error check).
+		if primary := primaryGeometryColumn(f); primary != "" {
+			var sorted *gobi.Frame
+			sorted, err = f.SortByHilbert(primary)
+			if err == nil {
+				meta, err = gobi.BuildGeoParquetMetadata(sorted)
+				if err == nil {
+					augmented = sorted
+					augmented.Retain()
+				}
+				sorted.Release()
+			}
+		} else {
+			meta, err = gobi.BuildGeoParquetMetadata(f)
+			if err == nil {
+				augmented = f
+				augmented.Retain()
+			}
+		}
+	case opts.SkipBboxCovering:
+		// No sort, no bbox augmentation. Same Retain-after-metadata
+		// discipline as above.
 		meta, err = gobi.BuildGeoParquetMetadata(f)
-	} else {
+		if err == nil {
+			augmented = f
+			augmented.Retain()
+		}
+	default:
+		// No sort, standard augmentation.
 		augmented, meta, err = gobi.WithBboxCoveringColumns(f)
 	}
 	if err != nil {
@@ -1000,6 +1064,46 @@ func frameFromRecord(rec arrow.RecordBatch, geoRaw string, hideCovering bool) (*
 // by frameFromTable / frameFromRecord to skip these columns in the
 // output frame while still keeping them available on disk for
 // row-group pruning.
+// primaryGeometryColumn returns the name of the primary geometry
+// column in f — the geometry a HilbertSort should sort against.
+//
+// Resolution order:
+//
+//  1. The schema-level "geo" metadata blob's primary_column field,
+//     when set. This is what GeoParquet 1.1 files carry explicitly
+//     and honors the writer's declared choice for multi-geometry-
+//     column frames.
+//  2. First schema-order field tagged as a geometry column via
+//     MetaGeometryType. Fallback for frames built up in-process
+//     that never got a geo metadata blob attached.
+//  3. Empty string when f has no geometry columns — HilbertSort
+//     becomes a no-op.
+//
+// Schema-only lookup — no data scan.
+func primaryGeometryColumn(f *gobi.Frame) string {
+	// Step 1: consult the geo metadata blob if the schema carries one.
+	if md := f.Schema().Metadata(); md.Len() > 0 {
+		if raw, ok := md.GetValue(gobi.GeoParquetMetadataKey); ok && raw != "" {
+			if meta, err := gobi.ParseGeoParquetMetadata(raw); err == nil && meta != nil && meta.PrimaryColumn != "" {
+				// Verify the declared primary column actually exists
+				// in the schema (defensive against stale metadata).
+				for _, field := range f.Schema().Fields() {
+					if field.Name == meta.PrimaryColumn {
+						return meta.PrimaryColumn
+					}
+				}
+			}
+		}
+	}
+	// Step 2: schema-order fallback.
+	for _, field := range f.Schema().Fields() {
+		if _, ok := field.Metadata.GetValue(gobi.MetaGeometryType); ok {
+			return field.Name
+		}
+	}
+	return ""
+}
+
 func coveringColumnNames(geoRaw string, hideCovering bool) map[string]struct{} {
 	if !hideCovering || geoRaw == "" {
 		return nil

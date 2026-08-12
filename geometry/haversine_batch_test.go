@@ -12,16 +12,16 @@ import (
 // specific numerical drift.
 func TestHaversineBatch_MatchesScalar(t *testing.T) {
 	from := []Point{
-		{X: -73.9857, Y: 40.7484}, // NYC
+		{X: -73.9857, Y: 40.7484},  // NYC
 		{X: -118.2437, Y: 34.0522}, // LA
-		{X: 0, Y: 0},                // null island
-		{X: 2.3522, Y: 48.8566},     // Paris
+		{X: 0, Y: 0},               // null island
+		{X: 2.3522, Y: 48.8566},    // Paris
 	}
 	to := []Point{
-		{X: -0.1276, Y: 51.5074},   // London
-		{X: -73.9857, Y: 40.7484},  // NYC
-		{X: 1, Y: 0},                // one deg east
-		{X: -0.1276, Y: 51.5074},   // London
+		{X: -0.1276, Y: 51.5074},  // London
+		{X: -73.9857, Y: 40.7484}, // NYC
+		{X: 1, Y: 0},              // one deg east
+		{X: -0.1276, Y: 51.5074},  // London
 	}
 	got, err := HaversineBatch(from, to, UnitKilometers)
 	if err != nil {
@@ -47,13 +47,13 @@ func TestHaversineBatch_KnownDistances(t *testing.T) {
 	got, err := HaversineBatch(
 		[]Point{
 			{X: -73.9857, Y: 40.7484}, // NYC
-			{X: 0, Y: 90},              // North pole
-			{X: 0, Y: 0},               // Equator
+			{X: 0, Y: 90},             // North pole
+			{X: 0, Y: 0},              // Equator
 		},
 		[]Point{
 			{X: -0.1276, Y: 51.5074}, // London
-			{X: 0, Y: 0},              // Equator
-			{X: 1, Y: 0},              // One deg east
+			{X: 0, Y: 0},             // Equator
+			{X: 1, Y: 0},             // One deg east
 		},
 		UnitKilometers,
 	)
@@ -149,7 +149,7 @@ func BenchmarkHaversineBatch_vs_ScalarLoop(b *testing.B) {
 
 	b.Run("Batch", func(b *testing.B) {
 		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			out, err := HaversineBatch(from, to, UnitKilometers)
 			if err != nil {
 				b.Fatal(err)
@@ -160,7 +160,7 @@ func BenchmarkHaversineBatch_vs_ScalarLoop(b *testing.B) {
 
 	b.Run("ScalarLoop", func(b *testing.B) {
 		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			out := make([]float64, N)
 			for j := range from {
 				d, err := Haversine(from[j], to[j], UnitKilometers)

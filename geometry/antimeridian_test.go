@@ -28,7 +28,7 @@ func TestCrossesAntimeridian(t *testing.T) {
 		},
 		{
 			name: "linestring straddling",
-			g: LineString{Points: []Point{{X: 179, Y: 0}, {X: -179, Y: 0}}, CRSValue: WGS84},
+			g:    LineString{Points: []Point{{X: 179, Y: 0}, {X: -179, Y: 0}}, CRSValue: WGS84},
 			want: true,
 		},
 		{

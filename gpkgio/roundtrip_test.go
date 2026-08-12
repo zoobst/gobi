@@ -193,9 +193,9 @@ func TestRoundTrip_MetadataInPlace(t *testing.T) {
 
 	// gpkg_contents row.
 	var (
-		dataType             string
+		dataType               string
 		minX, minY, maxX, maxY float64
-		srsID                int32
+		srsID                  int32
 	)
 	if err := db.QueryRow(`
 		SELECT data_type, min_x, min_y, max_x, max_y, srs_id

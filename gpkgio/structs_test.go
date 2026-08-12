@@ -13,7 +13,7 @@ import (
 type gpkgStructRow struct {
 	ID    int64   `gpkg:"fid" gobi:"id_generic"` // gpkg: wins
 	Name  string  `gpkg:"name"`
-	Value float64 `gobi:"value"`   // no gpkg tag → gobi fallback
+	Value float64 `gobi:"value"` // no gpkg tag → gobi fallback
 	Skip  string  `gpkg:"-"`
 	Geom  string  `gpkg:"geom" geom:"true"`
 }

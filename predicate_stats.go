@@ -72,6 +72,8 @@ func canMatchNode(n ExprNode, s Stats) bool {
 		return canMatchNode(n.inner, s)
 	case *geomPredicateNode:
 		return canMatchGeomPredicate(n, s)
+	case *geomDWithinNode:
+		return canMatchGeomDWithin(n, s)
 	}
 	// notNode, custom nodes, arithmetic — bail conservatively.
 	return true
@@ -125,8 +127,8 @@ func canMatchGeomPredicate(n *geomPredicateNode, s Stats) bool {
 		return true
 	}
 
-	switch {
-	case n.pred == geometry.PredDisjoint:
+	switch n.pred {
+	case geometry.PredDisjoint:
 		// Disjoint: pruning here is unsound in general. The tempting
 		// rule "row group is fully inside lit's bbox → no row is
 		// disjoint from lit" only holds when lit's bbox equals lit's
@@ -149,7 +151,7 @@ func canMatchGeomPredicate(n *geomPredicateNode, s Stats) bool {
 			return false
 		}
 		return true
-	case n.pred == geometry.PredWithin:
+	case geometry.PredWithin:
 		// Within: row's bbox must be inside the constant's bbox.
 		// Prune only when the row group's minimum extent is already
 		// bigger than the constant — i.e. the smallest x-span in the
@@ -162,6 +164,68 @@ func canMatchGeomPredicate(n *geomPredicateNode, s Stats) bool {
 		// require bbox intersection as a necessary condition.
 		return bboxesOverlap(litBounds, rgBounds)
 	}
+}
+
+// canMatchGeomDWithin handles a DWithin predicate against a row
+// group's covering-column stats. Same "necessary condition"
+// framing as canMatchGeomPredicate: prune only when the row group's
+// bbox is provably too far from the constant's bbox to have any
+// pair of points within `distance`.
+//
+// Only the constant-right case prunes (column-right has no static
+// distance geometry to compare against). Negative / NaN distance
+// yields all-false at runtime — safe to keep the row group and let
+// the executor produce the false answer.
+func canMatchGeomDWithin(n *geomDWithinNode, s Stats) bool {
+	lg, ok := unwrapAlias(n.right).(*literalGeomNode)
+	if !ok {
+		// Try the other side (unusual but symmetric).
+		lg, ok = unwrapAlias(n.left).(*literalGeomNode)
+		if !ok {
+			return true
+		}
+	}
+	geomCol, ok := extractDWithinColRef(n)
+	if !ok {
+		return true
+	}
+	rgBounds, ok := coveringBounds(s, geomCol.name)
+	if !ok {
+		return true
+	}
+	if lg.value == nil {
+		return true
+	}
+	litBounds := lg.value.Bounds()
+	if litBounds.Empty() {
+		return true
+	}
+	if n.distance < 0 || math.IsNaN(n.distance) {
+		return true // executor produces all-false; don't prune
+	}
+	// Expand the constant's bbox by `distance` in all directions.
+	// Any row group whose bbox doesn't overlap the expanded region
+	// is provably farther than `distance` from lit — safe to prune.
+	expanded := geometry.Bounds{
+		MinX: litBounds.MinX - n.distance,
+		MinY: litBounds.MinY - n.distance,
+		MaxX: litBounds.MaxX + n.distance,
+		MaxY: litBounds.MaxY + n.distance,
+	}
+	return bboxesOverlap(expanded, rgBounds)
+}
+
+// extractDWithinColRef mirrors extractGeomColRef for the DWithin
+// node — either operand may be the column reference, though
+// left-column-right-literal is the common shape.
+func extractDWithinColRef(n *geomDWithinNode) (*colRefNode, bool) {
+	if c, ok := unwrapAlias(n.left).(*colRefNode); ok {
+		return c, true
+	}
+	if c, ok := unwrapAlias(n.right).(*colRefNode); ok {
+		return c, true
+	}
+	return nil, false
 }
 
 // litIsBboxRectangle reports whether g's planar polygon area is

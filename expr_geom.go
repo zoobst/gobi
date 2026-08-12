@@ -340,6 +340,142 @@ func flatBinary(s Series) (*array.Binary, error) {
 	return bin, nil
 }
 
+// -----------------------------------------------------------------------------
+// GeomDWithin — distance-parameterized predicate. Distinct from
+// geomPredicateNode because it carries a scalar (the distance)
+// alongside the two geometry operands.
+// -----------------------------------------------------------------------------
+
+// GeomDWithin returns "e is within distance of other" as a Boolean
+// expression. distance is in the column's coordinate units — meters
+// for projected CRSes, degrees for lon/lat. For lon/lat data, apply
+// GeomToCRS first so the distance comparison stays meaningful.
+//
+// distance = 0 degenerates to GeomIntersects. Negative or NaN
+// distance yields all-false. Nulls propagate.
+//
+// The killer spatial-join operator: "AOIs within 5km of a road",
+// "polygons within 100m of the shoreline", "points within 50m of a
+// track". Composes with Filter like any other Expr predicate;
+// constant-right shape gets the bbox-expanded row-group pushdown
+// (see canMatchGeomDWithin).
+func (e Expr) GeomDWithin(other Expr, distance float64) Expr {
+	return Expr{node: &geomDWithinNode{
+		left:     e.node,
+		right:    other.node,
+		distance: distance,
+	}}
+}
+
+// geomDWithinNode is the executor node for Expr.GeomDWithin.
+// Separate from geomPredicateNode because DWithin carries a scalar
+// distance parameter that changes the pushdown logic (bbox-expanded
+// prune instead of plain bbox-overlap prune).
+type geomDWithinNode struct {
+	left, right ExprNode
+	distance    float64
+}
+
+func (n *geomDWithinNode) Eval(input *Frame) (Series, error) {
+	// Constant-right fast path.
+	if rlit, ok := n.right.(*literalGeomNode); ok {
+		if rlit.value == nil {
+			return allNullBool(input.NumRows(), n.outputName(""))
+		}
+		left, err := n.left.Eval(input)
+		if err != nil {
+			return Series{}, err
+		}
+		return n.evalConstantRight(left, rlit.value)
+	}
+	// Column-right: pair-wise per-row test.
+	left, err := n.left.Eval(input)
+	if err != nil {
+		return Series{}, err
+	}
+	right, err := n.right.Eval(input)
+	if err != nil {
+		return Series{}, err
+	}
+	return n.evalColumnRight(left, right)
+}
+
+func (n *geomDWithinNode) evalConstantRight(left Series, right geometry.Geometry) (Series, error) {
+	out, err := left.GeomDWithin(right, n.distance)
+	if err != nil {
+		return Series{}, err
+	}
+	return renameSeries(out, n.outputName(left.name)), nil
+}
+
+func (n *geomDWithinNode) evalColumnRight(left, right Series) (Series, error) {
+	if !left.IsGeometry() {
+		return Series{}, fmt.Errorf("%w: dwithin left operand", ErrNotGeometry)
+	}
+	if !right.IsGeometry() {
+		return Series{}, fmt.Errorf("%w: dwithin right operand", ErrNotGeometry)
+	}
+	if left.Len() != right.Len() {
+		return Series{}, fmt.Errorf("gobi: dwithin: length mismatch (%d vs %d)",
+			left.Len(), right.Len())
+	}
+	leftBin, err := flatBinary(left)
+	if err != nil {
+		return Series{}, err
+	}
+	defer leftBin.Release()
+	rightBin, err := flatBinary(right)
+	if err != nil {
+		return Series{}, err
+	}
+	defer rightBin.Release()
+
+	lcrs, _ := geometry.LookupCRS(geometryCRSFromField(left.field))
+	rcrs, _ := geometry.LookupCRS(geometryCRSFromField(right.field))
+
+	pool := memory.DefaultAllocator
+	b := array.NewBooleanBuilder(pool)
+	defer b.Release()
+	for i := range leftBin.Len() {
+		if leftBin.IsNull(i) || rightBin.IsNull(i) {
+			b.AppendNull()
+			continue
+		}
+		lg, err := geometry.ParseWKB(leftBin.Value(i))
+		if err != nil {
+			return Series{}, err
+		}
+		rg, err := geometry.ParseWKB(rightBin.Value(i))
+		if err != nil {
+			return Series{}, err
+		}
+		lg = attachCRS(lg, lcrs)
+		rg = attachCRS(rg, rcrs)
+		b.Append(geometry.WithinDistance(lg, rg, n.distance))
+	}
+	field := arrow.Field{Name: n.outputName(left.name), Type: arrow.FixedWidthTypes.Boolean, Nullable: true}
+	return SeriesFromArray(field, b.NewArray()), nil
+}
+
+func (n *geomDWithinNode) Type(_ *arrow.Schema) (arrow.DataType, error) {
+	return arrow.FixedWidthTypes.Boolean, nil
+}
+
+func (n *geomDWithinNode) Children() []Expr {
+	return []Expr{{node: n.left}, {node: n.right}}
+}
+
+func (n *geomDWithinNode) String() string {
+	return fmt.Sprintf("dwithin(%s, %s, %g)", n.left, n.right, n.distance)
+}
+
+func (n *geomDWithinNode) outputName(leftName string) string {
+	if leftName == "" {
+		return "dwithin"
+	}
+	return leftName + "_dwithin"
+}
+
 // allNullBool returns a Boolean Series of n rows, every value null.
 // Used when a constant-right predicate operand is nil — matches
 // Polars' "any null → null" semantic.

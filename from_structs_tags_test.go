@@ -6,7 +6,8 @@ import (
 )
 
 // TestResolveFieldName_TagPriority checks the resolution order:
-//   format-specific → gobi → csv → field name.
+//
+//	format-specific → gobi → csv → field name.
 func TestResolveFieldName_TagPriority(t *testing.T) {
 	type row struct {
 		A string `parquet:"a_parquet" gobi:"a_gobi" csv:"a_csv"`
@@ -26,7 +27,7 @@ func TestResolveFieldName_TagPriority(t *testing.T) {
 	}{
 		// format tag wins when set
 		{"A", "parquet", "a_parquet"},
-		{"A", "csv", "a_csv"},   // format=csv → csv:"a_csv" wins over gobi
+		{"A", "csv", "a_csv"},      // format=csv → csv:"a_csv" wins over gobi
 		{"A", "geojson", "a_gobi"}, // no geojson tag → gobi
 		{"A", "", "a_gobi"},        // no format → gobi
 		// gobi tag when no format match
@@ -69,12 +70,12 @@ func TestResolveFieldName_Skip(t *testing.T) {
 		field, format string
 		wantSkip      bool
 	}{
-		{"A", "", true},         // gobi:"-"
-		{"A", "parquet", true},  // fallback to gobi:"-"
-		{"B", "parquet", true},  // parquet:"-"
-		{"B", "csv", false},     // no csv:"-" set, and no gobi tag → falls back to field name
-		{"C", "csv", true},      // csv:"-"
-		{"C", "parquet", true},  // fallback to csv:"-"
+		{"A", "", true},        // gobi:"-"
+		{"A", "parquet", true}, // fallback to gobi:"-"
+		{"B", "parquet", true}, // parquet:"-"
+		{"B", "csv", false},    // no csv:"-" set, and no gobi tag → falls back to field name
+		{"C", "csv", true},     // csv:"-"
+		{"C", "parquet", true}, // fallback to csv:"-"
 	}
 	for _, c := range cases {
 		_, skip := ResolveFieldName(sf(c.field), c.format)

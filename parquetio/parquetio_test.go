@@ -28,14 +28,14 @@ Chicago,2746388,POINT (-87.6298 41.8781)
 
 func TestParseCodec(t *testing.T) {
 	cases := map[string]parquetio.Codec{
-		"":            parquetio.CodecUncompressed,
-		"NONE":        parquetio.CodecUncompressed,
-		"snappy":      parquetio.CodecSnappy,
-		"Gzip":        parquetio.CodecGzip,
-		"gz":          parquetio.CodecGzip,
-		"br":          parquetio.CodecBrotli,
-		"zstd":        parquetio.CodecZstd,
-		"lz4":         parquetio.CodecLZ4,
+		"":       parquetio.CodecUncompressed,
+		"NONE":   parquetio.CodecUncompressed,
+		"snappy": parquetio.CodecSnappy,
+		"Gzip":   parquetio.CodecGzip,
+		"gz":     parquetio.CodecGzip,
+		"br":     parquetio.CodecBrotli,
+		"zstd":   parquetio.CodecZstd,
+		"lz4":    parquetio.CodecLZ4,
 	}
 	for in, want := range cases {
 		got, err := parquetio.ParseCodec(in)

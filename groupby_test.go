@@ -10,7 +10,8 @@ import (
 )
 
 // salesFrame returns a frame:
-//   region string, product string, revenue float64, units int64
+//
+//	region string, product string, revenue float64, units int64
 func salesFrame(t *testing.T) *Frame {
 	t.Helper()
 	pool := memory.DefaultAllocator

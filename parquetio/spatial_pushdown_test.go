@@ -333,6 +333,96 @@ func TestSpatialPushdown_Disjoint_RectangularLiteralPrunes(t *testing.T) {
 	}
 }
 
+// TestSpatialPushdown_DWithin_PrunesFarRowGroups: DWithin pushdown
+// expands the constant's bbox by `distance` before checking
+// row-group overlap. A row group whose bbox is more than `distance`
+// from the AOI's bbox gets pruned.
+//
+// Fixture: two clusters, one near origin, one at (5000, 5000). AOI
+// at (0, 0). DWithin(AOI, distance=100) should prune the far cluster
+// (thousands of units away). DWithin(AOI, distance=6000) should keep
+// both.
+func TestSpatialPushdown_DWithin_PrunesFarRowGroups(t *testing.T) {
+	clusterA := geometry.Point{X: 10, Y: 10}
+	clusterB := geometry.Point{X: 5000, Y: 5000}
+	df := spatialFrame(t, 400, clusterA, clusterB)
+	defer df.Release()
+
+	path := filepath.Join(t.TempDir(), "dwithin_prune.parquet")
+	if err := parquetio.WriteFile(df, path, &parquetio.WriteOptions{
+		Codec:        parquetio.CodecSnappy,
+		RowGroupRows: 200,
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	aoi := geometry.SimplePolygon([]geometry.Point{
+		{X: 0, Y: 0},
+		{X: 20, Y: 0},
+		{X: 20, Y: 20},
+		{X: 0, Y: 20},
+		{X: 0, Y: 0},
+	}, geometry.PseudoMercator)
+
+	// Small distance → only cluster A's row group survives.
+	near, err := parquetio.ReadFile(path, &parquetio.ReadOptions{
+		Predicate: gobi.Col("geometry").GeomDWithin(gobi.Lit(aoi), 100),
+	})
+	if err != nil {
+		t.Fatalf("near read: %v", err)
+	}
+	defer near.Release()
+	nearRows, _ := near.Shape()
+	if nearRows != 200 {
+		t.Fatalf("DWithin(d=100): got %d rows, want 200 (only cluster A row group)", nearRows)
+	}
+
+	// Big distance → both clusters' row groups survive. Tightening
+	// the assertion: check that BOTH cluster A ids (< 200) AND
+	// cluster B ids (>= 200) are present in the output. A regression
+	// that wrongly pruned either cluster would show up as an
+	// unbalanced id distribution even if the row count happened to
+	// land at 400.
+	wide, err := parquetio.ReadFile(path, &parquetio.ReadOptions{
+		Predicate: gobi.Col("geometry").GeomDWithin(gobi.Lit(aoi), 8000),
+	})
+	if err != nil {
+		t.Fatalf("wide read: %v", err)
+	}
+	defer wide.Release()
+	wideRows, _ := wide.Shape()
+	if wideRows != 400 {
+		t.Fatalf("DWithin(d=8000): got %d rows, want 400 (both row groups)", wideRows)
+	}
+	if !containsUpperRightID(wide, 200) {
+		t.Errorf("wide DWithin: cluster A (id < 200) rows missing — pushdown wrongly pruned near cluster")
+	}
+	if !containsIDAtLeast(wide, 200) {
+		t.Errorf("wide DWithin: cluster B (id >= 200) rows missing — pushdown wrongly pruned far cluster")
+	}
+}
+
+// containsIDAtLeast reports whether the "id" column has any value
+// >= cutoff. Companion to containsUpperRightID for the "far
+// cluster's rows survived" half of the wide-distance assertion.
+func containsIDAtLeast(f *gobi.Frame, cutoff int64) bool {
+	col, err := f.Column("id")
+	if err != nil {
+		return false
+	}
+	for _, chunk := range col.Column().Data().Chunks() {
+		ints, ok := chunk.(*array.Int64)
+		if !ok {
+			return false
+		}
+		for i := range ints.Len() {
+			if !ints.IsNull(i) && ints.Value(i) >= cutoff {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // TestSpatialPushdown_LazyScanFilterCollect_NoPanic exercises the
 // end-to-end lazy path: parquetio.ScanFile(path).Filter(pred).Collect().
 //

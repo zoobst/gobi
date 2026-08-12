@@ -5,6 +5,144 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.5]
+
+### Added
+
+- **Hilbert-curve spatial pre-sort** — the piece that turns v0.3.4's
+  row-group bbox pushdown from "works on synthetic clustered files"
+  into "works on real-world data." Three layers:
+
+  - `geometry.HilbertIndex(x, y, bounds, order)` — pure-math
+    quantized-2D-to-1D space-filling curve index. Order 16 default
+    (65,536 × 65,536 grid); iterative quadrant-rotation kernel with
+    no lookup tables; ~30 ns/call. Out-of-bounds points clamp to
+    the grid edge; empty bounds return 0.
+  - `Frame.SortByHilbert(geomCol)` — reorders rows by the Hilbert
+    index of each row's geometry centroid. Bounds derived from the
+    column's own centroids (self-contained, no caller bbox
+    needed). Stable sort, nulls last. Under the hood: two-pass
+    O(N) — centroid + bbox computation, then quantize + sort.
+  - `parquetio.WriteOptions.HilbertSort` — opt-in flag that runs
+    `SortByHilbert` on the primary geometry column before bbox
+    covering augmentation and the actual write. Sort runs against
+    the pre-augmentation frame so the covering columns are
+    computed on the sorted row order.
+  - `HilbertSortWithCovering(f, geomCol)` — fused single-pass
+    equivalent of `SortByHilbert` followed by
+    `WithBboxCoveringColumns`. Parses each row's WKB exactly once
+    (vs twice for the two-step form) — the sort's centroid pass
+    and the augmentation's bbox pass share a single scan.
+    `parquetio.WriteFile` uses this automatically when
+    `HilbertSort=true` and `SkipBboxCovering=false` (the common
+    combination). Benchmark on a 40k-row 8-vertex-octagon corpus:
+    **27.7ms → 23.5ms (1.18× faster), 112MB → 86MB (24% less
+    memory), 33% fewer allocs**. Speedup grows with polygon vertex
+    count — the sort's f.take gather cost caps the improvement on
+    small polygons; on 1000-vertex GSHHS coastlines the WKB parse
+    dominates and the fused form wins by a bigger factor.
+
+  Same design principle as the previous release: no assumptions
+  about the caller's read pattern in the writer's defaults —
+  `HilbertSort` opts in explicitly.
+
+- **Real-world pushdown benchmark**: on a shuffled 40k-polygon
+  grid (mirrors the spatial-incoherence shape of a raw
+  `shp → parquet` dump), a small AOI query against the same file
+  written insertion-order vs. Hilbert-sorted:
+
+  | Read pattern                       | ns/op     | B/op       | allocs/op |
+  |------------------------------------|----------:|-----------:|----------:|
+  | Insertion-order, no pushdown       | 2,962,573 | 27,218,131 |     4,297 |
+  | Insertion-order, WITH pushdown     | 2,958,110 | 27,339,329 |     5,086 |
+  | Hilbert-sorted, WITH pushdown      |   632,654 |  2,100,576 |     2,594 |
+
+  Pushdown alone on shuffled data buys ~0% (row-group bboxes are
+  too wide to prune anything). Hilbert-sort + pushdown: **4.7×
+  faster read, 13× less memory allocated**.
+
+- **GSHHS demo re-benchmarked with sort.** Regenerated
+  `experiments/data/GSHHS_i_all.parquet` with `-hilbert=true`
+  (the new default in `gshhs_to_geoparquet`). Row-group bboxes went
+  from "every group spans ±180°" (pre-v0.3.5) to 9 spatially-
+  distinct clusters covering the Americas / North Atlantic / Europe
+  / Asia / Antarctica. On a California AOI query: **75.8% of the
+  file skipped** (2 of 9 row groups kept), up from ~15% (1 of 9)
+  on the insertion-order version.
+
+- **`experiments/gshhs_to_geoparquet` `-hilbert` flag** — defaults
+  to `true`. Applies during both single-file conversion and the
+  `-merge` step (so the merged file gets globally sorted, not just
+  locally sorted per input).
+
+- **`GeomDWithin(other, distance)` — the killer spatial-join
+  operator.** Reports whether two geometries are within a given
+  planar distance. "Roads within 100m of a coastline", "AOIs within
+  5km of a point of interest", "polygons within 50m of a
+  track" — all map straight to this call. Three layers:
+
+  - `geometry.WithinDistance(a, b, distance) bool` — pure primitive
+    with a bbox-min-distance short-circuit: two shapes whose
+    bounding rectangles are already farther apart than `distance`
+    return false without walking a single edge.
+  - `Series.GeomDWithin(other, distance) (Series, error)` — row-
+    wise predicate, null-propagating.
+  - `Expr.GeomDWithin(other Expr, distance float64) Expr` — lazy
+    composition alongside the seven binary predicates.
+
+  distance is in coordinate units — meters for projected CRSes,
+  degrees for lon/lat (project first with `GeomToCRS`). distance=0
+  degenerates to `Intersects`; negative or NaN → all-false.
+
+- **DWithin row-group pushdown**. `CanPossiblyMatch` grew a case
+  for the new `*geomDWithinNode`: expand the constant's bbox by
+  `distance` in all directions, then apply the standard bbox-
+  overlap test. Row groups whose bbox is more than `distance`
+  from the constant's bbox get pruned before any WKB decode.
+  Verified via `TestSpatialPushdown_DWithin_PrunesFarRowGroups`.
+
+- **Two spatial-sort orderings, chosen by access pattern.** Both
+  are peers — pick the one that matches how you'll query the file:
+
+  - **`Frame.SortByHilbert(geomCol)` + `SortByHilbertWith(geomCol,
+    opts)` + `HilbertSortOptions`**. Space-filling-curve ordering
+    that preserves 2D locality symmetrically. Best for point
+    queries, diagonal AOIs, and multi-file / multi-partition
+    sorts that need cross-file locality — pass
+    `HilbertSortOptions.Bounds = <union of all partitions'
+    bounds>` and each partition's Hilbert indices land on the same
+    curve, so downstream merges preserve global order.
+    `SortByHilbert(geomCol)` is the thin zero-opts wrapper.
+
+  - **`Frame.SortBySTR(geomCol, leafSize)`**. Sort-Tile-Recursive
+    partitions rows into ⌈√(N/leafSize)⌉ vertical strips sorted by
+    x, then sorts each strip by y — producing rectangular row
+    groups. Best for datasets queried predominantly along
+    axis-aligned AOIs (latitude bands, admin regions, timeseries
+    windows), where STR's rectangular tiles overlap fewer row
+    groups than Hilbert's diagonal-crossing curve.
+
+  Both are null-last, stable-within-leaf, and swap into
+  `WriteOptions.HilbertSort` interchangeably at the parquet layer
+  (though today the writer flag maps only to Hilbert; STR is a
+  library-level primitive callers apply before write).
+
+### Fixed
+
+None — v0.3.5 is purely additive.
+
+### Notes
+
+- The v0.3.4 CHANGELOG's description of `ReadOptions.Predicate`
+  was accurate but easy to misread: it's a **row-group pruning
+  hint**, NOT a row filter. The reader walks each row-group's
+  footer stats and skips groups whose bounds prove no match, but
+  every surviving group's rows come through untouched. Callers
+  wanting only the matching rows still run `Frame.FilterExpr(pred)`
+  on the eager path or feed via `LazyFrame.Filter(pred)` on the
+  lazy path (which does both — pushdown + row filter — in one
+  chain).
+
 ## [v0.3.4]
 
 ### Added
@@ -77,6 +215,16 @@ introduce breaking changes; check this file when upgrading.
   spatial predicates now; the `parquetio.ScanFile(path).Filter(pred)`
   lazy shape gets it via the optimizer's `PushPredicateToScan` rule,
   no caller plumbing required.
+
+  **Predicate is a row-group pruning hint, not a row filter.** The
+  reader walks each row-group's footer stats and skips groups whose
+  bounds prove no match, but every surviving group's rows come
+  through untouched. Callers wanting only the matching rows still
+  run `Frame.FilterExpr(pred)` on the eager path or feed via
+  `LazyFrame.Filter(pred)` on the lazy path (which does both —
+  pushdown + row filter — in one chain). Easy trap to fall into
+  when `ReadOptions.Predicate` reads like a filter; naming it a
+  "hint" would have been more honest.
 
   New API surface introduced in this feature — see the "Changed
   (post-review)" block below for the round-2 additions that pair

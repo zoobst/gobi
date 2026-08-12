@@ -319,9 +319,9 @@ func TestExec_StreamingAggregate_MultipleBatches(t *testing.T) {
 	// the scan operator: LazyFrame's Compile uses defaultBatchRows.
 	scan := newScanFrameExec(df, 2) // → 3 batches of 2/2/1
 	agg := &streamingAggregateExec{
-		input:     scan,
-		keys:      []string{"region"},
-		aggs:      []Aggregation{{Column: "price", Kind: AggSum}},
+		input: scan,
+		keys:  []string{"region"},
+		aggs:  []Aggregation{{Column: "price", Kind: AggSum}},
 		outSchema: newAggregateNode(&scanFrameNode{frame: df}, []string{"region"},
 			[]Aggregation{{Column: "price", Kind: AggSum}}).outSchema,
 	}
@@ -433,9 +433,9 @@ func TestExec_StreamingJoin_ProbeSideStreams(t *testing.T) {
 	// Force a multi-batch probe by driving the operator directly
 	// with a small batchRows on the left scan. The build side goes
 	// through Execute (single-batch pass) internally.
-	left := lazyFrame(t)   // 5 rows
-	right := lazyRegions(t) // 2 rows
-	leftScan := newScanFrameExec(left, 2)  // 3 probe batches
+	left := lazyFrame(t)                  // 5 rows
+	right := lazyRegions(t)               // 2 rows
+	leftScan := newScanFrameExec(left, 2) // 3 probe batches
 	rightScan := newScanFrameExec(right, 100)
 
 	join := &streamingJoinExec{

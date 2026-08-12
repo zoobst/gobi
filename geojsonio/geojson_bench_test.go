@@ -96,8 +96,8 @@ func BenchmarkGeoJSON_FeatureCollection_1M(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		var fc struct {
-			Type     string             `json:"type"`
-			Features []geojsonio.Feature  `json:"features"`
+			Type     string              `json:"type"`
+			Features []geojsonio.Feature `json:"features"`
 		}
 		if err := json.Unmarshal(data, &fc); err != nil {
 			b.Fatal(err)
@@ -125,8 +125,8 @@ func BenchmarkGeoJSON_FeatureCollection_1M_OuterOnly(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		var fc struct {
-			Type     string             `json:"type"`
-			Features []geojsonio.Feature  `json:"features"`
+			Type     string              `json:"type"`
+			Features []geojsonio.Feature `json:"features"`
 		}
 		if err := json.Unmarshal(data, &fc); err != nil {
 			b.Fatal(err)

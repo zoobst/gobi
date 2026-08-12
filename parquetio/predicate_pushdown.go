@@ -17,7 +17,7 @@ import (
 // work is O(#predicates × #row-groups) rather than O(#columns ×
 // #row-groups).
 type rowGroupStats struct {
-	rg       *metadata.RowGroupMetaData
+	rg        *metadata.RowGroupMetaData
 	colByName map[string]int
 }
 

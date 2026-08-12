@@ -184,4 +184,3 @@ func polyclipIssue8Outer() []Point {
 		{X: -118.8858033, Y: 34.1845418},
 	}
 }
-

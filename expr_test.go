@@ -283,8 +283,8 @@ func TestExpr_TypeInference(t *testing.T) {
 		{Col("price"), arrow.FLOAT64},
 		{Col("qty"), arrow.INT64},
 		{Col("price").Add(Lit(1.0)), arrow.FLOAT64},
-		{Col("qty").Add(Col("price")), arrow.FLOAT64},   // int + float → float
-		{Col("qty").Add(Lit(int64(1))), arrow.INT64},    // int + int → int
+		{Col("qty").Add(Col("price")), arrow.FLOAT64}, // int + float → float
+		{Col("qty").Add(Lit(int64(1))), arrow.INT64},  // int + int → int
 		{Col("price").Gt(Lit(1.0)), arrow.BOOL},
 		{Col("active").Not(), arrow.BOOL},
 		{Col("active").And(Col("active")), arrow.BOOL},

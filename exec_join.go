@@ -34,9 +34,9 @@ type streamingJoinExec struct {
 	outSchema         *arrow.Schema
 
 	built      bool
-	buildFrame *Frame              // right side, materialized on first Next
-	rightIndex map[string][]int    // right key → rows, built once and reused
-	rightKeyS  Series              // right's key column, cached for the per-batch join
+	buildFrame *Frame           // right side, materialized on first Next
+	rightIndex map[string][]int // right key → rows, built once and reused
+	rightKeyS  Series           // right's key column, cached for the per-batch join
 	closed     bool
 }
 

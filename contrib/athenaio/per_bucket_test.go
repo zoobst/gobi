@@ -370,7 +370,7 @@ func TestRawCTASBuckets_HappyPath(t *testing.T) {
 		HashFn:  "athenaio/hive/bucket/v1",
 	}
 	results, err := c.RawCTASBuckets(context.Background(), RawCTASSpec{
-		SQL: "CREATE TABLE ... WITH (bucketed_by = ARRAY['cell'], bucket_count = 3) AS SELECT ...",
+		SQL:              "CREATE TABLE ... WITH (bucketed_by = ARRAY['cell'], bucket_count = 3) AS SELECT ...",
 		TableName:        "user-table",
 		ExternalLocation: external,
 		Metadata:         userMeta,

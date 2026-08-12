@@ -227,9 +227,9 @@ func TestOptimize_Composition(t *testing.T) {
 	df := lazyFrame(t)
 	lf := df.Lazy().
 		Select(Col("id"), Col("price"), Col("active")).
-		Filter(Lit(true)).                        // → removed
-		Filter(Col("price").Gt(Lit(15.0))).       // ┐ combined
-		Filter(Col("active"))                     // ┘ into one
+		Filter(Lit(true)).                  // → removed
+		Filter(Col("price").Gt(Lit(15.0))). // ┐ combined
+		Filter(Col("active"))               // ┘ into one
 	// After optimize: Filter(price>15 AND active) below Project.
 
 	// Confirm end-to-end result is the same as raw.
@@ -411,10 +411,10 @@ func TestOptimize_PushFilterBelowSort(t *testing.T) {
 // records the last cols set applied so tests can assert what the
 // optimizer asked for.
 type projectableTestScan struct {
-	schema         *arrow.Schema
-	sourceFrame    *Frame
-	appliedCols    []string
-	callCount      int
+	schema      *arrow.Schema
+	sourceFrame *Frame
+	appliedCols []string
+	callCount   int
 }
 
 func (s *projectableTestScan) Schema() *arrow.Schema                 { return s.schema }

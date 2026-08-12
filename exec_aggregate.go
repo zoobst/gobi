@@ -731,7 +731,7 @@ type customIncrementalAcc struct {
 func (a *customIncrementalAcc) Update(col Series, rows []int) error {
 	return a.inner.Update(col, rows)
 }
-func (a *customIncrementalAcc) Finalize() any             { return a.inner.Finalize() }
+func (a *customIncrementalAcc) Finalize() any              { return a.inner.Finalize() }
 func (a *customIncrementalAcc) OutputType() arrow.DataType { return a.outType }
 
 // buildResultBatch produces the single result RecordBatch by iterating
@@ -912,14 +912,14 @@ func (a *countAcc) Update(col Series, rows []int) error {
 	return nil
 }
 
-func (a *countAcc) Finalize() any             { return a.n }
+func (a *countAcc) Finalize() any              { return a.n }
 func (a *countAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes.Int64 }
 
 // sumAcc keeps a running sum of numeric values. Skips nulls. Empty
 // group finalizes to nil (null in output).
 type sumAcc struct {
-	sum    float64
-	seen   bool
+	sum  float64
+	seen bool
 }
 
 func (a *sumAcc) Update(col Series, rows []int) error {
@@ -1231,9 +1231,9 @@ func (a *firstLastAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes
 // batches, one accumulator per group. Undefined for n<2; Finalize
 // returns nil in that case (matches pandas / polars).
 type stdVarAcc struct {
-	wantStd    bool
-	n          int64
-	mean, m2   float64
+	wantStd  bool
+	n        int64
+	mean, m2 float64
 }
 
 func (a *stdVarAcc) Update(col Series, rows []int) error {
@@ -1297,7 +1297,7 @@ func (a *nUniqueAcc) Update(col Series, rows []int) error {
 	return nil
 }
 
-func (a *nUniqueAcc) Finalize() any             { return int64(len(a.seen)) }
+func (a *nUniqueAcc) Finalize() any              { return int64(len(a.seen)) }
 func (a *nUniqueAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes.Int64 }
 
 // medianAcc buffers every non-null numeric value in the group and

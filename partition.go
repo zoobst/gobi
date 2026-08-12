@@ -128,16 +128,16 @@ func AlignedWith(l, r *PartitionMetadata) bool {
 //     the whole claim).
 //   - Nil assertion → always allowed (narrowing to "no claim").
 //   - Non-nil src, non-nil assertion:
-//       - Columns must byte-equal (assertion can't change what
-//         the source partitions on).
-//       - HashFn must byte-equal (can't change hash function).
-//       - assertion.SortedBy must be a prefix of src.SortedBy
-//         (writer contract that enforced [a, b, c] also enforced
-//         [a, b] as a prefix, so shorter prefixes are valid
-//         narrowings; different columns or reordered are not).
-//       - assertion.SortEnforced may downgrade true→false but not
-//         upgrade false→true (upgrading is a stronger claim than
-//         the source made).
+//   - Columns must byte-equal (assertion can't change what
+//     the source partitions on).
+//   - HashFn must byte-equal (can't change hash function).
+//   - assertion.SortedBy must be a prefix of src.SortedBy
+//     (writer contract that enforced [a, b, c] also enforced
+//     [a, b] as a prefix, so shorter prefixes are valid
+//     narrowings; different columns or reordered are not).
+//   - assertion.SortEnforced may downgrade true→false but not
+//     upgrade false→true (upgrading is a stronger claim than
+//     the source made).
 func validateAssertion(src, assertion *PartitionMetadata) error {
 	if src == nil || assertion == nil {
 		return nil

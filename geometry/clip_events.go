@@ -174,10 +174,10 @@ type eventQueue struct {
 	items []*sweepEvent
 }
 
-func (q *eventQueue) Len() int            { return len(q.items) }
-func (q *eventQueue) Less(i, j int) bool  { return lessEvent(q.items[i], q.items[j]) }
-func (q *eventQueue) Swap(i, j int)       { q.items[i], q.items[j] = q.items[j], q.items[i] }
-func (q *eventQueue) Push(x any)          { q.items = append(q.items, x.(*sweepEvent)) }
+func (q *eventQueue) Len() int           { return len(q.items) }
+func (q *eventQueue) Less(i, j int) bool { return lessEvent(q.items[i], q.items[j]) }
+func (q *eventQueue) Swap(i, j int)      { q.items[i], q.items[j] = q.items[j], q.items[i] }
+func (q *eventQueue) Push(x any)         { q.items = append(q.items, x.(*sweepEvent)) }
 func (q *eventQueue) Pop() any {
 	n := len(q.items)
 	x := q.items[n-1]
@@ -186,7 +186,7 @@ func (q *eventQueue) Pop() any {
 }
 
 func (q *eventQueue) push(e *sweepEvent) { heap.Push(q, e) }
-func (q *eventQueue) pop() *sweepEvent    { return heap.Pop(q).(*sweepEvent) }
+func (q *eventQueue) pop() *sweepEvent   { return heap.Pop(q).(*sweepEvent) }
 func (q *eventQueue) peek() *sweepEvent {
 	if len(q.items) == 0 {
 		return nil

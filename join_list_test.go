@@ -186,7 +186,8 @@ func TestJoin_FullCarriesListStringColumnWithNulls(t *testing.T) {
 }
 
 // The end-to-end use case that motivated this fix:
-//   Full-outer-join two branches, coalesce nulls to empty lists, union.
+//
+//	Full-outer-join two branches, coalesce nulls to empty lists, union.
 func TestJoin_FullThenCoalesceThenListUnion(t *testing.T) {
 	left := listJoinFrame(t,
 		[]int64{1, 2, 3},

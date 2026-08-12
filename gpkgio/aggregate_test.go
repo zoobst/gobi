@@ -34,7 +34,6 @@ func TestSumColumn_HappyPath(t *testing.T) {
 	}
 }
 
-
 // TestSumColumn_ValidationErrors — unsafe identifiers reject before
 // touching the DB; unknown layer/column surfaces the SQL error.
 func TestSumColumn_ValidationErrors(t *testing.T) {
@@ -50,12 +49,12 @@ func TestSumColumn_ValidationErrors(t *testing.T) {
 	defer g.Close()
 
 	cases := []struct{ layer, col string }{
-		{"", "value"},                // empty layer
-		{"features", ""},             // empty column
-		{"drop; --", "value"},        // injection in layer
-		{"features", "col; DROP T"},  // injection in column
-		{"missing_layer", "value"},   // unknown layer (SQL error)
-		{"features", "missing_col"},  // unknown column (SQL error)
+		{"", "value"},               // empty layer
+		{"features", ""},            // empty column
+		{"drop; --", "value"},       // injection in layer
+		{"features", "col; DROP T"}, // injection in column
+		{"missing_layer", "value"},  // unknown layer (SQL error)
+		{"features", "missing_col"}, // unknown column (SQL error)
 	}
 	for _, c := range cases {
 		if _, err := g.SumColumn(c.layer, c.col); err == nil {

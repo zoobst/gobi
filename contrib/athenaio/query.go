@@ -260,4 +260,3 @@ func ClearStats(lf *gobi.LazyFrame) {
 	delete(statsRegistry, key)
 	statsMu.Unlock()
 }
-

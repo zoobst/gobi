@@ -77,10 +77,10 @@ type Client struct {
 // trackedTable is one row of the created-tables ledger. Fields
 // captured at CTAS time so Close doesn't need to re-derive them.
 type trackedTable struct {
-	Database        string
-	Name            string
-	Cleanup         Cleanup
-	Format          TableFormat
+	Database         string
+	Name             string
+	Cleanup          Cleanup
+	Format           TableFormat
 	ExternalLocation string // s3://... for CleanupAll deletion (step 6b)
 }
 

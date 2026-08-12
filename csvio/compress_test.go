@@ -56,16 +56,16 @@ func zstdBytes(t *testing.T, s string) []byte {
 
 func TestDetectCodec_FromExtension(t *testing.T) {
 	cases := map[string]csvio.Codec{
-		"foo.csv":                 csvio.CodecNone,
-		"foo.csv.gz":              csvio.CodecGzip,
-		"foo.CSV.GZ":              csvio.CodecGzip,
-		"data.gz":                 csvio.CodecGzip,
-		"data.zst":                csvio.CodecZstd,
-		"data.csv.zst":            csvio.CodecZstd,
-		"archived.zstd":           csvio.CodecZstd,
-		"data.bz2":                csvio.CodecBzip2,
-		"data.csv.bz2":            csvio.CodecBzip2,
-		"unrelated.csv.snappy":    csvio.CodecNone,
+		"foo.csv":              csvio.CodecNone,
+		"foo.csv.gz":           csvio.CodecGzip,
+		"foo.CSV.GZ":           csvio.CodecGzip,
+		"data.gz":              csvio.CodecGzip,
+		"data.zst":             csvio.CodecZstd,
+		"data.csv.zst":         csvio.CodecZstd,
+		"archived.zstd":        csvio.CodecZstd,
+		"data.bz2":             csvio.CodecBzip2,
+		"data.csv.bz2":         csvio.CodecBzip2,
+		"unrelated.csv.snappy": csvio.CodecNone,
 	}
 	for path, want := range cases {
 		// detectCodecFromPath is unexported; expose it via a public

@@ -31,8 +31,8 @@ func TestSeries_GeomCircleContains(t *testing.T) {
 
 func TestSeries_GeomDistanceToCircle(t *testing.T) {
 	s := geomSeries(t, "geom", int32(geometry.PseudoMercator.EPSG), []geometry.Geometry{
-		geometry.Point{X: 0, Y: 0, CRSValue: geometry.PseudoMercator}, // center → -r
-		geometry.Point{X: 5, Y: 0, CRSValue: geometry.PseudoMercator}, // on boundary
+		geometry.Point{X: 0, Y: 0, CRSValue: geometry.PseudoMercator},  // center → -r
+		geometry.Point{X: 5, Y: 0, CRSValue: geometry.PseudoMercator},  // on boundary
 		geometry.Point{X: 10, Y: 0, CRSValue: geometry.PseudoMercator}, // 5 outside
 	})
 	c := geometry.Circle{Center: geometry.Point{X: 0, Y: 0}, Radius: 5}

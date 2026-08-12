@@ -362,9 +362,9 @@ func (n *namedCustomNode) Eval(input *Frame) (Series, error) {
 func (n *namedCustomNode) Type(*arrow.Schema) (arrow.DataType, error) {
 	return arrow.PrimitiveTypes.Float64, nil
 }
-func (n *namedCustomNode) Children() []Expr    { return nil }
-func (n *namedCustomNode) String() string      { return "custom(" + n.name + ")" }
-func (n *namedCustomNode) OutputName() string  { return n.name }
+func (n *namedCustomNode) Children() []Expr   { return nil }
+func (n *namedCustomNode) String() string     { return "custom(" + n.name + ")" }
+func (n *namedCustomNode) OutputName() string { return n.name }
 
 func TestLazy_Select_CustomNamerHonored(t *testing.T) {
 	df := lazyFrame(t)

@@ -11,8 +11,24 @@ func EmptyBounds() Bounds {
 	return Bounds{MinX: 1, MinY: 1, MaxX: -1, MaxY: -1} // deliberately inverted
 }
 
-// Empty reports whether the bounds are the zero-extent inverted sentinel.
+// Empty reports whether the bounds are the inverted-sentinel returned
+// by EmptyBounds — i.e. no point has ever been added to them.
+//
+// Empty is NOT the same as "zero-area rectangle." A Point's Bounds is
+// {x, y, x, y} (min == max on both axes), which is not Empty — it's a
+// legitimate zero-area rectangle carrying the point's location. Only
+// the inverted sentinel signals "unset." Use IsZero to test for the
+// zero-value Bounds{} shape, which callers using bounds as a
+// reference-frame parameter often want to treat as "derive from data."
 func (b Bounds) Empty() bool { return b.MinX > b.MaxX || b.MinY > b.MaxY }
+
+// IsZero reports whether the bounds are the Go zero-value Bounds{}
+// (all four fields == 0). Distinct from Empty (which catches the
+// inverted-sentinel EmptyBounds()). Callers that accept bounds as an
+// optional reference frame (see HilbertSortOptions.Bounds) treat
+// IsZero as "unspecified — derive from data" so users don't need to
+// know about the sentinel form.
+func (b Bounds) IsZero() bool { return b == Bounds{} }
 
 // Extend returns a Bounds enlarged to include (x, y).
 func (b Bounds) Extend(x, y float64) Bounds {
