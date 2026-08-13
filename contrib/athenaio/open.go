@@ -10,6 +10,7 @@ import (
 	gluetypes "github.com/aws/aws-sdk-go-v2/service/glue/types"
 
 	"github.com/zoobst/gobi"
+	"github.com/zoobst/gobi/parquetio"
 )
 
 // OpenPartitionedTable reads an existing Glue-cataloged table + its
@@ -90,7 +91,11 @@ func (c *Client) OpenPartitionedTable(ctx context.Context, database, tableName s
 		return nil, fmt.Errorf("athenaio: %s.%s: no result files under %s",
 			database, tableName, externalLoc)
 	}
-	frame, err := c.readBucketFiles(ctx, files)
+	var readOpts *parquetio.ReadOptions
+	if opts != nil {
+		readOpts = readOptsFromSpec(opts.Columns, opts.Predicate)
+	}
+	frame, err := c.readBucketFiles(ctx, files, readOpts)
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: %s.%s: %w", database, tableName, err)
 	}

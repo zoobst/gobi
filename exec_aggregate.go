@@ -1072,15 +1072,38 @@ func (a *meanAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes.Floa
 // minMaxAcc tracks a running min OR max. extreme is initialized to
 // +Inf for min and -Inf for max so the first non-null value always
 // replaces it.
+//
+// Timestamp columns: on first Update the accumulator captures the
+// source's arrow.TimestampType and switches to an int64 fast path
+// (tsExtreme). Finalize returns arrow.Timestamp in that case, and
+// OutputType returns the captured type so builderForType stands up
+// a matching TimestampBuilder in the LazyFrame executor and in
+// scalarAggNode.Eval (Over-scalar path). The Timestamp case never
+// mixes with the numeric case within one accumulator — a single
+// column drives a single accumulator, and column types don't shift
+// across batches.
 type minMaxAcc struct {
-	isMin   bool
-	extreme float64
-	seen    bool
+	isMin       bool
+	extreme     float64
+	seen        bool
+	isTimestamp bool
+	tsExtreme   arrow.Timestamp
+	tsType      arrow.DataType
 }
 
 func (a *minMaxAcc) Update(col Series, rows []int) error {
 	if col.col == nil {
 		return nil
+	}
+	// Timestamp branch (detected once on first non-empty Update).
+	if a.tsType == nil && !a.seen {
+		if _, isTS := col.DataType().(*arrow.TimestampType); isTS {
+			a.isTimestamp = true
+			a.tsType = col.DataType()
+		}
+	}
+	if a.isTimestamp {
+		return a.updateTimestamp(col, rows)
 	}
 	chunks := col.col.Data().Chunks()
 	if len(chunks) == 1 {
@@ -1104,6 +1127,32 @@ func (a *minMaxAcc) Update(col Series, rows []int) error {
 			continue
 		}
 		a.update(v)
+	}
+	return nil
+}
+
+// updateTimestamp compares raw int64 timestamp values without
+// float64 conversion — preserves nanosecond precision beyond 2^53
+// (matters for timestamps far from epoch).
+func (a *minMaxAcc) updateTimestamp(col Series, rows []int) error {
+	for _, row := range rows {
+		v, null, err := timestampAt(col, row)
+		if err != nil {
+			return err
+		}
+		if null {
+			continue
+		}
+		if !a.seen {
+			a.tsExtreme = v
+			a.seen = true
+			continue
+		}
+		if a.isMin && v < a.tsExtreme {
+			a.tsExtreme = v
+		} else if !a.isMin && v > a.tsExtreme {
+			a.tsExtreme = v
+		}
 	}
 	return nil
 }
@@ -1164,9 +1213,17 @@ func (a *minMaxAcc) Finalize() any {
 	if !a.seen {
 		return nil
 	}
+	if a.isTimestamp {
+		return a.tsExtreme
+	}
 	return a.extreme
 }
-func (a *minMaxAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes.Float64 }
+func (a *minMaxAcc) OutputType() arrow.DataType {
+	if a.isTimestamp && a.tsType != nil {
+		return a.tsType
+	}
+	return arrow.PrimitiveTypes.Float64
+}
 
 // firstLastAcc captures the first (keepFirst=true) or last
 // (keepFirst=false) non-null value seen. Update is called in row

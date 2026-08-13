@@ -215,6 +215,23 @@ func (g *GroupBy) buildAggBuilders(aggs []Aggregation, pool memory.Allocator) ([
 			aggFields[i] = arrow.Field{Name: aggName(a), Type: srcType, Nullable: true}
 			continue
 		}
+		if a.Kind == AggMin || a.Kind == AggMax {
+			src, err := g.frame.Column(a.Column)
+			if err != nil {
+				return nil, nil, err
+			}
+			if _, isTS := src.DataType().(*arrow.TimestampType); isTS {
+				srcType := src.DataType()
+				b, err := builderForType(pool, srcType)
+				if err != nil {
+					return nil, nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
+						i, aggName(a), err)
+				}
+				aggBuilders[i] = b
+				aggFields[i] = arrow.Field{Name: aggName(a), Type: srcType, Nullable: true}
+				continue
+			}
+		}
 		if _, err := g.frame.Column(a.Column); err != nil {
 			return nil, nil, err
 		}

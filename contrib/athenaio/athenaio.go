@@ -241,6 +241,17 @@ type OpenOptions struct {
 	// pointing at an Iceberg table must supply this override — the
 	// auto-detect path errors out with a hint.
 	Metadata *gobi.PartitionMetadata
+
+	// Columns projects each bucket parquet to a subset of top-level
+	// columns at read time — passed through to parquetio.ReadReader
+	// as ReadOptions.Columns. See RawCTASSpec.Columns for semantics.
+	Columns []string
+
+	// Predicate is a row-group pruning hint applied to every bucket
+	// parquet at read time — passed through to parquetio.ReadReader
+	// as ReadOptions.Predicate. See RawCTASSpec.Predicate for the
+	// pruning-vs-filtering distinction.
+	Predicate gobi.Expr
 }
 
 // RawCTASSpec configures a Client.RawCTAS call — the escape hatch
@@ -280,6 +291,29 @@ type RawCTASSpec struct {
 	// Cleanup overrides the Client-level Cleanup for this call.
 	// Zero-value CleanupInherit means "use Client default."
 	Cleanup Cleanup
+
+	// Columns projects each bucket parquet to a subset of top-level
+	// columns at read time — passed through to parquetio.ReadReader
+	// as ReadOptions.Columns. nil or empty reads every column.
+	//
+	// Named columns must be present in the CTAS output schema.
+	// Skipping columns avoids fetching, decompressing, and
+	// materializing them into arrow arrays — meaningful on wide
+	// bucket parquets where downstream code only touches a handful.
+	Columns []string
+
+	// Predicate is a row-group pruning hint applied to every bucket
+	// parquet at read time — passed through to parquetio.ReadReader
+	// as ReadOptions.Predicate. Same semantics as
+	// parquetio.ReadOptions.Predicate: row groups whose footer
+	// stats prove no row could satisfy the predicate are skipped
+	// wholesale; rows within surviving groups are NOT filtered.
+	//
+	// If callers want row-level filtering, they should also apply
+	// `.Filter(pred)` on the returned per-bucket LazyFrame — the
+	// Predicate here is a fast-path hint that avoids downloading +
+	// decoding irrelevant row groups from S3.
+	Predicate gobi.Expr
 }
 
 // UnloadSpec configures a single UnloadAndRead call: the user's
@@ -332,6 +366,18 @@ type UnloadSpec struct {
 	// eventually via its own failure state, just wrapped in nested
 	// SQL that's harder to read.
 	ValidatePartitionCols bool
+
+	// Columns projects each bucket parquet to a subset of top-level
+	// columns at read time — passed through to parquetio.ReadReader
+	// as ReadOptions.Columns. See RawCTASSpec.Columns for the
+	// column-projection semantics; identical here.
+	Columns []string
+
+	// Predicate is a row-group pruning hint applied to every bucket
+	// parquet at read time — passed through to parquetio.ReadReader
+	// as ReadOptions.Predicate. See RawCTASSpec.Predicate for the
+	// pruning-vs-filtering distinction; identical here.
+	Predicate gobi.Expr
 }
 
 // QueryStats reports Athena's per-query metadata surfaced back to

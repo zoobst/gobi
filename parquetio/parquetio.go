@@ -538,7 +538,7 @@ func ReadFileChunksFunc(path string, opts *ReadOptions, fn func(*gobi.Frame) err
 		cbErr := fn(frame)
 		frame.Release()
 		if cbErr != nil {
-			return fmt.Errorf("%w: %v", ErrChunksAborted, cbErr)
+			return fmt.Errorf("%w: %w", ErrChunksAborted, cbErr)
 		}
 	}
 	if err := rr.Err(); err != nil {
@@ -603,7 +603,7 @@ func ReadReaderChunksFunc(r io.ReaderAt, size int64, opts *ReadOptions, fn func(
 		cbErr := fn(frame)
 		frame.Release()
 		if cbErr != nil {
-			return fmt.Errorf("%w: %v", ErrChunksAborted, cbErr)
+			return fmt.Errorf("%w: %w", ErrChunksAborted, cbErr)
 		}
 	}
 	if err := rr.Err(); err != nil {

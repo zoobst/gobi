@@ -3,6 +3,7 @@ package gobi
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -131,6 +132,161 @@ func TestGroupBy_MultipleKeys_MinMaxMean(t *testing.T) {
 	maxU, _ := out.Column("max_units")
 	if v := maxU.col.Data().Chunks()[0].(*array.Float64).Value(naA); v != 10 {
 		t.Fatalf("(NA,A) max_units = %v, want 10", v)
+	}
+}
+
+// timestampGroupsFrame returns a frame:
+//
+//	group string, t timestamp[ns, tz=UTC]
+//
+// with two groups so min/max on the timestamp column has non-trivial
+// output. Includes a null t in group A to check null-skipping.
+func timestampGroupsFrame(t *testing.T) *Frame {
+	t.Helper()
+	pool := memory.DefaultAllocator
+	groupB := array.NewStringBuilder(pool)
+	defer groupB.Release()
+	groupB.AppendValues([]string{"A", "A", "A", "B", "B"}, nil)
+
+	tsType := &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}
+	tsB := array.NewTimestampBuilder(pool, tsType)
+	defer tsB.Release()
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	tsB.Append(arrow.Timestamp(base.Add(3 * time.Hour).UnixNano()))
+	tsB.Append(arrow.Timestamp(base.Add(1 * time.Hour).UnixNano()))
+	tsB.AppendNull()
+	tsB.Append(arrow.Timestamp(base.Add(5 * time.Hour).UnixNano()))
+	tsB.Append(arrow.Timestamp(base.Add(7 * time.Hour).UnixNano()))
+
+	fields := []arrow.Field{
+		{Name: "group", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "t", Type: tsType, Nullable: true},
+	}
+	arrays := []arrow.Array{groupB.NewArray(), tsB.NewArray()}
+	defer func() {
+		for _, a := range arrays {
+			a.Release()
+		}
+	}()
+	cols := make([]arrow.Column, len(fields))
+	for i, a := range arrays {
+		chunked := arrow.NewChunked(a.DataType(), []arrow.Array{a})
+		cols[i] = *arrow.NewColumn(fields[i], chunked)
+	}
+	f, err := NewFrame(arrow.NewSchema(fields, nil), cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// TestGroupBy_Timestamp_MinMax verifies that Min/Max on a Timestamp
+// column preserves the source's TimestampType (unit + timezone) in
+// the output schema and returns Timestamp values (not float64
+// nanoseconds). Nulls are skipped.
+func TestGroupBy_Timestamp_MinMax(t *testing.T) {
+	f := timestampGroupsFrame(t)
+	defer f.Release()
+
+	gb, err := f.GroupBy("group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := gb.Agg(
+		Aggregation{Column: "t", Kind: AggMin, Alias: "first_t"},
+		Aggregation{Column: "t", Kind: AggMax, Alias: "last_t"},
+	)
+	if err != nil {
+		t.Fatalf("Agg: %v", err)
+	}
+	defer out.Release()
+
+	// Schema check: min/max columns should be TimestampType, not
+	// Float64. TimeZone should survive the round trip.
+	firstF, ok := out.Schema().FieldsByName("first_t")
+	if !ok || len(firstF) == 0 {
+		t.Fatalf("no first_t column")
+	}
+	tsType, isTS := firstF[0].Type.(*arrow.TimestampType)
+	if !isTS {
+		t.Fatalf("first_t type = %s, want TimestampType", firstF[0].Type)
+	}
+	if tsType.TimeZone != "UTC" {
+		t.Errorf("first_t timezone = %q, want UTC", tsType.TimeZone)
+	}
+	if tsType.Unit != arrow.Nanosecond {
+		t.Errorf("first_t unit = %s, want Nanosecond", tsType.Unit)
+	}
+
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	// Groups sorted by string key: A, B.
+	firstCol, _ := out.Column("first_t")
+	firstArr := firstCol.col.Data().Chunks()[0].(*array.Timestamp)
+	lastCol, _ := out.Column("last_t")
+	lastArr := lastCol.col.Data().Chunks()[0].(*array.Timestamp)
+
+	// Group A: non-null values are +3h, +1h → min +1h, max +3h.
+	wantMinA := arrow.Timestamp(base.Add(1 * time.Hour).UnixNano())
+	wantMaxA := arrow.Timestamp(base.Add(3 * time.Hour).UnixNano())
+	if firstArr.Value(0) != wantMinA {
+		t.Errorf("A min = %d, want %d", firstArr.Value(0), wantMinA)
+	}
+	if lastArr.Value(0) != wantMaxA {
+		t.Errorf("A max = %d, want %d", lastArr.Value(0), wantMaxA)
+	}
+	// Group B: +5h, +7h → min +5h, max +7h.
+	wantMinB := arrow.Timestamp(base.Add(5 * time.Hour).UnixNano())
+	wantMaxB := arrow.Timestamp(base.Add(7 * time.Hour).UnixNano())
+	if firstArr.Value(1) != wantMinB {
+		t.Errorf("B min = %d, want %d", firstArr.Value(1), wantMinB)
+	}
+	if lastArr.Value(1) != wantMaxB {
+		t.Errorf("B max = %d, want %d", lastArr.Value(1), wantMaxB)
+	}
+}
+
+// TestLazyFrame_Timestamp_MinMax exercises the streaming aggregate
+// (LazyFrame.GroupBy.Agg) rather than the eager path — the two share
+// almost no code, so both need coverage.
+func TestLazyFrame_Timestamp_MinMax(t *testing.T) {
+	f := timestampGroupsFrame(t)
+	defer f.Release()
+
+	out, err := f.Lazy().
+		GroupBy("group").
+		Agg(
+			Aggregation{Column: "t", Kind: AggMin, Alias: "first_t"},
+			Aggregation{Column: "t", Kind: AggMax, Alias: "last_t"},
+		).
+		Collect()
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	defer out.Release()
+
+	firstF, ok := out.Schema().FieldsByName("first_t")
+	if !ok || len(firstF) == 0 {
+		t.Fatalf("no first_t column")
+	}
+	if _, isTS := firstF[0].Type.(*arrow.TimestampType); !isTS {
+		t.Fatalf("first_t type = %s, want TimestampType", firstF[0].Type)
+	}
+
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	firstCol, _ := out.Column("first_t")
+	firstArr := firstCol.col.Data().Chunks()[0].(*array.Timestamp)
+	wantMinA := arrow.Timestamp(base.Add(1 * time.Hour).UnixNano())
+	wantMinB := arrow.Timestamp(base.Add(5 * time.Hour).UnixNano())
+	// Groups may be in first-seen order (A, B) from the streaming
+	// path — either ordering is valid, so check that both expected
+	// values are present in the two output rows.
+	got := []arrow.Timestamp{firstArr.Value(0), firstArr.Value(1)}
+	has := func(want arrow.Timestamp) bool {
+		return got[0] == want || got[1] == want
+	}
+	if !has(wantMinA) || !has(wantMinB) {
+		t.Errorf("first_t values = %v, want both %d and %d present",
+			got, wantMinA, wantMinB)
 	}
 }
 

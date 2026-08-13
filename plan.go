@@ -309,13 +309,22 @@ func newAggregateNode(input LogicalPlan, keys []string, aggs []Aggregation) *agg
 
 	// Agg output columns. Count / NUnique → Int64 non-null;
 	// First / Last / Mode preserve the source column's arrow type;
-	// custom Aggregator uses its declared Type; everything else →
-	// Float64.
+	// Min / Max preserve source type when the source is Timestamp
+	// (so timestamp aggregation round-trips instead of collapsing to
+	// Float64); custom Aggregator uses its declared Type; everything
+	// else → Float64.
 	for _, a := range aggs {
 		t := aggOutputType(a)
 		if a.Fn == nil && (a.Kind == AggFirst || a.Kind == AggLast || a.Kind == AggMode) {
 			if fm, ok := inSchema.FieldsByName(a.Column); ok && len(fm) > 0 {
 				t = fm[0].Type
+			}
+		}
+		if a.Fn == nil && (a.Kind == AggMin || a.Kind == AggMax) {
+			if fm, ok := inSchema.FieldsByName(a.Column); ok && len(fm) > 0 {
+				if _, isTS := fm[0].Type.(*arrow.TimestampType); isTS {
+					t = fm[0].Type
+				}
 			}
 		}
 		fields = append(fields, arrow.Field{

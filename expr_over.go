@@ -140,15 +140,21 @@ func (n *scalarAggNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 		return nil, err
 	}
 	// The accumulator's OutputType doesn't depend on input dtype for
-	// most kinds; Sum/Min/Max ignore it, Mean/Median are always
-	// Float64, Count is always Int64. Mode preserves the source
-	// column's arrow type.
+	// most kinds; Sum ignores it, Mean/Median are always Float64,
+	// Count is always Int64. Mode preserves the source column's
+	// arrow type. Min/Max also preserve source type when the source
+	// is Timestamp — everything else falls through to Float64.
 	innerType, err := n.inner.Type(schema)
 	if err != nil {
 		return nil, err
 	}
 	if n.kind == AggMode {
 		return innerType, nil
+	}
+	if n.kind == AggMin || n.kind == AggMax {
+		if _, isTS := innerType.(*arrow.TimestampType); isTS {
+			return innerType, nil
+		}
 	}
 	return acc.OutputType(), nil
 }

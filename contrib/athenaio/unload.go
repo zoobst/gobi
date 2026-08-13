@@ -134,7 +134,7 @@ func (c *Client) UnloadAndRead(ctx context.Context, spec UnloadSpec) (*gobi.Lazy
 		return nil, fmt.Errorf("athenaio: UnloadAndRead %s: no result files under %s",
 			queryID, actualLoc)
 	}
-	frame, err := c.readBucketFiles(ctx, files)
+	frame, err := c.readBucketFiles(ctx, files, readOptsFromSpec(spec.Columns, spec.Predicate))
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: UnloadAndRead %s: %w", queryID, err)
 	}
@@ -261,7 +261,7 @@ func (c *Client) RawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 		return nil, fmt.Errorf("athenaio: RawCTAS %s: no result files under %s",
 			queryID, actualLoc)
 	}
-	frame, err := c.readBucketFiles(ctx, files)
+	frame, err := c.readBucketFiles(ctx, files, readOptsFromSpec(spec.Columns, spec.Predicate))
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
 	}
@@ -534,7 +534,11 @@ func locationMatches(a, b string) bool {
 // parquetio.ReadReader, and returns the resulting Frame. Extracted
 // so the per-bucket variants (UnloadAndReadBuckets, RawCTASBuckets)
 // can call it once per bucket without duplicating the S3-read plumbing.
-func (c *Client) openBucketFrame(ctx context.Context, uri string) (*gobi.Frame, error) {
+//
+// opts is passed to parquetio.ReadReader — Columns projects, Predicate
+// prunes row groups. nil means "read every column, no row-group
+// pruning" (the pre-v0.3.7 behavior).
+func (c *Client) openBucketFrame(ctx context.Context, uri string, opts *parquetio.ReadOptions) (*gobi.Frame, error) {
 	bucket, key, err := parseS3URI(uri)
 	if err != nil {
 		return nil, err
@@ -543,11 +547,25 @@ func (c *Client) openBucketFrame(ctx context.Context, uri string) (*gobi.Frame, 
 	if err != nil {
 		return nil, err
 	}
-	f, err := parquetio.ReadReader(ra, size, nil)
+	f, err := parquetio.ReadReader(ra, size, opts)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", uri, err)
 	}
 	return f, nil
+}
+
+// readOptsFromSpec builds a *parquetio.ReadOptions carrying columns
+// and predicate, or returns nil when neither is set — preserves the
+// pre-existing "opts == nil ⇒ default read" contract exactly when
+// callers leave both spec fields unset.
+func readOptsFromSpec(columns []string, predicate gobi.Expr) *parquetio.ReadOptions {
+	if len(columns) == 0 && predicate.Node() == nil {
+		return nil
+	}
+	return &parquetio.ReadOptions{
+		Columns:   columns,
+		Predicate: predicate,
+	}
 }
 
 // readBucketFiles opens each s3:// URI in files, reads it via
@@ -556,15 +574,19 @@ func (c *Client) openBucketFrame(ctx context.Context, uri string) (*gobi.Frame, 
 // Order preserved from files argument (typically lexicographic bucket
 // order from ListObjectsV2).
 //
+// opts applies to every per-file ReadReader — spec-derived Columns
+// projection and Predicate row-group pruning propagate identically
+// across the bucket set.
+//
 // Uses array.Concatenate for a single-chunk output rather than
 // gobi.Concat (which produces multi-chunk columns) because the
 // streaming executor's frameToBatch reads only chunks[0] — a multi-
 // chunk Frame reaching Collect silently drops rows past the first
 // chunk.
-func (c *Client) readBucketFiles(ctx context.Context, files []bucketFileInfo) (*gobi.Frame, error) {
+func (c *Client) readBucketFiles(ctx context.Context, files []bucketFileInfo, opts *parquetio.ReadOptions) (*gobi.Frame, error) {
 	frames := make([]*gobi.Frame, 0, len(files))
 	for _, fi := range files {
-		f, err := c.openBucketFrame(ctx, fi.URI)
+		f, err := c.openBucketFrame(ctx, fi.URI, opts)
 		if err != nil {
 			for _, prev := range frames {
 				prev.Release()
@@ -812,7 +834,7 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 	// nil slots so len(result) == BucketCount and index i maps to
 	// bucket i consistently across peer calls.
 	results := make([]BucketResult, spec.BucketCount)
-	totalRows, err := c.populateBucketResults(ctx, files, results, meta)
+	totalRows, err := c.populateBucketResults(ctx, files, results, meta, readOptsFromSpec(spec.Columns, spec.Predicate))
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: %w", queryID, err)
 	}
@@ -928,7 +950,7 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 	}
 
 	results := make([]BucketResult, bucketCount)
-	totalRows, err := c.populateBucketResults(ctx, files, results, spec.Metadata)
+	totalRows, err := c.populateBucketResults(ctx, files, results, spec.Metadata, readOptsFromSpec(spec.Columns, spec.Predicate))
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
 	}
@@ -955,15 +977,19 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 // derived from the parquet footer, no data-page cost beyond the
 // full read already happening for the LazyFrame wrap).
 //
+// opts propagates to every per-bucket parquetio.ReadReader call —
+// column projection + predicate row-group pruning derived from the
+// caller's spec.
+//
 // Slotting: file path suffix `bucket_NNNNN` (or Athena's naming
 // variant) is parsed to extract the bucket index; if parsing fails
 // (RawCTAS output without a matching name), files fill slots in
 // listing order. Missing bucket indices stay nil.
-func (c *Client) populateBucketResults(ctx context.Context, files []bucketFileInfo, results []BucketResult, meta *gobi.PartitionMetadata) (int64, error) {
+func (c *Client) populateBucketResults(ctx context.Context, files []bucketFileInfo, results []BucketResult, meta *gobi.PartitionMetadata, opts *parquetio.ReadOptions) (int64, error) {
 	nSlots := len(results)
 	var totalRows int64
 	for i, fi := range files {
-		frame, err := c.openBucketFrame(ctx, fi.URI)
+		frame, err := c.openBucketFrame(ctx, fi.URI, opts)
 		if err != nil {
 			return 0, err
 		}

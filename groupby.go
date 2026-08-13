@@ -298,6 +298,9 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 		// First / Last / Mode preserve the source column's arrow
 		// type. We stand up a builder matching that type and let
 		// appendAgg route through the type-generic value writer.
+		// Min / Max additionally preserve source type when the
+		// source is Timestamp — see the Timestamp branch in
+		// appendAgg for the matching read path.
 		if a.Kind == AggFirst || a.Kind == AggLast || a.Kind == AggMode {
 			src, err := g.frame.Column(a.Column)
 			if err != nil {
@@ -314,6 +317,25 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 				Name: aggName(a), Type: srcType, Nullable: true,
 			}
 			continue
+		}
+		if a.Kind == AggMin || a.Kind == AggMax {
+			src, err := g.frame.Column(a.Column)
+			if err != nil {
+				return nil, err
+			}
+			if _, isTS := src.DataType().(*arrow.TimestampType); isTS {
+				srcType := src.DataType()
+				b, err := builderForType(pool, srcType)
+				if err != nil {
+					return nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
+						i, aggName(a), err)
+				}
+				aggBuilders[i] = b
+				aggFields[i] = arrow.Field{
+					Name: aggName(a), Type: srcType, Nullable: true,
+				}
+				continue
+			}
 		}
 		if _, err := g.frame.Column(a.Column); err != nil {
 			return nil, err
@@ -1082,6 +1104,17 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 	if err != nil {
 		return err
 	}
+	// Timestamp Min/Max: reduce as int64 (the underlying storage) and
+	// emit back through the TimestampBuilder set up in buildAggBuilders.
+	// Keeps precision at the source column's TimeUnit and preserves
+	// timezone. Non-Min/Max kinds still route through the numeric
+	// path below and reject Timestamp (Sum/Mean/Std/Var on Timestamp
+	// are semantically muddy — we'd need a Duration return type).
+	if agg.Kind == AggMin || agg.Kind == AggMax {
+		if _, isTS := s.DataType().(*arrow.TimestampType); isTS {
+			return g.appendTimestampMinMax(b, s, agg.Kind, rows)
+		}
+	}
 	if !s.isNumeric() {
 		return fmt.Errorf("%w: %s", ErrNotNumeric, agg.Column)
 	}
@@ -1151,4 +1184,68 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 		return fmt.Errorf("gobi: unknown aggregation kind %d", agg.Kind)
 	}
 	return nil
+}
+
+// appendTimestampMinMax runs Min or Max over a Timestamp column's rows
+// as int64 (the underlying arrow storage), preserving the source column's
+// TimeUnit + TimeZone via the TimestampBuilder set up in
+// buildAggBuilders. Nulls are skipped. All-null groups emit null.
+func (g *GroupBy) appendTimestampMinMax(b array.Builder, s Series, kind AggKind, rows []int) error {
+	tb, ok := b.(*array.TimestampBuilder)
+	if !ok {
+		return fmt.Errorf("gobi: appendTimestampMinMax: builder is %T, want *TimestampBuilder", b)
+	}
+	var extreme arrow.Timestamp
+	seen := false
+	isMin := kind == AggMin
+	for _, row := range rows {
+		v, null, err := timestampAt(s, row)
+		if err != nil {
+			return err
+		}
+		if null {
+			continue
+		}
+		if !seen {
+			extreme = v
+			seen = true
+			continue
+		}
+		if isMin && v < extreme {
+			extreme = v
+		} else if !isMin && v > extreme {
+			extreme = v
+		}
+	}
+	if !seen {
+		tb.AppendNull()
+		return nil
+	}
+	tb.Append(extreme)
+	return nil
+}
+
+// timestampAt walks Series chunks to return the arrow.Timestamp value
+// at row i. Symmetric with numericAt but for Timestamp columns —
+// preserves the raw int64 rather than lossy-casting to float64.
+func timestampAt(s Series, i int) (arrow.Timestamp, bool, error) {
+	if i < 0 || i >= s.Len() {
+		return 0, false, fmt.Errorf("%w: %d not in [0,%d)", ErrRowOutOfRange, i, s.Len())
+	}
+	offset := 0
+	for _, chunk := range s.col.Data().Chunks() {
+		if i < offset+chunk.Len() {
+			local := i - offset
+			a, ok := chunk.(*array.Timestamp)
+			if !ok {
+				return 0, false, fmt.Errorf("gobi: timestampAt: chunk type %T, want *array.Timestamp", chunk)
+			}
+			if a.IsNull(local) {
+				return 0, true, nil
+			}
+			return a.Value(local), false, nil
+		}
+		offset += chunk.Len()
+	}
+	return 0, false, fmt.Errorf("%w: index %d unreachable", ErrRowOutOfRange, i)
 }

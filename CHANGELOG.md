@@ -5,6 +5,63 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.7]
+
+### Added
+
+- **`AggMin` / `AggMax` on Timestamp columns.** The eager `GroupBy.Agg`
+  path, the streaming `LazyFrame.GroupBy(...).Agg(...)` executor, the
+  aligned/fast group-by builder, and the `.Over(...)` scalar-agg path
+  all now accept Timestamp columns for min/max aggregation. Output
+  preserves the source column's arrow.TimestampType — same TimeUnit
+  and TimeZone come through, so downstream code doesn't have to
+  interpret raw int64 nanoseconds. Nulls skipped; all-null groups
+  emit null (parity with the numeric path).
+
+  Under the hood: `minMaxAcc` detects Timestamp on first `Update`
+  and switches to an int64 comparison track (no lossy float64 cast).
+  A new `timestampAt(s, i)` helper mirrors `numericAt` but for
+  Timestamp columns. `newAggregateNode` and both `buildAggBuilders`
+  paths declare the output column as the source's TimestampType
+  when the aggregation is `AggMin` / `AggMax` on a Timestamp source.
+
+  Before this, `f.Lazy().GroupBy(k).Agg(Aggregation{Column: "dt",
+  Kind: AggMin})` on a Timestamp column errored with
+  `series is not numeric: timestamp[ns, tz=UTC]`. Workaround was
+  `WithColumn(UnixNano)` before the GroupBy; that hoop-jump is
+  gone. Removing it from benchmarks cut LazyFrame per-
+  iter time from ~266 ms to ~152 ms on a 2M-row fixture (Apple M3
+  Pro), because the workaround required a full frame-sized cast
+  pass.
+
+  `AggSum` / `AggMean` / `AggStd` / `AggVar` on Timestamp still
+  error — those have no obviously-correct semantics without a
+  Duration return type, and pandas / polars split on the details.
+
+### Fixed
+
+- **Parallel scan executor: race in worker-error path.** In
+  `exec_scan_parallel.go`, `e.errs` is buffered at `len(subs)` so
+  multiple workers could all successfully send an error, and each
+  then called `close(e.done)` — a second-arriving worker panicked
+  with `close of closed channel`. Guarded `close(done)` with a
+  `sync.Once` (`doneOnce`) shared between the worker error path and
+  `Close()`. Also simplified `Close()` since `doneOnce` subsumes
+  its check-then-close dance.
+- **parquetio: `ErrChunksAborted` wrap dropped the inner sentinel.**
+  `ReadFileChunksFunc` / `ReadReaderChunksFunc` wrapped callback
+  errors as `fmt.Errorf("%w: %v", ErrChunksAborted, cbErr)` — the
+  `%v` verb formatted `cbErr` into a string and severed the wrap
+  chain, so `errors.Is(err, cbErr)` returned false. During normal
+  parallel-scan teardown (`errScanClosed` returned from the cb after
+  `done` fires), the outer scan executor didn't recognize the
+  wrapped sentinel and routed it through the "real worker error"
+  branch instead of the shutdown branch. Switched to
+  `fmt.Errorf("%w: %w", ErrChunksAborted, cbErr)` (Go 1.20+
+  multi-`%w`); both sentinel identities now propagate through
+  `errors.Is`. The existing `ErrChunksAborted`-in-chain test still
+  passes.
+
 ## [v0.3.6]
 
 ### Added

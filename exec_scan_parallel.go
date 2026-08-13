@@ -36,8 +36,15 @@ type parallelScanFileExec struct {
 
 	startOnce sync.Once
 	closeOnce sync.Once
-	closed    atomic.Bool
-	wg        sync.WaitGroup
+	// doneOnce guards close(done) — either the first erroring worker
+	// OR Close() may close it, but never both, and never twice from
+	// the worker side when multiple workers error at the same time.
+	// errs is buffered at len(subs) so multiple worker errors can all
+	// send; without this Once, each of them would race to close(done)
+	// and the second one would panic with "close of closed channel".
+	doneOnce sync.Once
+	closed   atomic.Bool
+	wg       sync.WaitGroup
 }
 
 // newParallelScanFileExec builds the operator without starting any
@@ -130,10 +137,13 @@ func (e *parallelScanFileExec) startWorkers() {
 			if err != nil && !errors.Is(err, errScanClosed) {
 				// Non-blocking send: only the first error is kept.
 				// Subsequent workers see done close via the fan-in
-				// closer goroutine below.
+				// closer goroutine below. errs is buffered at
+				// len(subs), so multiple workers can win the send
+				// race — doneOnce guards close(done) against the
+				// resulting concurrent-close of a shared channel.
 				select {
 				case e.errs <- err:
-					close(e.done) // signal sibling workers to stop
+					e.doneOnce.Do(func() { close(e.done) })
 				default:
 				}
 			}
@@ -152,15 +162,10 @@ func (e *parallelScanFileExec) Close() error {
 		return nil
 	}
 	e.closeOnce.Do(func() {
-		// Signal producers to stop. Guarded by closeOnce to keep
-		// close(done) safe against startWorkers' error path (which
-		// also closes done on the first worker error).
-		select {
-		case <-e.done:
-			// Already closed by an errored worker.
-		default:
-			close(e.done)
-		}
+		// Signal producers to stop. doneOnce covers both this call
+		// AND the error path in startWorkers — either can close
+		// done first, and the loser is a no-op.
+		e.doneOnce.Do(func() { close(e.done) })
 		// Drain any queued batches so producers blocked on send
 		// can wake up and exit.
 		for b := range e.batches {

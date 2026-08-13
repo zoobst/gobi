@@ -9,6 +9,48 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.11]
+
+### Added
+
+- **Column projection + row-group predicate pushdown on the S3 read
+  path.** `RawCTASSpec`, `UnloadSpec`, and `OpenOptions` all now
+  carry `Columns []string` + `Predicate gobi.Expr` fields. Both are
+  threaded through `openBucketFrame` / `readBucketFiles` /
+  `populateBucketResults` into the per-bucket
+  `parquetio.ReadReader` call as `ReadOptions.Columns` and
+  `ReadOptions.Predicate`.
+
+  Before this, every `RawCTAS` / `RawCTASBuckets` / `UnloadAndRead`
+  / `UnloadAndReadBuckets` / `OpenPartitionedTable` call materialized
+  every column of every row group of every bucket file into memory
+  before the caller's LazyFrame ops ran — projection/predicate
+  pushdown at the S3 read layer was dead code on these paths.
+  Downstream `.Filter(...)` / `.Select(...)` on the returned
+  LazyFrame still worked functionally but couldn't skip the S3
+  fetch or the arrow decode, so Lambda peak memory + Athena scan
+  billing scaled with the full bucket footprint, not the
+  post-filter shape.
+
+  Semantics match `parquetio.ReadOptions`:
+  - `Columns` fully projects — the excluded columns are never
+    fetched, decompressed, or materialized.
+  - `Predicate` prunes whole row groups whose footer stats prove
+    no row could satisfy it. Rows within surviving groups are
+    NOT filtered — callers wanting row-level filtering must also
+    apply `.Filter(pred)` on the returned LazyFrame. The
+    predicate here is a fast-path hint that avoids downloading
+    and decoding irrelevant row groups from S3.
+
+  Both fields are zero-value-safe: leaving them unset preserves
+  the pre-v0.1.10 read behavior exactly (helper `readOptsFromSpec`
+  returns nil when both are empty, matching parquetio's existing
+  "opts == nil ⇒ default read" contract).
+
+## [v0.1.10]
+
+- gofmt linting
+
 ## [v0.1.9]
 
 ### Fixed
