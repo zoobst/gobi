@@ -81,18 +81,18 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 	}
 	slices.Sort(order)
 
-	// Pre-extract numeric views for the aggregation columns.
-	aggViews := make([]numericView, len(aggs))
+	// Pre-extract views for the aggregation columns. Resample restricts
+	// callers to numeric aggregations — Timestamp Min/Max + NUnique are
+	// reachable through the fast-path aggView builder but not through
+	// this entry point today. Reject non-numeric shapes explicitly
+	// rather than silently mis-dispatch.
+	aggViews := make([]aggView, len(aggs))
 	for i, a := range aggs {
-		if a.Kind == AggCount && a.Column == "" {
-			continue
-		}
-		colS, err := r.frame.Column(a.Column)
+		v, ok, err := buildAggView(r.frame, a)
 		if err != nil {
 			return nil, err
 		}
-		v, ok := viewNumeric(colS)
-		if !ok {
+		if !ok || (v.kind != aggViewCountStar && v.kind != aggViewNumeric) {
 			return nil, fmt.Errorf("gobi: ResampleEvery.Agg requires single-chunk numeric aggregation column, %q is not", a.Column)
 		}
 		aggViews[i] = v
@@ -105,7 +105,7 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 	tsB := array.NewTimestampBuilder(pool, tsType)
 	defer tsB.Release()
 
-	aggBs, aggFields := makeAggBuilders(pool, aggs)
+	aggBs, aggFields := makeAggBuilders(pool, aggs, aggViews)
 	defer releaseBuilders(aggBs)
 
 	for _, bucketStart := range order {

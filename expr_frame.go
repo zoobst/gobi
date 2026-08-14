@@ -19,6 +19,15 @@ func (f *Frame) FilterExpr(e Expr) (*Frame, error) {
 	if e.node == nil {
 		return nil, fmt.Errorf("%w: nil expression", ErrExprTypeMismatch)
 	}
+	// Fused fast path: AND-chain of scalar comparisons on primitive
+	// numeric columns collapses to one loop, no intermediate Boolean
+	// Series per comparison + one more per AND. Falls through
+	// silently for predicates that don't match the fused shape.
+	if mask, ok, err := tryFusedFilterMask(f, e); err != nil {
+		return nil, err
+	} else if ok {
+		return f.Filter(mask)
+	}
 	mask, err := e.node.Eval(f)
 	if err != nil {
 		return nil, err

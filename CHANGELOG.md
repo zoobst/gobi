@@ -5,6 +5,84 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.8]
+
+### Performance
+
+- **Filter fusion for AND-chained scalar comparisons.** Predicates
+  of the shape `Col(a) OP lit AND Col(b) OP lit AND …` now evaluate
+  in a single row-loop with short-circuit on the first false, rather
+  than materializing one Boolean Series per comparison + one more
+  per AND. On a 2M-row bbox filter (`lat >= a AND lat <= b AND lon
+  >= c AND lon <= d`), filter cost dropped from ~98 ms to ~44 ms
+  (~55% faster) on Apple M3 Pro / Go 1.26. Predicates that don't
+  match the fused shape (column-vs-column comparisons, string
+  equality, OR branches, single leaves) fall through to the general
+  `Expr.Eval` path unchanged. Null propagation contract preserved:
+  any leaf null on a row surfaces as a null in the mask, which
+  `Frame.Filter` treats as false — same behavior as the pre-fusion
+  path.
+
+- **Scalar-comparison fast path covers `Ne` / `Le` / `Ge`.** The
+  `binOpNode.Eval` fast path that skips literal-broadcasting for
+  `(col OP lit)` previously only fired on `Eq` / `Lt` / `Gt` — the
+  other three comparisons fell through to the general path, which
+  broadcasts the literal to N rows before comparing (allocates one
+  N-element float64 slice per literal). Added `Series.NeScalar` /
+  `LeScalar` / `GeScalar` and extended `tryScalarFastPath` to
+  dispatch them. Independent of the AND-fusion above — helps every
+  filter using those operators, even single-leaf predicates.
+
+- **Group-by fast path (`aggFast`) now covers `AggNUnique` and
+  `AggMin` / `AggMax` on Timestamp columns.** Previously the fast
+  path bailed to the slow per-row `numericAt` loop whenever any
+  aggregation was `NUnique` or when Min/Max targeted a Timestamp
+  column — the "one bad agg disables the whole call" pattern.
+  `aggView` is now a discriminated union covering count-star,
+  numeric, timestamp, and hashable shapes, one per aggregation.
+  NUnique dispatches to per-group direct-hash maps
+  (`map[string]` / `map[int64]` / `map[float64]`) instead of the
+  byte-encoded `keyOfAppend` fallback. Timestamp Min/Max compares
+  raw int64 (no lossy float64 cast) and emits back as
+  `arrow.Timestamp` preserving the source's TimeUnit + TimeZone.
+
+- **Streaming `nUniqueAcc` type-specializes on first Update.** The
+  LazyFrame aggregate executor's per-group NUnique accumulator used
+  to run `keyOfAppend` — a chunk walk + type switch + byte encoding
+  — for every row. Now it inspects the source column once on first
+  non-empty Update and switches to a native `map[string]struct{}` /
+  `map[int64]struct{}` / `map[float64]struct{}` path. Falls through
+  to the byte-encoded generic path for multi-chunk batches or
+  non-primitive types. Bit-equal numerics still collapse identically
+  to the pre-fix behavior.
+
+- **Null-check hoisting in the fused filter.** When every leaf's
+  source column has `NullN() == 0` at setup (typical for numeric
+  columns from parquet reads), the row-loop skips the per-row per-
+  leaf `IsNull` calls and the validity-bitmap bookkeeping
+  entirely. 8M `IsNull` calls on the 2M-row × 4-leaf bbox filter
+  turn into zero. Null-carrying columns transparently fall
+  through to the general fused evaluator with validity
+  propagation preserved.
+
+- **Combined effect on the h3-agg benchmark:** LazyFrame per-iter
+  time on the 2M-row filter+groupby+agg pipeline dropped from
+  ~152 ms → ~86 ms (**-43%**), landing gobi_lazy within 0.1 ms of
+  pandas (86.01 ms). Filter cost alone: 98 → 40 ms (~-59%).
+  Bench methodology: 30 iterations, warmup 3, Apple M3 Pro,
+  Go 1.26.
+
+  Final four-way ranking on the h3-agg workload:
+  ```
+  polars      15.21 ms   (Rust SIMD)
+  gobi_lazy   85.90 ms   ← tied with pandas
+  pandas      86.01 ms   (compiled C loops)
+  gobi_pool  154.64 ms   (hand-written Go worker pool)
+  ```
+
+  Note that gobi_lazy also uses ~36% less peak RSS than pandas
+  (501 MB vs 792 MB) — same throughput, tighter memory footprint.
+
 ## [v0.3.7]
 
 ### Added

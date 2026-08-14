@@ -818,11 +818,20 @@ func (s Series) Ge(o Series) (Series, error) { return s.cmp(o, cmpGe) }
 // EqScalar returns a boolean Series true where s[i] == v.
 func (s Series) EqScalar(v float64) (Series, error) { return s.cmpScalar(v, cmpEq) }
 
+// NeScalar returns a boolean Series true where s[i] != v.
+func (s Series) NeScalar(v float64) (Series, error) { return s.cmpScalar(v, cmpNe) }
+
 // LtScalar returns a boolean Series true where s[i] < v.
 func (s Series) LtScalar(v float64) (Series, error) { return s.cmpScalar(v, cmpLt) }
 
+// LeScalar returns a boolean Series true where s[i] <= v.
+func (s Series) LeScalar(v float64) (Series, error) { return s.cmpScalar(v, cmpLe) }
+
 // GtScalar returns a boolean Series true where s[i] > v.
 func (s Series) GtScalar(v float64) (Series, error) { return s.cmpScalar(v, cmpGt) }
+
+// GeScalar returns a boolean Series true where s[i] >= v.
+func (s Series) GeScalar(v float64) (Series, error) { return s.cmpScalar(v, cmpGe) }
 
 func (s Series) cmp(o Series, op cmpOp) (Series, error) {
 	if !s.isNumeric() || !o.isNumeric() {

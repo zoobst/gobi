@@ -381,14 +381,24 @@ func tryScalarFastPath(op binOpKind, left Series, rhs float64) (Series, bool, er
 	case bopEq:
 		s, err := left.EqScalar(rhs)
 		return s, true, err
+	case bopNe:
+		s, err := left.NeScalar(rhs)
+		return s, true, err
 	case bopLt:
 		s, err := left.LtScalar(rhs)
+		return s, true, err
+	case bopLe:
+		s, err := left.LeScalar(rhs)
 		return s, true, err
 	case bopGt:
 		s, err := left.GtScalar(rhs)
 		return s, true, err
+	case bopGe:
+		s, err := left.GeScalar(rhs)
+		return s, true, err
 	}
-	// Ne/Le/Ge and the logical ops go through the general path.
+	// Logical ops (bopAnd / bopOr) don't have a scalar shortcut —
+	// they're already elementwise Boolean × Boolean.
 	return Series{}, false, nil
 }
 
