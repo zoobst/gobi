@@ -1,10 +1,12 @@
 package gobi
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
@@ -34,6 +36,25 @@ import (
 //
 //	gobi.If(cond, gobi.Col("int_col").Cast(arrow.PrimitiveTypes.Float64),
 //	              gobi.Lit(1.5))
+//
+// # Implementation
+//
+// Since v0.3.9 the numeric-cast kernel is arrow-go's
+// `arrow.compute.CastArray`, which on arm64 dispatches to
+// hand-written NEON SIMD (`internal/kernels/cast_numeric_neon_arm64.s`)
+// and on amd64 to hand-written AVX2/SSE4 SIMD. Measured 13.9× faster
+// than the previous hand-rolled scalar builder loops on a
+// 10M-row Float64→Int64 cast (arm64, Apple M3 Pro). See the
+// `compute` package docstring for the arrow-go vs gobi kernel
+// overlap map and the benchmark that produced the number.
+//
+// gobi wraps the arrow-go call to preserve the previous surface:
+// multi-chunk columns cast per chunk and reassemble; overflow modes
+// match Go's built-in conversion (silent wrap for int narrowing,
+// silent truncate for float→int); the whitelist of accepted target
+// types stays limited to numeric so unrelated arrow-go cast
+// capabilities (String↔Int, Date↔Timestamp) don't silently
+// activate — those are opt-in follow-ups.
 func (e Expr) Cast(target arrow.DataType) Expr {
 	return Expr{node: &castNode{inner: e.node, target: target}}
 }
@@ -72,336 +93,99 @@ func (n *castNode) String() string {
 	return fmt.Sprintf("%s.cast(%s)", n.inner, n.target)
 }
 
-// castSeries converts s to target. No-op when source and target
-// match. Numeric-to-numeric fast paths use a per-target dispatch;
-// each path type-switches once on the source chunk and iterates
-// with a direct typed accessor + Go's built-in numeric conversion.
+// castSeries converts s to target via arrow-go's SIMD-accelerated
+// compute.CastArray. Same-type is a short-circuit no-op. Multi-
+// chunk columns cast per chunk then reassemble into a chunked
+// output; single-chunk (the common case for streaming batches)
+// hits the fast one-pass path.
 func castSeries(s Series, target arrow.DataType) (Series, error) {
 	if arrow.TypeEqual(s.DataType(), target) {
 		return s, nil
 	}
+	// Whitelist: only numeric targets. arrow-go's cast surface is
+	// broader (String↔Int, Date↔Timestamp, etc.) but the previous
+	// gobi.Cast contract stopped at numeric-to-numeric; keep that
+	// contract stable until each additional path is deliberately
+	// exposed with its own semantic pass.
 	switch target.ID() {
-	case arrow.FLOAT64:
-		return castToFloat64(s)
-	case arrow.INT64:
-		return castToInt64(s)
-	case arrow.FLOAT32:
-		return castToFloat32(s)
-	case arrow.INT32:
-		return castToInt32(s)
-	case arrow.UINT64:
-		return castToUint64(s)
-	case arrow.UINT32:
-		return castToUint32(s)
+	case arrow.FLOAT64, arrow.FLOAT32,
+		arrow.INT64, arrow.INT32,
+		arrow.UINT64, arrow.UINT32:
+	default:
+		return Series{}, fmt.Errorf(
+			"%w: Cast: unsupported target type %s (v1 covers Float32/64, Int32/64, Uint32/64)",
+			ErrExprTypeMismatch, target)
 	}
-	return Series{}, fmt.Errorf(
-		"%w: Cast: unsupported target type %s (v1 covers Float32/64, Int32/64, Uint32/64)",
-		ErrExprTypeMismatch, target)
-}
 
-func castToFloat64(s Series) (Series, error) {
+	// TODO: thread ctx through castNode.Eval so an in-flight
+	// arrow.compute.CastArray call can be cancelled with the
+	// surrounding pipeline. Blocked on ExprNode.Eval not carrying
+	// a context.Context today; mechanical follow-up.
+	ctx := context.Background()
 	pool := memory.DefaultAllocator
-	b := array.NewFloat64Builder(pool)
-	defer b.Release()
-	for _, chunk := range s.col.Data().Chunks() {
-		switch arr := chunk.(type) {
-		case *array.Float64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(arr.Value(i))
-			}
-		case *array.Float32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(float64(arr.Value(i)))
-			}
-		case *array.Int64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(float64(arr.Value(i)))
-			}
-		case *array.Int32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(float64(arr.Value(i)))
-			}
-		case *array.Uint64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(float64(arr.Value(i)))
-			}
-		case *array.Uint32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(float64(arr.Value(i)))
-			}
-		case *array.Timestamp:
-			// Timestamp → Float64: emit the raw epoch value in the
-			// timestamp's declared unit (nanoseconds / microseconds /
-			// milliseconds / seconds). Callers that want a
-			// unit-normalized value should route via
-			// Expr.UnixNano().Cast(Float64) instead.
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(float64(arr.Value(i)))
-			}
-		default:
-			return Series{}, castUnsupportedErr(chunk.DataType(), arrow.PrimitiveTypes.Float64)
-		}
+	opts := &compute.CastOptions{
+		ToType:             target,
+		AllowIntOverflow:   true, // matches Go's silent wrap on int narrowing
+		AllowFloatTruncate: true, // matches Go's silent truncate on float→int
+		AllowTimeTruncate:  true, // preserved for future timestamp targets
 	}
-	return arrayToSeries(pool, "cast", arrow.PrimitiveTypes.Float64, b.NewArray())
+
+	chunks := s.col.Data().Chunks()
+	outChunks := make([]arrow.Array, 0, len(chunks))
+	// Every branch below (error and success) must release the
+	// CastArray outputs we own. arrow.NewChunked RETAINS each
+	// input array (does not steal ownership) — so after passing
+	// outChunks to NewChunked, we still own the initial CastArray
+	// ref and need to release it. The deferred loop covers both
+	// paths uniformly.
+	defer func() {
+		for _, c := range outChunks {
+			c.Release()
+		}
+	}()
+	for _, chunk := range chunks {
+		out, err := compute.CastArray(ctx, chunk, opts)
+		if err != nil {
+			return Series{}, fmt.Errorf(
+				"%w: Cast %s → %s: %v",
+				ErrExprTypeMismatch, chunk.DataType(), target, err)
+		}
+		outChunks = append(outChunks, out)
+	}
+	chunked := arrow.NewChunked(target, outChunks)
+	defer chunked.Release()
+	arr, err := arrayFromChunked(chunked)
+	if err != nil {
+		return Series{}, fmt.Errorf(
+			"%w: Cast %s → %s: assemble chunks: %v",
+			ErrExprTypeMismatch, s.DataType(), target, err)
+	}
+	return arrayToSeries(pool, "cast", target, arr)
 }
 
-func castToInt64(s Series) (Series, error) {
+// arrayFromChunked returns the single concrete Array a chunked
+// carries when it has exactly one chunk, else concatenates. Used
+// by castSeries to produce an arrow.Array from
+// compute.CastArray's per-chunk outputs. Single-chunk (the
+// streaming batch case) avoids the copy.
+//
+// The returned array carries a refcount the caller must Release.
+// Empty-input case still returns a valid (length-0) array of the
+// target type — matches the "casting an empty column returns an
+// empty column of the target type" contract.
+func arrayFromChunked(c *arrow.Chunked) (arrow.Array, error) {
+	if c.Len() == 0 {
+		return array.MakeArrayOfNull(memory.DefaultAllocator, c.DataType(), 0), nil
+	}
+	if len(c.Chunks()) == 1 {
+		a := c.Chunk(0)
+		a.Retain() // outlives the chunked's release
+		return a, nil
+	}
 	pool := memory.DefaultAllocator
-	b := array.NewInt64Builder(pool)
-	defer b.Release()
-	for _, chunk := range s.col.Data().Chunks() {
-		switch arr := chunk.(type) {
-		case *array.Int64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(arr.Value(i))
-			}
-		case *array.Int32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(int64(arr.Value(i)))
-			}
-		case *array.Uint32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(int64(arr.Value(i)))
-			}
-		case *array.Float64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(int64(arr.Value(i)))
-			}
-		case *array.Float32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(int64(arr.Value(i)))
-			}
-		case *array.Timestamp:
-			// Timestamp → Int64: emit the raw epoch value in the
-			// timestamp's declared unit. See castToFloat64's Timestamp
-			// arm for the unit-normalization note.
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(int64(arr.Value(i)))
-			}
-		default:
-			return Series{}, castUnsupportedErr(chunk.DataType(), arrow.PrimitiveTypes.Int64)
-		}
+	out, err := array.Concatenate(c.Chunks(), pool)
+	if err != nil {
+		return nil, err
 	}
-	return arrayToSeries(pool, "cast", arrow.PrimitiveTypes.Int64, b.NewArray())
-}
-
-func castToFloat32(s Series) (Series, error) {
-	pool := memory.DefaultAllocator
-	b := array.NewFloat32Builder(pool)
-	defer b.Release()
-	for _, chunk := range s.col.Data().Chunks() {
-		switch arr := chunk.(type) {
-		case *array.Float32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(arr.Value(i))
-			}
-		case *array.Float64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(float32(arr.Value(i)))
-			}
-		case *array.Int64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(float32(arr.Value(i)))
-			}
-		case *array.Int32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(float32(arr.Value(i)))
-			}
-		default:
-			return Series{}, castUnsupportedErr(chunk.DataType(), arrow.PrimitiveTypes.Float32)
-		}
-	}
-	return arrayToSeries(pool, "cast", arrow.PrimitiveTypes.Float32, b.NewArray())
-}
-
-func castToInt32(s Series) (Series, error) {
-	pool := memory.DefaultAllocator
-	b := array.NewInt32Builder(pool)
-	defer b.Release()
-	for _, chunk := range s.col.Data().Chunks() {
-		switch arr := chunk.(type) {
-		case *array.Int32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(arr.Value(i))
-			}
-		case *array.Int64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(int32(arr.Value(i)))
-			}
-		case *array.Float64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(int32(arr.Value(i)))
-			}
-		case *array.Float32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(int32(arr.Value(i)))
-			}
-		default:
-			return Series{}, castUnsupportedErr(chunk.DataType(), arrow.PrimitiveTypes.Int32)
-		}
-	}
-	return arrayToSeries(pool, "cast", arrow.PrimitiveTypes.Int32, b.NewArray())
-}
-
-func castToUint64(s Series) (Series, error) {
-	pool := memory.DefaultAllocator
-	b := array.NewUint64Builder(pool)
-	defer b.Release()
-	for _, chunk := range s.col.Data().Chunks() {
-		switch arr := chunk.(type) {
-		case *array.Uint64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(arr.Value(i))
-			}
-		case *array.Uint32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(uint64(arr.Value(i)))
-			}
-		case *array.Int64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(uint64(arr.Value(i)))
-			}
-		default:
-			return Series{}, castUnsupportedErr(chunk.DataType(), arrow.PrimitiveTypes.Uint64)
-		}
-	}
-	return arrayToSeries(pool, "cast", arrow.PrimitiveTypes.Uint64, b.NewArray())
-}
-
-func castToUint32(s Series) (Series, error) {
-	pool := memory.DefaultAllocator
-	b := array.NewUint32Builder(pool)
-	defer b.Release()
-	for _, chunk := range s.col.Data().Chunks() {
-		switch arr := chunk.(type) {
-		case *array.Uint32:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(arr.Value(i))
-			}
-		case *array.Uint64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(uint32(arr.Value(i)))
-			}
-		case *array.Int64:
-			for i := range arr.Len() {
-				if arr.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				b.Append(uint32(arr.Value(i)))
-			}
-		default:
-			return Series{}, castUnsupportedErr(chunk.DataType(), arrow.PrimitiveTypes.Uint32)
-		}
-	}
-	return arrayToSeries(pool, "cast", arrow.PrimitiveTypes.Uint32, b.NewArray())
-}
-
-func castUnsupportedErr(src, target arrow.DataType) error {
-	return fmt.Errorf("%w: Cast: unsupported source type %s → %s",
-		ErrExprTypeMismatch, src, target)
+	return out, nil
 }

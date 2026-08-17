@@ -3,6 +3,7 @@ package gobi
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -273,6 +274,199 @@ func BenchmarkGroupByAligned(b *testing.B) {
 
 // BenchmarkGroupByUnaligned is the paired baseline — same fixture
 // but no metadata attached, so the general hash-map path runs.
+// sortedGroupByFrameWithTimestamp builds an aligned+sorted 2-key
+// (region, id) fixture with a Timestamp column added. Used to
+// exercise Min/Max on Timestamp under the aligned fast path —
+// tryEmitContiguousSIMD refuses (Timestamp outputs via
+// TimestampBuilder, not Float64Builder), so the general path must
+// still emit. Guards the "silent drop" bug where the general-path
+// second loop skipped kind-eligible aggs even when SIMD had
+// refused them.
+func sortedGroupByFrameWithTimestamp(t testing.TB, nRegions, nIDs, rowsPerGroup int) *Frame {
+	t.Helper()
+	pool := memory.DefaultAllocator
+	rb := array.NewStringBuilder(pool)
+	defer rb.Release()
+	ib := array.NewStringBuilder(pool)
+	defer ib.Release()
+	tsType := &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}
+	tsB := array.NewTimestampBuilder(pool, tsType)
+	defer tsB.Release()
+
+	base := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+	for reg := range nRegions {
+		rn := fmt.Sprintf("r%03d", reg)
+		for id := range nIDs {
+			in := fmt.Sprintf("id%06d", id)
+			for r := range rowsPerGroup {
+				rb.Append(rn)
+				ib.Append(in)
+				tsB.Append(arrow.Timestamp(base.Add(time.Duration(reg*nIDs*rowsPerGroup+id*rowsPerGroup+r) * time.Second).UnixNano()))
+			}
+		}
+	}
+	rArr := rb.NewArray()
+	defer rArr.Release()
+	iArr := ib.NewArray()
+	defer iArr.Release()
+	tsArr := tsB.NewArray()
+	defer tsArr.Release()
+
+	fields := []arrow.Field{
+		{Name: "region", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "id", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "ts", Type: tsType, Nullable: false},
+	}
+	schema := arrow.NewSchema(fields, nil)
+	cols := []arrow.Column{
+		*arrow.NewColumn(fields[0], arrow.NewChunked(rArr.DataType(), []arrow.Array{rArr})),
+		*arrow.NewColumn(fields[1], arrow.NewChunked(iArr.DataType(), []arrow.Array{iArr})),
+		*arrow.NewColumn(fields[2], arrow.NewChunked(tsArr.DataType(), []arrow.Array{tsArr})),
+	}
+	f, err := NewFrame(schema, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// TestGroupByAligned_TimestampMinMax_NotSilentlyDropped is a
+// regression test for the bug caught in code review: the aligned
+// GroupBy's second loop used to skip aggs whose kind was
+// SIMD-eligible (Sum/Min/Max/Mean) even when the SIMD attempt
+// refused (e.g., because the output builder was TimestampBuilder,
+// not Float64Builder). Result: Min/Max on Timestamp under the
+// aligned path silently produced no output for those aggs,
+// leaving per-column length mismatches (or worse — misaligned
+// data across groups).
+func TestGroupByAligned_TimestampMinMax_NotSilentlyDropped(t *testing.T) {
+	f := sortedGroupByFrameWithTimestamp(t, 3, 4, 10)
+	defer f.Release()
+	f.WithPartitionMeta(alignedGroupByMeta())
+
+	gb, err := f.GroupBy("region", "id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := gb.Agg(
+		Aggregation{Column: "ts", Kind: AggMin, Alias: "first_ts"},
+		Aggregation{Column: "ts", Kind: AggMax, Alias: "last_ts"},
+	)
+	if err != nil {
+		t.Fatalf("Agg: %v", err)
+	}
+	defer out.Release()
+
+	if got := out.NumRows(); got != 12 {
+		t.Fatalf("row count = %d, want 12 groups", got)
+	}
+	// Every output column must have length 12 — the silent-drop
+	// bug would leave first_ts / last_ts short.
+	for _, name := range []string{"region", "id", "first_ts", "last_ts"} {
+		col, err := out.Column(name)
+		if err != nil {
+			t.Fatalf("Column(%q): %v", name, err)
+		}
+		if col.Len() != 12 {
+			t.Errorf("column %q length = %d, want 12", name, col.Len())
+		}
+	}
+	// Timestamp min/max preserved the source type (not widened to
+	// Float64) — regression check on the buildAggBuilders path.
+	fields, _ := out.Schema().FieldsByName("first_ts")
+	if _, isTS := fields[0].Type.(*arrow.TimestampType); !isTS {
+		t.Errorf("first_ts type = %s, want TimestampType (silently misrouted?)", fields[0].Type)
+	}
+}
+
+// TestGroupByAligned_SumWithNulls_NotSilentlyDropped is the second
+// half of the silent-drop regression coverage: Sum on a Float64
+// column that carries nulls. tryEmitContiguousSIMD refuses on
+// NullN() != 0 (SIMD reduce doesn't propagate nulls the same way
+// the general Welford loop does), so the general path must emit.
+func TestGroupByAligned_SumWithNulls_NotSilentlyDropped(t *testing.T) {
+	pool := memory.DefaultAllocator
+	rb := array.NewStringBuilder(pool)
+	defer rb.Release()
+	ib := array.NewStringBuilder(pool)
+	defer ib.Release()
+	vb := array.NewFloat64Builder(pool)
+	defer vb.Release()
+
+	// 2 regions × 2 ids × 3 rows/group = 12 rows. One null per
+	// group so NullN() > 0 on the source column.
+	for reg := 0; reg < 2; reg++ {
+		rn := fmt.Sprintf("r%03d", reg)
+		for id := 0; id < 2; id++ {
+			in := fmt.Sprintf("id%06d", id)
+			rb.Append(rn)
+			ib.Append(in)
+			vb.Append(1.0)
+			rb.Append(rn)
+			ib.Append(in)
+			vb.Append(2.0)
+			rb.Append(rn)
+			ib.Append(in)
+			vb.AppendNull()
+		}
+	}
+	rArr := rb.NewArray()
+	defer rArr.Release()
+	iArr := ib.NewArray()
+	defer iArr.Release()
+	vArr := vb.NewArray()
+	defer vArr.Release()
+
+	fields := []arrow.Field{
+		{Name: "region", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "id", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "v", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+	}
+	schema := arrow.NewSchema(fields, nil)
+	cols := []arrow.Column{
+		*arrow.NewColumn(fields[0], arrow.NewChunked(rArr.DataType(), []arrow.Array{rArr})),
+		*arrow.NewColumn(fields[1], arrow.NewChunked(iArr.DataType(), []arrow.Array{iArr})),
+		*arrow.NewColumn(fields[2], arrow.NewChunked(vArr.DataType(), []arrow.Array{vArr})),
+	}
+	f, err := NewFrame(schema, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Release()
+	f.WithPartitionMeta(alignedGroupByMeta())
+
+	gb, err := f.GroupBy("region", "id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := gb.Agg(Aggregation{Column: "v", Kind: AggSum, Alias: "s"})
+	if err != nil {
+		t.Fatalf("Agg: %v", err)
+	}
+	defer out.Release()
+
+	if got := out.NumRows(); got != 4 {
+		t.Fatalf("row count = %d, want 4 groups", got)
+	}
+	sumCol, err := out.Column("s")
+	if err != nil {
+		t.Fatalf("Column(s): %v", err)
+	}
+	if sumCol.Len() != 4 {
+		t.Errorf("sum column length = %d, want 4 (silent-drop regression would leave it short)", sumCol.Len())
+	}
+	sumArr := sumCol.Column().Data().Chunks()[0].(*array.Float64)
+	for i := 0; i < sumArr.Len(); i++ {
+		if sumArr.IsNull(i) {
+			t.Errorf("group %d Sum is null, want 3.0 (nulls should skip, not propagate)", i)
+			continue
+		}
+		if sumArr.Value(i) != 3.0 {
+			t.Errorf("group %d Sum = %v, want 3.0 (1+2, nulls skipped)", i, sumArr.Value(i))
+		}
+	}
+}
+
 func BenchmarkGroupByUnaligned(b *testing.B) {
 	f := sortedGroupByFrame(b, 10, 100, 100)
 	// Deliberately no WithPartitionMeta call — hash-map path runs.

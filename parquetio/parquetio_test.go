@@ -122,6 +122,36 @@ func testRoundTrip(t *testing.T, codec parquetio.Codec) {
 	}
 }
 
+// TestWrite_ToBuffer confirms the io.Writer-backed entrypoint
+// produces bytes that round-trip through ReadReader identically to
+// WriteFile. The buffer stand-in mirrors the shape of an S3 uploader,
+// a tar entry writer, or any other non-filesystem sink.
+func TestWrite_ToBuffer(t *testing.T) {
+	df, err := csvio.Read[city](strings.NewReader(citiesCSV), &csvio.ReadOptions{CRSHint: 4326})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := parquetio.Write(df, &buf, &parquetio.WriteOptions{Codec: parquetio.CodecSnappy}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	loaded, err := parquetio.ReadReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), nil)
+	if err != nil {
+		t.Fatalf("ReadReader: %v", err)
+	}
+	rows, cols := loaded.Shape()
+	if rows != 3 || cols != 3 {
+		t.Fatalf("round-trip shape got (%d, %d), want (3, 3)", rows, cols)
+	}
+	geoRaw, ok := loaded.Schema().Metadata().GetValue("geo")
+	if !ok {
+		t.Fatal("geo metadata key missing after Write→ReadReader round-trip")
+	}
+	if !strings.Contains(geoRaw, `"primary_column":"geometry"`) {
+		t.Fatalf("primary_column not in metadata: %s", geoRaw)
+	}
+}
+
 // TestReadReader confirms the io.ReaderAt-backed entrypoint reads a
 // Parquet payload identically to ReadFile. Writes to a file, slurps
 // the bytes, feeds them back via bytes.Reader (which satisfies

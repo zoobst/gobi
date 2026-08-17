@@ -7,6 +7,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+
+	"github.com/zoobst/gobi/compute"
 )
 
 // groupByFastPathApplicable reports whether GroupBy.Agg can take
@@ -106,15 +108,58 @@ func (g *GroupBy) aggAligned(aggs []Aggregation) (*Frame, error) {
 
 	// emit reduces rows [start, end) as a single group and appends
 	// its key row + aggregation values to the output builders.
+	//
+	// Two dispatch paths per aggregation:
+	//   - Contiguous SIMD: when the agg kind is Sum / Min / Max /
+	//     Mean on a null-free single-chunk Float64 or Int64 column
+	//     AND no per-agg filter is active, hand the group's
+	//     contiguous slice directly to gobi/compute's reduction
+	//     kernels. Skips the rowsBuf construction + per-row indexed
+	//     access; SIMD wins ~4× on Float64 Min/Max under
+	//     GOEXPERIMENT=simd.
+	//   - General: the existing rowsBuf + appendAgg path. Handles
+	//     everything the SIMD path doesn't cover (custom aggs,
+	//     nulls, non-numeric types, filtered aggs, First/Last, etc.).
+	//
+	// Whether the SIMD attempt actually succeeded is tracked in
+	// handledBySIMD (per-emit-call) — the general-path second loop
+	// must NOT skip based on kind eligibility, because kind checks
+	// can't tell whether tryEmitContiguousSIMD accepted or refused
+	// (e.g., Sum on a null-carrying column is kind-eligible but
+	// shape-ineligible, and skipping it would silently drop the
+	// agg and misalign the output columns).
+	handledBySIMD := make([]bool, len(aggs))
 	emit := func(start, end int) error {
+		if err := appendKeyRow(keyBuilders, g.keys, start); err != nil {
+			return err
+		}
+		for i := range handledBySIMD {
+			handledBySIMD[i] = false
+		}
+		needRowsBuf := false
+		for i, a := range aggs {
+			if filterMasks[i] == nil {
+				if ok, err := g.tryEmitContiguousSIMD(aggBuilders[i], a, start, end); err != nil {
+					return err
+				} else if ok {
+					handledBySIMD[i] = true
+					continue
+				}
+			}
+			needRowsBuf = true
+		}
+		if !needRowsBuf {
+			return nil
+		}
+		// Some agg wants the row-index path — build rowsBuf once.
 		rowsBuf = rowsBuf[:0]
 		for k := start; k < end; k++ {
 			rowsBuf = append(rowsBuf, k)
 		}
-		if err := appendKeyRow(keyBuilders, g.keys, start); err != nil {
-			return err
-		}
 		for i, a := range aggs {
+			if handledBySIMD[i] {
+				continue
+			}
 			toAgg := rowsBuf
 			if filterMasks[i] != nil {
 				toAgg = applyFilterMask(rowsBuf, filterMasks[i], filteredBuf[:0])
@@ -275,4 +320,123 @@ func (g *GroupBy) assembleOutput(keyBuilders, aggBuilders []array.Builder, aggFi
 		chunked.Release()
 	}
 	return NewFrame(schema, cols)
+}
+
+// tryEmitContiguousSIMD emits one aggregation over rows [start, end)
+// via the gobi/compute reduction kernels. The rows must be a
+// contiguous range in the source frame — the aligned GroupBy path
+// guarantees this. Returns (true, nil) on success; (false, nil)
+// when the shape doesn't match (falls through to the general
+// per-row-index path). Returns an error only for real problems
+// (missing column, unexpected builder type).
+//
+// Preconditions checked here:
+//   - Aggregation kind is one of Sum / Min / Max / Mean (numeric
+//     reductions). Others fall through.
+//   - Source column resolves cleanly.
+//   - Source column is single-chunk (RecordBatch columns always
+//     are, but the eager path may see multi-chunk).
+//   - Source column is null-free (any nulls fall through — the
+//     general path handles null propagation).
+//   - Source column is Float64 or Int64 (both have SIMD Sum;
+//     Float64 additionally has SIMD Min/Max).
+//   - Output builder is *array.Float64Builder (buildAggBuilders
+//     picks Float64 for all four reduction kinds on numeric input).
+func (g *GroupBy) tryEmitContiguousSIMD(b array.Builder, a Aggregation, start, end int) (bool, error) {
+	// Kind gate: only reducible numeric aggs are candidates.
+	// Custom Fn aggs, First/Last/Median/Mode/Count/NUnique all
+	// fall through to the general path.
+	if a.Fn != nil {
+		return false, nil
+	}
+	switch a.Kind {
+	case AggSum, AggMin, AggMax, AggMean:
+	default:
+		return false, nil
+	}
+	col, err := g.frame.Column(a.Column)
+	if err != nil {
+		return false, err
+	}
+	chunks := col.col.Data().Chunks()
+	if len(chunks) != 1 {
+		return false, nil
+	}
+	fb, ok := b.(*array.Float64Builder)
+	if !ok {
+		return false, nil
+	}
+	switch arr := chunks[0].(type) {
+	case *array.Float64:
+		if arr.NullN() != 0 {
+			return false, nil
+		}
+		vals := arr.Float64Values()[start:end]
+		return emitReducedFloat64(fb, a.Kind, vals), nil
+	case *array.Int64:
+		if arr.NullN() != 0 {
+			return false, nil
+		}
+		return emitReducedInt64(fb, a.Kind, arr.Int64Values()[start:end]), nil
+	}
+	return false, nil
+}
+
+// emitReducedFloat64 appends the reduction of vals to b. Returns
+// true unconditionally (the caller already committed to this
+// path); the bool is for symmetry with tryEmitContiguousSIMD.
+// Empty ranges emit null for min/max/mean (no values seen) and 0
+// for sum (identity).
+func emitReducedFloat64(b *array.Float64Builder, kind AggKind, vals []float64) bool {
+	if len(vals) == 0 {
+		switch kind {
+		case AggSum:
+			b.Append(0)
+		default:
+			b.AppendNull()
+		}
+		return true
+	}
+	switch kind {
+	case AggSum:
+		b.Append(compute.SumF64(vals))
+	case AggMean:
+		b.Append(compute.SumF64(vals) / float64(len(vals)))
+	case AggMin:
+		m, _ := compute.MinF64(vals)
+		b.Append(m)
+	case AggMax:
+		m, _ := compute.MaxF64(vals)
+		b.Append(m)
+	}
+	return true
+}
+
+// emitReducedInt64 is the Int64-input counterpart. Aligned
+// GroupBy's output builder for numeric reductions is Float64
+// (matches the general path), so integer results widen on emit —
+// same convention as gobi's other integer aggregations.
+func emitReducedInt64(b *array.Float64Builder, kind AggKind, vals []int64) bool {
+	if len(vals) == 0 {
+		switch kind {
+		case AggSum:
+			b.Append(0)
+		default:
+			b.AppendNull()
+		}
+		return true
+	}
+	switch kind {
+	case AggSum:
+		b.Append(float64(compute.SumI64(vals)))
+	case AggMean:
+		b.Append(float64(compute.SumI64(vals)) / float64(len(vals)))
+	case AggMin:
+		m, _ := compute.MinI64(vals)
+		b.Append(float64(m))
+	case AggMax:
+		m, _ := compute.MaxI64(vals)
+		b.Append(float64(m))
+	}
+	return true
 }

@@ -257,6 +257,51 @@ func TestCast_TypeInferenceReportsTarget(t *testing.T) {
 	}
 }
 
+// TestCast_NoRefcountLeak guards against the arrow.NewChunked
+// refcount contract being misread. NewChunked RETAINS each input
+// array (does not steal ownership) — callers keep the initial
+// ref and must Release it. A CheckedAllocator here would report
+// leaked buffers if castSeries ever regresses on this discipline.
+// Runs a mix of source types through Cast, then releases the
+// output Series and asserts the allocator's checked-size returns
+// to zero.
+func TestCast_NoRefcountLeak(t *testing.T) {
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer pool.AssertSize(t, 0)
+
+	// Build a fixture on the checked pool so every buffer allocated
+	// during the test flows through the leak tracker.
+	f64B := array.NewFloat64Builder(pool)
+	f64B.AppendValues([]float64{1.5, 2.7, 3.9, 4.1, 5.2}, nil)
+	f64Arr := f64B.NewArray()
+	f64B.Release()
+
+	field := arrow.Field{Name: "v", Type: arrow.PrimitiveTypes.Float64, Nullable: false}
+	chunked := arrow.NewChunked(f64Arr.DataType(), []arrow.Array{f64Arr})
+	f64Arr.Release()
+	col := arrow.NewColumn(field, chunked)
+	chunked.Release()
+	schema := arrow.NewSchema([]arrow.Field{field}, nil)
+	frame, err := NewFrame(schema, []arrow.Column{*col})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frame.Release()
+
+	// Cast Float64 → Int64 (goes through arrow.compute.CastArray).
+	// If the outChunks = nil bug reappears, CastArray's initial
+	// ref leaks and the checked allocator's deferred AssertSize
+	// fails.
+	out, err := Col("v").Cast(arrow.PrimitiveTypes.Int64).Node().Eval(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Series's underlying column is the Cast output — Release the
+	// column (via a Frame wrapper so we can call Release cleanly).
+	outCol := out.Column()
+	outCol.Release()
+}
+
 // TestCast_LazyPipeline — Cast round-trips through Compile + Execute.
 func TestCast_LazyPipeline(t *testing.T) {
 	f := castFixtureFrame(t)

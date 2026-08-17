@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -64,12 +66,38 @@ type streamingAggregateExec struct {
 	// key allocations from ~2/row to ~1/new-group.
 	keyScratch []byte
 
+	// touchedScratch is the per-batch touched-groups list used by
+	// consumeBatch. Grown once (up to the batch's group cardinality)
+	// and truncated between batches — steady-state append per new-
+	// group-per-batch, no map lookup. Replaces the pre-v0.3.9
+	// `buckets map[*aggGroup][]int` that added a second map lookup
+	// per row on the hot path.
+	touchedScratch []*aggGroup
+
 	// dispatchScratch is the parallel reader's per-row composite key
 	// buffer. Only the reader goroutine touches it, so no
 	// synchronization is needed. Workers do not use this — they
 	// recompute keys off the batch with their own local scratch on
 	// the receive side, so nothing key-shaped crosses the channel.
 	dispatchScratch []byte
+
+	// rowsPool recycles the []int payloads that dispatchBatch sends
+	// through the worker inboxes as partitionMsg.rows. Every batch
+	// the reader partitions rows into `workers` slices and hands
+	// each to a worker; the worker returns its slice to this pool
+	// after processing. Without pooling, 1BRC allocates ~5-8 GB of
+	// []int garbage on this path (~500K dispatches × workers ×
+	// per-row appends). The pool caps in-flight slices at
+	// (workers × chanBuf) ≈ 44 for the default config.
+	//
+	// Stored as `*[]int` (not `[]int`) to avoid the boxing
+	// allocation that `sync.Pool.Put(anySliceValue)` would incur:
+	// passing a slice header through the untyped `any` interface
+	// allocates a small object to hold the (ptr, len, cap) triple.
+	// Storing pointers to slice headers dodges that allocation on
+	// every Put — meaningful given this path runs hundreds of
+	// thousands of times per full 1BRC-scale query.
+	rowsPool sync.Pool
 	// One-shot emit: buildIfNeeded produces the whole result batch,
 	// Next hands it out, subsequent Next calls return io.EOF.
 	resultBatch arrow.RecordBatch
@@ -149,9 +177,30 @@ const (
 // aggregation. Key values are the raw Go scalars captured when the
 // group was first seen — appended into the output when the result
 // is emitted.
+//
+// batchRows and touched are per-batch scratch state used by the
+// consume loop to avoid a `map[*aggGroup][]int` bucket structure
+// that previously sat on the hot path. Every batch, the consume
+// loop walks each row's key once, finds/creates the group, and
+// appends the row index to that group's batchRows — no second
+// map lookup. After the row walk, the loop iterates touched
+// groups once, calls Update on each accumulator with the group's
+// batchRows, resets batchRows[:0] and touched=false, and moves on.
+//
+// batchRows is retained across batches (its cap grows to the
+// group's max-per-batch cardinality), so the reset is O(1)
+// and steady-state per-row cost is one append into an already-
+// allocated slice.
+//
+// Concurrency: aggGroup is per-worker in the parallel build
+// (each worker has its own `groups map[string]*aggGroup`) and
+// single-owner in the serial build. No cross-goroutine access
+// to batchRows/touched.
 type aggGroup struct {
-	keyVals []any            // one per key column
-	accs    []aggAccumulator // one per Aggregation
+	keyVals   []any            // one per key column
+	accs      []aggAccumulator // one per Aggregation
+	batchRows []int            // per-batch row indices, reused across batches
+	touched   bool             // set when this group has rows in the current batch
 }
 
 // aggAccumulator is the streaming counterpart to the built-in Aggregation
@@ -161,6 +210,20 @@ type aggAccumulator interface {
 	// Update accepts a full column and the row indices within it
 	// that belong to the current group. Called at most once per
 	// input batch per group.
+	//
+	// Contract: implementations MUST NOT retain the `rows` slice
+	// past the Update call. The caller reuses the underlying
+	// backing array (aggGroup.batchRows) across batches — a
+	// retained alias would see it overwritten with the next
+	// batch's row indices, silently corrupting downstream reads.
+	// Copy any subset you need to hold onto (rare — the built-in
+	// accumulators all consume rows synchronously).
+	//
+	// Implementations MAY retain values extracted FROM the column
+	// (e.g., firstLastAcc keeps the first non-null scalar), but
+	// arrow buffer aliases (like strings via arr.Value(i)) must
+	// be cloned since the batch's arrow arrays are released after
+	// Update returns. See nUniqueAcc.updateString for the pattern.
 	Update(col Series, rows []int) error
 	// Finalize returns the aggregated value as any. Nil signals a
 	// null output for this group (empty groups on numeric aggs).
@@ -247,7 +310,7 @@ func (e *streamingAggregateExec) buildSerial(ctx context.Context) error {
 		batch.Release()
 	}
 	if e.keyMode == keyModeInt641 {
-		sort.Slice(e.orderInt64, func(i, j int) bool { return e.orderInt64[i] < e.orderInt64[j] })
+		slices.Sort(e.orderInt64)
 	} else {
 		sort.Strings(e.order)
 	}
@@ -294,20 +357,15 @@ func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
 		aggCols[i] = s
 	}
 
-	// Bucket rows by group pointer. Three paths depending on keyMode:
-	//   - keyModeString1: read the arrow value directly, use as
-	//     `map[string]*aggGroup` key. Skips composite encoding.
-	//   - keyModeInt641: widen the arrow value to int64, use as
-	//     `map[int64]*aggGroup` key. Skips composite encoding AND
-	//     the string-hash path — Go's runtime uses word-at-a-time
-	//     hashing on int keys.
-	//   - keyModeComposite: build encoded bytes into e.keyScratch,
-	//     use string(scratch) as `map[string]*aggGroup` key.
+	// Route rows to their group's per-batch scratch (g.batchRows) as
+	// we walk the key column. Tracking touched groups in a slice
+	// rather than a `map[*aggGroup][]int` bucket saves one map
+	// lookup per row — which shows up as ~9% of the CPU profile
+	// on 1BRC-shaped workloads (10K groups × 1B rows).
 	//
-	// All three paths use *aggGroup as the bucket key so the per-row
-	// map write doesn't allocate a string (the compiler's
-	// map[string(bytes)] optimization only applies to reads).
-	buckets := make(map[*aggGroup][]int)
+	// Three paths depending on keyMode; see keyMode consts for
+	// the specific fast paths.
+	touched := e.touchedScratch[:0]
 	rows := int(batch.NumRows())
 	switch e.keyMode {
 	case keyModeString1:
@@ -330,7 +388,12 @@ func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
 				e.groups[ks] = g
 				e.order = append(e.order, ks)
 			}
-			buckets[g] = append(buckets[g], row)
+			if !g.touched {
+				g.touched = true
+				g.batchRows = g.batchRows[:0]
+				touched = append(touched, g)
+			}
+			g.batchRows = append(g.batchRows, row)
 		}
 	case keyModeInt641:
 		intArr, err := resolveIntArray(keySeries[0])
@@ -368,7 +431,12 @@ func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
 				e.groupsInt64[k] = g
 				e.orderInt64 = append(e.orderInt64, k)
 			}
-			buckets[g] = append(buckets[g], row)
+			if !g.touched {
+				g.touched = true
+				g.batchRows = g.batchRows[:0]
+				touched = append(touched, g)
+			}
+			g.batchRows = append(g.batchRows, row)
 		}
 	default:
 		for row := range rows {
@@ -387,26 +455,35 @@ func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
 				e.groups[ks] = g
 				e.order = append(e.order, ks)
 			}
-			buckets[g] = append(buckets[g], row)
+			if !g.touched {
+				g.touched = true
+				g.batchRows = g.batchRows[:0]
+				touched = append(touched, g)
+			}
+			g.batchRows = append(g.batchRows, row)
 		}
 	}
 
-	// Update each group's accumulators with its bucket's rows.
-	for g, groupRows := range buckets {
+	// Update each touched group's accumulators, then reset its
+	// per-batch state ready for the next batch. batchRows keeps
+	// its capacity — steady-state cost is one append per row.
+	for _, g := range touched {
 		for i, a := range e.aggs {
 			src := aggCols[i]
 			if a.Column == "" {
 				// Count-star: accumulator ignores col, uses len(rows).
-				if err := g.accs[i].Update(Series{}, groupRows); err != nil {
+				if err := g.accs[i].Update(Series{}, g.batchRows); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := g.accs[i].Update(src, groupRows); err != nil {
+			if err := g.accs[i].Update(src, g.batchRows); err != nil {
 				return err
 			}
 		}
+		g.touched = false
 	}
+	e.touchedScratch = touched[:0]
 	return nil
 }
 
