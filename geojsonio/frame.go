@@ -140,26 +140,71 @@ func ReadFileChunksFunc(path string, opts *ReadOptions, fn func(*gobi.Frame) err
 	if format == FormatAuto {
 		format = detectFormatFromPath(path)
 	}
+	return readChunks(f, opts, format, fn)
+}
+
+// Read materializes an entire GeoJSON stream from r as a single
+// Frame. The caller owns r and is responsible for closing it. Use
+// ReadFile for the common path-based case.
+//
+// When opts.Format is FormatAuto, the reader defaults to
+// FormatFeatureCollection — there's no filename to sniff.
+func Read(r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
+	if opts == nil {
+		opts = &ReadOptions{}
+	}
+	var frames []*gobi.Frame
+	err := ReadChunksFunc(r, opts, func(f *gobi.Frame) error {
+		f.Retain()
+		frames = append(frames, f)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(frames) == 0 {
+		return emptyFrameWithSchema(nil)
+	}
+	if len(frames) == 1 {
+		return frames[0], nil
+	}
+	out, err := gobi.Concat(frames...)
+	for _, f := range frames {
+		f.Release()
+	}
+	return out, err
+}
+
+// ReadChunksFunc is the io.Reader-based counterpart to
+// ReadFileChunksFunc. The caller owns r; ReadChunksFunc does not
+// close it. When opts.Format is FormatAuto, the reader defaults to
+// FormatFeatureCollection.
+func ReadChunksFunc(r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) error) error {
+	if opts == nil {
+		opts = &ReadOptions{}
+	}
+	format := opts.Format
+	if format == FormatAuto {
+		format = FormatFeatureCollection
+	}
+	return readChunks(r, opts, format, fn)
+}
+
+// readChunks is the shared streaming core behind ReadFileChunksFunc
+// and ReadChunksFunc. Both public entry points resolve the format
+// (path-sniff vs. Auto→FeatureCollection) and hand it in explicitly.
+//
+// Batches are materialized independently — property columns may
+// differ from batch to batch because type inference runs per-batch.
+func readChunks(r io.Reader, opts *ReadOptions, format Format, fn func(*gobi.Frame) error) error {
 	batchSize := opts.ChunkRows
 	if batchSize <= 0 {
 		batchSize = DefaultChunkRows
 	}
-
-	// Two-pass streaming: first walk collects all features into
-	// batch buffers of `batchSize` and inspects property keys +
-	// types. The second walk is unnecessary — we type-infer within
-	// each batch independently, so different batches may have
-	// different property columns.
-	//
-	// Building typed columns from a heterogeneous property soup is
-	// the interesting part: we buffer each batch's raw properties
-	// (as map[string]any), scan them to pick a per-column arrow
-	// type, then materialize.
-	iter, err := newFeatureIter(f, format)
+	iter, err := newFeatureIter(r, format)
 	if err != nil {
 		return err
 	}
-
 	buf := &featureBatch{max: batchSize}
 	for {
 		g, props, more, err := iter.Next()
@@ -630,6 +675,26 @@ func allWhitespace(b []byte) bool {
 // String → JSON string, Timestamp → RFC 3339 string. Nulls emit
 // as JSON null.
 func WriteFile(df *gobi.Frame, path string, opts *WriteOptions) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := Write(df, f, opts); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// Write encodes df as GeoJSON to w. The caller owns w and is
+// responsible for closing it. Use WriteFile for the common
+// path-based case.
+//
+// When opts.Format is FormatAuto (or opts is nil), FeatureCollection
+// is emitted — there's no filename to disambiguate from. WriteFile
+// resolves FormatAuto the same way today, but if it ever grows
+// extension sniffing, keep this docstring in sync.
+func Write(df *gobi.Frame, w io.Writer, opts *WriteOptions) error {
 	if opts == nil {
 		opts = &WriteOptions{}
 	}
@@ -643,7 +708,7 @@ func WriteFile(df *gobi.Frame, path string, opts *WriteOptions) error {
 			}
 		}
 		if geomIdx < 0 {
-			return fmt.Errorf("geojsonio: WriteFile: GeomCol %q not in frame", opts.GeomCol)
+			return fmt.Errorf("geojsonio: Write: GeomCol %q not in frame", opts.GeomCol)
 		}
 	} else {
 		for i := range df.NumCols() {
@@ -655,14 +720,17 @@ func WriteFile(df *gobi.Frame, path string, opts *WriteOptions) error {
 		}
 	}
 
-	f, err := os.Create(path)
-	if err != nil {
-		return err
+	// Skip wrapping if the caller already handed us a *bufio.Writer —
+	// double-buffering is wasteful and the outer Flush wouldn't
+	// propagate through the caller's buffer without a second call.
+	// When we own the buffer we flush it before returning; when the
+	// caller owns it, they're on the hook for flushing before close.
+	var flush func() error
+	if _, ok := w.(*bufio.Writer); !ok {
+		bw := bufio.NewWriter(w)
+		flush = bw.Flush
+		w = bw
 	}
-	defer f.Close()
-	bw := bufio.NewWriter(f)
-	defer bw.Flush()
-
 	format := opts.Format
 	if format == FormatAuto {
 		format = FormatFeatureCollection
@@ -670,10 +738,18 @@ func WriteFile(df *gobi.Frame, path string, opts *WriteOptions) error {
 
 	switch format {
 	case FormatLineDelimited:
-		return writeLines(bw, df, geomIdx)
+		if err := writeLines(w, df, geomIdx); err != nil {
+			return err
+		}
 	default:
-		return writeFeatureCollection(bw, df, geomIdx, opts.Indent)
+		if err := writeFeatureCollection(w, df, geomIdx, opts.Indent); err != nil {
+			return err
+		}
 	}
+	if flush != nil {
+		return flush()
+	}
+	return nil
 }
 
 // writeFeatureCollection emits a `{"type":"FeatureCollection","features":[...]}`

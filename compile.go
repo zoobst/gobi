@@ -164,14 +164,25 @@ func compileNode(p LogicalPlan) (ExecOperator, error) {
 			// Worker count for the partitioned build. resolveWorkers
 			// returns >=1 and folds SetMaxParallelism + GOMAXPROCS in
 			// the documented priority.
-			return &streamingAggregateExec{
+			exec := &streamingAggregateExec{
 				input:     child,
 				keys:      keys,
 				aggs:      aggs,
 				outSchema: n.outSchema,
 				workers:   resolveWorkers(),
 				keyMode:   pickKeyMode(n),
-			}, nil
+			}
+			// New closes over an initial capacity so cold-cache
+			// Gets return an already-sized *[]int. Actual per-
+			// dispatch guess (nRows/workers+8) still grows the
+			// slice on first use for over-guess batches; the
+			// starting cap here is just a hint to reduce
+			// per-append reallocs on the very first batch.
+			exec.rowsPool.New = func() any {
+				s := make([]int, 0, 128)
+				return &s
+			}
+			return exec, nil
 		}
 
 		// Fallback: buffer the whole input, hand to eager engine.

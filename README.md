@@ -764,17 +764,22 @@ and scripts live under [`benchmarks/`](benchmarks/) — regenerate with
 
 ### Compute ops (1M-row Parquet, non-spatial)
 
-| Op                            |    gobi | pandas 2.3 | Polars 1T | Polars all |
-|-------------------------------|--------:|-----------:|----------:|-----------:|
-| `Sum(value_a)`                | 0.94 ms |    0.31 ms |   0.10 ms |    0.09 ms |
-| `value_a + value_b`           | 1.00 ms |    1.03 ms |   0.82 ms |    0.90 ms |
-| `Filter(value_a > 500k)`      | 15.1 ms |    6.83 ms |   1.96 ms |    1.60 ms |
-| `GroupBy(key).Agg(Sum,Mean)`  | 48.2 ms |   19.73 ms |   9.89 ms |    2.42 ms |
+| Op                            | gobi (default) | gobi (SIMD) | pandas 2.3 | Polars 1T | Polars all |
+|-------------------------------|---------------:|------------:|-----------:|----------:|-----------:|
+| `Sum(value_a)`                |        1.04 ms | **0.43 ms** |    0.31 ms |   0.10 ms |    0.09 ms |
+| `value_a + value_b`           |        1.79 ms |     1.55 ms |    1.03 ms |   0.82 ms |    0.90 ms |
+| `Filter(value_a > 500k)`      |       15.9 ms  |    14.9 ms  |    6.83 ms |   1.96 ms |    1.60 ms |
+| `GroupBy(key).Agg(Sum,Mean)`  |       45.4 ms  |    42.6 ms  |   19.73 ms |   9.89 ms |    2.42 ms |
 
 Polars 1T = `POLARS_MAX_THREADS=1`; Polars all = default (all cores).
-pandas sits between gobi and single-threaded Polars on every op — numpy's
-SIMD reductions and C-implemented groupby carry it past pure-Go for now.
-See the SIMD note below.
+gobi (SIMD) = compiled with `GOEXPERIMENT=simd` on Go 1.27+ arm64/amd64;
+gobi (default) = normal build with the scalar compute path. `Sum` gained
+a 2.4× speedup under SIMD (`compute.SumF64` via `simd.Float64s.Add`
+lane-parallel reduce). The other ops changed less because SIMD helps
+compute-bound loops most and pandas/Polars' remaining lead here is
+architectural (NumPy's arena allocator, Polars' cache-blocked kernels)
+rather than kernel-level SIMD. See [compute/](compute/) for the full
+per-op arrow-go vs gobi kernel positioning.
 
 ### CSV read (38.6 MB / 1M rows)
 
@@ -834,25 +839,33 @@ weather-station rows in Snappy-compressed parquet (~4 GB on disk).
 Query: min / mean / max of `temperature` grouped by `station`. Apple
 M3 Pro, 11 GOMAXPROCS.
 
-| Engine                                   |    wall |  user CPU | peak RSS |
-|------------------------------------------|--------:|----------:|---------:|
-| **gobi streaming** (parallel scan + agg) | **18.1s** | **~140s** | **1.27 GB** |
-| Polars 1.42 streaming (reference)        |   3.0 s |      ~15s |  4.42 GB |
-| Polars 1.42 eager (reference)            |  12.0 s |     ~120s | 20.96 GB |
+| Engine                                   |     wall |  user CPU | peak RSS |
+|------------------------------------------|---------:|----------:|---------:|
+| **gobi streaming** (parallel scan + agg) | **12.7s** | **~88s** | **611 MB** |
+| Polars 1.42 streaming (reference)        |    3.0 s |      ~15s |  4.42 GB |
+| Polars 1.42 eager (reference)            |   12.0 s |     ~120s | 20.96 GB |
 
 Streaming end-to-end — no `LazyFrame.CollectRaw()` materialization,
-no disk spill. Getting here took three complementary changes:
-partitioning the parquet scan across row-groups, sharding the
-streaming hash aggregate by key hash across workers, and eliminating
-per-row key allocations in the hot path (reusable scratch buffers +
-single-string-key fast path that reads the arrow value zero-copy).
+no disk spill. Getting here took six complementary changes:
+partitioning the parquet scan across row-groups; sharding the
+streaming hash aggregate by key hash across workers; eliminating
+per-row key allocations (reusable scratch buffers +
+single-string-key fast path that reads the arrow value zero-copy);
+eliminating the per-row `map[*aggGroup][]int` bucket lookup that
+sat between `groups[key]` and the accumulator `Update` calls
+(v0.3.9); pooling the parallel dispatcher's per-worker `[]int`
+row-index payloads via `sync.Pool` (v0.3.9); and threading the
+pooled payloads as `*[]int` through the channel path so
+`sync.Pool.Put` doesn't box the slice header into an interface
+per call (v0.3.9). gobi's own allocations across a full 1BRC run
+are ~540 MB total — down from ~13 GB pre-pool.
 
-Peak RSS is 3.5× lower than Polars streaming and 16× lower than
+Peak RSS is **7.2× lower than Polars streaming** and 34× lower than
 Polars eager because gobi keeps at most one batch per worker in
-memory (~1.3 GB total on 11 workers) — Polars buffers larger working
-sets by design.
+memory + recycles per-batch scratch through `sync.Pool` — Polars
+buffers larger working sets by design.
 
-### v0.2.0 alignment fast paths (1M rows, 1000 groups)
+### Alignment fast paths (1M rows, 1000 groups)
 
 When the caller can prove input partitioning + sort order via
 `WithPartitionMeta(...)`, `Over` and `GroupBy` skip the general
@@ -863,8 +876,15 @@ expose alignment metadata, so it picks its own path.
 
 | Op                              |     gobi (unaligned) | gobi (aligned) |    Polars all |
 |---------------------------------|---------------------:|---------------:|--------------:|
-| `Over(region, id).Sum(v)`       |             54.03 ms |    **37.85 ms** (30% faster) |       7.11 ms |
-| `GroupBy(region, id).Sum(v)`    |            107.87 ms |    **32.36 ms** (70% faster) |       4.65 ms |
+| `Over(region, id).Sum(v)`       |             47.8 ms  |    **29.9 ms** (37% faster) |       7.11 ms |
+| `GroupBy(region, id).Sum(v)`    |             94.6 ms  |    **22.1 ms** (77% faster) |       4.65 ms |
+
+The aligned `GroupBy` number improved from 32.4 ms → 22.1 ms in v0.3.9
+(vs the v0.2.0 landing) via two complementary changes: the streaming-
+aggregate refactor (buckets-map elimination + `sync.Pool` for per-worker
+row-index payloads, `-32%` overall) and the aligned-path SIMD reduce
+wire-in (`compute.SumF64` on contiguous per-group slices under
+`GOEXPERIMENT=simd`).
 
 Sort-merge Inner join (also alignment-gated) is measured in-tree
 rather than in this fixture bench — a fixture-scale self-join is
@@ -876,28 +896,92 @@ streaming-hash-join build-side cache fix that landed with the
 alignment work is 49% faster on multi-batch Inner joins.
 
 Polars still wins in absolute terms — the aligned fast paths close a
-2× gap on Over and a 3× gap on GroupBy while leaving the vectorized-
-reduction gap untouched (see the SIMD note below). If the workload
-can carry alignment metadata, taking it is nearly free.
+1.6× gap on Over and cut a 3.3× gap on GroupBy to 4.8× overall. If
+the workload can carry alignment metadata, taking it is nearly free.
+
+### h3-agg (bbox filter + groupby-h3 + aggregate, 2M rows)
+
+A geospatial analytics workload: bbox-filter 2M `(lat, lon, eid, dt,
+h3_res8)` rows down to ~500K survivors, group by H3 cell (~39K
+groups), and aggregate `count`, `n_unique(eid)`, `min(dt)`,
+`max(dt)`. The h3-agg bench harness lives at
+[`benchmarks/gobi/gobi_h3_agg_lazy_bench.go`](benchmarks/gobi/gobi_h3_agg_lazy_bench.go)
++ [`benchmarks/python/polars_h3_agg_bench.py`](benchmarks/python/polars_h3_agg_bench.py) — precomputed h3
+cells so every engine measures the same aggregation throughput, not
+h3 encoding.
+
+| Engine                                 | per-iter wall |  peak RSS |
+|----------------------------------------|--------------:|----------:|
+| Polars 1.42 streaming                  |     **15 ms** |   341 MB  |
+| **gobi (v0.3.9)**                      |     **86 ms** | **501 MB** |
+| pandas 2.3                             |        86 ms  |   792 MB  |
+| gobi (v0.3.8, pre-session)             |       152 ms  |   ~500 MB |
+
+`gobi (v0.3.9)` matches pandas within measurement noise on wall
+time and uses **36% less peak RSS than pandas**. Getting here took
+five stacked changes that each earn their entry in
+[CHANGELOG.md](CHANGELOG.md):
+
+1. **Filter fusion** — `Col(a) OP lit AND Col(b) OP lit AND …`
+   evaluates in a single row-loop with short-circuit on first
+   false; no intermediate Boolean Series per comparison.
+2. **Scalar-cmp fast path for `Ne` / `Le` / `Ge`** — the pre-existing
+   `binOpNode.Eval` shortcut only fired on `Eq` / `Lt` / `Gt`.
+3. **Null-check hoisting in the fused filter** — when every leaf's
+   column has `NullN() == 0` (typical for numeric parquet), the
+   per-row × per-leaf `IsNull()` calls vanish.
+4. **`aggFast` (fast-path GroupBy) covers `AggNUnique` + Timestamp
+   Min/Max** — previously "one bad agg disabled the whole call."
+5. **Streaming `nUniqueAcc` type-specialization** — LazyFrame
+   groupby-with-nunique dispatches to native `map[string]/[int64]/
+   [float64]` instead of byte-encoded keys.
+
+Polars is still 5.7× faster wall-time on this shape. That gap is
+architectural (cache-blocked kernels, arena allocator, compiled
+expression graph) rather than kernel-level and won't close without
+a rewrite of the same magnitude. gobi's differentiator here is
+matching pandas on throughput while using less memory than pandas
+— on this specific workload Polars beats gobi on both wall and RSS,
+because Polars streams the parquet decode straight into its
+grouper without our intermediate LazyFrame batches. The RSS story
+inverts at the 1BRC scale below.
 
 ### Why the remaining compute-op gap will shrink
 
 `Sum` / `Add` are already memory-bandwidth-bound. The remaining gap on
 `Sum` is SIMD reduction (Polars and numpy both use parallel-lane
 accumulators). The Go `simd` and `simd/archsimd` packages gain arm64
-NEON support in **Go 1.27 (August 2026)**, at which point the existing
-`//go:build goexperiment.simd` kernel gets rewritten against the
-portable package and closes most of the Sum gap — see
-`TODO(1.27-simd)` in `series_ops_simd_*.go`.
+NEON support in **Go 1.27 (August 2026)**. The `compute/` subpackage
+(v0.3.8) ships the initial SIMD scaffolding behind
+`//go:build goexperiment.simd && (arm64 || amd64)` — comparison
+kernels landed (measured **5.6× vs scalar** on the h3-agg 2M-row bbox
+filter); reduction and arithmetic kernels are the next batch.
 
-The 1BRC gap breaks down similarly: with parallelism landed, most of
-the remaining 6× vs Polars streaming is per-row accumulator throughput
-(`minMaxAcc.Update` calls `Series.numericAt` per row, dispatching
-through an interface + type switch). Vectorized kernels — tight
-loops over typed slices — would close a meaningful fraction on the
-Go compiler alone; the last factor comes from the same Go 1.27 SIMD
-package. Neither is on the roadmap until the toolchain support
-lands.
+The remaining ~4.5× 1BRC gap vs Polars streaming breaks down (from
+CPU profile, post-v0.3.9):
+
+- ~22% arrow-go parquet decode (not our code; a custom pooled
+  `memory.Allocator` wrapping arrow-go's decoder path is a
+  scoped-out future win — see Future Work in CLAUDE.md)
+- ~12% Go runtime `map[string]*aggGroup` probe (the fundamental
+  hash-by-string cost; possibly addressable with a specialized
+  Robin-Hood / Swiss-table impl)
+- ~30% runtime scheduling / idle wait between workers
+- ~14% GC background work (down proportionally with v0.3.9's alloc
+  churn cuts)
+- ~11% gobi's aggregate consume path (already tight per-batch
+  typed-slice loops; the fast-path type-switch already dispatches
+  once per chunk, not per row)
+- remainder: misc
+
+Wall-time gains from here need either (a) SIMD reduction kernels
+wired into the streaming aggregate's `Update` methods (Go 1.27),
+(b) a custom decoder-buffer allocator to cut arrow-go's contribution,
+or (c) a specialized hash-map for the string-keyed groupby probe.
+None are on a specific timeline; the v0.3.9 wins have already
+put gobi solidly ahead of pandas (matched exactly on h3-agg,
+substantially ahead on memory) and closed the wall-time gap to
+Polars from 6× to 4.5×.
 
 ## Development
 

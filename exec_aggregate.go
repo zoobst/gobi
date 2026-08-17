@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -64,12 +66,38 @@ type streamingAggregateExec struct {
 	// key allocations from ~2/row to ~1/new-group.
 	keyScratch []byte
 
+	// touchedScratch is the per-batch touched-groups list used by
+	// consumeBatch. Grown once (up to the batch's group cardinality)
+	// and truncated between batches — steady-state append per new-
+	// group-per-batch, no map lookup. Replaces the pre-v0.3.9
+	// `buckets map[*aggGroup][]int` that added a second map lookup
+	// per row on the hot path.
+	touchedScratch []*aggGroup
+
 	// dispatchScratch is the parallel reader's per-row composite key
 	// buffer. Only the reader goroutine touches it, so no
 	// synchronization is needed. Workers do not use this — they
 	// recompute keys off the batch with their own local scratch on
 	// the receive side, so nothing key-shaped crosses the channel.
 	dispatchScratch []byte
+
+	// rowsPool recycles the []int payloads that dispatchBatch sends
+	// through the worker inboxes as partitionMsg.rows. Every batch
+	// the reader partitions rows into `workers` slices and hands
+	// each to a worker; the worker returns its slice to this pool
+	// after processing. Without pooling, 1BRC allocates ~5-8 GB of
+	// []int garbage on this path (~500K dispatches × workers ×
+	// per-row appends). The pool caps in-flight slices at
+	// (workers × chanBuf) ≈ 44 for the default config.
+	//
+	// Stored as `*[]int` (not `[]int`) to avoid the boxing
+	// allocation that `sync.Pool.Put(anySliceValue)` would incur:
+	// passing a slice header through the untyped `any` interface
+	// allocates a small object to hold the (ptr, len, cap) triple.
+	// Storing pointers to slice headers dodges that allocation on
+	// every Put — meaningful given this path runs hundreds of
+	// thousands of times per full 1BRC-scale query.
+	rowsPool sync.Pool
 	// One-shot emit: buildIfNeeded produces the whole result batch,
 	// Next hands it out, subsequent Next calls return io.EOF.
 	resultBatch arrow.RecordBatch
@@ -149,9 +177,30 @@ const (
 // aggregation. Key values are the raw Go scalars captured when the
 // group was first seen — appended into the output when the result
 // is emitted.
+//
+// batchRows and touched are per-batch scratch state used by the
+// consume loop to avoid a `map[*aggGroup][]int` bucket structure
+// that previously sat on the hot path. Every batch, the consume
+// loop walks each row's key once, finds/creates the group, and
+// appends the row index to that group's batchRows — no second
+// map lookup. After the row walk, the loop iterates touched
+// groups once, calls Update on each accumulator with the group's
+// batchRows, resets batchRows[:0] and touched=false, and moves on.
+//
+// batchRows is retained across batches (its cap grows to the
+// group's max-per-batch cardinality), so the reset is O(1)
+// and steady-state per-row cost is one append into an already-
+// allocated slice.
+//
+// Concurrency: aggGroup is per-worker in the parallel build
+// (each worker has its own `groups map[string]*aggGroup`) and
+// single-owner in the serial build. No cross-goroutine access
+// to batchRows/touched.
 type aggGroup struct {
-	keyVals []any            // one per key column
-	accs    []aggAccumulator // one per Aggregation
+	keyVals   []any            // one per key column
+	accs      []aggAccumulator // one per Aggregation
+	batchRows []int            // per-batch row indices, reused across batches
+	touched   bool             // set when this group has rows in the current batch
 }
 
 // aggAccumulator is the streaming counterpart to the built-in Aggregation
@@ -161,6 +210,20 @@ type aggAccumulator interface {
 	// Update accepts a full column and the row indices within it
 	// that belong to the current group. Called at most once per
 	// input batch per group.
+	//
+	// Contract: implementations MUST NOT retain the `rows` slice
+	// past the Update call. The caller reuses the underlying
+	// backing array (aggGroup.batchRows) across batches — a
+	// retained alias would see it overwritten with the next
+	// batch's row indices, silently corrupting downstream reads.
+	// Copy any subset you need to hold onto (rare — the built-in
+	// accumulators all consume rows synchronously).
+	//
+	// Implementations MAY retain values extracted FROM the column
+	// (e.g., firstLastAcc keeps the first non-null scalar), but
+	// arrow buffer aliases (like strings via arr.Value(i)) must
+	// be cloned since the batch's arrow arrays are released after
+	// Update returns. See nUniqueAcc.updateString for the pattern.
 	Update(col Series, rows []int) error
 	// Finalize returns the aggregated value as any. Nil signals a
 	// null output for this group (empty groups on numeric aggs).
@@ -247,7 +310,7 @@ func (e *streamingAggregateExec) buildSerial(ctx context.Context) error {
 		batch.Release()
 	}
 	if e.keyMode == keyModeInt641 {
-		sort.Slice(e.orderInt64, func(i, j int) bool { return e.orderInt64[i] < e.orderInt64[j] })
+		slices.Sort(e.orderInt64)
 	} else {
 		sort.Strings(e.order)
 	}
@@ -294,20 +357,15 @@ func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
 		aggCols[i] = s
 	}
 
-	// Bucket rows by group pointer. Three paths depending on keyMode:
-	//   - keyModeString1: read the arrow value directly, use as
-	//     `map[string]*aggGroup` key. Skips composite encoding.
-	//   - keyModeInt641: widen the arrow value to int64, use as
-	//     `map[int64]*aggGroup` key. Skips composite encoding AND
-	//     the string-hash path — Go's runtime uses word-at-a-time
-	//     hashing on int keys.
-	//   - keyModeComposite: build encoded bytes into e.keyScratch,
-	//     use string(scratch) as `map[string]*aggGroup` key.
+	// Route rows to their group's per-batch scratch (g.batchRows) as
+	// we walk the key column. Tracking touched groups in a slice
+	// rather than a `map[*aggGroup][]int` bucket saves one map
+	// lookup per row — which shows up as ~9% of the CPU profile
+	// on 1BRC-shaped workloads (10K groups × 1B rows).
 	//
-	// All three paths use *aggGroup as the bucket key so the per-row
-	// map write doesn't allocate a string (the compiler's
-	// map[string(bytes)] optimization only applies to reads).
-	buckets := make(map[*aggGroup][]int)
+	// Three paths depending on keyMode; see keyMode consts for
+	// the specific fast paths.
+	touched := e.touchedScratch[:0]
 	rows := int(batch.NumRows())
 	switch e.keyMode {
 	case keyModeString1:
@@ -315,7 +373,7 @@ func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
 		if err != nil {
 			return err
 		}
-		for row := 0; row < rows; row++ {
+		for row := range rows {
 			s := strArr.value(row) // zero-copy alias to arrow buffer
 			g, ok := e.groups[s]
 			if !ok {
@@ -330,7 +388,12 @@ func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
 				e.groups[ks] = g
 				e.order = append(e.order, ks)
 			}
-			buckets[g] = append(buckets[g], row)
+			if !g.touched {
+				g.touched = true
+				g.batchRows = g.batchRows[:0]
+				touched = append(touched, g)
+			}
+			g.batchRows = append(g.batchRows, row)
 		}
 	case keyModeInt641:
 		intArr, err := resolveIntArray(keySeries[0])
@@ -340,7 +403,7 @@ func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
 		if e.groupsInt64 == nil {
 			e.groupsInt64 = make(map[int64]*aggGroup)
 		}
-		for row := 0; row < rows; row++ {
+		for row := range rows {
 			k, ok := intArr.value(row)
 			if !ok {
 				// Skip null-keyed rows in the fast path. The int64
@@ -368,10 +431,15 @@ func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
 				e.groupsInt64[k] = g
 				e.orderInt64 = append(e.orderInt64, k)
 			}
-			buckets[g] = append(buckets[g], row)
+			if !g.touched {
+				g.touched = true
+				g.batchRows = g.batchRows[:0]
+				touched = append(touched, g)
+			}
+			g.batchRows = append(g.batchRows, row)
 		}
 	default:
-		for row := 0; row < rows; row++ {
+		for row := range rows {
 			scratch, err := composeCompositeKeyInto(e.keyScratch[:0], keySeries, row)
 			if err != nil {
 				return err
@@ -387,46 +455,43 @@ func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
 				e.groups[ks] = g
 				e.order = append(e.order, ks)
 			}
-			buckets[g] = append(buckets[g], row)
+			if !g.touched {
+				g.touched = true
+				g.batchRows = g.batchRows[:0]
+				touched = append(touched, g)
+			}
+			g.batchRows = append(g.batchRows, row)
 		}
 	}
 
-	// Update each group's accumulators with its bucket's rows.
-	for g, groupRows := range buckets {
+	// Update each touched group's accumulators, then reset its
+	// per-batch state ready for the next batch. batchRows keeps
+	// its capacity — steady-state cost is one append per row.
+	for _, g := range touched {
 		for i, a := range e.aggs {
 			src := aggCols[i]
 			if a.Column == "" {
 				// Count-star: accumulator ignores col, uses len(rows).
-				if err := g.accs[i].Update(Series{}, groupRows); err != nil {
+				if err := g.accs[i].Update(Series{}, g.batchRows); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := g.accs[i].Update(src, groupRows); err != nil {
+			if err := g.accs[i].Update(src, g.batchRows); err != nil {
 				return err
 			}
 		}
+		g.touched = false
 	}
+	e.touchedScratch = touched[:0]
 	return nil
 }
 
-// composeCompositeKey builds a byte-encoded composite of multi-column
-// key values for a single row. Reuses the same encoding as
-// GroupBy.rowKey so the streaming and eager engines agree on group
-// identity (important for keeping test expectations aligned).
-//
-// Allocates a fresh []byte per call. The streaming aggregate hot
-// paths use composeCompositeKeyInto with a reusable scratch buffer
-// instead; keep this thin wrapper for the eager/tests callers that
-// don't need to bother with scratch management.
-func composeCompositeKey(keys []Series, row int) ([]byte, error) {
-	return composeCompositeKeyInto(nil, keys, row)
-}
-
 // composeCompositeKeyInto appends the byte-encoded composite key
-// for row into dst and returns the resulting slice. Byte-for-byte
-// identical to composeCompositeKey(keys, row); callers pass
-// scratch[:0] to reuse a buffer across rows.
+// for row into dst and returns the resulting slice. Callers pass
+// scratch[:0] to reuse a buffer across rows — the streaming
+// aggregate hot paths thread one scratch buffer through every row
+// to avoid per-row allocation.
 func composeCompositeKeyInto(dst []byte, keys []Series, row int) ([]byte, error) {
 	for i, s := range keys {
 		if i > 0 {
@@ -710,7 +775,9 @@ func newAccumulator(a Aggregation) (aggAccumulator, error) {
 	case AggVar:
 		return &stdVarAcc{wantStd: false}, nil
 	case AggNUnique:
-		return &nUniqueAcc{seen: make(map[string]struct{})}, nil
+		// Maps are lazy-initialized on first Update after kind
+		// selection — the zero value is a valid accumulator.
+		return &nUniqueAcc{}, nil
 	case AggMedian:
 		return &medianAcc{}, nil
 	case AggMode:
@@ -1322,18 +1389,176 @@ func (a *stdVarAcc) Finalize() any {
 }
 func (a *stdVarAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes.Float64 }
 
-// nUniqueAcc counts distinct non-null values seen. Uses the same
-// keyOfAppend byte encoding as GroupBy itself so bit-equal numeric
-// values collapse identically. Memory is O(distinct-values-per-group);
-// on high-cardinality columns this can blow up — no different from
-// polars / pandas nunique in that respect. The scratch buffer is
-// per-acc (per-group) which is acceptable for typical group sizes.
+// nUniqueAcc counts distinct non-null values seen. Type-specializes
+// on first non-empty Update so subsequent rows skip the keyOfAppend
+// byte-encoding for String / Int64 / Float64 columns — the common
+// cases — and store into a native Go map keyed on the arrow value
+// directly. Other column shapes (multi-chunk in a single batch,
+// non-primitive types) fall through to the byte-encoded generic
+// path, which matches GroupBy's own key encoding so bit-equal
+// numeric values still collapse identically.
+//
+// Memory is O(distinct-values-per-group); no different from polars /
+// pandas nunique in that respect. String path clones on first-seen
+// (arrow string values alias into the batch buffer, which is
+// released before Finalize walks the map).
 type nUniqueAcc struct {
-	seen    map[string]struct{}
-	scratch []byte
+	// kind is set on first Update from a non-empty batch. Subsequent
+	// Updates dispatch on it without re-inspecting col.
+	kind nuKind
+
+	// Populated when kind matches. Only one of the four is used per
+	// accumulator instance.
+	seenStr   map[string]struct{}
+	seenI64   map[int64]struct{}
+	seenF64   map[float64]struct{}
+	seenBytes map[string]struct{}
+	scratch   []byte
 }
 
+type nuKind uint8
+
+const (
+	nuKindUnset nuKind = iota
+	nuKindString
+	nuKindInt64
+	nuKindFloat64
+	nuKindBytes
+)
+
 func (a *nUniqueAcc) Update(col Series, rows []int) error {
+	if a.kind == nuKindUnset && len(rows) > 0 && col.col != nil {
+		a.pickKind(col)
+	}
+	switch a.kind {
+	case nuKindString:
+		if err := a.updateString(col, rows); err == errNUniqueFallback {
+			return a.updateBytes(col, rows)
+		} else if err != nil {
+			return err
+		}
+	case nuKindInt64:
+		if err := a.updateInt64(col, rows); err == errNUniqueFallback {
+			return a.updateBytes(col, rows)
+		} else if err != nil {
+			return err
+		}
+	case nuKindFloat64:
+		if err := a.updateFloat64(col, rows); err == errNUniqueFallback {
+			return a.updateBytes(col, rows)
+		} else if err != nil {
+			return err
+		}
+	default:
+		return a.updateBytes(col, rows)
+	}
+	return nil
+}
+
+// errNUniqueFallback is an internal sentinel: the type-specialized
+// Update saw a column shape it can't handle (e.g. a mid-stream batch
+// has multiple chunks, or a mid-stream batch's chunk type doesn't
+// match the specialization). Not a user-visible error — the caller
+// retries via the byte-encoded generic path so the accumulator's
+// final count remains correct even in mixed-shape streams.
+var errNUniqueFallback = fmt.Errorf("nUniqueAcc: fallback to byte-encoded path")
+
+// pickKind inspects col's first chunk and selects the specialization.
+// Multi-chunk or unsupported types go to the byte-encoded fallback.
+func (a *nUniqueAcc) pickKind(col Series) {
+	chunks := col.col.Data().Chunks()
+	if len(chunks) != 1 {
+		a.kind = nuKindBytes
+		a.seenBytes = make(map[string]struct{})
+		return
+	}
+	switch chunks[0].(type) {
+	case *array.String:
+		a.kind = nuKindString
+		a.seenStr = make(map[string]struct{})
+	case *array.Int64:
+		a.kind = nuKindInt64
+		a.seenI64 = make(map[int64]struct{})
+	case *array.Float64:
+		a.kind = nuKindFloat64
+		a.seenF64 = make(map[float64]struct{})
+	default:
+		a.kind = nuKindBytes
+		a.seenBytes = make(map[string]struct{})
+	}
+}
+
+func (a *nUniqueAcc) updateString(col Series, rows []int) error {
+	chunks := col.col.Data().Chunks()
+	if len(chunks) != 1 {
+		return errNUniqueFallback
+	}
+	arr, ok := chunks[0].(*array.String)
+	if !ok {
+		return errNUniqueFallback
+	}
+	for _, row := range rows {
+		if arr.IsNull(row) {
+			continue
+		}
+		v := arr.Value(row)
+		if _, seen := a.seenStr[v]; !seen {
+			// arr.Value aliases into the batch's arrow buffer, which
+			// is Released before Finalize walks the map. Clone only
+			// on first-seen so the alloc is O(distinct-values), not
+			// O(rows).
+			a.seenStr[strings.Clone(v)] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func (a *nUniqueAcc) updateInt64(col Series, rows []int) error {
+	chunks := col.col.Data().Chunks()
+	if len(chunks) != 1 {
+		return errNUniqueFallback
+	}
+	arr, ok := chunks[0].(*array.Int64)
+	if !ok {
+		return errNUniqueFallback
+	}
+	values := arr.Int64Values()
+	for _, row := range rows {
+		if arr.IsNull(row) {
+			continue
+		}
+		a.seenI64[values[row]] = struct{}{}
+	}
+	return nil
+}
+
+func (a *nUniqueAcc) updateFloat64(col Series, rows []int) error {
+	chunks := col.col.Data().Chunks()
+	if len(chunks) != 1 {
+		return errNUniqueFallback
+	}
+	arr, ok := chunks[0].(*array.Float64)
+	if !ok {
+		return errNUniqueFallback
+	}
+	values := arr.Float64Values()
+	for _, row := range rows {
+		if arr.IsNull(row) {
+			continue
+		}
+		a.seenF64[values[row]] = struct{}{}
+	}
+	return nil
+}
+
+// updateBytes is the generic path: byte-encode each value via
+// keyOfAppend + insert into a map[string] keyed on the encoding.
+// Matches GroupBy's own key encoding so bit-equal numerics collapse
+// identically to how the group column would collapse them.
+func (a *nUniqueAcc) updateBytes(col Series, rows []int) error {
+	if a.seenBytes == nil {
+		a.seenBytes = make(map[string]struct{})
+	}
 	for _, row := range rows {
 		null, err := isNullAtSeries(col, row)
 		if err != nil {
@@ -1347,14 +1572,25 @@ func (a *nUniqueAcc) Update(col Series, rows []int) error {
 			return err
 		}
 		a.scratch = buf
-		if _, ok := a.seen[string(buf)]; !ok {
-			a.seen[string(buf)] = struct{}{}
+		if _, ok := a.seenBytes[string(buf)]; !ok {
+			a.seenBytes[string(buf)] = struct{}{}
 		}
 	}
 	return nil
 }
 
-func (a *nUniqueAcc) Finalize() any              { return int64(len(a.seen)) }
+func (a *nUniqueAcc) Finalize() any {
+	switch a.kind {
+	case nuKindString:
+		return int64(len(a.seenStr))
+	case nuKindInt64:
+		return int64(len(a.seenI64))
+	case nuKindFloat64:
+		return int64(len(a.seenF64))
+	default:
+		return int64(len(a.seenBytes))
+	}
+}
 func (a *nUniqueAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes.Int64 }
 
 // medianAcc buffers every non-null numeric value in the group and

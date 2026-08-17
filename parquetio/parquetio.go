@@ -1,9 +1,16 @@
 // Package parquetio reads and writes gobi Frames as Apache Parquet.
 //
 // Compression is delegated to Parquet's built-in codecs. When a Frame
-// contains geometry columns, WriteFile emits a GeoParquet 1.1 metadata
-// blob under the Parquet file-level "geo" key; ReadFile re-hydrates it
-// into the returned Frame's schema.
+// contains geometry columns, the writers emit a GeoParquet 1.1
+// metadata blob under the Parquet file-level "geo" key; the readers
+// re-hydrate it into the returned Frame's schema.
+//
+// The writer offers two entry points:
+//
+//   - WriteFile serializes a Frame to a filesystem path.
+//   - Write serializes a Frame to any io.Writer; the caller owns the
+//     stream. Useful for object storage uploads, tar streams, or
+//     in-memory buffers.
 //
 // The reader offers two entry points:
 //
@@ -548,15 +555,23 @@ func ReadFileChunksFunc(path string, opts *ReadOptions, fn func(*gobi.Frame) err
 }
 
 // ReadReader is the io.ReaderAt-backed counterpart to ReadFile. Reads
-// a Parquet file from any random-access byte source (S3 GetObject with
-// Range headers, in-memory bytes.Reader, etc.) whose size is known
-// upfront. Materializes the whole payload as a single Frame — memory
-// footprint mirrors ReadFile.
+// a Parquet file from any random-access byte source whose size is
+// known upfront. Materializes the whole payload as a single Frame —
+// memory footprint mirrors ReadFile.
+//
+// Why io.ReaderAt (not plain io.Reader) on the read side? Parquet
+// reads footer-first, then jumps to individual row groups; a
+// sequential stream can't satisfy that shape. Common sources that
+// already satisfy io.ReaderAt without any adapter:
+//
+//   - *bytes.Reader (in-memory payloads, test fixtures)
+//   - *os.File (any file — pair with fi.Size())
+//   - S3 GetObject output — s3.GetObjectOutput.Body wrapped as
+//     io.ReaderAt via a thin shim on top of Range GET requests
+//     (aws-sdk-go-v2's manager.NewDownloader and third-party
+//     packages provide this out of the box)
 //
 // The caller retains ownership of r; ReadReader does not Close it.
-// Pass io.ReaderAt + Size explicitly rather than requiring io.Seeker
-// so callers implementing thin S3 / HTTP shims don't need to fake
-// seeking against a known length.
 //
 // GeoParquet metadata + column projection + predicate pushdown work
 // the same as ReadFile — ReadOptions is honored uniformly.
@@ -678,6 +693,31 @@ func (noopCloser) Close() error { return nil }
 // less per-group overhead. The parquet default is a reasonable
 // starting point for most workloads.
 func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
+	out, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := Write(f, out, opts); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// writeOnly hides an io.Writer's io.Closer surface (if any) from
+// pqarrow. FileWriter.Close calls Close on the underlying writer
+// when it satisfies io.Closer, which would violate Write's
+// caller-owns-w contract (e.g. a *gzip.Writer wrapping a *os.File,
+// or a caller who intends to append more data after the parquet
+// payload).
+type writeOnly struct{ w io.Writer }
+
+func (wo writeOnly) Write(p []byte) (int, error) { return wo.w.Write(p) }
+
+// Write serializes f as Parquet to w. The caller owns w and is
+// responsible for closing it. Use WriteFile for the common
+// path-based case.
+func Write(f *gobi.Frame, w io.Writer, opts *WriteOptions) error {
 	if opts == nil {
 		opts = &WriteOptions{}
 	}
@@ -753,12 +793,6 @@ func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 	}
 	defer augmented.Release()
 
-	out, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
 	writerProps := []parquet.WriterProperty{parquet.WithCompression(compression)}
 	if opts.RowGroupRows > 0 {
 		writerProps = append(writerProps, parquet.WithMaxRowGroupLength(opts.RowGroupRows))
@@ -774,7 +808,7 @@ func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 
 	writer, err := pqarrow.NewFileWriter(
 		augmented.Schema(),
-		out,
+		writeOnly{w: w},
 		parquet.NewWriterProperties(writerProps...),
 		pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()),
 	)
@@ -787,21 +821,22 @@ func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 	// f, effectively doubling f's memory footprint until it's
 	// eventually collected.
 	tbl := augmented.Table()
+	// On error paths, join Close's error with the primary failure —
+	// the parquet footer is written on Close, so a truncated/invalid
+	// output leaves diagnostic value in Close's return even when the
+	// primary error is more informative.
 	if err := writer.WriteTable(tbl, int64(augmented.NumRows())); err != nil {
 		tbl.Release()
-		_ = writer.Close()
-		return err
+		return errors.Join(err, writer.Close())
 	}
 	tbl.Release()
 	if meta != nil {
 		blob, err := marshalGeoMeta(meta)
 		if err != nil {
-			_ = writer.Close()
-			return err
+			return errors.Join(err, writer.Close())
 		}
 		if err := writer.AppendKeyValueMetadata(gobi.GeoParquetMetadataKey, blob); err != nil {
-			_ = writer.Close()
-			return err
+			return errors.Join(err, writer.Close())
 		}
 	}
 	return writer.Close()

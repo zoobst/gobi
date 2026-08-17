@@ -1,6 +1,7 @@
 package geojsonio_test
 
 import (
+	"bytes"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -247,6 +248,80 @@ func TestFrame_WriteAndRead_FeatureCollection(t *testing.T) {
 	}
 	if _, ok := g.(geometry.Point); !ok {
 		t.Errorf("row 0 geom: expected Point, got %T", g)
+	}
+}
+
+// TestFrame_Write_ToBuffer_FeatureCollection round-trips through
+// the io.Writer entry point + io.Reader entry point without
+// touching disk. Mirrors the WriteFile/ReadFile FC test.
+func TestFrame_Write_ToBuffer_FeatureCollection(t *testing.T) {
+	df := buildFeatureFrame(t)
+	var buf bytes.Buffer
+	if err := geojsonio.Write(df, &buf, nil); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := geojsonio.Read(bytes.NewReader(buf.Bytes()), nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.NumRows() != 3 {
+		t.Fatalf("rows = %d, want 3", got.NumRows())
+	}
+	geomS, err := got.Column("geometry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !geomS.IsGeometry() {
+		t.Errorf("geometry column lost its tag")
+	}
+}
+
+// TestFrame_Write_ToBuffer_LineDelimited confirms line-delimited
+// output through the io.Writer entry point is parseable via the
+// io.Reader entry point when Format is set explicitly.
+func TestFrame_Write_ToBuffer_LineDelimited(t *testing.T) {
+	df := buildFeatureFrame(t)
+	var buf bytes.Buffer
+	if err := geojsonio.Write(df, &buf, &geojsonio.WriteOptions{
+		Format: geojsonio.FormatLineDelimited,
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte{'\n'}) {
+		t.Fatal("line-delimited output missing newlines")
+	}
+	got, err := geojsonio.Read(bytes.NewReader(buf.Bytes()), &geojsonio.ReadOptions{
+		Format: geojsonio.FormatLineDelimited,
+	})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.NumRows() != 3 {
+		t.Fatalf("rows = %d, want 3", got.NumRows())
+	}
+}
+
+// TestReadChunksFunc_Streaming confirms the io.Reader streaming
+// entry point yields the same total row count as the whole-payload
+// read, and that batches are emitted at the requested chunk size.
+func TestReadChunksFunc_Streaming(t *testing.T) {
+	df := buildFeatureFrame(t)
+	var buf bytes.Buffer
+	if err := geojsonio.Write(df, &buf, nil); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	var total int
+	err := geojsonio.ReadChunksFunc(bytes.NewReader(buf.Bytes()),
+		&geojsonio.ReadOptions{ChunkRows: 2},
+		func(f *gobi.Frame) error {
+			total += f.NumRows()
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("ReadChunksFunc: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("streamed row count = %d, want 3", total)
 	}
 }
 

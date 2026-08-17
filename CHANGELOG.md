@@ -5,6 +5,335 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.8]
+
+### Performance
+
+- **[compute/](compute/) gains reduction kernels: `SumF64`, `SumI64`,
+  `MinF64`, `MaxF64`, `MinI64`, `MaxI64`.** Portable scalar +
+  Go 1.27 SIMD (arm64 NEON, amd64 AVX2/AVX-512) paths behind the
+  same `//go:build goexperiment.simd` gate as the existing compare
+  kernels. Fills a gap arrow-go/compute doesn't cover at all
+  (arrow-go has no aggregate/reduction kernels).
+
+  Measured on arm64 (Apple M3 Pro, n=10M, GOEXPERIMENT=simd
+  vs default build):
+
+  ```
+                  scalar         SIMD           delta
+  SumF64          1409 Mrows/s   3005 Mrows/s   2.1×
+  MinF64           906 Mrows/s   3726 Mrows/s   4.1×   ← branch-free lane-Min
+  MaxF64           977 Mrows/s   3726 Mrows/s   3.8×
+  SumI64          3603 Mrows/s   3639 Mrows/s   ~flat  (compiler ILP saturates)
+  MinI64          1715 Mrows/s   1813 Mrows/s   ~flat  (scalar in both — no Int64s.Min)
+  MaxI64          1728 Mrows/s   1828 Mrows/s   ~flat
+  ```
+
+  Float64 Min/Max benefits most because `simd.Float64s.Min` /
+  `Float64s.Max` are lane-parallel branch-free operations, versus
+  scalar's `if v < m { m = v }` which the compiler can't vectorize.
+  Float64 Sum is 2× because scalar `s += v` already extracts some
+  ILP via the compiler. Int64 doesn't have `Min` / `Max` methods
+  in Go 1.27's `simd` stdlib, so those stay scalar in the SIMD build.
+
+  Wired into `Series.Min` / `Series.Max` / `Series.Sum` null-free
+  fast paths ([series_ops.go](series_ops.go) `minMaxF64` + the
+  `sumF64Kernel` fallback). Default builds get the identical
+  scalar inner loop (no regression); `GOEXPERIMENT=simd` builds
+  on arm64/amd64 pick up the SIMD path automatically.
+
+  Also wired into the aligned GroupBy fast path
+  ([groupby_aligned.go](groupby_aligned.go) `tryEmitContiguousSIMD`):
+  when the input carries `PartitionMetadata` proving per-group row
+  contiguity (aligned + sorted + SortEnforced=true) AND an agg is
+  Sum/Min/Max/Mean on a null-free single-chunk Float64 or Int64
+  column, the group's `vals[start:end]` slice goes directly to
+  `compute.SumF64` / `MinF64` / `MaxF64`. Skips the per-group
+  `rowsBuf []int` construction + the per-row indexed-access
+  Welford loop.
+
+  Pipeline-level impact caveat: on typical GroupBy workloads
+  (hundreds-to-thousands of groups, ~100 rows each), the boundary-
+  detection cost over 1M+ rows dominates the reduce cost, so
+  wall-time savings are within noise. The wire-in delivers real
+  savings only when per-group cardinality is large (thousands+
+  rows per group) and the reduce is a meaningful fraction of the
+  work. The Series.Sum/Min/Max wire-in above is where the
+  measurable per-op wins land today (2-4× on null-free Float64
+  columns).
+
+  Streaming aggregate integration is NOT covered here — the
+  `map[key]*aggGroup` + per-batch bucket → per-group Update path
+  walks scattered row indices, not contiguous slices. Adding SIMD
+  there would require either sort-then-reduce (O(n log n) sort
+  dwarfs the reduce win) or per-batch per-group gather into
+  scratch (memory-bandwidth-limited on arm64, no gather
+  instruction). Neither is on the roadmap.
+
+- **`Expr.Cast` dispatches through `arrow.compute.CastArray`.**
+  Pre-fix, gobi's Cast walked chunks with a per-target builder
+  loop (`castToFloat64`, `castToInt64`, `castToFloat32`,
+  `castToInt32`, `castToUint64`, `castToUint32` — six ~50-line
+  helpers, ~300 lines total). Every element paid a null-check +
+  arrow-array typed `Value(i)` accessor + builder `Append`. Scalar.
+  Slow.
+
+  arrow-go ships hand-written NEON SIMD (`internal/kernels/
+  cast_numeric_neon_arm64.s`) and AVX2/SSE4 (`cast_numeric_avx2_
+  amd64.s`) for numeric casts. Routing gobi's Cast through
+  `arrow.compute.CastArray` gets us the SIMD kernel on both
+  architectures for free.
+
+  Measured on arm64 (Apple M3 Pro, arrow-go v18.7.0, Go 1.27rc1)
+  via `benchmarks/arrow_compute/main.go`:
+
+  ```
+                                  before      after       delta
+  Cast Float64→Int64, n=10M       38.4 ms     2.83 ms     -13.6×
+  Cast Float64→Int64, n=1M         3.54 ms    0.30 ms     -11.8×
+  Cast Float64→Int64, n=100K       0.475 ms   0.052 ms    -9.1×
+  ```
+
+  gobi's Cast now matches `arrow.compute.CastArray` throughput
+  directly (3530 vs 3547 Mrows/s at 10M — the ~0.5% delta is
+  gobi's chunked-wrapper overhead). Removed ~300 lines of
+  hand-rolled scalar cast loops.
+
+  Contract preserved: same supported target types (Float32/64,
+  Int32/64, Uint32/64), same silent-wrap / silent-truncate
+  overflow semantics (matches Go's built-in numeric conversion),
+  same null propagation. Broader arrow-go cast capabilities
+  (String↔Int, Date↔Timestamp, etc.) stay out of gobi's public
+  Cast API until each path is deliberately exposed with its own
+  semantic contract.
+
+  This is the FIRST place gobi calls into `arrow.compute` — see
+  the `compute/` subpackage doc for the arrow-go delta table
+  (what to route through arrow-go, what to keep bespoke, why).
+
+- **Streaming aggregate: pooled `[]int` payloads flow as `*[]int`
+  through the channel path.** Follow-up to the previous item.
+  `sync.Pool.Put([]int)` boxes the 3-word slice header into an
+  `any` interface — a per-Put heap allocation. And a naive fix
+  (`p := s; pool.Put(&p)`) still allocates because the fresh `&p`
+  escapes to the heap. The real fix: change `partitionMsg.rows`
+  from `[]int` to `*[]int` so the pool's pointer identity flows
+  Get → dispatch → channel → worker → Put unchanged. Threaded
+  through the append sites via `*partRows[w] = append(*partRows[w],
+  row)` and through the worker via a one-time `rows := *msg.rows`
+  deref at the top of `workerConsume`.
+
+  Additional measured impact on 1BRC beyond the earlier boxed-slice
+  pool: aggregation wall 13.6 s → 12.72 s (−6%). Cumulative across
+  this session: 16.6 s → 12.72 s (**−23%**), gobi allocations
+  13 GB → 540 MB (**−24× less**).
+
+- **Streaming aggregate: pooled the parallel dispatcher's per-worker
+  `[]int` row-index buffers.** Every batch the reader partitions
+  rows into `workers` slices and hands each to a worker via
+  `partitionMsg.rows`. Pre-fix, each dispatch call allocated
+  `workers` fresh `[]int` slices at capacity ~`nRows/workers+8`
+  — profiled at **12.75 GB of allocations on 1BRC** (from ~500K
+  batches × 11 workers), dominating gobi's total allocation
+  footprint.
+
+  Added a `sync.Pool` (`rowsPool`) on the exec. Dispatcher `Get`s
+  slices at dispatch time (falling back to `make` on cold cache);
+  workers `Put` slices back after `workerConsume` returns; empty-
+  partition slices bypass the channel and go straight back. Steady-
+  state in-flight pool size caps at `workers × chanBuf` ≈ 44 for
+  the default config. `Put`s hand back `s[:0]` so the underlying
+  array's capacity is preserved for the next dispatch.
+
+  Measured on the 1BRC fixture (1B rows, Apple M3 Pro, 11
+  GOMAXPROCS):
+
+  ```
+                          before      after       change
+  aggregation wall time   15.5 s      13.6 s      −12%
+  gobi allocations        13.06 GB    564 MB      −23×
+  peak OS RSS             724 MB      611 MB      −16%
+  user CPU time           102 s       88 s        −14%
+  ```
+
+  Wall-time win comes from reduced GC pressure — with 23× less
+  allocation churn, GC background workers do 14% less work, and
+  the CPU freed up serves useful compute. Peak Go heap in-use
+  is nearly flat (~553 MB → ~569 MB) because the live working
+  set didn't change; only the allocation *rate* dropped.
+
+  Combined with the `buckets` map elimination (previous entry),
+  1BRC agg wall drops from 16.6 s → 13.6 s (−18% overall) with
+  peak RSS from 1.06 GB → 611 MB (−42% overall).
+
+- **Streaming aggregate: eliminated per-row `map[*aggGroup][]int`
+  bucket lookup.** The old `consumeBatch` / `workerConsume` hot
+  path did TWO map lookups per row on high-cardinality groupby
+  workloads: the primary key→group lookup (`groups[key]`) plus a
+  secondary bucket write (`buckets[g] = append(buckets[g], row)`).
+  Profiling 1BRC (1B rows, 413 groups) showed the second lookup
+  alone consumed ~10 s of CPU time (9% of the profile) with real
+  memory-allocation churn from the ephemeral per-batch map.
+
+  Replaced the buckets map with per-`aggGroup` `batchRows []int`
+  scratch + a per-batch `touched []*aggGroup` list. Every row now
+  does exactly one map lookup (the primary key→group probe) and
+  then appends to the group's own reusable slice — no second
+  hash. After the row walk, the loop iterates `touched` once,
+  calls `Update` on each accumulator, and resets `touched` + each
+  group's `batchRows[:0]` for the next batch. `batchRows`
+  capacity is retained across batches so steady-state per-row
+  cost is one append into an already-allocated slice.
+
+  Measured on the 1BRC fixture (1B rows, Apple M3 Pro, 11
+  GOMAXPROCS):
+
+  ```
+                          before      after      change
+  aggregation wall time   16.6 s      15.5 s     −7%
+  peak Go heap in-use     606 MB      553 MB     −9%
+  peak OS RSS             1.06 GB     724 MB     −32%
+  ```
+
+  The RSS drop dwarfs the wall-time drop because the buckets map
+  was allocation-heavy (fresh per batch, keyed on pointer, values
+  were growing slices) — removing it drops the working set
+  substantially. Wall-time win is modest because the buckets cost
+  was already parallelizing across 11 workers; the ~10 s CPU
+  saved is ~0.9 s wall on 11 cores.
+
+  Applies to every LazyFrame aggregation, not just 1BRC. Any
+  `GroupBy(...).Agg(...)` streaming path benefits — the win
+  scales with (rows × groups-touched-per-batch), so highest on
+  high-cardinality groupby workloads.
+
+- **Filter fusion for AND-chained scalar comparisons.** Predicates
+  of the shape `Col(a) OP lit AND Col(b) OP lit AND …` now evaluate
+  in a single row-loop with short-circuit on the first false, rather
+  than materializing one Boolean Series per comparison + one more
+  per AND. On a 2M-row bbox filter (`lat >= a AND lat <= b AND lon
+  >= c AND lon <= d`), filter cost dropped from ~98 ms to ~44 ms
+  (~55% faster) on Apple M3 Pro / Go 1.26. Predicates that don't
+  match the fused shape (column-vs-column comparisons, string
+  equality, OR branches, single leaves) fall through to the general
+  `Expr.Eval` path unchanged. Null propagation contract preserved:
+  any leaf null on a row surfaces as a null in the mask, which
+  `Frame.Filter` treats as false — same behavior as the pre-fusion
+  path.
+
+- **Scalar-comparison fast path covers `Ne` / `Le` / `Ge`.** The
+  `binOpNode.Eval` fast path that skips literal-broadcasting for
+  `(col OP lit)` previously only fired on `Eq` / `Lt` / `Gt` — the
+  other three comparisons fell through to the general path, which
+  broadcasts the literal to N rows before comparing (allocates one
+  N-element float64 slice per literal). Added `Series.NeScalar` /
+  `LeScalar` / `GeScalar` and extended `tryScalarFastPath` to
+  dispatch them. Independent of the AND-fusion above — helps every
+  filter using those operators, even single-leaf predicates.
+
+- **Group-by fast path (`aggFast`) now covers `AggNUnique` and
+  `AggMin` / `AggMax` on Timestamp columns.** Previously the fast
+  path bailed to the slow per-row `numericAt` loop whenever any
+  aggregation was `NUnique` or when Min/Max targeted a Timestamp
+  column — the "one bad agg disables the whole call" pattern.
+  `aggView` is now a discriminated union covering count-star,
+  numeric, timestamp, and hashable shapes, one per aggregation.
+  NUnique dispatches to per-group direct-hash maps
+  (`map[string]` / `map[int64]` / `map[float64]`) instead of the
+  byte-encoded `keyOfAppend` fallback. Timestamp Min/Max compares
+  raw int64 (no lossy float64 cast) and emits back as
+  `arrow.Timestamp` preserving the source's TimeUnit + TimeZone.
+
+- **Streaming `nUniqueAcc` type-specializes on first Update.** The
+  LazyFrame aggregate executor's per-group NUnique accumulator used
+  to run `keyOfAppend` — a chunk walk + type switch + byte encoding
+  — for every row. Now it inspects the source column once on first
+  non-empty Update and switches to a native `map[string]struct{}` /
+  `map[int64]struct{}` / `map[float64]struct{}` path. Falls through
+  to the byte-encoded generic path for multi-chunk batches or
+  non-primitive types. Bit-equal numerics still collapse identically
+  to the pre-fix behavior.
+
+- **Null-check hoisting in the fused filter.** When every leaf's
+  source column has `NullN() == 0` at setup (typical for numeric
+  columns from parquet reads), the row-loop skips the per-row per-
+  leaf `IsNull` calls and the validity-bitmap bookkeeping
+  entirely. 8M `IsNull` calls on the 2M-row × 4-leaf bbox filter
+  turn into zero. Null-carrying columns transparently fall
+  through to the general fused evaluator with validity
+  propagation preserved.
+
+- **Combined effect on the h3-agg benchmark:** LazyFrame per-iter
+  time on the 2M-row filter+groupby+agg pipeline dropped from
+  ~152 ms → ~86 ms (**-43%**), landing gobi_lazy within 0.1 ms of
+  pandas (86.01 ms). Filter cost alone: 98 → 40 ms (~-59%).
+  Bench methodology: 30 iterations, warmup 3, Apple M3 Pro,
+  Go 1.26.
+
+  Final four-way ranking on the h3-agg workload:
+  ```
+  polars      15.21 ms   (Rust SIMD)
+  gobi_lazy   85.90 ms   ← tied with pandas
+  pandas      86.01 ms   (compiled C loops)
+  gobi_pool  154.64 ms   (hand-written Go worker pool)
+  ```
+
+  Note that gobi_lazy also uses ~36% less peak RSS than pandas
+  (501 MB vs 792 MB) — same throughput, tighter memory footprint.
+
+### Added
+
+- **`parquetio.Write(f, w, opts)` and `geojsonio.Write(f, w, opts)` /
+  `geojsonio.Read(r, opts)` / `geojsonio.ReadChunksFunc(r, opts, fn)`.**
+  `io.Writer` / `io.Reader` entry points to complement the existing
+  path-based `WriteFile` / `ReadFile` / `ReadFileChunksFunc`. The
+  caller owns the stream and is responsible for closing it — enabling
+  non-filesystem sinks and sources: object-storage uploads / downloads,
+  tar-stream entries, in-memory `bytes.Buffer` round-trips, HTTP
+  request/response bodies. `WriteFile` / `ReadFile` are now thin
+  wrappers that open the file and delegate.
+
+  `parquetio.Write` wraps the caller's writer in a `writeOnly`
+  adapter that hides `io.Closer` from `pqarrow.FileWriter.Close`
+  — pqarrow's `Close` calls `Close` on the underlying writer when
+  it implements `io.Closer`, which would violate the caller-owns-w
+  contract (e.g. a `*gzip.Writer` wrapping a `*os.File`, or a
+  caller who intends to append more bytes after the parquet
+  payload).
+
+  `geojsonio.Read` / `ReadChunksFunc` default to
+  `FormatFeatureCollection` when `opts.Format` is `FormatAuto`
+  (path-based readers still sniff `.geojsonl` / `.ndjson`). Set
+  `Format: FormatLineDelimited` explicitly to stream line-delimited
+  GeoJSON from a reader.
+
+  This brings the write-side API of `parquetio` and `geojsonio` in
+  line with `kmlio` (which already had both variants). `csvio`
+  has no writer at all today; `gpkgio` needs a seekable file on
+  disk (SQLite backend), and `shpio` is a multi-file format —
+  neither fits a single `io.Writer` cleanly.
+
+### Shelved
+
+- **Pooled `memory.Allocator` for arrow-go's parquet decode buffers.**
+  Prototyped as `parquetio.NewPooledAllocator` — a size-bucketed
+  pool implementing arrow-go's `memory.Allocator` interface, opt-in
+  via `ReadOptions.Allocator`. Both an unbounded `sync.Pool[[]byte]`
+  variant and a bounded `chan *[]byte` variant were measured
+  against `-workers=11` on the 1BRC fixture; both **increased**
+  peak RSS by 30-50% versus the default `memory.GoAllocator`
+  (measured: 659 MB → 950-1046 MB). Alloc-size histogram
+  confirmed 100% of arrow-go's requests fell inside the bucketed
+  range — the pool was catching allocations, but arrow-go's
+  per-batch fresh-output-buffer pattern means the pool retention
+  piles up ON TOP of the fresh in-flight allocations rather than
+  substituting for them. The earlier "700-900 MB RSS reduction"
+  prediction in the Future Work doc was based on a mental model
+  that didn't match arrow-go's actual allocation shape.
+  Implementation deleted (both `allocator_pool.go` and its test
+  file) rather than shipping something that misleads opt-in users
+  into worse RSS.
+
 ## [v0.3.7]
 
 ### Added
@@ -2383,7 +2712,7 @@ First tagged release. Everything below is what a caller sees when
 
 Every subpackage exposes a consistent `ReadOptions` + `WriteOptions`
 struct and (where applicable) `ReadFile` / `WriteFile` / `ScanFile`
-entry points. Options field naming is documented in CLAUDE.md.
+entry points.
 
 - **`parquetio`** — Parquet + GeoParquet 1.1 read/write. Column
   projection, row-group predicate pushdown via footer stats,
@@ -2447,10 +2776,3 @@ entry points. Options field naming is documented in CLAUDE.md.
   landed.
 - Vectorized numeric accumulator kernels — deferred until Go
   1.27's stdlib `simd` package ships arm64 support (August 2026).
-- Pooled arrow decoder buffers for parallel scan — documented as
-  future work in CLAUDE.md; would drop 1BRC peak RSS from ~1.3 GB
-  toward ~400 MB.
-
-[Unreleased]: https://github.com/zoobst/gobi/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/zoobst/gobi/releases/tag/v0.1.1
-[0.1.0]: https://github.com/zoobst/gobi/releases/tag/v0.1.0

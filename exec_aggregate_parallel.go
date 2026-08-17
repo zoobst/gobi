@@ -3,6 +3,8 @@ package gobi
 import (
 	"context"
 	"io"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -13,9 +15,19 @@ import (
 // partitionMsg carries one batch's rows to one worker. The reader
 // retains the batch once per recipient before sending; the worker
 // Releases when it's done processing the message.
+//
+// rows is a pointer (*[]int, not []int) so the pool-recycled header
+// travels through the channel without allocating. sync.Pool.Put on
+// a bare []int would box the 3-word header into an interface — a
+// per-Put heap allocation. Storing pointers, and threading the same
+// pointer Get → dispatch → worker → Put, amortizes header
+// allocation across the pool's steady-state cap (workers × chanBuf
+// pointers total). Without this, the reader emits ~500K messages
+// per 1BRC-scale query — 500K × workers header allocations, each
+// putting pressure on GC.
 type partitionMsg struct {
 	batch arrow.RecordBatch
-	rows  []int // row indices in batch belonging to this worker
+	rows  *[]int // pool-managed; worker returns to pool post-consume
 }
 
 // buildParallel is the partitioned build path for streamingAggregateExec.
@@ -80,7 +92,6 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for i := range workers {
-		i := i
 		go func() {
 			defer wg.Done()
 			var groups map[string]*aggGroup
@@ -96,15 +107,34 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 			// Reused across every row this worker consumes so key
 			// computation is zero-alloc except at first-touch inserts.
 			var scratch []byte
+			// touched carries the per-batch list of groups that had at
+			// least one row in the current batch — populated by
+			// workerConsume, drained by workerConsume's Update loop,
+			// then reused (as touched[:0]) on the next call. Same
+			// reuse pattern as scratch. Replaces the pre-v0.3.9
+			// `buckets map[*aggGroup][]int` that added a second map
+			// lookup per row on the hot path.
+			var touched []*aggGroup
 			for msg := range inboxes[i] {
 				// If the pipeline was cancelled we still need to drain
 				// remaining messages to unblock the reader; skip work.
 				if wctx.Err() == nil {
-					if err := workerConsume(msg, e.keys, e.aggs, e.keyMode, groups, &order, groupsInt, &orderInt, &scratch); err != nil {
+					if err := workerConsume(msg, e.keys, e.aggs, e.keyMode, groups, &order, groupsInt, &orderInt, &scratch, &touched); err != nil {
 						setErr(err)
 					}
 				}
 				msg.batch.Release()
+				// Return the *[]int payload to the dispatcher's
+				// pool. Truncating to zero length preserves the
+				// capacity so the next dispatchBatch that pulls this
+				// pointer can append into it without a fresh
+				// allocation. Safe regardless of ctx cancellation
+				// (the slice is no longer aliased anywhere). The
+				// same pointer flows Get → dispatch → channel →
+				// here → Put, so no header allocation on Put —
+				// see rowsPool docs.
+				*msg.rows = (*msg.rows)[:0]
+				e.rowsPool.Put(msg.rows)
 			}
 			workerGroups[i] = groups
 			workerOrder[i] = order
@@ -163,12 +193,10 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 		e.groupsInt64 = make(map[int64]*aggGroup, total)
 		e.orderInt64 = make([]int64, 0, total)
 		for i := range workerGroupsInt {
-			for k, g := range workerGroupsInt[i] {
-				e.groupsInt64[k] = g
-			}
+			maps.Copy(e.groupsInt64, workerGroupsInt[i])
 			e.orderInt64 = append(e.orderInt64, workerOrderInt[i]...)
 		}
-		sort.Slice(e.orderInt64, func(i, j int) bool { return e.orderInt64[i] < e.orderInt64[j] })
+		slices.Sort(e.orderInt64)
 		return nil
 	}
 	total := 0
@@ -178,9 +206,7 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 	e.groups = make(map[string]*aggGroup, total)
 	e.order = make([]string, 0, total)
 	for i := range workerGroups {
-		for k, g := range workerGroups[i] {
-			e.groups[k] = g
-		}
+		maps.Copy(e.groups, workerGroups[i])
 		e.order = append(e.order, workerOrder[i]...)
 	}
 	sort.Strings(e.order)
@@ -214,12 +240,31 @@ func (e *streamingAggregateExec) dispatchBatch(ctx context.Context, batch arrow.
 
 	nRows := int(batch.NumRows())
 	workers := len(inboxes)
-	// Per-partition scratch, one entry per worker. Preallocate to
-	// nRows/workers with slack so the first few appends don't grow.
-	guess := nRows/workers + 8
-	partRows := make([][]int, workers)
+	// Per-partition scratch, one *[]int per worker. Pointers pulled
+	// from e.rowsPool — reused across batches once workers return
+	// them post-consume. First-batch cost is a heap-allocated []int
+	// header + backing array per worker at the guess capacity;
+	// steady-state cost is a pool Get + a `*p = (*p)[:0]` truncate.
+	//
+	// The pool stores `*[]int`, not `[]int`. The pointer identity
+	// flows Get → dispatch → channel → worker Update → Put back
+	// unchanged, so no header re-allocation occurs on the hot path.
+	// Passing bare `[]int` through `sync.Pool.Put` would box the
+	// 3-word slice header into an `any` interface every Put, and
+	// creating a fresh `*[]int` per Put (via `p := s; &p`) would
+	// heap-allocate the header — both defeat the pool's purpose on
+	// high-cardinality streaming workloads. See rowsPool docs.
+	// e.rowsPool.New is set at exec construction (see compile.go)
+	// so Get always returns a non-nil *[]int — no fallback branch
+	// needed. First-batch pointers come out at the pool's default
+	// initial cap (128); subsequent batches reuse whatever the
+	// worker Put'd back after the last consume.
+	_ = nRows // guess capacity is applied by the pool's New; keep for future dispatch tuning
+	partRows := make([]*[]int, workers)
 	for i := range workers {
-		partRows[i] = make([]int, 0, guess)
+		p := e.rowsPool.Get().(*[]int)
+		*p = (*p)[:0]
+		partRows[i] = p
 	}
 
 	switch e.keyMode {
@@ -233,10 +278,10 @@ func (e *streamingAggregateExec) dispatchBatch(ctx context.Context, batch arrow.
 		if err != nil {
 			return err
 		}
-		for row := 0; row < nRows; row++ {
+		for row := range nRows {
 			s := strArr.value(row)
 			w := int(fnvHashString1(s) % uint64(workers))
-			partRows[w] = append(partRows[w], row)
+			*partRows[w] = append(*partRows[w], row)
 		}
 	case keyModeInt641:
 		// Fast path: widen arrow value to int64, splatter through
@@ -249,30 +294,34 @@ func (e *streamingAggregateExec) dispatchBatch(ctx context.Context, batch arrow.
 		if err != nil {
 			return err
 		}
-		for row := 0; row < nRows; row++ {
+		for row := range nRows {
 			k, ok := intArr.value(row)
 			if !ok {
 				continue
 			}
 			w := int(fnvHashInt64(k) % uint64(workers))
-			partRows[w] = append(partRows[w], row)
+			*partRows[w] = append(*partRows[w], row)
 		}
 	default:
-		for row := 0; row < nRows; row++ {
+		for row := range nRows {
 			scratch, err := composeCompositeKeyInto(e.dispatchScratch[:0], keySeries, row)
 			if err != nil {
 				return err
 			}
 			e.dispatchScratch = scratch
 			w := int(fnvHashBytes(scratch) % uint64(workers))
-			partRows[w] = append(partRows[w], row)
+			*partRows[w] = append(*partRows[w], row)
 		}
 	}
 
 	// Send to workers that received at least one row. Retain the
 	// batch once per recipient so each worker's Release balances.
+	// Slices for empty partitions go straight back to the pool
+	// rather than into the channel — the worker never sees them.
+	// The same *[]int flows through: no per-call header allocation.
 	for i := range workers {
-		if len(partRows[i]) == 0 {
+		if len(*partRows[i]) == 0 {
+			e.rowsPool.Put(partRows[i])
 			continue
 		}
 		batch.Retain()
@@ -281,8 +330,16 @@ func (e *streamingAggregateExec) dispatchBatch(ctx context.Context, batch arrow.
 		case inboxes[i] <- msg:
 		case <-ctx.Done():
 			// Undo the retain we just did — no worker will receive
-			// this message.
+			// this message. Return the pool pointer ourselves since
+			// the worker won't. Also return every remaining
+			// partition's pointer — otherwise those slices' capacity
+			// escapes the pool on cancellation and gets GC'd
+			// unnecessarily.
 			batch.Release()
+			e.rowsPool.Put(partRows[i])
+			for j := i + 1; j < workers; j++ {
+				e.rowsPool.Put(partRows[j])
+			}
 			return ctx.Err()
 		}
 	}
@@ -310,6 +367,7 @@ func workerConsume(
 	groupsInt map[int64]*aggGroup,
 	orderInt *[]int64,
 	scratch *[]byte,
+	touchedPtr *[]*aggGroup,
 ) error {
 	frame, err := batchToFrame(msg.batch)
 	if err != nil {
@@ -335,18 +393,25 @@ func workerConsume(
 		aggCols[i] = s
 	}
 
-	// Bucket rows by group pointer. See consumeBatch for the
-	// rationale on why bucketing keys off *aggGroup instead of the
-	// key. Three paths depending on keyMode. Only one of the two
-	// container pairs (string vs int) is populated per invocation.
-	buckets := make(map[*aggGroup][]int)
+	// Route rows to their group's per-batch scratch (g.batchRows) as
+	// we walk the key column. Tracking touched groups in a slice
+	// rather than a `map[*aggGroup][]int` bucket saves one map
+	// lookup per row — which showed up as ~9% of the CPU profile
+	// on 1BRC before this change. See aggGroup docs for the
+	// batchRows / touched invariants.
+	//
+	// msg.rows is `*[]int` (pool-managed pointer identity across
+	// batches — see partitionMsg + rowsPool docs). Deref once here
+	// for the switch branches to range over a plain slice.
+	rows := *msg.rows
+	touched := (*touchedPtr)[:0]
 	switch mode {
 	case keyModeString1:
 		strArr, err := resolveStringArray(keySeries[0])
 		if err != nil {
 			return err
 		}
-		for _, row := range msg.rows {
+		for _, row := range rows {
 			s := strArr.value(row)
 			g, ok := groups[s]
 			if !ok {
@@ -358,14 +423,19 @@ func workerConsume(
 				groups[ks] = g
 				*order = append(*order, ks)
 			}
-			buckets[g] = append(buckets[g], row)
+			if !g.touched {
+				g.touched = true
+				g.batchRows = g.batchRows[:0]
+				touched = append(touched, g)
+			}
+			g.batchRows = append(g.batchRows, row)
 		}
 	case keyModeInt641:
 		intArr, err := resolveIntArray(keySeries[0])
 		if err != nil {
 			return err
 		}
-		for _, row := range msg.rows {
+		for _, row := range rows {
 			k, ok := intArr.value(row)
 			if !ok {
 				// dispatchBatch also skips null-keyed rows, but a
@@ -381,10 +451,15 @@ func workerConsume(
 				groupsInt[k] = g
 				*orderInt = append(*orderInt, k)
 			}
-			buckets[g] = append(buckets[g], row)
+			if !g.touched {
+				g.touched = true
+				g.batchRows = g.batchRows[:0]
+				touched = append(touched, g)
+			}
+			g.batchRows = append(g.batchRows, row)
 		}
 	default:
-		for _, row := range msg.rows {
+		for _, row := range rows {
 			buf, err := composeCompositeKeyInto((*scratch)[:0], keySeries, row)
 			if err != nil {
 				return err
@@ -400,24 +475,33 @@ func workerConsume(
 				groups[ks] = g
 				*order = append(*order, ks)
 			}
-			buckets[g] = append(buckets[g], row)
+			if !g.touched {
+				g.touched = true
+				g.batchRows = g.batchRows[:0]
+				touched = append(touched, g)
+			}
+			g.batchRows = append(g.batchRows, row)
 		}
 	}
 
-	// Update accumulators one group at a time.
-	for g, groupRows := range buckets {
+	// Update each touched group's accumulators, then reset its
+	// per-batch state ready for the next batch. batchRows keeps
+	// its capacity — steady-state cost is one append per row.
+	for _, g := range touched {
 		for i, a := range aggs {
 			if a.Column == "" {
-				if err := g.accs[i].Update(Series{}, groupRows); err != nil {
+				if err := g.accs[i].Update(Series{}, g.batchRows); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := g.accs[i].Update(aggCols[i], groupRows); err != nil {
+			if err := g.accs[i].Update(aggCols[i], g.batchRows); err != nil {
 				return err
 			}
 		}
+		g.touched = false
 	}
+	*touchedPtr = touched[:0]
 	return nil
 }
 

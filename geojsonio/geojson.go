@@ -21,10 +21,17 @@
 //   - MarshalFeature / UnmarshalFeature — Feature wrapper codec
 //     (geometry + properties + id).
 //
-//   - ReadFile / ReadFileChunksFunc / WriteFile — Frame-level I/O.
-//     Reads a FeatureCollection (or line-delimited GeoJSON) into a
-//     Frame with a `geometry` column plus one column per unique
-//     property key. Writes a Frame back out as FeatureCollection.
+//   - ReadFile / ReadFileChunksFunc / WriteFile — Frame-level I/O
+//     against a filesystem path. Reads a FeatureCollection (or
+//     line-delimited GeoJSON) into a Frame with a `geometry` column
+//     plus one column per unique property key. Writes a Frame back
+//     out as FeatureCollection.
+//
+//   - Read / ReadChunksFunc / Write — io.Reader / io.Writer variants
+//     for non-filesystem sources (object storage, tar streams,
+//     in-memory buffers). The caller owns the stream. FormatAuto
+//     defaults to FeatureCollection since there's no filename to
+//     sniff.
 //
 //   - ScanFile — LazyFrame entry point matching parquetio /
 //     gpkgio / csvio's shape. No predicate pushdown (JSON is
