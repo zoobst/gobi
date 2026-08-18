@@ -2,11 +2,18 @@ package gobi
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
+
+// timestampNanoUTC is the arrow type gobi uses for time.Time literals
+// and matches the type produced by from_structs.go for time.Time
+// struct fields. TimeZone empty means "unspecified" per arrow — same
+// convention gobi uses elsewhere.
+var timestampNanoUTC = &arrow.TimestampType{Unit: arrow.Nanosecond}
 
 // -----------------------------------------------------------------------------
 // colRefNode: `Col("x")`
@@ -57,6 +64,16 @@ func newLiteralNode(v any) *literalNode {
 		return &literalNode{value: v, dtype: arrow.PrimitiveTypes.Float64}
 	case string:
 		return &literalNode{value: v, dtype: arrow.BinaryTypes.String}
+	case time.Time:
+		// Stored as arrow.Timestamp (int64 nanoseconds since epoch)
+		// to match the wire representation of Timestamp columns.
+		// UnixNano overflows for times before 1678 or after 2262 —
+		// out of range for the workloads this literal is meant to
+		// support (recent-past bounded queries, event-stream cutoffs).
+		return &literalNode{
+			value: arrow.Timestamp(v.UnixNano()),
+			dtype: timestampNanoUTC,
+		}
 	default:
 		return &literalNode{err: fmt.Errorf("%w: literal of type %T",
 			ErrUnsupportedLiteral, v)}
@@ -186,6 +203,24 @@ func (n *binOpNode) Eval(input *Frame) (Series, error) {
 	// literal that maps cleanly to Series' *Scalar methods.
 	if rlit, ok := n.right.(*literalNode); ok && rlit.err == nil {
 		if _, isLeftLit := n.left.(*literalNode); !isLeftLit {
+			// Timestamp/Timestamp scalar comparison — evaluated
+			// directly on int64 nanosecond values without widening
+			// to float64 (which would lose precision on very large
+			// nanosecond values). Fires before the float64 path
+			// because rlit.asFloat64() rejects Timestamp anyway.
+			if n.op.isComparison() {
+				if tsLit, ok := rlit.value.(arrow.Timestamp); ok {
+					left, err := n.left.Eval(input)
+					if err != nil {
+						return Series{}, err
+					}
+					if s, ok, err := tryScalarTimestampFastPath(n.op, left, tsLit); err != nil {
+						return Series{}, err
+					} else if ok {
+						return s, nil
+					}
+				}
+			}
 			if v, ok := rlit.asFloat64(); ok {
 				left, err := n.left.Eval(input)
 				if err != nil {
@@ -360,6 +395,21 @@ func (n *binOpNode) String() string {
 	return fmt.Sprintf("(%s %s %s)", n.left, n.op, n.right)
 }
 
+// tryScalarTimestampFastPath emits (Timestamp-col cmp Timestamp-lit)
+// via cmpScalarTs, keeping the comparison on raw int64 values.
+// Returns ok=false when left isn't a single-chunk Timestamp column or
+// the op isn't a comparison — caller falls back to the general path.
+func tryScalarTimestampFastPath(op binOpKind, left Series, v arrow.Timestamp) (Series, bool, error) {
+	if !op.isComparison() {
+		return Series{}, false, nil
+	}
+	vals, arr, ok := left.singleTS()
+	if !ok {
+		return Series{}, false, nil
+	}
+	return cmpScalarTS(vals, arr, v, binOpToCmpOp(op), left.name), true, nil
+}
+
 // tryScalarFastPath attempts to dispatch (col op literal) to a Series
 // *Scalar method. Returns (result, true, nil) on success, (_, false,
 // nil) if the op has no fast path and the caller should fall back to
@@ -410,6 +460,30 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 		if left.DataType() != nil && left.DataType().ID() == arrow.STRING &&
 			right.DataType() != nil && right.DataType().ID() == arrow.STRING {
 			return stringCompare(left, right, op == bopNe)
+		}
+	}
+	// Timestamp col-vs-col comparisons: Series.Cmp requires isNumeric
+	// (false for Timestamp), so route here via cmpTsTs. Unit match is
+	// guaranteed by promoteForComparison in binOpNode.Type; a mismatch
+	// reaches here only through code paths that bypass Type checking.
+	if op.isComparison() {
+		if _, lok := left.DataType().(*arrow.TimestampType); lok {
+			if _, rok := right.DataType().(*arrow.TimestampType); rok {
+				if left.Len() != right.Len() {
+					return Series{}, fmt.Errorf("%w: %d vs %d",
+						ErrColumnLenMismatch, left.Len(), right.Len())
+				}
+				aVals, aArr, aOk := left.singleTS()
+				bVals, bArr, bOk := right.singleTS()
+				if aOk && bOk {
+					return cmpTSTS(aVals, bVals, aArr, bArr, binOpToCmpOp(op), left.name), nil
+				}
+				// Multi-chunk Timestamp compare — fall through to
+				// error path below since Series.Eq etc. also reject.
+				return Series{}, fmt.Errorf(
+					"%w: multi-chunk Timestamp comparison not supported",
+					ErrExprTypeMismatch)
+			}
 		}
 	}
 	switch op {
@@ -586,6 +660,14 @@ func broadcastLiteral(value any, dtype arrow.DataType, n int) (Series, error) {
 			b.Append(v)
 		}
 		return arrayToSeries(pool, "lit", dtype, b.NewArray())
+	case arrow.TIMESTAMP:
+		v := value.(arrow.Timestamp)
+		b := array.NewTimestampBuilder(pool, dtype.(*arrow.TimestampType))
+		defer b.Release()
+		for range n {
+			b.Append(v)
+		}
+		return arrayToSeries(pool, "lit", dtype, b.NewArray())
 	}
 	return Series{}, fmt.Errorf("%w: cannot broadcast literal of type %s",
 		ErrUnsupportedLiteral, dtype)
@@ -690,7 +772,8 @@ func promoteNumeric(lt, rt arrow.DataType) (arrow.DataType, error) {
 
 // promoteForComparison verifies that lt and rt can be compared. Numeric
 // types compare against any numeric type; String compares against
-// String; Boolean against Boolean. Other combinations error.
+// String; Boolean against Boolean; Timestamp compares against Timestamp
+// when the units match. Other combinations error.
 func promoteForComparison(lt, rt arrow.DataType) (arrow.DataType, error) {
 	if isNumericType(lt) && isNumericType(rt) {
 		return promoteNumeric(lt, rt)
@@ -700,6 +783,20 @@ func promoteForComparison(lt, rt arrow.DataType) (arrow.DataType, error) {
 	}
 	if lt.ID() == arrow.BOOL && rt.ID() == arrow.BOOL {
 		return arrow.FixedWidthTypes.Boolean, nil
+	}
+	if lts, lok := lt.(*arrow.TimestampType); lok {
+		if rts, rok := rt.(*arrow.TimestampType); rok {
+			// Different units would need a nanosecond conversion — punt
+			// until a user hits it. Callers who need to compare
+			// microsecond and nanosecond timestamps can cast one side
+			// explicitly with Expr.Cast.
+			if lts.Unit != rts.Unit {
+				return nil, fmt.Errorf(
+					"%w: Timestamp unit mismatch (%s vs %s) — cast one side first",
+					ErrExprTypeMismatch, lts.Unit, rts.Unit)
+			}
+			return lt, nil
+		}
 	}
 	return nil, fmt.Errorf("%w: comparison between %s and %s",
 		ErrExprTypeMismatch, lt, rt)

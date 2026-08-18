@@ -5,6 +5,64 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.9]
+
+### Added
+
+- **`Lit(time.Time)` and end-to-end Timestamp comparison support.**
+  Prior to this, `gobi.Lit(t)` returned an "unsupported literal type"
+  error and Timestamp columns had no expression-layer comparison path
+  at all — `Col("ts").Ge(anything)` failed at `promoteForComparison`
+  regardless of the RHS type. Fixed in three layers:
+
+  1. `Lit(time.Time)` at [expr_eval.go](expr_eval.go) now stores the
+     value as `arrow.Timestamp` (int64 UnixNano) with dtype
+     `Timestamp[ns]`, matching the type from_structs.go produces for
+     `time.Time` struct fields. `broadcastLiteral` gains a TIMESTAMP
+     case using `array.NewTimestampBuilder`.
+
+  2. `promoteForComparison` now allows Timestamp vs Timestamp when
+     units match; unit mismatch (e.g. millisecond col vs nanosecond
+     Lit) errors with `"Timestamp unit mismatch — cast one side first"`
+     rather than silently reinterpreting.
+
+  3. Two new kernels in [series_ops.go](series_ops.go): `cmpScalarTs`
+     for Timestamp-col vs Timestamp-lit and `cmpTsTs` for col-vs-col,
+     both operating directly on int64 nanosecond values (no float64
+     widening — nanoseconds past 2^53 stay exact). Wired via
+     `tryScalarTimestampFastPath` in `binOpNode.Eval` and a
+     Timestamp/Timestamp branch in `applyBinaryOp`.
+
+  What now works: `Col("ts").{Eq,Ne,Lt,Le,Gt,Ge}(Lit(t))` on
+  Timestamp columns, `Col("start").Lt(Col("end"))` on two Timestamp
+  columns, `WithColumnExpr("cutoff", Lit(t))` to broadcast a
+  Timestamp scalar to every row.
+
+- **Fused-filter path recognizes Timestamp leaves.**
+  `parseFusedLeaf` at [filter_fused.go](filter_fused.go) previously
+  rejected `*array.Timestamp` outright ("rare filter shape, keep
+  fused semantics tight"). Now it accepts Timestamp columns with
+  matching-unit Timestamp literals via a new kind=3 leaf. The
+  scaffolding (`fusedFilterLeaf.kind = 3`, both `evalRow` and
+  `evalRowNoNull` already routing kind=3 through `cmpI64`) was
+  already in place — this wire-up completes it.
+
+  Zero-copy int64 view via `tsValuesAsInt64` using `unsafe.Slice` —
+  sound because `arrow.Timestamp` is declared `type Timestamp int64`
+  at the arrow-go layer (identical size/alignment/layout). The
+  F64/I64 leaves get zero-copy views via `Float64Values` /
+  `Int64Values`; the Timestamp leaf needs the same treatment to
+  keep the fused-vs-general contract on 100M+ row filters where an
+  O(n) leaf-setup copy would dominate. First `unsafe` in the root
+  package, tightly scoped to one helper with a stated safety
+  argument.
+
+  What now fuses: `Col("ts").Ge(Lit(lo)).And(Col("ts").Lt(Lit(hi)))`
+  goes through the single fused row-loop with short-circuit AND,
+  rather than materializing two Boolean Series and a separate AND.
+  Unit-mismatched leaves fall through to the general path (which
+  errors clearly at Type()).
+
 ## [v0.3.8]
 
 ### Performance

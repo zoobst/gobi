@@ -84,6 +84,9 @@ func Col(name string) Expr {
 //	int, int32, int64   → Int64
 //	float32, float64    → Float64
 //	string              → String
+//	time.Time           → Timestamp[ns] (stored as UnixNano; matches
+//	                      the type from_structs.go produces for
+//	                      time.Time struct fields)
 //
 // Values implementing geometry.Geometry (Point, LineString, Polygon,
 // etc.) route to LitGeom, so `Lit(aoi).GeomIntersects(...)` composes

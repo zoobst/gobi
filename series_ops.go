@@ -127,6 +127,21 @@ func (s Series) singleI64() (vals []int64, arr *array.Int64, ok bool) {
 	return a.Int64Values(), a, true
 }
 
+// singleTS mirrors singleI64 for Timestamp (any unit / timezone).
+// Values come back as []arrow.Timestamp (int64 under the hood);
+// callers doing comparisons work on them directly.
+func (s Series) singleTS() (vals []arrow.Timestamp, arr *array.Timestamp, ok bool) {
+	chunks := s.col.Data().Chunks()
+	if len(chunks) != 1 {
+		return nil, nil, false
+	}
+	a, isTS := chunks[0].(*array.Timestamp)
+	if !isTS {
+		return nil, nil, false
+	}
+	return a.TimestampValues(), a, true
+}
+
 // bothInt reports whether both operands are integer-typed.
 func bothInt(a, b Series) bool {
 	aInt := a.DataType().ID() == arrow.INT64 || a.DataType().ID() == arrow.INT32
@@ -1004,6 +1019,127 @@ func cmpScalarF64(a []float64, arr *array.Float64, v float64, op cmpOp, name str
 			out[i] = a[i] > v
 		case cmpGe:
 			out[i] = a[i] >= v
+		}
+		validity[i] = true
+	}
+	return buildBoolSeries(name, out, validity)
+}
+
+// cmpScalarTS compares a Timestamp column against a Timestamp scalar
+// (both int64 nanoseconds — arrow.Timestamp is an int64 alias, so
+// comparisons on the raw values match the timeline order regardless
+// of unit as long as both sides share the same unit).
+func cmpScalarTS(a []arrow.Timestamp, arr *array.Timestamp, v arrow.Timestamp, op cmpOp, name string) Series {
+	n := len(a)
+	out := make([]bool, n)
+	if arr.NullN() == 0 {
+		switch op {
+		case cmpEq:
+			for i := range n {
+				out[i] = a[i] == v
+			}
+		case cmpNe:
+			for i := range n {
+				out[i] = a[i] != v
+			}
+		case cmpLt:
+			for i := range n {
+				out[i] = a[i] < v
+			}
+		case cmpLe:
+			for i := range n {
+				out[i] = a[i] <= v
+			}
+		case cmpGt:
+			for i := range n {
+				out[i] = a[i] > v
+			}
+		case cmpGe:
+			for i := range n {
+				out[i] = a[i] >= v
+			}
+		}
+		return buildBoolSeries(name, out, nil)
+	}
+	validity := make([]bool, n)
+	for i := range n {
+		if arr.IsNull(i) {
+			continue
+		}
+		switch op {
+		case cmpEq:
+			out[i] = a[i] == v
+		case cmpNe:
+			out[i] = a[i] != v
+		case cmpLt:
+			out[i] = a[i] < v
+		case cmpLe:
+			out[i] = a[i] <= v
+		case cmpGt:
+			out[i] = a[i] > v
+		case cmpGe:
+			out[i] = a[i] >= v
+		}
+		validity[i] = true
+	}
+	return buildBoolSeries(name, out, validity)
+}
+
+// cmpTSTS compares two Timestamp columns element-wise. Requires
+// matching lengths and units — callers should have gate-checked
+// units via promoteForComparison.
+func cmpTSTS(a, b []arrow.Timestamp, aArr, bArr *array.Timestamp, op cmpOp, name string) Series {
+	n := len(a)
+	out := make([]bool, n)
+	aNulls := aArr.NullN() > 0
+	bNulls := bArr.NullN() > 0
+	if !aNulls && !bNulls {
+		switch op {
+		case cmpEq:
+			for i := range n {
+				out[i] = a[i] == b[i]
+			}
+		case cmpNe:
+			for i := range n {
+				out[i] = a[i] != b[i]
+			}
+		case cmpLt:
+			for i := range n {
+				out[i] = a[i] < b[i]
+			}
+		case cmpLe:
+			for i := range n {
+				out[i] = a[i] <= b[i]
+			}
+		case cmpGt:
+			for i := range n {
+				out[i] = a[i] > b[i]
+			}
+		case cmpGe:
+			for i := range n {
+				out[i] = a[i] >= b[i]
+			}
+		}
+		return buildBoolSeries(name, out, nil)
+	}
+	validity := make([]bool, n)
+	for i := range n {
+		if aArr.IsNull(i) || bArr.IsNull(i) {
+			continue
+		}
+		switch op {
+		case cmpEq:
+			out[i] = a[i] == b[i]
+		case cmpNe:
+			out[i] = a[i] != b[i]
+		case cmpLt:
+			out[i] = a[i] < b[i]
+		case cmpLe:
+			out[i] = a[i] <= b[i]
+		case cmpGt:
+			out[i] = a[i] > b[i]
+		case cmpGe:
+			out[i] = a[i] >= b[i]
 		}
 		validity[i] = true
 	}

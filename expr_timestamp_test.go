@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,6 +110,173 @@ func TestExpr_UnixNano_RejectsNonTimestamp(t *testing.T) {
 	}
 	if !errors.Is(err, ErrExprTypeMismatch) {
 		t.Errorf("error should wrap ErrExprTypeMismatch, got %v", err)
+	}
+}
+
+// TestExpr_LitTime_Type — Lit(time.Time) constructs a Timestamp[ns]
+// literal (matching from_structs.go's mapping for time.Time struct
+// fields) without erroring at construction.
+func TestExpr_LitTime_Type(t *testing.T) {
+	when := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	e := Lit(when)
+	dt, err := e.node.Type(nil)
+	if err != nil {
+		t.Fatalf("Type: %v", err)
+	}
+	ts, ok := dt.(*arrow.TimestampType)
+	if !ok {
+		t.Fatalf("dtype = %s, want *TimestampType", dt)
+	}
+	if ts.Unit != arrow.Nanosecond {
+		t.Errorf("unit = %s, want nanosecond", ts.Unit)
+	}
+}
+
+// TestExpr_LitTime_Broadcast — Lit(time.Time) used via WithColumnExpr
+// broadcasts to a Timestamp column of the frame's row count.
+func TestExpr_LitTime_Broadcast(t *testing.T) {
+	when := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	f := timestampFrame(t, arrow.Nanosecond, []int64{0, 1_000, 2_000})
+	out, err := f.WithColumnExpr("stamp", Lit(when))
+	if err != nil {
+		t.Fatalf("WithColumnExpr: %v", err)
+	}
+	col, _ := out.Column("stamp")
+	if _, ok := col.DataType().(*arrow.TimestampType); !ok {
+		t.Fatalf("dtype = %s, want Timestamp", col.DataType())
+	}
+	arr := col.col.Data().Chunks()[0].(*array.Timestamp)
+	if arr.Len() != 3 {
+		t.Fatalf("len = %d, want 3", arr.Len())
+	}
+	want := arrow.Timestamp(when.UnixNano())
+	for i := range arr.Len() {
+		if arr.Value(i) != want {
+			t.Errorf("row %d = %v, want %v", i, arr.Value(i), want)
+		}
+	}
+}
+
+// TestExpr_TimestampCol_GeLit — Col(ts).Ge(Lit(cutoff)) filters
+// correctly. Uses the scalar Timestamp fast path in binOpNode.Eval.
+func TestExpr_TimestampCol_GeLit(t *testing.T) {
+	// Frame rows: 2026-01-01, 2026-06-01, 2027-01-01 (nanoseconds).
+	rows := []int64{
+		time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
+		time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
+		time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
+	}
+	f := timestampFrame(t, arrow.Nanosecond, rows)
+	cutoff := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	out, err := f.FilterExpr(Col("ts").Ge(Lit(cutoff)))
+	if err != nil {
+		t.Fatalf("FilterExpr: %v", err)
+	}
+	if out.NumRows() != 2 {
+		t.Fatalf("rows = %d, want 2 (>= 2026-06-01)", out.NumRows())
+	}
+}
+
+// TestExpr_TimestampCol_LtLit_TypeInference — Type() on
+// (Timestamp col < Timestamp lit) reports Boolean, not an error.
+func TestExpr_TimestampCol_LtLit_TypeInference(t *testing.T) {
+	f := timestampFrame(t, arrow.Nanosecond, []int64{0})
+	cutoff := time.Now()
+	dt, err := Col("ts").Lt(Lit(cutoff)).node.Type(f.Schema())
+	if err != nil {
+		t.Fatalf("Type: %v", err)
+	}
+	if dt.ID() != arrow.BOOL {
+		t.Errorf("dtype = %s, want BOOL", dt)
+	}
+}
+
+// TestExpr_TimestampUnitMismatch_ErrorsClearly — comparing a
+// millisecond-unit Timestamp column against a nanosecond Lit
+// surfaces a clear unit-mismatch error at type-check time rather
+// than silently producing wrong results.
+func TestExpr_TimestampUnitMismatch_ErrorsClearly(t *testing.T) {
+	f := timestampFrame(t, arrow.Millisecond, []int64{1000})
+	_, err := Col("ts").Ge(Lit(time.Now())).node.Type(f.Schema())
+	if err == nil {
+		t.Fatal("expected unit-mismatch error")
+	}
+	if !errors.Is(err, ErrExprTypeMismatch) {
+		t.Errorf("error should wrap ErrExprTypeMismatch, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "unit mismatch") {
+		t.Errorf("error should mention unit mismatch, got %v", err)
+	}
+}
+
+// TestExpr_TimestampFusedFilter — Col(ts).Ge(Lit(a)).And(Col(ts).Lt(Lit(b)))
+// hits the fused-filter path (two Timestamp cmp leaves) and returns
+// the correct row window. Regression against parseFusedLeaf's older
+// blanket rejection of *array.Timestamp.
+func TestExpr_TimestampFusedFilter(t *testing.T) {
+	// Frame rows: 2026-01-01, 2026-06-01, 2026-09-01, 2027-01-01.
+	rows := []int64{
+		time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
+		time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
+		time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
+		time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(),
+	}
+	f := timestampFrame(t, arrow.Nanosecond, rows)
+	lo := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	hi := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	// Range filter: lo <= ts < hi. Matches rows[1] and rows[2].
+	out, err := f.FilterExpr(Col("ts").Ge(Lit(lo)).And(Col("ts").Lt(Lit(hi))))
+	if err != nil {
+		t.Fatalf("FilterExpr: %v", err)
+	}
+	if out.NumRows() != 2 {
+		t.Fatalf("rows = %d, want 2 ([lo, hi))", out.NumRows())
+	}
+	col, _ := out.Column("ts")
+	arr := col.col.Data().Chunks()[0].(*array.Timestamp)
+	if int64(arr.Value(0)) != rows[1] || int64(arr.Value(1)) != rows[2] {
+		t.Errorf("rows = [%d, %d], want [%d, %d]",
+			int64(arr.Value(0)), int64(arr.Value(1)), rows[1], rows[2])
+	}
+}
+
+// TestExpr_TimestampFusedFilter_ParseFusedLeaf — direct check that
+// parseFusedLeaf accepts a Timestamp cmp Timestamp-lit leaf (kind=3)
+// and rejects Timestamp cmp non-Timestamp-lit (unit or type
+// mismatch would misorder).
+func TestExpr_TimestampFusedFilter_ParseFusedLeaf(t *testing.T) {
+	f := timestampFrame(t, arrow.Nanosecond, []int64{0, 1, 2})
+
+	// Accept: Timestamp col cmp Timestamp lit.
+	e := Col("ts").Ge(Lit(time.Unix(0, 1))).node
+	leaf, ok := parseFusedLeaf(f, e)
+	if !ok {
+		t.Fatal("expected parseFusedLeaf to accept Timestamp/Timestamp leaf")
+	}
+	if leaf.kind != 3 {
+		t.Errorf("kind = %d, want 3 (timestamp)", leaf.kind)
+	}
+	if leaf.scalarI != 1 {
+		t.Errorf("scalarI = %d, want 1", leaf.scalarI)
+	}
+
+	// Reject: Timestamp col cmp int-lit (would silently misorder if
+	// accepted — user must cast explicitly).
+	e2 := Col("ts").Ge(Lit(int64(1))).node
+	if _, ok := parseFusedLeaf(f, e2); ok {
+		t.Error("expected parseFusedLeaf to reject Timestamp/Int64 leaf")
+	}
+}
+
+// TestExpr_TimestampFusedFilter_UnitMismatchRejected — a Timestamp col
+// with millisecond unit compared to a nanosecond Lit(time.Time) must
+// NOT be accepted by parseFusedLeaf; the general path errors at
+// Type() with a clear unit-mismatch message.
+func TestExpr_TimestampFusedFilter_UnitMismatchRejected(t *testing.T) {
+	f := timestampFrame(t, arrow.Millisecond, []int64{1000, 2000})
+	e := Col("ts").Ge(Lit(time.Now())).node
+	if _, ok := parseFusedLeaf(f, e); ok {
+		t.Error("expected parseFusedLeaf to reject unit-mismatched Timestamp leaf")
 	}
 }
 

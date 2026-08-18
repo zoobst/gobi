@@ -1,6 +1,8 @@
 package gobi
 
 import (
+	"unsafe"
+
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 )
@@ -285,13 +287,61 @@ func parseFusedLeaf(f *Frame, n ExprNode) (fusedFilterLeaf, bool) {
 			op: op, scalarI: iv, n: arr.Len(),
 		}, true
 	case *array.Timestamp:
-		// Timestamp literals aren't handled here — the general
-		// filter path can compare Timestamp cols against int64/f64
-		// literals via numericAt widening, but that's a rare
-		// filter shape. Reject to keep the fused semantics tight.
-		return fusedFilterLeaf{}, false
+		// Timestamp cmp Timestamp-lit — unit match required
+		// (nanosecond-vs-microsecond would silently misorder).
+		// Reject non-Timestamp literals; the general path errors
+		// on those at Type() anyway, so no capability lost.
+		tsLit, ok := litNode.value.(arrow.Timestamp)
+		if !ok {
+			return fusedFilterLeaf{}, false
+		}
+		colTS, okCol := colTSType(colNode, f)
+		litTS, _ := litNode.dtype.(*arrow.TimestampType)
+		if !okCol || litTS == nil || colTS.Unit != litTS.Unit {
+			return fusedFilterLeaf{}, false
+		}
+		// arrow.Timestamp is int64 under the hood; unsafe.Slice-free
+		// conversion via TimestampValues + reslice into []int64
+		// isn't safe without unsafe, so copy through the arrow view.
+		// The leaf's i64 slice aliases arrow's backing storage via
+		// the arrow.Timestamp → int64 identity (both are 8-byte,
+		// same layout) using a lane-count-checked reinterpret in
+		// tsValuesAsInt64.
+		return fusedFilterLeaf{
+			kind: 3, i64: tsValuesAsInt64(arr), arr: arr,
+			op: op, scalarI: int64(tsLit), n: arr.Len(),
+		}, true
 	}
 	return fusedFilterLeaf{}, false
+}
+
+// colTsType looks up colNode's arrow type and returns the resolved
+// TimestampType if the column is one. Second return is false when
+// the column isn't Timestamp or the lookup failed — both fall through
+// to the caller's reject path.
+func colTSType(colNode *colRefNode, f *Frame) (*arrow.TimestampType, bool) {
+	s, err := f.Column(colNode.name)
+	if err != nil {
+		return nil, false
+	}
+	ts, ok := s.DataType().(*arrow.TimestampType)
+	return ts, ok
+}
+
+// tsValuesAsInt64 reinterprets an *array.Timestamp's backing values
+// as []int64 without copying. Sound because arrow.Timestamp is
+// declared `type Timestamp int64` at the arrow-go layer — identical
+// size + alignment + layout. Skipping the copy matters for the
+// fused-filter workload: the F64 and I64 paths get zero-copy views
+// via Float64Values / Int64Values; the Timestamp path needs the same
+// treatment to keep the "fused = faster" contract on 100M-row
+// filters where an O(n) leaf-setup allocation would dominate.
+func tsValuesAsInt64(a *array.Timestamp) []int64 {
+	src := a.TimestampValues()
+	if len(src) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*int64)(unsafe.Pointer(&src[0])), len(src))
 }
 
 // binOpToCmpOp translates the Expr layer's comparison operator into
