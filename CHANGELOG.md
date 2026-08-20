@@ -5,6 +5,53 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.10]
+
+### Fixed
+
+- **parquetio: `ReadOptions.Columns` returned the wrong columns on
+  files with nested top-level fields.** `resolveColumns` in
+  [parquetio/parquetio.go](parquetio/parquetio.go) was treating each
+  requested name's arrow top-level field index as a parquet **leaf**
+  column index and passing that straight into
+  `pqarrow.FileReader.ReadRowGroups` / `GetRecordReader`. Those two
+  indices coincide only for fully flat schemas — as soon as a nested
+  top-level field (struct, list-of-struct, map) widens the leaf count,
+  every field past it is misrouted onto whatever leaf happened to sit
+  at the same slot number.
+
+  Reported against Overture Maps 2026-08-19.0 transportation segments
+  (`bbox: struct<xmin,xmax,ymin,ymax>` plus several list-of-struct
+  fields): `ReadReader(..., &ReadOptions{Columns: {"id", "subtype",
+  "class", "geometry"}})` returned a Frame with `[id, names,
+  road_surface]` — three of four requested columns silently absent,
+  two unrequested columns present, and the surviving `id` column was
+  the only one on the correct leaf. Files written by gobi itself were
+  unaffected because the writer only emits flat schemas; the bug was
+  strictly a reader-of-third-party-files issue.
+
+  Fix walks the pqarrow `SchemaManifest.Fields` tree for each
+  requested name and appends every leaf `ColIndex` beneath it in
+  declaration order (new `appendLeafColIndices` helper). Selecting a
+  nested top-level field by name pulls in its complete child leaf
+  set — matches pyarrow / DuckDB / Polars behavior. Selecting a
+  nested descendant by dotted path (`"bbox.xmin"`) remains
+  unsupported; only top-level names resolve.
+
+  Regression test in
+  [parquetio/chunks_test.go](parquetio/chunks_test.go)
+  (`TestReadFile_ColumnProjection_NestedSchema`) writes a
+  struct-containing fixture directly via `pqarrow.NewFileWriter` —
+  gobi's own writer is flat, so covering this case required reaching
+  past it. Verifies both schema and row-value integrity after
+  projection past the struct, and that selecting the struct alone
+  round-trips all four child leaves.
+
+- **`ReadOptions.Columns` doc clarifies nested-field behavior.**
+  Docstring now spells out that struct / list-of-struct / map
+  top-level fields pull their full child tree when selected by name,
+  and that dotted-path descendants are not a supported selector.
+
 ## [v0.3.9]
 
 ### Added

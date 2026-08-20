@@ -3,6 +3,7 @@ package parquetio_test
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/compress"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 
 	"github.com/zoobst/gobi"
 	"github.com/zoobst/gobi/csvio"
@@ -176,7 +180,7 @@ func TestReadFileChunksFunc_DataIntegrity(t *testing.T) {
 		func(f *gobi.Frame) error {
 			idCol, _ := f.Column("id")
 			arr := idCol.Column().Data().Chunks()[0].(*array.Int64)
-			for i := 0; i < arr.Len(); i++ {
+			for i := range arr.Len() {
 				if arr.Value(i) != rowIdx {
 					return fmt.Errorf("row %d id = %d, want %d", rowIdx, arr.Value(i), rowIdx)
 				}
@@ -292,4 +296,177 @@ func TestReadFileChunksFunc_EmptyFile(t *testing.T) {
 	if called != 0 {
 		t.Fatalf("fn called %d times on empty file, want 0", called)
 	}
+}
+
+// writeNestedSchemaFixture writes a parquet file whose top-level arrow
+// fields include a struct-typed column (bbox: struct<xmin, xmax, ymin,
+// ymax>) placed between the flat primitive columns. This exercises the
+// nested-schema branch of resolveColumns — top-level arrow field index
+// no longer matches parquet leaf column index once a nested field
+// widens the leaf count. gobi's own writer only emits flat schemas, so
+// this helper reaches into pqarrow directly.
+//
+// Resulting arrow top-level fields:  id, bbox, subtype, geometry
+// Resulting parquet leaf columns:    id(0), bbox.xmin(1), bbox.xmax(2),
+//
+//	bbox.ymin(3), bbox.ymax(4),
+//	subtype(5), geometry(6)
+func writeNestedSchemaFixture(t *testing.T, path string, n int) {
+	t.Helper()
+	pool := memory.DefaultAllocator
+
+	bboxType := arrow.StructOf(
+		arrow.Field{Name: "xmin", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
+		arrow.Field{Name: "xmax", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
+		arrow.Field{Name: "ymin", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
+		arrow.Field{Name: "ymax", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
+	)
+	fields := []arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "bbox", Type: bboxType, Nullable: false},
+		{Name: "subtype", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "geometry", Type: arrow.BinaryTypes.Binary, Nullable: false},
+	}
+	schema := arrow.NewSchema(fields, nil)
+
+	idB := array.NewInt64Builder(pool)
+	defer idB.Release()
+	bboxB := array.NewStructBuilder(pool, bboxType)
+	defer bboxB.Release()
+	subtypeB := array.NewStringBuilder(pool)
+	defer subtypeB.Release()
+	geomB := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
+	defer geomB.Release()
+
+	xminB := bboxB.FieldBuilder(0).(*array.Float64Builder)
+	xmaxB := bboxB.FieldBuilder(1).(*array.Float64Builder)
+	yminB := bboxB.FieldBuilder(2).(*array.Float64Builder)
+	ymaxB := bboxB.FieldBuilder(3).(*array.Float64Builder)
+
+	for i := range n {
+		idB.Append(int64(i))
+		bboxB.Append(true)
+		xminB.Append(float64(i))
+		xmaxB.Append(float64(i) + 1)
+		yminB.Append(float64(i) * 2)
+		ymaxB.Append(float64(i)*2 + 1)
+		subtypeB.Append(fmt.Sprintf("subtype-%d", i%3))
+		geomB.Append(fmt.Appendf(nil, "wkb-%d", i))
+	}
+
+	arrs := []arrow.Array{
+		idB.NewArray(), bboxB.NewArray(), subtypeB.NewArray(), geomB.NewArray(),
+	}
+	defer func() {
+		for _, a := range arrs {
+			a.Release()
+		}
+	}()
+
+	rec := array.NewRecordBatch(schema, arrs, int64(n))
+	defer rec.Release()
+
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create fixture: %v", err)
+	}
+	// pqarrow.FileWriter.Close closes the underlying io.Writer.
+	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy))
+	w, err := pqarrow.NewFileWriter(schema, out, props, pqarrow.NewArrowWriterProperties())
+	if err != nil {
+		_ = out.Close()
+		t.Fatalf("new file writer: %v", err)
+	}
+	if err := w.Write(rec); err != nil {
+		_ = w.Close()
+		t.Fatalf("write record: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+}
+
+// TestReadFile_ColumnProjection_NestedSchema is the regression test for
+// the Overture-shaped bug: when a top-level arrow field is nested
+// (struct-typed, list-of-struct, etc.), arrow field index N no longer
+// equals parquet leaf column index N. Projecting by name across such a
+// schema previously returned the wrong columns because resolveColumns
+// treated arrow field indices as leaf column indices directly.
+func TestReadFile_ColumnProjection_NestedSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested.parquet")
+	writeNestedSchemaFixture(t, path, 50)
+
+	// Sanity: unprojected read sees all 4 top-level fields.
+	full, err := parquetio.ReadFile(path, nil)
+	if err != nil {
+		t.Fatalf("unprojected read: %v", err)
+	}
+	if got, want := full.ColumnNames(), []string{"id", "bbox", "subtype", "geometry"}; !slicesEqual(got, want) {
+		t.Fatalf("unprojected cols = %v, want %v", got, want)
+	}
+	full.Release()
+
+	// Project past the nested struct: id sits before bbox (flat), while
+	// subtype and geometry sit after it — those are exactly the ones the
+	// pre-fix arrow-index==leaf-index shortcut would misroute onto bbox
+	// child leaves.
+	requested := []string{"id", "subtype", "geometry"}
+	projected, err := parquetio.ReadFile(path, &parquetio.ReadOptions{Columns: requested})
+	if err != nil {
+		t.Fatalf("projected read: %v", err)
+	}
+	defer projected.Release()
+
+	if got := projected.ColumnNames(); !slicesEqual(got, requested) {
+		t.Fatalf("projected cols = %v, want %v", got, requested)
+	}
+	if got, want := projected.NumRows(), 50; got != want {
+		t.Fatalf("num rows = %d, want %d", got, want)
+	}
+
+	// Data integrity: values in the projected columns must correspond to
+	// the correct source columns, not to some other leaf that happened to
+	// slot into the same arrow-field-index slot pre-fix.
+	idCol, err := projected.Column("id")
+	if err != nil {
+		t.Fatalf("id column: %v", err)
+	}
+	subCol, err := projected.Column("subtype")
+	if err != nil {
+		t.Fatalf("subtype column: %v", err)
+	}
+	idArr := idCol.Column().Data().Chunks()[0].(*array.Int64)
+	subArr := subCol.Column().Data().Chunks()[0].(*array.String)
+	for i := range idArr.Len() {
+		if idArr.Value(i) != int64(i) {
+			t.Fatalf("id[%d] = %d, want %d", i, idArr.Value(i), i)
+		}
+		want := fmt.Sprintf("subtype-%d", i%3)
+		if subArr.Value(i) != want {
+			t.Fatalf("subtype[%d] = %q, want %q", i, subArr.Value(i), want)
+		}
+	}
+
+	// Also verify that a nested top-level field can be selected on its
+	// own — its child leaves need to travel together.
+	bboxOnly, err := parquetio.ReadFile(path, &parquetio.ReadOptions{Columns: []string{"bbox"}})
+	if err != nil {
+		t.Fatalf("nested-only read: %v", err)
+	}
+	defer bboxOnly.Release()
+	if got := bboxOnly.ColumnNames(); !slicesEqual(got, []string{"bbox"}) {
+		t.Fatalf("nested-only cols = %v, want [bbox]", got)
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

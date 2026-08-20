@@ -75,12 +75,20 @@ type ReadOptions struct {
 	// Columns projects the file to a subset of top-level columns by
 	// name. nil or empty = read all columns.
 	//
-	// Names not present in the file's schema return ErrColumnNotFound.
-	// Column projection is applied at the parquet reader layer: the
-	// excluded columns are never fetched, decompressed, or materialized
-	// into arrow arrays. The savings scale with how large those columns
-	// are relative to the file — narrow analytical files where the caller
-	// wants a few columns out of many benefit most.
+	// A "top-level column" is a field of the file's root arrow schema.
+	// Flat primitives (int64, string, binary, …) map to a single parquet
+	// leaf; nested types (struct, list, list-of-struct, map) expand into
+	// multiple leaves that all travel together — selecting a struct-typed
+	// name by itself pulls its full child tree, matching pyarrow / DuckDB
+	// / Polars behavior. Selecting a nested descendant by dotted path
+	// (e.g. "bbox.xmin") is not supported.
+	//
+	// Names not present in the file's top-level schema return
+	// ErrColumnNotFound. Column projection is applied at the parquet
+	// reader layer: the excluded columns are never fetched, decompressed,
+	// or materialized into arrow arrays. The savings scale with how large
+	// those columns are relative to the file — narrow analytical files
+	// where the caller wants a few columns out of many benefit most.
 	Columns []string
 
 	// ChunkRows is the arrow record-batch size used by
@@ -982,9 +990,11 @@ func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOpt
 // ReadRowGroups treats nil as "no columns," so we always emit a
 // concrete list to keep both paths symmetric.
 //
-// Parquet flat schemas (all top-level primitives) have arrow-field-index
-// == parquet-leaf-column-index. Nested types would need a different
-// mapping; gobi currently only emits flat schemas.
+// Top-level arrow fields can expand to more than one parquet leaf (a
+// struct, a list-of-struct, a map, etc.), so we walk the pqarrow
+// SchemaManifest for each requested name and collect every leaf ColIndex
+// beneath it. Assuming arrow-field-index == parquet-leaf-index only
+// works for fully flat schemas and silently returns the wrong columns.
 func resolveColumns(pf *file.Reader, fr *pqarrow.FileReader, names []string) ([]int, error) {
 	numLeaves := pf.MetaData().Schema.NumColumns()
 	if len(names) == 0 {
@@ -994,23 +1004,33 @@ func resolveColumns(pf *file.Reader, fr *pqarrow.FileReader, names []string) ([]
 		}
 		return all, nil
 	}
-	arrowSchema, err := fr.Schema()
-	if err != nil {
-		return nil, fmt.Errorf("parquetio: read arrow schema: %w", err)
-	}
-	nameToIdx := make(map[string]int, len(arrowSchema.Fields()))
-	for i, field := range arrowSchema.Fields() {
-		nameToIdx[field.Name] = i
+	manifest := fr.Manifest
+	nameToField := make(map[string]*pqarrow.SchemaField, len(manifest.Fields))
+	for i := range manifest.Fields {
+		f := &manifest.Fields[i]
+		nameToField[f.Field.Name] = f
 	}
 	out := make([]int, 0, len(names))
 	for _, name := range names {
-		idx, ok := nameToIdx[name]
+		field, ok := nameToField[name]
 		if !ok {
 			return nil, fmt.Errorf("%w: %q", ErrColumnNotFound, name)
 		}
-		out = append(out, idx)
+		appendLeafColIndices(field, &out)
 	}
 	return out, nil
+}
+
+// appendLeafColIndices walks a pqarrow SchemaField subtree and appends
+// every leaf's parquet column index to out in declaration order.
+func appendLeafColIndices(f *pqarrow.SchemaField, out *[]int) {
+	if f.IsLeaf() {
+		*out = append(*out, f.ColIndex)
+		return
+	}
+	for i := range f.Children {
+		appendLeafColIndices(&f.Children[i], out)
+	}
 }
 
 func chunkRows(opts *ReadOptions) int64 {
