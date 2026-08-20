@@ -5,6 +5,66 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.11]
+
+### Fixed
+
+- **parquetio: GeoParquet 1.1 file-level geometry declarations now
+  reach `Series.IsGeometry()`.** GeoParquet 1.1 declares geometry
+  columns exclusively in a file-level `"geo"` JSON blob (encoding,
+  geometry types, CRS as PROJJSON). gobi's own writer additionally
+  stamps per-field arrow metadata via `GeometryField` — so gobi ↔
+  gobi round-trips saw the field-level tag `IsGeometry` reads. Files
+  written by pyarrow / geopandas / DuckDB spatial / Overture Maps
+  don't carry that per-field tag, so every geometry-aware operator
+  (`s.IsGeometry()`, `Buffer`, `SJoin`, `HilbertSort`, spatial
+  predicates) reported the column as non-geometry after read.
+
+  Fix in [parquetio/parquetio.go](parquetio/parquetio.go): `attachGeoKey`
+  now parses the "geo" JSON blob and, for each BINARY-typed top-level
+  column declared in `meta.Columns` that isn't already tagged, stamps
+  `gobi:geometry_type` (from the blob's `encoding`, defaulting to
+  `"WKB"`) and `gobi:crs_epsg` (extracted from the PROJJSON
+  `id.{authority:"EPSG", code:N}`; `null`/missing CRS resolves to
+  4326 per GeoParquet's OGC:CRS84 default) onto the schema field.
+  `frameFromTable` now rebuilds each output `arrow.Column` against
+  the stamped schema field via `arrow.NewColumn(field, src.Data())`
+  so `Column.Field()` — the source of `Series.field` in `NewSeries`
+  — carries the tag; `frameFromRecord` already used the schema-side
+  field so no change was needed there. Refcount contract preserved
+  (`NewColumn` retains the Chunked once, matching the pre-fix
+  `Data().Retain()`).
+
+  Pre-existing per-field tags win over the file-level blob — files
+  written by gobi still round-trip byte-identically. Non-BINARY
+  fields declared as geometry (WKT / GeoArrow-native encodings)
+  aren't stamped: gobi's WKB-only geometry path wouldn't recognise
+  them anyway, and silently tagging them would misroute downstream
+  operators.
+
+  Regression test in
+  [parquetio/chunks_test.go](parquetio/chunks_test.go)
+  (`TestReadFile_GeoParquet_RecognizesFileLevelMetadata`) writes a
+  fixture directly via `pqarrow.NewFileWriter` +
+  `AppendKeyValueMetadata` — file-level "geo" blob only, no per-field
+  metadata on the geometry column, `crs: null` — then verifies
+  `IsGeometry()` on both the full-file read path and the
+  Columns-projected read path.
+
+### Verified
+
+Both the v0.3.10 projection fix and this release's geometry-recognition
+fix were exercised end-to-end against the original bug report's
+fixture: Overture Maps `release/2026-08-19.0` transportation-segment
+`part-00000-*.zstd.parquet` (~449 MB, 2,728,305 rows, 21 top-level
+columns; `bbox` is a 4-leaf struct, 12 of the 21 columns are
+list-of-struct types, so top-level arrow field indices diverge from
+parquet leaf indices by 40+ positions before reaching `geometry` at
+arrow index 18). `ReadReader` with `Columns: {"id", "subtype",
+"class", "geometry"}` returns exactly those four columns in the
+requested order, and `projected.Column("geometry").IsGeometry()`
+reports true — the two symptoms called out in the report.
+
 ## [v0.3.10]
 
 ### Fixed

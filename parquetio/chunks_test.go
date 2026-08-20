@@ -470,3 +470,113 @@ func slicesEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// writeGeoParquetFileLevelOnly writes a parquet file whose geometry
+// column is declared solely via the file-level "geo" JSON blob — no
+// per-field arrow metadata on the geometry column itself. This
+// reproduces the Overture / geopandas / DuckDB-spatial shape, where
+// GeoParquet 1.1 file-level metadata is the only signal that a column
+// is a WKB geometry. gobi's writer stamps per-field metadata on top of
+// the file-level blob, so exercising the reader's file-level-only path
+// requires reaching past it.
+func writeGeoParquetFileLevelOnly(t *testing.T, path string) {
+	t.Helper()
+	pool := memory.DefaultAllocator
+
+	fields := []arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		// No metadata on `geometry` — the file-level blob is the only
+		// declaration that this column holds WKB.
+		{Name: "geometry", Type: arrow.BinaryTypes.Binary, Nullable: true},
+	}
+	schema := arrow.NewSchema(fields, nil)
+
+	idB := array.NewInt64Builder(pool)
+	defer idB.Release()
+	geomB := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
+	defer geomB.Release()
+	for i := range 5 {
+		idB.Append(int64(i))
+		geomB.Append(fmt.Appendf(nil, "wkb-%d", i))
+	}
+	arrs := []arrow.Array{idB.NewArray(), geomB.NewArray()}
+	defer func() {
+		for _, a := range arrs {
+			a.Release()
+		}
+	}()
+	rec := array.NewRecordBatch(schema, arrs, 5)
+	defer rec.Release()
+
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create fixture: %v", err)
+	}
+	// pqarrow.FileWriter.Close closes the underlying io.Writer.
+	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy))
+	w, err := pqarrow.NewFileWriter(schema, out, props, pqarrow.NewArrowWriterProperties())
+	if err != nil {
+		_ = out.Close()
+		t.Fatalf("new file writer: %v", err)
+	}
+	if err := w.Write(rec); err != nil {
+		_ = w.Close()
+		t.Fatalf("write record: %v", err)
+	}
+	// GeoParquet 1.1-style file-level metadata. crs is null → readers
+	// treat as OGC:CRS84 == EPSG:4326 for planar WKB.
+	geoBlob := `{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":["Point"],"crs":null}}}`
+	if err := w.AppendKeyValueMetadata(gobi.GeoParquetMetadataKey, geoBlob); err != nil {
+		_ = w.Close()
+		t.Fatalf("append geo metadata: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+}
+
+// TestReadFile_GeoParquet_RecognizesFileLevelMetadata verifies that
+// reading a GeoParquet 1.1 file whose only geometry declaration lives
+// in the file-level "geo" JSON (no per-field arrow metadata) still
+// yields a Frame whose Series.IsGeometry() reports true. Regression
+// against the Overture bug: the projection now returns the right
+// column names, but callers previously couldn't run any geometry-aware
+// operator on the column because the field-level tag IsGeometry checks
+// wasn't present.
+func TestReadFile_GeoParquet_RecognizesFileLevelMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "geo_file_level.parquet")
+	writeGeoParquetFileLevelOnly(t, path)
+
+	df, err := parquetio.ReadFile(path, nil)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	defer df.Release()
+
+	geom, err := df.Column("geometry")
+	if err != nil {
+		t.Fatalf("column geometry: %v", err)
+	}
+	if !geom.IsGeometry() {
+		t.Fatalf("geometry column not recognised: field metadata = %+v",
+			df.Schema().Field(1).Metadata)
+	}
+
+	// Column projection must preserve the tag when the geometry column
+	// is projected — Overture callers reach the column via a Columns
+	// projection, not the full-file read.
+	proj, err := parquetio.ReadFile(path, &parquetio.ReadOptions{
+		Columns: []string{"geometry"},
+	})
+	if err != nil {
+		t.Fatalf("projected read: %v", err)
+	}
+	defer proj.Release()
+	pg, err := proj.Column("geometry")
+	if err != nil {
+		t.Fatalf("projected geometry column: %v", err)
+	}
+	if !pg.IsGeometry() {
+		t.Fatalf("projected geometry column not recognised")
+	}
+}

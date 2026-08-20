@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -1072,13 +1073,19 @@ func frameFromTable(table arrow.Table, geoRaw string, hideCovering bool) (*gobi.
 	keptFields := make([]arrow.Field, 0, table.NumCols())
 	keptCols := make([]arrow.Column, 0, table.NumCols())
 	for i := int64(0); i < table.NumCols(); i++ {
-		c := *table.Column(int(i))
-		if _, drop := hidden[c.Name()]; drop {
+		field := schema.Field(int(i))
+		if _, drop := hidden[field.Name]; drop {
 			continue
 		}
-		c.Data().Retain() // Frame gets its own ref on the Chunked.
-		keptFields = append(keptFields, schema.Field(int(i)))
-		keptCols = append(keptCols, c)
+		// Rebuild the Column against the (possibly geometry-stamped)
+		// schema field rather than reusing the pqarrow-provided
+		// Column.Field. NewColumn retains the underlying Chunked, so
+		// the Frame ends up with its own ref — mirrors the pre-fix
+		// c.Data().Retain() but also lets attachGeoKey's per-field
+		// tags reach Series.field via Column.Field().
+		src := table.Column(int(i))
+		keptFields = append(keptFields, field)
+		keptCols = append(keptCols, *arrow.NewColumn(field, src.Data()))
 	}
 	outSchema := arrow.NewSchema(keptFields, schemaMetadataPtr(schema))
 	return gobi.NewFrame(outSchema, keptCols)
@@ -1201,7 +1208,17 @@ func marshalGeoMeta(meta *gobi.GeoParquetMetadata) (string, error) {
 }
 
 // attachGeoKey returns schema with the "geo" file-level metadata key set
-// to raw.
+// to raw AND with per-field gobi:geometry_type / gobi:crs_epsg tags
+// added to every top-level column declared as a geometry in the blob
+// that isn't already tagged.
+//
+// Rationale: GeoParquet 1.1 declares geometry columns only in the
+// file-level JSON blob — files not written by gobi (Overture,
+// geopandas, DuckDB spatial, etc.) carry no arrow-level per-field
+// metadata for the geometry column. gobi's IsGeometry check works off
+// the per-field tag, so re-projecting the blob into per-field
+// metadata at read time is what makes third-party GeoParquet files
+// interoperate with the geometry-aware operators.
 func attachGeoKey(schema *arrow.Schema, raw string) (*arrow.Schema, error) {
 	keys := []string{gobi.GeoParquetMetadataKey}
 	values := []string{raw}
@@ -1216,5 +1233,84 @@ func attachGeoKey(schema *arrow.Schema, raw string) (*arrow.Schema, error) {
 		}
 	}
 	md := arrow.NewMetadata(keys, values)
-	return arrow.NewSchema(schema.Fields(), &md), nil
+
+	fields := schema.Fields()
+	if meta, err := gobi.ParseGeoParquetMetadata(raw); err == nil && meta != nil && len(meta.Columns) > 0 {
+		stamped := make([]arrow.Field, len(fields))
+		copy(stamped, fields)
+		for i := range stamped {
+			cm, ok := meta.Columns[stamped[i].Name]
+			if !ok {
+				continue
+			}
+			if stamped[i].Type.ID() != arrow.BINARY {
+				// gobi's geometry path only recognises BINARY-typed
+				// WKB columns; leave WKT/GeoArrow-native fields alone.
+				continue
+			}
+			if _, already := stamped[i].Metadata.GetValue(gobi.MetaGeometryType); already {
+				continue
+			}
+			stamped[i] = stampGeometryField(stamped[i], cm)
+		}
+		fields = stamped
+	}
+
+	return arrow.NewSchema(fields, &md), nil
+}
+
+// stampGeometryField merges the gobi geometry tags derived from cm
+// into f's per-field metadata, preserving any pre-existing keys.
+func stampGeometryField(f arrow.Field, cm gobi.GeoParquetColumnMeta) arrow.Field {
+	encoding := cm.Encoding
+	if encoding == "" {
+		encoding = "WKB" // GeoParquet 1.1 spec default
+	}
+	epsg := epsgFromCRS(cm.CRS)
+
+	newKeys := make([]string, 0, f.Metadata.Len()+2)
+	newVals := make([]string, 0, f.Metadata.Len()+2)
+	for i, k := range f.Metadata.Keys() {
+		newKeys = append(newKeys, k)
+		newVals = append(newVals, f.Metadata.Values()[i])
+	}
+	newKeys = append(newKeys, gobi.MetaGeometryType, gobi.MetaGeometryCRS)
+	newVals = append(newVals, encoding, strconv.FormatInt(int64(epsg), 10))
+
+	md := arrow.NewMetadata(newKeys, newVals)
+	return arrow.Field{
+		Name:     f.Name,
+		Type:     f.Type,
+		Nullable: f.Nullable,
+		Metadata: md,
+	}
+}
+
+// epsgFromCRS pulls the EPSG code from a PROJJSON blob's top-level
+// id.{authority: "EPSG", code: N}. GeoParquet 1.1 treats a missing or
+// null crs as OGC:CRS84 — same datum and axis order as EPSG:4326 for
+// planar-encoded WKB coordinates, so gobi returns 4326 there. Returns
+// 0 when the blob is present but doesn't cleanly encode an EPSG code;
+// the field is still tagged as geometry but with an unknown CRS.
+func epsgFromCRS(crs map[string]any) int32 {
+	if len(crs) == 0 {
+		return 4326
+	}
+	id, ok := crs["id"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	if auth, _ := id["authority"].(string); auth != "EPSG" {
+		return 0
+	}
+	switch code := id["code"].(type) {
+	case float64:
+		return int32(code)
+	case int:
+		return int32(code)
+	case int64:
+		return int32(code)
+	default:
+		return 0
+	}
 }
