@@ -28,7 +28,11 @@ built around a strongly-typed schema.
   divide-and-conquer merge (like shapely's `unary_union`). Bit-exact
   parity with geopandas verified on a 500-polygon benchmark; a
   Sutherland-Hodgman fast path takes over when both operands are
-  convex (4× faster than the general sweep).
+  convex (4× faster than the general sweep). Linestring-vs-polygon
+  clipping has its own Cyrus-Beck primitive: `LineString.Clip(p)` and
+  `SplitBy(p)` (same on `MultiLineString`), targeting the Overture
+  road-vs-h3-cell partitioning workload — 100-vertex hex clip in
+  ~890 ns on M3 Pro.
 - **Antimeridian handling.** `CrossesAntimeridian(g)` detects
   ±180°-crossing geographic-CRS input; `SplitAtAntimeridian(g)`
   splits it into per-side components via linear-lon interpolation.
@@ -457,6 +461,32 @@ merged, _ := gs.GeomDissolve()
 inter, _ := geometry.Clip(subject, mask)
 uni,   _ := geometry.Union(subject, mask)
 ```
+
+### Linestring clipping (LineString / MultiLineString vs Polygon)
+
+Boolean ops handle Polygon-vs-Polygon; linestring-vs-polygon has its
+own primitive that skips the general polygon sweep entirely.
+
+```go
+line := geometry.NewLineString([]geometry.Point{
+    {X: -5, Y: 5}, {X: 15, Y: 5}, {X: 15, Y: -5}, {X: -5, Y: -5},
+}, geometry.PseudoMercator)
+cell := geometry.SimplePolygon(hexPts, geometry.PseudoMercator)
+
+inside            := line.Clip(cell)          // fragments inside cell
+inside, outside   := line.SplitBy(cell)       // both sides, one pass
+
+// MultiLineString version — flat []LineString result, walk order
+// preserved across components.
+ml := geometry.NewMultiLineString([]geometry.LineString{line, other}, geometry.PseudoMercator)
+frags := ml.Clip(cell)
+```
+
+Convex polygons (including h3 cells) take a Cyrus-Beck fast path with
+per-segment AABB reject; concave / multi-ring polygons fall back to
+sort-and-march. Coordinate system is planar — densify first if you
+need geodesic accuracy, and use `SplitAtAntimeridian` before clipping
+if your linestring crosses ±180°.
 
 ### Antimeridian split
 

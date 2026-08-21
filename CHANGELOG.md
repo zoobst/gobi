@@ -5,6 +5,48 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.12]
+
+### Added
+
+- **`LineString.Clip(Polygon)` / `SplitBy(Polygon)` and the same on
+  `MultiLineString`.** Planar linestring-vs-polygon clipping in
+  [geometry/clip_linestring.go](geometry/clip_linestring.go). `Clip`
+  returns just the sub-linestrings that lie inside the polygon
+  (inclusive of the boundary), preserving walk order; `SplitBy` returns
+  inside and outside fragments in one pass. `MultiLineString` wraps the
+  per-component call with a container-level bounds-reject fast path and
+  propagates the container's `CRSValue` / `HasZ` onto each component
+  (same precedent as `AppendWKB`).
+
+  Convex polygons take a Cyrus-Beck fast path with a per-segment AABB
+  short-circuit — the ring's bounding box is hoisted once and each
+  segment does a four-scalar reject against it before touching
+  Cyrus-Beck's half-plane math. Measured 45-61% faster on
+  long-linestring-vs-small-hexagon workloads (the Overture road-vs-h3
+  shape); no measurable regression when the whole linestring is inside
+  the polygon. See
+  [geometry/clip_linestring_bench_test.go](geometry/clip_linestring_bench_test.go);
+  the 100-vertex hex clip runs in ~890 ns on M3 Pro against the
+  feature-request target of <10 µs.
+
+  Concave / multi-ring polygons take an O(V·E) sort-and-march fallback:
+  each linestring segment is intersected with every polygon edge, the
+  resulting parameter values are sorted, and each sub-interval is
+  classified by testing its midpoint with `Polygon.Contains`. Correct
+  except for linestring segments that lie exactly on a polygon edge —
+  the midpoint falls on `Polygon.Contains`'s undefined-boundary case, so
+  the concave path's behavior for coincident-with-edge input is
+  documented as unspecified and tracked with a skip-test
+  (`TestLineStringClip_ConcaveCoincidentWithEdge_KnownLimitation`).
+  A vertex-marching Weiler-Atherton replacement will land in a
+  follow-up.
+
+  Motivated by the Overture-transportation partitioning workflow, which
+  clips each road segment against the h3 cells it touches — that shape
+  hit polyclip-go's polygon-vs-polygon engine for every row despite
+  never needing polygon-vs-polygon topology.
+
 ## [v0.3.11]
 
 ### Fixed
