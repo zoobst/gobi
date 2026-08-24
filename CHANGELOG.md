@@ -5,6 +5,45 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.3.13]
+
+### Fixed
+
+- **`Frame.Concat` / `Series.Concat` single-input short-circuit now
+  retains the returned value.** The multi-input path in
+  [setops.go](setops.go) explicitly `Retain()`s every chunk it pulls
+  from each input so the returned Frame owns its Arrow buffers
+  independently of the callers' inputs. The `len(others) == 0`
+  short-circuit returned `f` (or `s`) aliased without a matching
+  Retain, silently breaking the "caller owns the returned value
+  independently of the inputs" contract the multi-input path
+  establishes. A caller that immediately Released the input after
+  Concat (a reasonable pattern, and the one that motivated this fix)
+  drove the shared refcount to zero, freeing the Arrow buffers that
+  the returned frame still pointed at — later reads saw a zero-row
+  frame with the correct schema (or worse, garbage), and a subsequent
+  Release triggered a refcount-underflow panic.
+
+  In practice this bit a streaming merge that used
+  `frames[0].Concat(frames[1:]...)` after per-partition reads: when
+  exactly one partition was non-empty, the variadic call collapsed to
+  the single-input path, and the caller's post-Concat `releaseInputs()`
+  dropped the output's buffers on the floor. The merge then wrote a
+  schema-only 0-row parquet, logged success, and unlinked the real
+  per-partition file — reproducibly turning a 200k-row query into
+  0 rows for single-partition workloads. Multi-partition workloads
+  took the retaining path and were unaffected, which is why this
+  didn't show up in tests.
+
+  Fix: `Frame.Concat` calls `f.Retain()`, `Series.Concat` calls
+  `s.col.Retain()` before returning through the short-circuit. Both
+  paths now honor the same ownership contract.
+  Regression tests in
+  [setops_test.go](setops_test.go) (`TestFrame_Concat_SingleFrame_RetainsOutput`,
+  `TestSeries_Concat_SingleSeries_RetainsOutput`) drive the exact
+  release-input-then-read sequence under a `CheckedAllocator` so the
+  invariant stays enforced.
+
 ## [v0.3.12]
 
 ### Added

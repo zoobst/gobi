@@ -43,6 +43,7 @@ func (f *Frame) Concat(others ...*Frame) (*Frame, error) {
 		return nil, fmt.Errorf("gobi: Frame.Concat on nil frame")
 	}
 	if len(others) == 0 {
+		f.Retain()
 		return f, nil
 	}
 	// Schema-compat check against every frame up front so we fail
@@ -213,6 +214,7 @@ func (s Series) Concat(others ...Series) (Series, error) {
 		return Series{}, fmt.Errorf("gobi: Series.Concat on empty series")
 	}
 	if len(others) == 0 {
+		s.col.Retain()
 		return s, nil
 	}
 	for i, o := range others {

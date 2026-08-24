@@ -263,6 +263,63 @@ func TestSeries_SetOp_TypeMismatch(t *testing.T) {
 	}
 }
 
+// TestFrame_Concat_SingleFrame_RetainsOutput guards the single-frame
+// Concat short-circuit against the regression where it returned the
+// input frame aliased (no Retain), so a caller that Released the
+// input dropped the output's Arrow buffers with it. Both paths
+// (multi-frame via the `others` slice, single-frame via the
+// short-circuit) must yield an output the caller can outlive the
+// input on.
+func TestFrame_Concat_SingleFrame_RetainsOutput(t *testing.T) {
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer pool.AssertSize(t, 0)
+
+	f := buildI64Frame(t, pool, "x", []int64{10, 20, 30})
+
+	out, err := f.Concat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drop the input immediately; the output must survive independently.
+	f.Release()
+
+	if out.NumRows() != 3 {
+		t.Fatalf("out rows = %d, want 3", out.NumRows())
+	}
+	xs, _ := out.Column("x")
+	v, _, _ := xs.numericAt(2)
+	if int64(v) != 30 {
+		t.Fatalf("out[2] = %v, want 30", v)
+	}
+	out.Release()
+}
+
+// TestSeries_Concat_SingleSeries_RetainsOutput is the Series-level
+// twin of TestFrame_Concat_SingleFrame_RetainsOutput.
+func TestSeries_Concat_SingleSeries_RetainsOutput(t *testing.T) {
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer pool.AssertSize(t, 0)
+
+	f := buildI64Frame(t, pool, "x", []int64{7, 8, 9})
+	s, _ := f.Column("x")
+
+	out, err := s.Concat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Release the source frame (and with it, its Series' column ref).
+	f.Release()
+
+	if out.Len() != 3 {
+		t.Fatalf("out len = %d, want 3", out.Len())
+	}
+	v, _, _ := out.numericAt(1)
+	if int64(v) != 8 {
+		t.Fatalf("out[1] = %v, want 8", v)
+	}
+	out.col.Release()
+}
+
 // containsAll returns true when s contains every substr. Cheaper
 // than pulling in strings.Contains chains inline.
 func containsAll(s string, subs []string) bool {
