@@ -39,7 +39,8 @@
 package geojsonio
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 
@@ -60,10 +61,10 @@ var ErrInvalidGeoJSON = errors.New("geojson: invalid input")
 // value types, so JSON's usual (float64 / string / bool / nil / []any
 // / map[string]any) shapes apply.
 type Feature struct {
-	Type       string          `json:"type"`
-	Geometry   json.RawMessage `json:"geometry"`
-	Properties map[string]any  `json:"properties,omitempty"`
-	ID         any             `json:"id,omitempty"`
+	Type       string         `json:"type"`
+	Geometry   jsontext.Value `json:"geometry"`
+	Properties map[string]any `json:"properties,omitempty"`
+	ID         any            `json:"id,omitempty"`
 }
 
 // FeatureCollection is the top-level container GeoJSON files
@@ -94,9 +95,9 @@ func Marshal(g geometry.Geometry) ([]byte, error) {
 // arrays yield 2D geometries.
 func Unmarshal(data []byte) (geometry.Geometry, error) {
 	var head struct {
-		Type        string          `json:"type"`
-		Coordinates json.RawMessage `json:"coordinates"`
-		Geometries  json.RawMessage `json:"geometries"`
+		Type        string         `json:"type"`
+		Coordinates jsontext.Value `json:"coordinates"`
+		Geometries  jsontext.Value `json:"geometries"`
 	}
 	if err := json.Unmarshal(data, &head); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidGeoJSON, err)
@@ -108,7 +109,7 @@ func Unmarshal(data []byte) (geometry.Geometry, error) {
 // Feature (RFC 7946 §3.2). Passing a nil geometry emits a Feature
 // with `"geometry": null`, which is valid per the RFC.
 func MarshalFeature(g geometry.Geometry, properties map[string]any) ([]byte, error) {
-	var geomRaw json.RawMessage
+	var geomRaw jsontext.Value
 	if g != nil {
 		buf, err := marshalGeom(g)
 		if err != nil {
@@ -116,7 +117,7 @@ func MarshalFeature(g geometry.Geometry, properties map[string]any) ([]byte, err
 		}
 		geomRaw = buf
 	} else {
-		geomRaw = json.RawMessage("null")
+		geomRaw = jsontext.Value("null")
 	}
 	f := Feature{Type: "Feature", Geometry: geomRaw, Properties: properties}
 	return json.Marshal(f)
@@ -147,7 +148,7 @@ func UnmarshalFeature(data []byte) (geometry.Geometry, map[string]any, error) {
 // decodeGeom dispatches on the RFC 7946 geometry-type name. Handles
 // every type in §3.1, including GeometryCollection which uses
 // "geometries" instead of "coordinates".
-func decodeGeom(typ string, coords, geoms json.RawMessage) (geometry.Geometry, error) {
+func decodeGeom(typ string, coords, geoms jsontext.Value) (geometry.Geometry, error) {
 	switch typ {
 	case "Point":
 		return decodePoint(coords)
@@ -171,7 +172,7 @@ func decodeGeom(typ string, coords, geoms json.RawMessage) (geometry.Geometry, e
 // per RFC 7946 §3.1.1. A 3-element array populates Z + sets HasZ.
 // Positions with more than 3 elements silently drop the extras
 // (RFC guidance).
-func decodePoint(coords json.RawMessage) (geometry.Point, error) {
+func decodePoint(coords jsontext.Value) (geometry.Point, error) {
 	pos, err := decodePosition(coords)
 	if err != nil {
 		return geometry.Point{}, fmt.Errorf("%w: point coords: %v", ErrInvalidGeoJSON, err)
@@ -179,7 +180,7 @@ func decodePoint(coords json.RawMessage) (geometry.Point, error) {
 	return pos.toPoint(), nil
 }
 
-func decodeLineString(coords json.RawMessage) (geometry.LineString, error) {
+func decodeLineString(coords jsontext.Value) (geometry.LineString, error) {
 	pts, hasZ, err := decodePositionList(coords)
 	if err != nil {
 		return geometry.LineString{}, fmt.Errorf("%w: linestring coords: %v", ErrInvalidGeoJSON, err)
@@ -187,7 +188,7 @@ func decodeLineString(coords json.RawMessage) (geometry.LineString, error) {
 	return geometry.LineString{Points: pts, CRSValue: geometry.WGS84, HasZ: hasZ}, nil
 }
 
-func decodePolygon(coords json.RawMessage) (geometry.Polygon, error) {
+func decodePolygon(coords jsontext.Value) (geometry.Polygon, error) {
 	rings, hasZ, err := decodeRings(coords)
 	if err != nil {
 		return geometry.Polygon{}, fmt.Errorf("%w: polygon coords: %v", ErrInvalidGeoJSON, err)
@@ -195,7 +196,7 @@ func decodePolygon(coords json.RawMessage) (geometry.Polygon, error) {
 	return geometry.Polygon{Rings: rings, CRSValue: geometry.WGS84, HasZ: hasZ}, nil
 }
 
-func decodeMultiPoint(coords json.RawMessage) (geometry.MultiPoint, error) {
+func decodeMultiPoint(coords jsontext.Value) (geometry.MultiPoint, error) {
 	pts, hasZ, err := decodePositionList(coords)
 	if err != nil {
 		return geometry.MultiPoint{}, fmt.Errorf("%w: multipoint coords: %v", ErrInvalidGeoJSON, err)
@@ -203,7 +204,7 @@ func decodeMultiPoint(coords json.RawMessage) (geometry.MultiPoint, error) {
 	return geometry.MultiPoint{Points: pts, CRSValue: geometry.WGS84, HasZ: hasZ}, nil
 }
 
-func decodeMultiLineString(coords json.RawMessage) (geometry.MultiLineString, error) {
+func decodeMultiLineString(coords jsontext.Value) (geometry.MultiLineString, error) {
 	rings, hasZ, err := decodeRings(coords)
 	if err != nil {
 		return geometry.MultiLineString{}, fmt.Errorf("%w: multilinestring coords: %v", ErrInvalidGeoJSON, err)
@@ -215,11 +216,11 @@ func decodeMultiLineString(coords json.RawMessage) (geometry.MultiLineString, er
 	return geometry.MultiLineString{Lines: lines, CRSValue: geometry.WGS84, HasZ: hasZ}, nil
 }
 
-func decodeMultiPolygon(coords json.RawMessage) (geometry.MultiPolygon, error) {
+func decodeMultiPolygon(coords jsontext.Value) (geometry.MultiPolygon, error) {
 	// A MultiPolygon's coordinates are `[polygon, polygon, ...]`,
 	// where each polygon is `[ring, ring, ...]`, where each ring is
 	// `[position, position, ...]`. Three levels of nesting.
-	var polyCoords []json.RawMessage
+	var polyCoords []jsontext.Value
 	if err := json.Unmarshal(coords, &polyCoords); err != nil {
 		return geometry.MultiPolygon{}, fmt.Errorf("%w: multipolygon coords: %v", ErrInvalidGeoJSON, err)
 	}
@@ -238,11 +239,11 @@ func decodeMultiPolygon(coords json.RawMessage) (geometry.MultiPolygon, error) {
 	return geometry.MultiPolygon{Polygons: polygons, CRSValue: geometry.WGS84, HasZ: anyZ}, nil
 }
 
-func decodeGeometryCollection(geoms json.RawMessage) (geometry.GeometryCollection, error) {
+func decodeGeometryCollection(geoms jsontext.Value) (geometry.GeometryCollection, error) {
 	// RFC 7946 §3.1.8: `geometries` is an array of geometry objects
 	// (each with its own "type" + coords). Recursively decode each,
 	// then wrap.
-	var raw []json.RawMessage
+	var raw []jsontext.Value
 	if err := json.Unmarshal(geoms, &raw); err != nil {
 		return geometry.GeometryCollection{}, fmt.Errorf("%w: geometrycollection: %v", ErrInvalidGeoJSON, err)
 	}
@@ -280,7 +281,7 @@ func (p position) toPoint() geometry.Point {
 // decodePosition parses one coordinate array. Accepts 2 or 3 elements
 // (RFC 7946 §3.1.1 requires at least 2; MAY have 3 for elevation;
 // SHOULD NOT extend beyond 3). Silently truncates 4+ element arrays.
-func decodePosition(data json.RawMessage) (position, error) {
+func decodePosition(data jsontext.Value) (position, error) {
 	var arr []float64
 	if err := json.Unmarshal(data, &arr); err != nil {
 		return position{}, err
@@ -302,8 +303,8 @@ func decodePosition(data json.RawMessage) (position, error) {
 // on a single line is technically undefined in the RFC; we consume
 // it by treating the line as 3D and defaulting Z=0 for the 2D
 // positions.
-func decodePositionList(data json.RawMessage) ([]geometry.Point, bool, error) {
-	var raw []json.RawMessage
+func decodePositionList(data jsontext.Value) ([]geometry.Point, bool, error) {
+	var raw []jsontext.Value
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, false, err
 	}
@@ -332,8 +333,8 @@ func decodePositionList(data json.RawMessage) ([]geometry.Point, bool, error) {
 
 // decodeRings parses `[[[x,y], ...], [[x,y], ...], ...]` — the
 // Polygon / MultiLineString shape (list of position-lists).
-func decodeRings(data json.RawMessage) ([][]geometry.Point, bool, error) {
-	var raw []json.RawMessage
+func decodeRings(data jsontext.Value) ([][]geometry.Point, bool, error) {
+	var raw []jsontext.Value
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, false, err
 	}
@@ -361,9 +362,9 @@ func decodeRings(data json.RawMessage) ([][]geometry.Point, bool, error) {
 // GeometryCollection; `Coordinates` for everything else. Both are
 // tagged omitempty so the two branches emit their proper JSON.
 type geomObject struct {
-	Type        string          `json:"type"`
-	Coordinates json.RawMessage `json:"coordinates,omitempty"`
-	Geometries  json.RawMessage `json:"geometries,omitempty"`
+	Type        string         `json:"type"`
+	Coordinates jsontext.Value `json:"coordinates,omitempty"`
+	Geometries  jsontext.Value `json:"geometries,omitempty"`
 }
 
 // marshalGeom is the encoder dispatcher — one branch per geometry
@@ -422,14 +423,14 @@ func marshalGeom(g geometry.Geometry) ([]byte, error) {
 	return nil, fmt.Errorf("%w: unsupported geometry %T", ErrInvalidGeoJSON, g)
 }
 
-func encodePosition(x, y, z float64, hasZ bool) (json.RawMessage, error) {
+func encodePosition(x, y, z float64, hasZ bool) (jsontext.Value, error) {
 	if hasZ {
 		return json.Marshal([3]float64{x, y, z})
 	}
 	return json.Marshal([2]float64{x, y})
 }
 
-func encodePositionList(pts []geometry.Point, hasZ bool) (json.RawMessage, error) {
+func encodePositionList(pts []geometry.Point, hasZ bool) (jsontext.Value, error) {
 	if hasZ {
 		out := make([][3]float64, len(pts))
 		for i, p := range pts {
@@ -444,7 +445,7 @@ func encodePositionList(pts []geometry.Point, hasZ bool) (json.RawMessage, error
 	return json.Marshal(out)
 }
 
-func encodeRings(rings [][]geometry.Point, hasZ bool) (json.RawMessage, error) {
+func encodeRings(rings [][]geometry.Point, hasZ bool) (jsontext.Value, error) {
 	if hasZ {
 		out := make([][][3]float64, len(rings))
 		for i, r := range rings {
@@ -467,7 +468,7 @@ func encodeRings(rings [][]geometry.Point, hasZ bool) (json.RawMessage, error) {
 	return json.Marshal(out)
 }
 
-func encodeMultiPolygonCoords(polys []geometry.Polygon, hasZ bool) (json.RawMessage, error) {
+func encodeMultiPolygonCoords(polys []geometry.Polygon, hasZ bool) (jsontext.Value, error) {
 	if hasZ {
 		out := make([][][][3]float64, len(polys))
 		for i, p := range polys {
@@ -502,8 +503,8 @@ func encodeMultiPolygonCoords(polys []geometry.Polygon, hasZ bool) (json.RawMess
 // for GeometryCollection.geometries. Each nested geometry gets its
 // own recursive marshal — depth is bounded because GeometryCollection
 // can't nest inside GeometryCollection (RFC 7946 §3.1.8).
-func encodeGeometries(gs []geometry.Geometry) (json.RawMessage, error) {
-	pieces := make([]json.RawMessage, len(gs))
+func encodeGeometries(gs []geometry.Geometry) (jsontext.Value, error) {
+	pieces := make([]jsontext.Value, len(gs))
 	for i, g := range gs {
 		b, err := marshalGeom(g)
 		if err != nil {

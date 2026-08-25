@@ -2,7 +2,8 @@ package geojsonio
 
 import (
 	"bufio"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -299,51 +300,50 @@ func (it *lineIter) Next() (geometry.Geometry, map[string]any, bool, error) {
 	return nil, nil, false, nil
 }
 
-// fcIter reads a FeatureCollection via a streaming json.Decoder.
+// fcIter reads a FeatureCollection via a streaming jsontext.Decoder.
 // The decoder tokenizes the top-level object, seeks the "features"
 // array, then decodes one Feature at a time so peak memory stays
 // bounded to a single feature.
 type fcIter struct {
-	dec  *json.Decoder
+	dec  *jsontext.Decoder
 	done bool
 }
 
 func newFCIter(r io.Reader) (*fcIter, error) {
-	dec := json.NewDecoder(r)
+	dec := jsontext.NewDecoder(r)
 	// Advance past the opening `{`.
-	tok, err := dec.Token()
+	tok, err := dec.ReadToken()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidGeoJSON, err)
 	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return nil, fmt.Errorf("%w: expected '{' at top level, got %v", ErrInvalidGeoJSON, tok)
+	if tok.Kind() != '{' {
+		return nil, fmt.Errorf("%w: expected '{' at top level, got %v", ErrInvalidGeoJSON, tok.Kind())
 	}
 	// Consume key/value pairs until we hit "features". Ignore
 	// "type", "bbox", and any RFC-7946 foreign members that come
 	// before it — the "features" key is required.
-	for dec.More() {
-		tok, err := dec.Token()
+	for dec.PeekKind() != '}' {
+		keyTok, err := dec.ReadToken()
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidGeoJSON, err)
 		}
-		key, ok := tok.(string)
-		if !ok {
-			return nil, fmt.Errorf("%w: non-string object key: %v", ErrInvalidGeoJSON, tok)
+		if keyTok.Kind() != '"' {
+			return nil, fmt.Errorf("%w: non-string object key: %v", ErrInvalidGeoJSON, keyTok.Kind())
 		}
+		key := keyTok.String()
 		if key == "features" {
 			// Advance past the '['.
-			openArr, err := dec.Token()
+			openArr, err := dec.ReadToken()
 			if err != nil {
 				return nil, fmt.Errorf("%w: %v", ErrInvalidGeoJSON, err)
 			}
-			if d, ok := openArr.(json.Delim); !ok || d != '[' {
+			if openArr.Kind() != '[' {
 				return nil, fmt.Errorf("%w: features not an array", ErrInvalidGeoJSON)
 			}
 			return &fcIter{dec: dec}, nil
 		}
 		// Skip the value of any non-features key.
-		var scratch json.RawMessage
-		if err := dec.Decode(&scratch); err != nil {
+		if err := dec.SkipValue(); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidGeoJSON, err)
 		}
 	}
@@ -354,12 +354,12 @@ func (it *fcIter) Next() (geometry.Geometry, map[string]any, bool, error) {
 	if it.done {
 		return nil, nil, false, nil
 	}
-	if !it.dec.More() {
+	if it.dec.PeekKind() == ']' {
 		it.done = true
 		return nil, nil, false, nil
 	}
-	var raw json.RawMessage
-	if err := it.dec.Decode(&raw); err != nil {
+	raw, err := it.dec.ReadValue()
+	if err != nil {
 		return nil, nil, false, fmt.Errorf("%w: %v", ErrInvalidGeoJSON, err)
 	}
 	g, props, err := UnmarshalFeature(raw)

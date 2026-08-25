@@ -980,12 +980,14 @@ inverts at the 1BRC scale below.
 
 `Sum` / `Add` are already memory-bandwidth-bound. The remaining gap on
 `Sum` is SIMD reduction (Polars and numpy both use parallel-lane
-accumulators). The Go `simd` and `simd/archsimd` packages gain arm64
-NEON support in **Go 1.27 (August 2026)**. The `compute/` subpackage
-(v0.3.8) ships the initial SIMD scaffolding behind
-`//go:build goexperiment.simd && (arm64 || amd64)` — comparison
-kernels landed (measured **5.6× vs scalar** on the h3-agg 2M-row bbox
-filter); reduction and arithmetic kernels are the next batch.
+accumulators). Go 1.27 (August 2026) shipped the portable `simd`
+stdlib package with arm64 NEON + amd64 AVX2/AVX-512 backends under
+`GOEXPERIMENT=simd`. The `compute/` subpackage plus `series_ops_simd.go`
+(v0.4.0) ship SIMD kernels behind
+`//go:build goexperiment.simd && (arm64 || amd64)` — comparisons,
+reductions (`SumF64` / `MinF64` / `MaxF64`), and elementwise
+arithmetic all landed on portable `simd` (previously amd64-only via
+`simd/archsimd`).
 
 The remaining ~4.5× 1BRC gap vs Polars streaming breaks down (from
 CPU profile, post-v0.3.9):

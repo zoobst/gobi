@@ -2,7 +2,7 @@ package geometry
 
 import (
 	_ "embed"
-	"encoding/json"
+	json "encoding/json/v2"
 	"sync"
 )
 

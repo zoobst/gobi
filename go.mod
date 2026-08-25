@@ -1,6 +1,6 @@
 module github.com/zoobst/gobi
 
-go 1.26
+go 1.27
 
 require (
 	github.com/apache/arrow-go/v18 v18.7.0

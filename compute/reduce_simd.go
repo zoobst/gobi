@@ -7,7 +7,7 @@
 // SIMD path.
 //
 // Only Float64 has direct SIMD Min/Max in the stdlib `simd`
-// package as of Go 1.27rc1. Int64 has Add (for Sum) but no direct
+// package as of Go 1.27. Int64 has Add (for Sum) but no direct
 // Min/Max — those fall to scalar in this build too.
 //
 // Benchmark reference (arm64, NEON, 10M rows, Apple M3 Pro):

@@ -55,7 +55,8 @@
 //	Fused compare chains      absent                 unique (BBox, Range,
 //	                                                 WithinSqDist)
 //	Reductions (Sum/Min/Max)  absent                 unique when landed
-//	arm64 SIMD arithmetic     absent                 landing via Go 1.27
+//	arm64 SIMD arithmetic     absent                 landed in v0.4.0
+//	                                                 (portable simd, Go 1.27+)
 //
 // # Takeaway
 //
@@ -92,11 +93,12 @@
 // # Build tags
 //
 // The SIMD path lives behind `//go:build goexperiment.simd && (arm64
-// || amd64)`. When Go 1.27 stabilizes and the simd experiment
-// graduates, that tag simplifies to just the arch check. Until
-// then, code linked without `GOEXPERIMENT=simd` gets the scalar
-// path — this file provides the entry points; the specific
-// implementations live in *_simd.go / *_scalar.go pairs alongside.
+// || amd64)`. As of Go 1.27 (August 2026) the stdlib `simd` package
+// shipped but remains behind `GOEXPERIMENT=simd` — code linked
+// without the flag gets the scalar path. This file provides the
+// entry points; specific implementations live in *_simd.go /
+// *_scalar.go pairs alongside. When the experiment eventually
+// graduates the tag simplifies to just the arch check.
 //
 // # Adding a kernel
 //

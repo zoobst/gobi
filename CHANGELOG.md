@@ -5,6 +5,98 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.0]
+
+Go 1.27 release cycle work: adopt the promoted `encoding/json/v2`,
+consolidate SIMD onto the portable `simd` stdlib package, drop the
+archsimd-only amd64 kernels.
+
+### Changed
+
+- **`go.mod` now requires Go 1.27.** The 1.27 release cycle brought
+  two things gobi has been watching for: the portable `simd` stdlib
+  package (arm64 NEON + amd64 AVX2/AVX-512, still behind
+  `GOEXPERIMENT=simd`), and `encoding/json/v2` (default-on, opt-out
+  via `GOEXPERIMENT=nojsonv2`). Neither `simd/archsimd` nor
+  `simd/archsimd`-shaped code remains in the tree.
+
+- **`geojsonio`, `geoparquet.go`, and `geometry/projjson.go` migrated
+  to `encoding/json/v2` + `encoding/json/jsontext`.** The v2 API is
+  freely importable under Go 1.27 (no `GOEXPERIMENT` flag), so
+  downstream users get the migration transparently. Concrete changes:
+
+  - `json.RawMessage` → `jsontext.Value` throughout the geojsonio
+    Feature codec (~30 sites — struct field types, decode arguments,
+    intermediate raw slices).
+  - `json.NewDecoder(r) + .Token() / .Delim / .Decode(&raw)` →
+    `jsontext.NewDecoder(r) + .ReadToken() / .Kind() / .ReadValue()`
+    in the streaming FeatureCollection walk. The `.PeekKind()`-based
+    end-of-array detection replaces the v1 `.More()` idiom.
+  - Skipping non-`features` object members inside the FC header
+    now uses `dec.SkipValue()` instead of decoding into a throwaway
+    `json.RawMessage`.
+
+  Beneficial side effects of the v2 backing (available on any Go 1.27
+  build, migration or not):
+
+  - Significantly faster unmarshal on FeatureCollection reads (the
+    v1 `encoding/json` package is now internally backed by v2).
+  - Marshal performance broadly at parity with v1's old
+    implementation.
+  - Stricter default validation on the migrated call sites: v2
+    rejects invalid UTF-8 in JSON strings and duplicate object
+    keys, matching RFC 8259.
+
+  Behavior worth flagging for downstream users: `Feature.Geometry`'s
+  type changed from `json.RawMessage` to `jsontext.Value`. Both are
+  `[]byte` under the hood and convert cleanly, but code that
+  type-asserts on the field type will need an update.
+
+- **`series_ops_simd_amd64.go` deleted; replaced by
+  `series_ops_simd.go` on portable `simd`.** The old file used the
+  `simd/archsimd` 256-bit AVX2 `Float64x4` API, which was amd64-only
+  and had its API revised in 1.27 (would not have compiled
+  unchanged). The rewrite:
+
+  - Uses the portable `simd.Float64s` type via `simd.BroadcastFloat64s`
+    + `simd.LoadFloat64s` + arithmetic methods + `.Store`.
+  - Lane count is queried at runtime (2 on NEON, 4 on AVX2, 8 on
+    AVX-512) rather than baked in as 4.
+  - Same six elementwise Float64 kernels
+    (Add/Sub/Mul/Div/AddScalar/MulScalar) plus `sumF64Kernel`
+    delegating to `compute.SumF64`.
+  - Build tag `//go:build goexperiment.simd && (arm64 || amd64)` —
+    now covers arm64 NEON in addition to amd64. Previously
+    `Series.Add` etc. ran scalar on arm64 even under
+    `GOEXPERIMENT=simd`; now it gets NEON lane-parallel throughput.
+  - The `series_ops_simd_fallback.go` scalar path is unchanged;
+    only its build tag simplified (still the strict complement of
+    the SIMD file).
+
+- **Miscellaneous doc cleanup.** Removed the `TODO(1.27-simd)`
+  blocks in `series_ops_simd*.go` (superseded by this release).
+  README and `compute/compute.go` package docs no longer describe
+  the SIMD path as "landing via Go 1.27" — it landed. The compute
+  README table now shows arm64 SIMD arithmetic as available under
+  the experiment flag.
+
+### Migration notes
+
+- **Upgrading is `go 1.27` in go.mod + rebuild.** No source changes
+  required in downstream code unless you type-asserted on
+  `json.RawMessage` in a Feature (see above).
+- **SIMD builds:** `GOEXPERIMENT=simd go build ./...` on arm64 or
+  amd64 activates lane-parallel kernels in the compute layer plus
+  the six elementwise Series arithmetic kernels. Default builds get
+  scalar throughout — no regression from prior releases.
+- **JSON v2 opt-out:** if the stricter v1-vs-v2 semantic differences
+  cause a compatibility regression (invalid UTF-8 in old
+  FeatureCollection blobs, duplicate keys in generated files), build
+  with `GOEXPERIMENT=nojsonv2` to restore v1's behavior for the
+  transparent `encoding/json` backing. The explicit `encoding/json/v2`
+  imports gobi uses will still be v2 semantics — the opt-out only
+  affects code paths that go through the v1 package.
+
 ## [v0.3.13]
 
 ### Fixed

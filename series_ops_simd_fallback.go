@@ -1,20 +1,17 @@
-//go:build !(goexperiment.simd && amd64)
+//go:build !goexperiment.simd || (!arm64 && !amd64)
 
-// TODO(1.27-simd): Revisit when Go 1.27 ships. Once the amd64 SIMD path is
-// rewritten against the portable `simd` package, the build-tag conditions
-// here will need to change — likely to `//go:build !goexperiment.simd`,
-// since the portable simd path will cover arm64/amd64/wasm in a single
-// file. If Go 1.27 mainlines simd (drops the GOEXPERIMENT gate), this
-// entire file becomes dead code. See series_ops_simd_amd64.go for the
-// full migration plan.
+// Scalar fallbacks — active when SIMD isn't built in (default Go
+// build, or on unsupported architectures). Signatures MUST match
+// series_ops_simd.go exactly so callers get identical behavior —
+// only throughput changes.
 
 package gobi
 
 import "github.com/zoobst/gobi/compute"
 
-// simdEnabled indicates whether the AVX SIMD path is compiled into this
-// binary. This file provides the scalar fallback used everywhere except
-// amd64 with GOEXPERIMENT=simd; the compiler will inline these tight loops.
+// simdEnabled indicates whether the SIMD path is compiled in.
+// False on this fallback file; the arm64/amd64 counterpart in
+// series_ops_simd.go sets it to true.
 const simdEnabled = false
 
 func addF64Kernel(out, a, b []float64) {

@@ -192,8 +192,8 @@ func TestMultiLineStringClip_MixedComponents(t *testing.T) {
 func TestMultiLineStringClip_Ordering(t *testing.T) {
 	// Component order must be preserved: first component's inside fragment
 	// should list before second component's inside fragment.
-	first := ls(pt(1, 5), pt(9, 5))                    // fully inside
-	second := ls(pt(-5, 5), pt(15, 5))                 // enters and exits
+	first := ls(pt(1, 5), pt(9, 5))    // fully inside
+	second := ls(pt(-5, 5), pt(15, 5)) // enters and exits
 	got := mls(first, second).Clip(lsSquare())
 	if len(got) != 2 {
 		t.Fatalf("expected 2 inside fragments, got %d: %+v", len(got), got)
