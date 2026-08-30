@@ -9,6 +9,47 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.12]
+
+### Fixed
+
+- **`UnloadAndReadBuckets` / `RawCTASBuckets` no longer error on
+  legitimately-empty CTAS results.** Both functions were erroring
+  with `"no result files under <loc>"` when the S3 file listing came
+  back empty — same failure path as a real spec/data mismatch. But by
+  the time execution reached those checks, either `verifyCTASOutput`
+  (UnloadAndReadBuckets) or `readGlueBucketCount` (RawCTASBuckets)
+  had already confirmed the CTAS itself succeeded; the only remaining
+  signal was "the SELECT produced zero rows." That's a legitimate
+  empty result, not a failure.
+
+  Real-world impact: downstream callers (e.g. HTTP handlers dispatching
+  bucketed reads) were surfacing user-visible 500s on small AOIs /
+  narrow time windows where the SELECT genuinely had no matching data.
+  The correct response there is "no activity found," not "server error."
+
+  Fix: delete both `len(files) == 0` error paths. Both functions now
+  return a `spec.BucketCount`-length slice of nil-Frame `BucketResult`s
+  (equivalently, nil `*gobi.LazyFrame`s from `UnloadAndReadBuckets`) —
+  matching the pre-existing per-bucket-empty shape (see
+  `TestUnloadAndReadBuckets_MissingBucketAsNil`). Callers iterating
+  `for _, r := range results { if r.Frame == nil { continue } ... }`
+  handle whole-empty and partially-empty results uniformly. Index
+  consistency across peer calls (bucket i in slice always maps to
+  bucket i in the CTAS shape) is preserved.
+
+  Two new regression tests cover the fix:
+  `TestUnloadAndReadBuckets_ZeroFilesIsEmptyResult` and
+  `TestRawCTASBuckets_ZeroFilesIsEmptyResult`.
+
+  **Scope note:** the same bug exists in the non-`Buckets` variants
+  (`UnloadAndRead` at [unload.go:133](unload.go#L133) and `RawCTAS`
+  at [unload.go:260](unload.go#L260)), but the fix there requires
+  schema discovery to construct an empty Frame with the correct
+  columns — separate follow-up. This release only closes the
+  bucketed-read paths that gobrock's `h3ify_streaming` handler
+  depends on.
+
 ## [v0.1.11]
 
 ### Added

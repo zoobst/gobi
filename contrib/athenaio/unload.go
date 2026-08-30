@@ -815,12 +815,14 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 	if err != nil {
 		return nil, err
 	}
-	// Empty bucket set is legitimate for skew-heavy inputs but is
-	// almost always a spec/data mismatch — flag it early.
-	if len(files) == 0 {
-		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: no result files under %s",
-			queryID, actualLoc)
-	}
+	// Empty file set is a legitimate outcome — the CTAS succeeded
+	// (verifyCTASOutput above passed) and the SELECT produced zero
+	// rows. Callers on small AOIs / narrow time windows hit this
+	// path when their input has genuinely no matching data. Return
+	// a BucketCount-length slice of nil-Frame results (same shape as
+	// per-bucket-empty at line 836 below) so caller code that
+	// iterates buckets stays uniform between "some buckets empty"
+	// and "all buckets empty."
 
 	meta := &gobi.PartitionMetadata{
 		Columns:      append([]string(nil), spec.PartitionBy...),
@@ -944,10 +946,12 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
 	}
-	if len(files) == 0 {
-		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: no result files under %s",
-			queryID, actualLoc)
-	}
+	// Empty file set is a legitimate outcome — the CTAS succeeded
+	// (readGlueBucketCount above confirmed bucket_count > 0) and
+	// the caller-provided SELECT produced zero rows. Return a
+	// bucketCount-length slice of nil-Frame results so caller code
+	// iterating buckets stays uniform between partially-empty and
+	// fully-empty results. Matches the UnloadAndReadBuckets shape.
 
 	results := make([]BucketResult, bucketCount)
 	totalRows, err := c.populateBucketResults(ctx, files, results, spec.Metadata, readOptsFromSpec(spec.Columns, spec.Predicate))

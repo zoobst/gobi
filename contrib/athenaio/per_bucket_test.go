@@ -163,6 +163,112 @@ func TestUnloadAndReadBuckets_MissingBucketAsNil(t *testing.T) {
 	}
 }
 
+// TestUnloadAndReadBuckets_ZeroFilesIsEmptyResult — CTAS succeeds
+// (Glue table exists + verifyCTASOutput passes) but the SELECT
+// produced zero rows, so Athena wrote no files under the external
+// location. Expected behavior: return a BucketCount-length slice of
+// nil-Frame results, NOT a hard error. Same shape as the
+// per-bucket-empty case in TestUnloadAndReadBuckets_MissingBucketAsNil,
+// just scaled to "every bucket empty."
+//
+// Regression: pre-fix (see unload.go pre-v0.4.0), this errored with
+// "no result files under <loc>" — a false 500 on any small AOI / narrow
+// time window where the SELECT legitimately produced zero rows.
+func TestUnloadAndReadBuckets_ZeroFilesIsEmptyResult(t *testing.T) {
+	mockA := &mockCTASAthena{pollsBeforeDone: 1}
+	mockS := &mockS3{objects: map[string][]byte{}} // no files
+	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{}}
+	c, _ := NewClient(ClientConfig{
+		Workgroup: "wg", ResultLocation: "s3://test-bucket/results",
+		Database: "test_db", ClientID: "abcd1234",
+		Athena: mockA, S3: mockS, Glue: mockG,
+		PollInterval: 1 * time.Millisecond,
+	})
+
+	// Glue table exists and reports the correct Iceberg shape, but
+	// no S3 files are populated — mimics a CTAS whose SELECT matched
+	// zero rows.
+	wrapper := &mockCTASAthenaWithSideEffect{
+		inner: mockA,
+		onStart: func(sql, outputLoc string) {
+			tableName := extractCTASName(sql)
+			mockG.tables[glueTableKey{Database: "test_db", Name: tableName}] = &gluetypes.Table{
+				Name: aws.String(tableName),
+				Parameters: map[string]string{
+					"table_type": "ICEBERG",
+				},
+				StorageDescriptor: &gluetypes.StorageDescriptor{
+					Location: aws.String(outputLoc),
+				},
+			}
+		},
+	}
+	c.athena = wrapper
+
+	results, err := c.UnloadAndReadBuckets(context.Background(), UnloadSpec{
+		SQL:         "SELECT id, v FROM base WHERE never_true",
+		PartitionBy: []string{"id"},
+		BucketCount: 3,
+		TableFormat: FormatIceberg,
+	})
+	if err != nil {
+		t.Fatalf("UnloadAndReadBuckets on empty result should not error, got: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results length = %d, want 3 (BucketCount preserved for peer-call index consistency)", len(results))
+	}
+	for i, lf := range results {
+		if lf != nil {
+			t.Errorf("bucket %d LazyFrame should be nil (no files at all), got non-nil", i)
+		}
+	}
+}
+
+// TestRawCTASBuckets_ZeroFilesIsEmptyResult — the RawCTAS counterpart
+// to the previous test. readGlueBucketCount has already confirmed
+// bucket_count > 0; if the caller-composed SELECT produced zero rows,
+// return the bucketCount-length nil-Frame slice rather than erroring.
+func TestRawCTASBuckets_ZeroFilesIsEmptyResult(t *testing.T) {
+	external := "s3://test-bucket/raw-buckets/empty-table/"
+	mockA := &mockCTASAthena{pollsBeforeDone: 0}
+	mockS := &mockS3{objects: map[string][]byte{}} // no files
+	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{
+		{Database: "test_db", Name: "empty-table"}: {
+			Name: aws.String("empty-table"),
+			StorageDescriptor: &gluetypes.StorageDescriptor{
+				NumberOfBuckets: 4,
+				Location:        aws.String(external),
+			},
+		},
+	}}
+	c, _ := NewClient(ClientConfig{
+		Workgroup: "wg", ResultLocation: "s3://test-bucket/results/",
+		Database: "test_db",
+		Athena:   mockA, S3: mockS, Glue: mockG,
+		PollInterval: 1 * time.Millisecond,
+	})
+
+	results, err := c.RawCTASBuckets(context.Background(), RawCTASSpec{
+		SQL:              "CREATE TABLE ... WITH (bucketed_by = ARRAY['cell'], bucket_count = 4) AS SELECT ... WHERE never_true",
+		TableName:        "empty-table",
+		ExternalLocation: external,
+	})
+	if err != nil {
+		t.Fatalf("RawCTASBuckets on empty result should not error, got: %v", err)
+	}
+	if len(results) != 4 {
+		t.Fatalf("results length = %d, want 4 (Glue NumberOfBuckets)", len(results))
+	}
+	for i, r := range results {
+		if r.Frame != nil {
+			t.Errorf("bucket %d Frame should be nil (no files at all), got non-nil", i)
+		}
+		if r.S3URI != "" {
+			t.Errorf("bucket %d S3URI should be empty, got %q", i, r.S3URI)
+		}
+	}
+}
+
 // TestUnloadAndReadBuckets_RejectsEmptyPartitionBy — the aligned
 // bucketing contract requires PartitionBy. Empty PartitionBy errors
 // before any Athena work.
