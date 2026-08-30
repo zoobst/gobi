@@ -42,14 +42,6 @@ see [Versioning](#versioning) below.
   `TestUnloadAndReadBuckets_ZeroFilesIsEmptyResult` and
   `TestRawCTASBuckets_ZeroFilesIsEmptyResult`.
 
-  **Scope note:** the same bug exists in the non-`Buckets` variants
-  (`UnloadAndRead` at [unload.go:133](unload.go#L133) and `RawCTAS`
-  at [unload.go:260](unload.go#L260)), but the fix there requires
-  schema discovery to construct an empty Frame with the correct
-  columns — separate follow-up. This release only closes the
-  bucketed-read paths that gobrock's `h3ify_streaming` handler
-  depends on.
-
 ## [v0.1.11]
 
 ### Added
