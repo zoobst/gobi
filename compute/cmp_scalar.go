@@ -71,6 +71,56 @@ func AndChainF64BBox(a []float64, aLo, aHi float64, b []float64, bLo, bHi float6
 	}
 }
 
+// CmpI64Ge writes out[i] = a[i] >= b. Same shape as CmpF64Ge but
+// on int64 columns. Signatures match cmp_simd.go — SIMD build
+// vectorizes the compare via simd.Int64s.GreaterEqual + mask store.
+func CmpI64Ge(a []int64, b int64, out []bool) {
+	for i, v := range a {
+		out[i] = v >= b
+	}
+}
+
+// CmpI64Le writes out[i] = a[i] <= b.
+func CmpI64Le(a []int64, b int64, out []bool) {
+	for i, v := range a {
+		out[i] = v <= b
+	}
+}
+
+// CmpI64Gt writes out[i] = a[i] > b.
+func CmpI64Gt(a []int64, b int64, out []bool) {
+	for i, v := range a {
+		out[i] = v > b
+	}
+}
+
+// CmpI64Lt writes out[i] = a[i] < b.
+func CmpI64Lt(a []int64, b int64, out []bool) {
+	for i, v := range a {
+		out[i] = v < b
+	}
+}
+
+// CountTrue returns the number of true entries in a. Foundational
+// bool-reduce kernel used by filter mask sizing (`Frame.Filter`
+// can allocate the keep-index slice at exact selectivity instead
+// of over-allocating to full mask length) and any bool-column
+// count/sum reduction.
+//
+// Scalar loop; the SIMD variant in cmp_simd.go uses a packed
+// popcount when the target has one available. Both variants
+// treat any non-false byte value in `a` as true — bool slices
+// from Go are byte-per-element with 0/1 values.
+func CountTrue(a []bool) int {
+	var n int
+	for _, v := range a {
+		if v {
+			n++
+		}
+	}
+	return n
+}
+
 // WithinSqDistF64 writes
 //
 //	out[i] = ((lats[i]-refLat)² + ((lons[i]-refLon)·cosRefLat)²) <= sqThreshold

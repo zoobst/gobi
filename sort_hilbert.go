@@ -127,11 +127,18 @@ func (f *Frame) SortByHilbertWith(geomCol string, opts HilbertSortOptions) (*Fra
 				idx++
 				continue
 			}
-			g, err := geometry.ParseWKB(bin.Value(i))
-			if err != nil {
-				return nil, fmt.Errorf("row %d: %w", idx, err)
+			// Fast path: CentroidFromWKB extracts the centroid via a
+			// byte-stream scan without materializing the geometry.
+			// Semantics match g.Centroid() for Point / LineString /
+			// Polygon / MultiPoint / MultiLineString exactly; for
+			// MultiPolygon and GeometryCollection it uses bbox-center
+			// (see CentroidFromWKB's docstring for the geodesic-Area
+			// rationale — locality-preserving, CRS-independent, right
+			// for the Hilbert-sort use case here). Zero-alloc per row.
+			c, perr := geometry.CentroidFromWKB(bin.Value(i))
+			if perr != nil {
+				return nil, fmt.Errorf("row %d: %w", idx, perr)
 			}
-			c := g.Centroid()
 			centroids[idx] = c
 			if deriveBounds {
 				bounds = bounds.Extend(c.X, c.Y)
@@ -220,13 +227,20 @@ func HilbertSortWithCovering(f *Frame, geomCol string) (*Frame, *GeoParquetMetad
 				idx++
 				continue
 			}
-			g, perr := geometry.ParseWKB(bin.Value(i))
+			// Fast path: CentroidAndBoundsFromWKB scans the WKB byte
+			// stream once and returns both centroid + 2D bounds
+			// without allocating an intermediate geometry. Same
+			// centroid semantics as the two-pass SortByHilbertWith
+			// path (see CentroidFromWKB docstring); bounds match
+			// BoundsFromWKB. This eliminates the "parse every row's
+			// WKB and immediately discard the geometry" cost that
+			// dominated the fused write path.
+			c, bb, perr := geometry.CentroidAndBoundsFromWKB(bin.Value(i))
 			if perr != nil {
 				return nil, nil, fmt.Errorf("row %d: %w", idx, perr)
 			}
-			c := g.Centroid()
 			centroids[idx] = c
-			bboxes[idx] = g.Bounds()
+			bboxes[idx] = bb
 			centroidBounds = centroidBounds.Extend(c.X, c.Y)
 			idx++
 		}

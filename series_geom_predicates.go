@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -125,6 +126,16 @@ func (s Series) GeomDWithin(other geometry.Geometry, distance float64) (Series, 
 	epsg := geometryCRSFromField(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
 	other = attachCRS(other, crs)
+	otherBounds := other.Bounds()
+	// Slice 15 SoA fast path: per-row bbox-min-distance reject.
+	// If the row's bbox is already farther than `distance` from
+	// other's bbox, no interior point pair can be closer — emit
+	// false without ParseWKB. Same shape as Slice 14 predicate
+	// wire-in.
+	//
+	// Skipped when distance is NaN / negative (all-false trivially)
+	// or when otherBounds is empty (nothing to compare against).
+	bboxReject := !otherBounds.Empty() && !math.IsNaN(distance) && distance >= 0
 	pool := memory.DefaultAllocator
 	b := array.NewBooleanBuilder(pool)
 	defer b.Release()
@@ -139,7 +150,19 @@ func (s Series) GeomDWithin(other geometry.Geometry, distance float64) (Series, 
 				b.AppendNull()
 				continue
 			}
-			g, err := geometry.ParseWKB(bin.Value(i))
+			wkb := bin.Value(i)
+			if bboxReject {
+				rowBounds, err := geometry.BoundsFromWKB(wkb)
+				if err != nil {
+					return Series{}, err
+				}
+				if !rowBounds.Empty() &&
+					geometry.BoundsMinDistance(rowBounds, otherBounds) > distance {
+					b.Append(false)
+					continue
+				}
+			}
+			g, err := geometry.ParseWKB(wkb)
 			if err != nil {
 				return Series{}, err
 			}
@@ -192,6 +215,19 @@ func geomBoolFnOp(s Series, nameSuffix string, fn func(geometry.Geometry) bool) 
 // and `other` swapped (used by GeomWithin, which is Contains reversed).
 // Follows the release discipline from geomBinaryOp so Arrow refcounts
 // stay balanced on every path.
+//
+// # SoA fast path (Slice 14)
+//
+// Per row: read the row's bbox via BoundsFromWKB (zero-alloc) and
+// call geometry.BoundsCompatible(pred, aBounds, bBounds). If the
+// predicate's necessary-condition on bboxes rejects the row →
+// emit false without a ParseWKB. If the bboxes are compatible →
+// fall through to the AoS ParseWKB + Test path (potentially still
+// a false answer, just not shortcuttable by bbox alone).
+//
+// For filter-shaped workloads where most rows are disjoint from
+// `other`, the ParseWKB is skipped on the majority of rows —
+// mirrors the Slice 13 GeomDistance pattern.
 func geomPredicateOp(s Series, other geometry.Geometry, pred geometry.Predicate, nameSuffix string, swap bool) (Series, error) {
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
@@ -202,6 +238,14 @@ func geomPredicateOp(s Series, other geometry.Geometry, pred geometry.Predicate,
 	epsg := geometryCRSFromField(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
 	other = attachCRS(other, crs)
+	otherBounds := other.Bounds()
+	// Bbox-reject fast path only fires on positive predicates
+	// (Intersects / Contains / Within / Touches / Crosses / Overlaps)
+	// — those have the "bboxes-fail → predicate-false" necessary
+	// condition. PredDisjoint has the opposite polarity so a bbox
+	// mismatch would need to short-circuit true, not false — falls
+	// through to the AoS Test path.
+	bboxReject := pred != geometry.PredDisjoint
 	pool := memory.DefaultAllocator
 	b := array.NewBooleanBuilder(pool)
 	defer b.Release()
@@ -216,7 +260,24 @@ func geomPredicateOp(s Series, other geometry.Geometry, pred geometry.Predicate,
 				b.AppendNull()
 				continue
 			}
-			g, err := geometry.ParseWKB(bin.Value(i))
+			wkb := bin.Value(i)
+			if bboxReject {
+				rowBounds, err := geometry.BoundsFromWKB(wkb)
+				if err != nil {
+					return Series{}, err
+				}
+				var ab, bb geometry.Bounds
+				if swap {
+					ab, bb = otherBounds, rowBounds
+				} else {
+					ab, bb = rowBounds, otherBounds
+				}
+				if !geometry.BoundsCompatible(pred, ab, bb) {
+					b.Append(false)
+					continue
+				}
+			}
+			g, err := geometry.ParseWKB(wkb)
 			if err != nil {
 				return Series{}, err
 			}

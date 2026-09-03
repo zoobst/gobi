@@ -2,7 +2,7 @@ package geometry
 
 import (
 	"math/rand"
-	"sort"
+	"slices"
 	"testing"
 )
 
@@ -34,8 +34,8 @@ func TestRTree_SingleItem(t *testing.T) {
 func TestRTree_SearchGridMatchesBruteForce(t *testing.T) {
 	// 10x10 grid of unit boxes; query rectangle picks a 3x3 window.
 	var bounds []Bounds
-	for y := 0; y < 10; y++ {
-		for x := 0; x < 10; x++ {
+	for y := range 10 {
+		for x := range 10 {
 			bounds = append(bounds, Bounds{
 				MinX: float64(x), MinY: float64(y),
 				MaxX: float64(x) + 0.9, MaxY: float64(y) + 0.9,
@@ -45,7 +45,7 @@ func TestRTree_SearchGridMatchesBruteForce(t *testing.T) {
 	tree := NewRTree(bounds)
 	q := Bounds{MinX: 3.2, MinY: 3.2, MaxX: 5.8, MaxY: 5.8}
 	got := tree.Search(q)
-	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+	slices.Sort(got)
 
 	var want []int32
 	for i, b := range bounds {
@@ -62,7 +62,7 @@ func TestRTree_LargeRandomSearchMatchesBruteForce(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	n := 500
 	bounds := make([]Bounds, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		x := rng.Float64() * 100
 		y := rng.Float64() * 100
 		w := rng.Float64() * 3
@@ -71,12 +71,12 @@ func TestRTree_LargeRandomSearchMatchesBruteForce(t *testing.T) {
 	}
 	tree := NewRTree(bounds)
 
-	for iter := 0; iter < 20; iter++ {
+	for iter := range 20 {
 		qx := rng.Float64() * 100
 		qy := rng.Float64() * 100
 		q := Bounds{MinX: qx, MinY: qy, MaxX: qx + 5, MaxY: qy + 5}
 		got := tree.Search(q)
-		sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+		slices.Sort(got)
 
 		var want []int32
 		for i, b := range bounds {
@@ -94,7 +94,7 @@ func TestRTree_NearestReturnsSortedIDs(t *testing.T) {
 	// Place points along y=0 at x = 0, 1, 2, ..., 9. Query from (0.5, 0)
 	// — the two closest should be items 0 and 1.
 	var bounds []Bounds
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		bounds = append(bounds, Bounds{
 			MinX: float64(i), MinY: 0, MaxX: float64(i), MaxY: 0,
 		})
@@ -124,6 +124,45 @@ func TestRTree_NearestKGreaterThanN(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %d, want 2", len(got))
 	}
+}
+
+// BenchmarkRTree_Search — bbox-intersect queries against a static
+// tree. This is the primary R-tree operation on the spatial-join
+// hot path (per-point candidate lookup) and the shape the SoA
+// rewrite is trying to accelerate. 100k unit-box items scattered
+// over a 10k × 10k plane, 1k queries per iteration each sized to
+// pull ~10 hits out of the tree.
+func BenchmarkRTree_Search(b *testing.B) {
+	rng := rand.New(rand.NewSource(1))
+	const N = 100_000
+	bounds := make([]Bounds, N)
+	for i := range bounds {
+		x := rng.Float64() * 10_000
+		y := rng.Float64() * 10_000
+		bounds[i] = Bounds{MinX: x, MinY: y, MaxX: x + 1, MaxY: y + 1}
+	}
+	tree := NewRTree(bounds)
+
+	const Q = 1_000
+	queries := make([]Bounds, Q)
+	for i := range queries {
+		x := rng.Float64() * 10_000
+		y := rng.Float64() * 10_000
+		// ~10 hits per query at ~1 item per unit square, side 3.16.
+		queries[i] = Bounds{MinX: x, MinY: y, MaxX: x + 3.16, MaxY: y + 3.16}
+	}
+
+	buf := make([]int32, 0, 64)
+	b.ReportAllocs()
+
+	var sink int
+	for b.Loop() {
+		for _, q := range queries {
+			buf = tree.SearchInto(buf, q)
+			sink += len(buf)
+		}
+	}
+	_ = sink
 }
 
 func equalInt32(a, b []int32) bool {

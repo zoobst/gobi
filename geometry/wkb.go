@@ -45,6 +45,36 @@ func ParseWKB(data []byte) (Geometry, error) {
 	return g, err
 }
 
+// WKBTypeCode returns the OGC type code (and whether Z is present)
+// of the WKB blob without decoding any coordinates. Zero-alloc.
+// Callers dispatching per-type fast paths (SoA scanners vs AoS
+// fallback based on shape) use this to peek before committing to a
+// full ParseWKB.
+//
+// Returned codes match the WKB spec: 1=Point, 2=LineString,
+// 3=Polygon, 4=MultiPoint, 5=MultiLineString, 6=MultiPolygon,
+// 7=GeometryCollection. hasZ=true when the code is the 1001-1007
+// variant.
+func WKBTypeCode(data []byte) (typ uint32, hasZ bool, err error) {
+	if len(data) < 5 {
+		return 0, false, ErrShortWKB
+	}
+	bo, err := byteOrder(data[0])
+	if err != nil {
+		return 0, false, err
+	}
+	raw := bo.Uint32(data[1:5])
+	switch raw {
+	case wkbPoint, wkbLineString, wkbPolygon,
+		wkbMultiPoint, wkbMultiLineString, wkbMultiPolygon, wkbGeometryCollection:
+		return raw, false, nil
+	case wkbPointZ, wkbLineStringZ, wkbPolygonZ,
+		wkbMultiPointZ, wkbMultiLineStringZ, wkbMultiPolygonZ, wkbGeometryCollectionZ:
+		return raw - 1000, true, nil
+	}
+	return 0, false, fmt.Errorf("%w: %d", ErrUnsupportedWKB, raw)
+}
+
 func byteOrder(b byte) (binary.ByteOrder, error) {
 	switch b {
 	case wkbXDR:

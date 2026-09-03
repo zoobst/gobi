@@ -62,8 +62,8 @@ func TestRTree_NearestOne_MatchesNearest(t *testing.T) {
 			// Tie-break case: the two closest items may be at the
 			// exact same distance and both are valid answers.
 			// Compare distances directly to avoid false failures.
-			gotD := bboxDist(tree.itemBounds[gotID], qx, qy)
-			wantD := bboxDist(tree.itemBounds[want[0]], qx, qy)
+			gotD := tree.itemBboxDist(gotID, qx, qy)
+			wantD := tree.itemBboxDist(want[0], qx, qy)
 			if gotD != wantD {
 				t.Errorf("iter %d @ (%v,%v): NearestOne=%d (d=%v) Nearest[0]=%d (d=%v)",
 					iter, qx, qy, gotID, gotD, want[0], wantD)

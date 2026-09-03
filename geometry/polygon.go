@@ -2,7 +2,6 @@ package geometry
 
 import (
 	"math"
-	"sort"
 	"strings"
 )
 
@@ -230,42 +229,37 @@ func (p Polygon) AppendWKB(buf []byte) []byte {
 	return buf
 }
 
-// ConvexHull returns the convex hull of the polygon's exterior points using
-// the Graham scan. Points on collinear edges are dropped.
+// ConvexHull returns the convex hull of the polygon's exterior
+// points. Collinear points on hull edges are dropped.
+//
+// Slice-12 SoA rewrite: extracts the exterior into parallel Xs /
+// Ys slabs and runs Andrew's monotone chain (ConvexHullFromXY),
+// replacing the AoS Graham scan's polar-angle sort on []Point.
+// Sorting indices (8-byte swaps) instead of Point structs
+// (40-byte swaps) with coord reads from cache-friendly float64
+// slabs cuts wall time meaningfully on n≥1K exteriors.
+//
+// The result's starting vertex may differ from the pre-Slice-12
+// Graham output (Andrew starts at leftmost-then-lowest-Y;
+// Graham started at lowest-Y-then-lowest-X) — the vertex SET
+// and CCW ordering are the same.
 func (p Polygon) ConvexHull() Polygon {
 	src := p.Exterior()
 	if len(src) < 3 {
 		return Polygon{Rings: [][]Point{append([]Point(nil), src...)}, CRSValue: p.CRSValue}
 	}
-	pts := append([]Point(nil), src...)
-
-	lowIdx := 0
-	for i, pt := range pts {
-		if pt.Y < pts[lowIdx].Y || (pt.Y == pts[lowIdx].Y && pt.X < pts[lowIdx].X) {
-			lowIdx = i
-		}
+	xs := make([]float64, len(src))
+	ys := make([]float64, len(src))
+	for i, pt := range src {
+		xs[i] = pt.X
+		ys[i] = pt.Y
 	}
-	pts[0], pts[lowIdx] = pts[lowIdx], pts[0]
-	pivot := pts[0]
-
-	rest := pts[1:]
-	sort.Slice(rest, func(i, j int) bool {
-		c := cross(pivot, rest[i], rest[j])
-		if c == 0 {
-			return distSq(pivot, rest[i]) < distSq(pivot, rest[j])
-		}
-		return c > 0
-	})
-
-	hull := make([]Point, 0, len(pts))
-	hull = append(hull, pivot)
-	for _, pt := range rest {
-		for len(hull) >= 2 && cross(hull[len(hull)-2], hull[len(hull)-1], pt) <= 0 {
-			hull = hull[:len(hull)-1]
-		}
-		hull = append(hull, pt)
+	hxs, hys := ConvexHullFromXY(xs, ys)
+	hull := make([]Point, len(hxs))
+	for i := range hxs {
+		hull[i] = Point{X: hxs[i], Y: hys[i]}
 	}
-	return Polygon{Rings: [][]Point{closedRing(hull)}, CRSValue: p.CRSValue}
+	return Polygon{Rings: [][]Point{hull}, CRSValue: p.CRSValue}
 }
 
 // closedRing returns r if it is already closed, otherwise a copy with the
@@ -303,7 +297,7 @@ func planarRingArea(ring []Point) float64 {
 	}
 	ring = closedRing(ring)
 	var a float64
-	for i := 0; i < len(ring)-1; i++ {
+	for i := range len(ring) - 1 {
 		a += ring[i].X*ring[i+1].Y - ring[i+1].X*ring[i].Y
 	}
 	return math.Abs(a) / 2
@@ -315,7 +309,7 @@ func sphericalRingArea(ring []Point, radiusM float64) float64 {
 	}
 	ring = closedRing(ring)
 	var total float64
-	for i := 0; i < len(ring)-1; i++ {
+	for i := range len(ring) - 1 {
 		λ1 := degToRad(ring[i].X)
 		λ2 := degToRad(ring[i+1].X)
 		φ1 := degToRad(ring[i].Y)
@@ -331,7 +325,7 @@ func pointInRing(pt Point, ring []Point) bool {
 	}
 	ring = closedRing(ring)
 	inside := false
-	for i := 0; i < len(ring)-1; i++ {
+	for i := range len(ring) - 1 {
 		xi, yi := ring[i].X, ring[i].Y
 		xj, yj := ring[i+1].X, ring[i+1].Y
 		if (yi > pt.Y) != (yj > pt.Y) {

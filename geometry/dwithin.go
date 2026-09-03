@@ -42,6 +42,15 @@ func WithinDistance(a, b Geometry, d float64) bool {
 	return planarMinDistance(a, b) <= d
 }
 
+// BoundsMinDistance returns the minimum Euclidean distance between
+// two axis-aligned bounding rectangles. Zero when they overlap or
+// touch. Empty bounds → +Inf.
+//
+// Used by WithinDistance's short-circuit; also exposed publicly
+// so per-row `Series.GeomDWithin` callers can reject far rows via
+// `BoundsFromWKB` + this helper without a full ParseWKB.
+func BoundsMinDistance(a, b Bounds) float64 { return bboxMinDistance(a, b) }
+
 // bboxMinDistance returns the minimum Euclidean distance between
 // two axis-aligned bounding rectangles. Zero when they overlap or
 // touch. Empty bounds → +Inf (a defensive value that makes the

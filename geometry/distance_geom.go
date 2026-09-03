@@ -34,39 +34,24 @@ func GeomDistance(a, b Geometry, u Unit) (float64, error) {
 
 // planarMinDistance returns the min Euclidean distance between a and b
 // in coord units. Assumes non-intersecting inputs.
+//
+// Slice-11 SoA rewrite: extracts each input's polylines + vertices
+// into slab form once, then runs a slab-based nested loop that
+// tracks running-min *squared* distance and calls sqrt exactly
+// once at the end. Replaces the AoS forEachVertex/forEachSegment
+// closure walk, which paid one math.Hypot per (vertex, segment)
+// pair — for a Polygon×Polygon distance on ~100-vertex inputs
+// that's 10k Hypot calls (10k sqrts) per row, all discarded
+// except the minimum.
 func planarMinDistance(a, b Geometry) float64 {
-	best := math.Inf(1)
-	forEachVertex(a, func(p Point) {
-		forEachSegment(b, func(s0, s1 Point) {
-			if d := pointToSegmentDistance(p, s0, s1); d < best {
-				best = d
-			}
-		})
-	})
-	forEachVertex(b, func(p Point) {
-		forEachSegment(a, func(s0, s1 Point) {
-			if d := pointToSegmentDistance(p, s0, s1); d < best {
-				best = d
-			}
-		})
-	})
-	// Point-to-Point fallback when neither side has segments (both are
-	// Points / MultiPoints). forEachSegment produces nothing for those,
-	// so `best` stays at +Inf; do a vertex-to-vertex pass instead.
-	if math.IsInf(best, 1) {
-		forEachVertex(a, func(pa Point) {
-			forEachVertex(b, func(pb Point) {
-				d := math.Hypot(pa.X-pb.X, pa.Y-pb.Y)
-				if d < best {
-					best = d
-				}
-			})
-		})
-	}
+	var ag, bg distanceGeometry
+	extractDistanceGeometry(a, &ag)
+	extractDistanceGeometry(b, &bg)
+	best := planarMinDistanceSquared(&ag, &bg)
 	if math.IsInf(best, 1) {
 		return 0
 	}
-	return best
+	return math.Sqrt(best)
 }
 
 // pointToSegmentDistance returns Euclidean distance from p to the closed

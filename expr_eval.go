@@ -198,6 +198,19 @@ type binOpNode struct {
 }
 
 func (n *binOpNode) Eval(input *Frame) (Series, error) {
+	// Slice 22b/c: AND fusion for chained scalar comparisons.
+	// Detect (col_range AND col_range) shapes and dispatch to the
+	// fused compute kernels (AndChainF64Range for same-column
+	// two-sided ranges, AndChainF64BBox for two-column bbox
+	// filters). Skips both intermediate boolean-column materialization
+	// AND the elementwise Boolean AND that a naive eval would run.
+	if n.op == bopAnd {
+		if s, ok, err := tryAndFusionFastPath(n, input); err != nil {
+			return Series{}, err
+		} else if ok {
+			return s, nil
+		}
+	}
 	// Fast path: (col op literal). Applies to arithmetic and numeric
 	// comparisons; left must be non-literal, right must be a numeric
 	// literal that maps cleanly to Series' *Scalar methods.

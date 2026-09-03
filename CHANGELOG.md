@@ -5,6 +5,1014 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.1]
+
+Geometry-package struct-of-arrays push (Slices 1–4), spatial-predicate
+prepared-geometry API (Slice 5), explicit SIMD kernels in `compute/`
+(Slice 6), byte-stream planar length/area scanners (Slice 7), SIMD
+PIP crossing kernel (Slice 8), iterative SoA Douglas-Peucker
+(Slice 9), WKB → PointsView direct-parse (Slice 10), SoA
+min-distance kernels (Slice 11), Andrew's monotone-chain convex
+hull on slabs (Slice 12), WKB-direct `Series.GeomDistance` fast
+path (Slice 13), Series / LazyFrame predicate + accessor coverage
+(Slice 14), remaining Series wire-ins (Slice 15),
+boundary-inclusive WKB PIP + SJoin Points × Polygons fast path
+(Slice 16), clip / difference bbox-reject fast paths (Slice 17),
+convex-containment fast paths in the clip engine (Slice 18),
+relaxed Sutherland-Hodgman for convex clipper × concave subject
+(Slice 19), extended SJoin + Union/Difference containment
+coverage (Slice 20), Union/SymDifference Series-level bbox concat + SJoin
+SPWithin/SPContains fast paths (Slice 21), LazyFrame AND fusion
++ SIMD scalar-compare wire-in (Slice 22), and Int64 comparison
+kernels + CountTrue + Apple-2-lane-NEON regression fix (Slice
+23). Every entry below is a **pure addition or internal refactor
+with unchanged public signatures** — no breaking changes since
+v0.4.0.
+
+The theme: the geometry package's per-point `[]Point` representation
+was leaving real perf on the table (40-byte structs where operations
+touch only `.X/.Y`; per-row WKB parses even when the caller discarded
+the geometry immediately after `.Bounds()`). This release adds
+byte-stream-shaped and slab-shaped kernels that skip the `[]Point`
+intermediate on hot paths, wired via new APIs that live alongside
+the AoS ones. Default methods (`Polygon.Contains`, etc.) stay AoS to
+protect single-op callers from fresh-view materialization overhead.
+
+### Added
+
+#### Geometry SoA foundation (Slice 1)
+
+- **[`geometry.PointsView`](geometry/points_view.go)** — struct-of-arrays
+  view over a sequence of 2D or 3D points sharing a single CRS:
+
+  ```go
+  type PointsView struct {
+      Xs, Ys []float64
+      Zs     []float64  // nil when HasZ == false
+      HasZ   bool
+      CRS    CRS
+  }
+  ```
+
+  Materialized via new methods that walk `[]Point` once and copy into
+  parallel slabs:
+
+  - `LineString.View() PointsView`
+  - `MultiPoint.View() PointsView`
+  - `Polygon.RingViews() []PointsView` — exterior first, then holes
+  - `MultiLineString.LineViews() []PointsView`
+  - `MultiPolygon.PolygonRingViews() [][]PointsView`
+
+  Amortization break-even is roughly two SoA operations per view. Fresh
+  `View() + Bounds()` at n=1M is 3.25 ms vs AoS `Bounds()` at 1.55 ms —
+  the O(n) conversion tax outweighs the SoA kernel win for one-shot
+  callers. Held-view `Bounds()` on the same n=1M is 1.10 ms (−29% vs
+  AoS), which is the shape spatial-join refine loops and other multi-op
+  callers should adopt.
+
+- **[`geometry.BoundsFromXY(xs, ys) Bounds`](geometry/points_view.go)** —
+  portable-Go SoA-form bbox kernel. Callers holding raw `[]float64`
+  slabs (WKB parse-into-slab, arrow-backed coordinate columns) can call
+  it directly without constructing a `PointsView`. Semantics match
+  `PointsView.Bounds()` exactly.
+
+#### WKB byte-stream scanners (Slices 2 + 3 + 4)
+
+Zero-allocation byte-stream scanners that walk WKB blobs tracking
+running accumulators instead of materializing intermediate `[]Point`
+/ `Polygon` / etc. structs. Semantics match `ParseWKB(data).<op>()`
+exactly for every supported geometry type.
+
+- **[`geometry.BoundsFromWKB(data) (Bounds, error)`](geometry/wkb_bounds.go)**
+  — Slice 2. Walks the WKB byte stream tracking min/max on X and Y.
+  Handles Point / LineString / Polygon / MultiPoint / MultiLineString /
+  MultiPolygon / GeometryCollection, both 2D and 3D variants, both
+  byte orders. Wired into [`geoparquet.computeBboxColumns`](geoparquet.go)
+  — the parquetio GeoParquet write path's bbox-covering-columns compute.
+
+  **Measured on 100k-row 9-vertex-polygon workload**: −31% wall time
+  (31.7 ms → 21.9 ms), −47% memory (154 MB → 81 MB), −50% allocs
+  (600k → 300k). Microbench: 2–3.5× at all sizes.
+
+- **[`geometry.CentroidFromWKB(data) (Point, error)`](geometry/wkb_centroid.go)**
+  — Slice 3. Walks the WKB byte stream running per-type centroid
+  accumulators. Point / LineString / Polygon / MultiPoint /
+  MultiLineString centroids match `g.Centroid()` exactly.
+
+  MultiPolygon and GeometryCollection use bbox-center — documented
+  divergence from the AoS `MultiPolygon.Centroid()` which weights by
+  geodesic `Area(UnitMeters)`. bbox-center is locality-preserving and
+  CRS-independent, correct for the spatial-sort consumers that drove
+  the API (Hilbert indexing).
+
+- **[`geometry.CentroidAndBoundsFromWKB(data) (Point, Bounds, error)`](geometry/wkb_centroid.go)**
+  — Slice 3 fused scanner. Computes centroid + 2D bounds in a single
+  byte-stream pass. Wired into [`HilbertSortWithCovering`](sort_hilbert.go)
+  (the fused write-path) and [`SortByHilbertWith`](sort_hilbert.go)
+  (two-pass form uses `CentroidFromWKB`).
+
+  **Measured on 100k-row 9-vertex-polygon workload:**
+  - `SortByHilbert`: −24% wall (33.6 → 25.5 ms), −63% memory
+    (115.6 → 42.9 MB), 300k → 66 allocs (essentially zero-alloc pass)
+  - `HilbertSortWithCovering`: −18% wall (51.1 → 41.8 ms), −36% memory
+    (203.5 → 131 MB), −50% allocs (600k → 300k)
+
+- **[`geometry.PIPFromWKB(data, tx, ty) (bool, error)`](geometry/wkb_pip.go)**
+  — Slice 4. Point-in-polygon test scanning a Polygon or MultiPolygon
+  WKB blob directly. Non-polygon type codes return `(false, nil)`.
+  Boundary-inclusive semantics via fall-through pattern matching
+  `pointInPolygon → pointOnPolygonBoundary`.
+
+#### SoA PIP kernels (Slice 4)
+
+- **[`geometry.PIPRingFromXY(xs, ys, tx, ty) bool`](geometry/pip.go)** —
+  even-odd crossing rule on parallel Xs/Ys slabs. Handles closed +
+  unclosed rings via the same `(n-1, 0)` closing-edge walk. Zero alloc.
+
+- **[`geometry.PIPPolygonFromRings(rings []PointsView, tx, ty) bool`](geometry/pip.go)**
+  — full polygon (exterior + holes) with early-exit. The high-leverage
+  amortized-view API: `polygon.RingViews()` once, `PIPPolygonFromRings`
+  per candidate point.
+
+  **Measured amortized-view microbench** (64-vertex polygon, 100
+  candidate points — the SJoin-refine-loop shape):
+  - AoS `Polygon.Contains` per point: 13.1 μs
+  - SoA held-view `PIPPolygonFromRings` per point: **4.4 μs (3× faster)**
+  - SoA fresh-view: 23.6 μs (slower — confirms "don't rewire default
+    methods" call)
+
+#### Prepared-geometry predicate API (Slice 5)
+
+- **[`geometry.PreparedGeometry`](geometry/prepared.go)** — wraps a
+  `Geometry` with a precomputed bbox + `PointsView` ring cache for
+  polygon / multi-polygon inputs. Cached slabs let `TestPrepared`
+  amortize the O(n) AoS→SoA conversion across many predicate calls.
+
+- **[`geometry.Prepare(g) PreparedGeometry`](geometry/prepared.go)** —
+  constructor. Materializes ring views for `Polygon` /
+  `MultiPolygon`; caches bounds only for other types.
+
+- **[`geometry.TestPrepared(pred, a, b) bool`](geometry/prepared.go)**
+  — pair-predicate dispatch with SoA fast paths for
+  Point×Polygon and Point×MultiPolygon (both orderings, all four
+  containment/intersection/within predicates). Non-fast-path shapes
+  fall through to `Test(a.G, b.G)`.
+
+  **Not used by gobi's built-in SJoin.** Measurement showed SJoin's
+  R-tree pre-filter drives the candidate ratio to ~1-per-polygon on
+  standard fixtures — below the ~10-per-polygon break-even where
+  Prepare's up-front view materialization pays off. Docstring
+  documents the amortization guidance explicitly. Advanced callers
+  with genuinely dense workloads (overlapping polygons,
+  spatial-index-free refine loops, per-polygon many-candidate tests)
+  should use these APIs directly.
+
+#### Explicit SIMD kernels in `compute/` (Slice 6)
+
+Scalar + SIMD paired kernels behind the existing
+`//go:build goexperiment.simd && (arm64 || amd64)` pattern.
+
+- **[`compute.BoundsF64(xs, ys) (minX, minY, maxX, maxY float64, ok bool)`](compute/geom_scalar.go)**
+  — lane-parallel min/max reduce on parallel Xs/Ys. **Arch-divergent
+  win:** measured 2.4× faster than scalar on Apple M3 (arm64 NEON,
+  deep-OOO), but 48% SLOWER on Ampere Altra (arm64 NEON,
+  Neoverse-N-class throughput-tuned). Root cause: Neoverse cores have
+  higher vector `Float64.Min/Max` intrinsic latency than Apple silicon.
+
+  **The Slice 6a wire-in into `geometry.BoundsFromXY` was attempted and reverted**
+  after the Ampere measurement — a transparent 2.4× win
+  on Apple is not worth a 48% regression on production ARM64 server
+  hardware. The kernel remains available for explicit callers who
+  know their target arch; `BoundsFromXY` is portable scalar.
+
+- **[`compute.PolygonCentroidShoelace(xs, ys) (cx, cy float64, ok bool)`](compute/geom_scalar.go)**
+  — lane-parallel shoelace `cross = x0*y1 - x1*y0` + per-lane
+  accumulators for areaTwo, cx, cy, sx, sy; horizontal reduce at the
+  tail. Staggered coordinate loads break the scalar loop's per-segment
+  carry dependency.
+
+  **Arch-divergent, ships as-is** (no regression on any measured
+  arch): flat on Apple M3 (deep-OOO already ILP-saturates the
+  5-accumulator scalar), **−28% wall time on Ampere Altra** at every
+  size ≥64 (narrower Neoverse ILP leaves headroom for SIMD's 2-lane
+  parallelism to reclaim). `simdMinSize=64` gate protects small-
+  polygon workloads on any arch.
+
+- **[`compute.PIPCrossingCount(xs, ys, tx, ty) bool`](compute/geom_common.go)**
+  — the reformulated running-count PIP kernel (breaks the scalar
+  `inside = !inside` per-iteration dependency). Scalar in both builds
+  today; the SIMD vector body is deferred to a future release pending
+  amd64 measurement hardware.
+
+#### Planar length + area WKB scanners (Slice 7)
+
+Zero-allocation byte-stream scanners for the `.Length()` / `.Area()`
+side of the write path. Same shape as `BoundsFromWKB` / `CentroidFromWKB`:
+walk the WKB blob once with a running accumulator instead of
+materializing `[]Point` / `Polygon` structs the caller throws away.
+
+- **[`geometry.PlanarLengthFromWKB(data) ([]byte) → (float64, error)`](geometry/wkb_length.go)**
+  — sums Euclidean segment lengths for LineString / MultiLineString;
+  recurses into GeometryCollections. Returns coordinate-unit length;
+  callers apply `1 / metersPerUnit(u)` themselves for Unit conversion.
+  Geographic CRSes (haversine required) fall back to the AoS path.
+
+- **[`geometry.PlanarAreaFromWKB(data) ([]byte) → (float64, error)`](geometry/wkb_area.go)**
+  — planar shoelace on Polygon (exterior − holes), summed across
+  MultiPolygon components. Same GeometryCollection recursion.
+  Semantics match `PlanarRingArea` composed via `Polygon.Area` on a
+  projected CRS.
+
+- **Wired into [`series_geom.go`](series_geom.go) `GeomArea` / `GeomLength`**
+  behind a `CRS.Projected` fast path. Projected CRSes with meter-based
+  linear units (the geoparquet default) get the scanner; geographic
+  CRSes still take the AoS haversine / spherical-excess path.
+
+  **Microbench on 1M-vertex WKB blob** (Apple M3 Pro, `go test
+  -bench PlanarLength_FromWKB_SoA / PlanarArea_FromWKB_SoA`):
+
+  | Scanner   | Baseline (ParseWKB + AoS) | Scanner  | Δ wall | Allocs   |
+  | --------- | ------------------------- | -------- | ------ | -------- |
+  | Length    | 12.2 ms                   | 4.0 ms   | −67%   | 2 → **0** |
+  | Area      | 6.6 ms                    | 3.5 ms   | −48%   | 3 → **0** |
+
+  Delta grows with vertex count — at n=1024 (mid-detail admin
+  boundary): −76% length, −61% area.
+
+#### SIMD PIP crossing kernel (Slice 8)
+
+- **[`compute.PIPCrossingCount`](compute/geom_simd.go)** — the
+  reformulated running-count PIP kernel promoted from
+  build-tag-neutral (`geom_common.go`) to a paired scalar / SIMD
+  implementation. Divless SIMD body: rather than compute
+  `xInter = (xj-xi)*(ty-yi)/(yj-yi) + xi` and compare `tx <
+  xInter`, the vector body evaluates
+  `pred = (tx-xi)*(yj-yi) - (xj-xi)*(ty-yi)` and checks
+  `sign(pred) != sign(dy)` — one mul less per lane, and (critically)
+  **no division** on lanes where the straddle mask is false.
+
+  **Arch-gated dispatch**: on measured Apple M3 the SIMD path
+  regresses 2.4× at every size because 2-lane NEON pays full
+  compute across all lanes while the scalar path branches out on
+  ~O(1/n) of segments (convex ring + interior query). Neoverse
+  N-class ARM64 (Ampere / Graviton) is expected to behave the same.
+  The public dispatch gates the SIMD body behind `lane ≥ 4`, so
+  today only amd64 AVX2 (4-lane) / AVX-512 (8-lane) callers hit it.
+  2-lane hardware falls back to scalar — no regression.
+
+  Kernel is preserved for future measurement: unmeasured on
+  amd64. A test-only entry point
+  ([`pipCrossingCountSIMDBody`](compute/geom_simd.go)) lets the
+  SIMD body's parity be verified on any build.
+
+#### Iterative SoA Douglas-Peucker (Slice 9)
+
+- **[`geometry.SimplifyDPFromXY(xs, ys, tol) ([]float64, []float64)`](geometry/simplify_view.go)**
+  — iterative Douglas-Peucker on parallel Xs / Ys slabs, replacing
+  the AoS `douglasPeucker`'s recursive `[]Point` splice+append
+  pattern. Explicit (lo, hi) stack + retain-bitmap; three total
+  allocations regardless of split count. The inner argmax loop
+  uses squared-cross-product magnitude, deferring the single
+  `sqrt` per split to the outside compare — skipped entirely on
+  segments where no interior point exceeds tolerance.
+
+- **[`PointsView.SimplifyDP(tol) PointsView`](geometry/simplify_view.go)**
+  — amortized-view entry point. XYZ input retains Z coordinates
+  alongside XY at every kept index; the split decision is XY-only,
+  matching the AoS shape.
+
+- **Wired into [`douglasPeucker`](geometry/simplify.go)** — the
+  internal function every `LineString.Simplify` /
+  `Polygon.Simplify` / etc. call site routes through. All
+  simplify entry points get the SoA speedup transparently.
+
+  **Measured on a wiggly-sine polyline benchmark** (Apple M3
+  Pro, `go test -bench SimplifyDP`):
+
+  | n    | AoS recursive       | SoA iterative       | Δ wall | Allocs        |
+  | ---- | ------------------- | ------------------- | ------ | ------------- |
+  | 64   | 1.80 μs / 17 allocs | **302 ns / 3 allocs** | **−83%** | 17 → **3**    |
+  | 1K   | 126 μs / 259 allocs | **25 μs / 4 allocs**  | **−80%** | 259 → **4**   |
+  | 64K  | 81.5 ms / 17k allocs / 122 MB | **16.7 ms / 8 allocs / 242 KB** | **−80%** | 17k → **8**  |
+  | 1M   | 3.85 s / 260k allocs / 5.75 GB | **0.75 s / 11 allocs / 3.2 MB** | **−81%** | 260k → **11** |
+
+  Semantics + tie-breaking match the recursive form exactly: strict
+  `>` argmax picks the first occurrence, and split order is
+  left-then-right via a stack that pushes right first.
+
+#### WKB → PointsView direct parse (Slice 10)
+
+The Slice-1 `.View()` / `.RingViews()` constructors on the concrete
+geometry types are AoS-fed — they walk `[]Point` and copy into
+fresh `[]float64` slabs. Callers holding raw WKB bytes pay
+**two** materializations: `ParseWKB` allocates `[]Point` per ring,
+then `.RingViews()` allocates `[]float64` pairs and copies.
+Slice 10 adds direct-parse entry points that skip the AoS
+intermediate for the polygon-family types.
+
+- **[`geometry.LineStringViewFromWKB(data) (PointsView, error)`](geometry/wkb_view.go)**
+  — parses a LineString / LineStringZ WKB directly into a
+  `PointsView`. Two allocations (Xs, Ys) instead of three
+  (`[]Point` + Xs + Ys copy).
+
+- **[`geometry.PolygonRingViewsFromWKB(data) ([]PointsView, error)`](geometry/wkb_view.go)**
+  — parses a Polygon / PolygonZ WKB directly into per-ring
+  `PointsView` slabs. **Measured 2.3× faster** than
+  `ParseWKB(data).RingViews()` on a 1M-vertex polygon
+  (8.4 ms → 3.7 ms), **5× less memory** (80 MB → 16 MB), half
+  the allocations (6 → 3).
+
+- **[`geometry.MultiPolygonRingViewsFromWKB(data) ([][]PointsView, error)`](geometry/wkb_view.go)**
+  — same shape for MultiPolygon. One `[]PointsView` per
+  sub-polygon; ring layout matches
+  `MultiPolygon.PolygonRingViews()` exactly.
+
+- **[`geometry.PrepareFromWKB(data) (PreparedGeometry, error)`](geometry/wkb_view.go)**
+  — WKB-facing sibling of `Prepare()`. Single byte-stream walk:
+  parses to slabs, then materializes the AoS `Polygon` /
+  `MultiPolygon` needed for `TestPrepared`'s non-fast-path
+  fall-through from the slabs (float64 → Point copy, not a
+  second WKB parse).
+
+  **Measured on Apple M3 Pro** vs `Prepare(ParseWKB(data))`:
+
+  | n     | `Prepare(ParseWKB)` | `PrepareFromWKB` | Δ wall  |
+  | ----- | ------------------: | ---------------: | :------ |
+  | 5     | 247 ns              | **168 ns**       | **−32%** |
+  | 64    | 1.13 μs             | **874 ns**       | **−23%** |
+  | 1K    | 13.0 μs             | **11.2 μs**      | **−14%** |
+  | 1M    | 9.52 ms             | **7.40 ms**      | **−22%** |
+
+  The win is smaller than the standalone-`RingViews` case
+  because `PrepareFromWKB` still retains the AoS geometry for the
+  fall-through contract. Advanced callers with polygon-only
+  workloads can bypass this by constructing `PreparedGeometry`
+  directly with `PolygonRingViewsFromWKB`.
+
+#### SoA min-distance kernels (Slice 11)
+
+The pre-Slice-11 `planarMinDistance` walked geometries via
+`forEachVertex` / `forEachSegment` closures and called
+`math.Hypot` per (vertex, segment) pair — on a Polygon×Polygon
+distance with n=1024 vertices each, that's ~1M `Hypot` calls
+(each doing a `sqrt`) per row. Slice 11 defers the sqrt to the
+outermost call and moves the inner loop onto flat coordinate
+slabs.
+
+- **[`geometry.PointToSegmentDistanceSqXY(px, py, ax, ay, bx, by) float64`](geometry/distance_view.go)**
+  — squared Euclidean distance from a point to a line segment.
+  Handles zero-length segments as point-to-point. Zero-alloc,
+  branch-free hot path suitable for tight inner loops.
+
+- **[`geometry.PointToPolylineMinDistanceSq(px, py, xs, ys, closed) float64`](geometry/distance_view.go)**
+  — min squared distance from a point to any segment of a
+  polyline (or closed ring when `closed=true`). Runs the segment
+  loop directly on parallel Xs / Ys slabs.
+
+- **Internal `planarMinDistance` rewrite**: extracts each input's
+  polylines + standalone vertices into slab-form once, then
+  runs a nested slab loop tracking running-min *squared* distance
+  and calls `math.Sqrt` exactly once at the end. Every
+  `GeomDistance` / `dwithin` / `WithinDistance` caller benefits
+  transparently — public signatures unchanged.
+
+  **Measured on Apple M3 Pro, disjoint convex Polygon×Polygon**:
+
+  | n     | Legacy AoS (closure + per-pair Hypot) | Slab-form SoA    | Δ wall     |
+  | ----- | ------------------------------------: | ---------------: | :--------- |
+  | 16    | 6.9 μs                                | **1.7 μs**       | **−76%**   |
+  | 64    | 106 μs                                | **21 μs**        | **−80%**   |
+  | 256   | 1.60 ms                               | **272 μs**       | **−83%**   |
+  | 1024  | 28.8 ms                               | **5.3 ms**       | **−82%**   |
+
+  The SoA form pays 8 allocs/op for the per-call view
+  materialization (816 B → 38 KB depending on n). For workloads
+  that call GeomDistance in tight loops (e.g. `Series.GeomDistance`
+  per row) a follow-up could pool these — but even with the
+  allocs, wall-time drops 4-6× at every measured size.
+
+#### Convex hull on slabs (Slice 12)
+
+- **[`geometry.ConvexHullFromXY(xs, ys) ([]float64, []float64)`](geometry/hull_view.go)**
+  — Andrew's monotone-chain algorithm on parallel Xs / Ys slabs.
+  Returns the CCW convex hull with a closing repeat of the first
+  vertex. Replaces the AoS Graham scan's polar-angle
+  `sort.Slice` on `[]Point` — index-sort on `[]int` (8-byte
+  swaps) with coord reads from cache-friendly float64 arrays.
+
+- **[`PointsView.ConvexHull() PointsView`](geometry/hull_view.go)**
+  — amortized-view entry point. XYZ retains Z at every hull
+  vertex; XY-only decision.
+
+- **Wired into [`Polygon.ConvexHull`](geometry/polygon.go)** —
+  every AoS caller (including `geometry.ConvexHull(g)` on any
+  geometry type) gets the SoA speedup transparently. Starting
+  vertex may differ from the pre-Slice-12 Graham output
+  (Andrew starts leftmost-then-lowest-Y; Graham started
+  lowest-Y-then-lowest-X) — vertex set and CCW ordering are
+  identical.
+
+  **Measured on Apple M3 Pro, wobbly-circle Polygon exterior**:
+
+  | n     | AoS Graham (sort []Point)       | SoA Andrew (index sort)    | Δ wall     | Δ mem      |
+  | ----- | ------------------------------: | -------------------------: | :--------- | :--------- |
+  | 64    | 4.6 μs / 12.6 KB / 7 allocs     | **2.5 μs / 6.9 KB / 13 allocs** | **−45%** | **−45%**  |
+  | 1K    | 84 μs / 153 KB                  | **39 μs / 47 KB**           | **−54%** | **−69%**  |
+  | 64K   | 10.9 ms / 8.4 MB                | **6.8 ms / 2.2 MB**         | **−38%** | **−74%**  |
+  | 1M    | 212 ms / 128 MB                 | **148 ms / 32 MB**          | **−30%** | **−75%**  |
+
+  Allocation *count* is slightly higher (13 vs 7) because the
+  wire-in extracts + reassembles the `[]Point` for the AoS
+  return type; the memory *volume* still drops 3-4× because
+  the sort operates on `[]int` indices instead of `[]Point`
+  structs. A follow-up could pool the extraction slabs to
+  match the AoS alloc count.
+
+#### WKB-direct `Series.GeomDistance` fast path (Slice 13)
+
+- **[`geometry.PlanarMinDistanceFromWKB(a, b []byte) (float64, error)`](geometry/wkb_distance.go)**
+  — parses two WKB blobs directly into the slab-form
+  `distanceGeometry` representation and runs the Slice-11
+  min-distance nested loop. No `[]Point` intermediate on either
+  side. Assumes the two inputs are non-intersecting (skips the
+  segment-segment intersects check that `geometry.GeomDistance`
+  performs) — callers must guarantee this or fall through to
+  `GeomDistance` for correctness on overlapping geometries.
+
+- **Wired into [`Series.GeomDistance`](series_geom_metrics.go)**
+  as a bbox-disjoint fast path for projected CRSes:
+
+  1. Extract `other`'s bounds + WKB blob once at Series level.
+  2. Per row: read the row's bounds via `BoundsFromWKB`
+     (Slice 2, zero-alloc).
+  3. If the row's bbox is disjoint from `other`'s bbox → **the
+     row is definitely non-intersecting**, so dispatch to
+     `PlanarMinDistanceFromWKB` and skip the AoS `ParseWKB`
+     entirely.
+  4. If bboxes overlap → fall through to
+     `geometry.GeomDistance` for the correct `Intersects → 0`
+     semantics.
+
+  Geographic CRSes (haversine required) still take the AoS path.
+
+  **Measured on Apple M3 Pro, 10k-row × fixed target**:
+
+  | Row shape                  | Legacy AoS               | SoA fast path            | Δ wall     | Δ mem       |
+  | -------------------------- | -----------------------: | -----------------------: | :--------- | :---------- |
+  | 4-vertex squares (`size=4`)      | 5.53 ms / 9.33 MB / 120k allocs  | **5.29 ms / 6.86 MB / 100k allocs**  | **−4%**    | **−27%**  |
+  | 4-vertex squares (`size=50`)     | 5.84 ms / 9.31 MB / 120k allocs  | **5.50 ms / 6.85 MB / 100k allocs**  | **−6%**    | **−26%**  |
+  | 64-vertex circles                | 33.0 ms / **65.3 MB** / 120k allocs | **29.0 ms / 17.6 MB** / 100k allocs | **−12%**   | **−73%**   |
+
+  Memory is the dominant win — the AoS `ParseWKB` allocates a
+  full `[]Point` per row whose size scales with vertex count.
+  For 10k rows of 64-vertex polygons that's ~65 MB per call
+  that Slice 13 avoids entirely on bbox-disjoint rows.
+
+#### Series / LazyFrame predicate + accessor coverage (Slice 14)
+
+Closes the "wired transparently vs. still-AoS" gap identified
+after Slice 13. Previously the SoA byte-stream scanners were
+plumbed into a subset of Series operations (GeomArea, GeomLength,
+GeomDistance) but the predicate family (GeomIntersects,
+GeomContains, GeomWithin) and simple accessors (GeomBounds,
+GeomCentroid) still ran the AoS ParseWKB per row — so common
+gobi shapes like `Frame.Lazy().Filter(Col("geom").GeomIntersects(x))`
+did not benefit from the earlier slices.
+
+- **[`geometry.WKBTypeCode(data) (uint32, bool, error)`](geometry/wkb.go)**
+  — zero-alloc WKB type-code peek. Callers dispatching per-shape
+  fast paths (SoA scanner vs AoS fallback based on geometry type)
+  use this before committing to a full ParseWKB.
+
+- **[`geometry.BoundsCompatible(pred, ab, bb) bool`](geometry/prepared.go)**
+  — previously unexported; now public so the per-row bbox-reject
+  fast path in Series predicates can call it directly. Reports
+  whether two bboxes satisfy pred's necessary-condition.
+
+- **[`Series.GeomBounds`](series_geom.go)** — direct wire to
+  `BoundsFromWKB`. Semantics match `g.Bounds()` exactly for every
+  shape, so no per-type dispatch needed.
+
+- **[`Series.GeomCentroid`](series_geom.go)** — direct wire to
+  `CentroidFromWKB` for Point / LineString / Polygon / MultiPoint /
+  MultiLineString / GeometryCollection. MultiPolygon rows fall
+  back to AoS ParseWKB → Centroid to preserve the area-weighted
+  semantic (CentroidFromWKB uses bbox-center for MultiPolygons —
+  a documented Slice-3 divergence acceptable for spatial-sort
+  but observable to GeomCentroid callers).
+
+- **[`Series.GeomIntersects` / `GeomContains` / `GeomWithin`](series_geom_predicates.go)**
+  — bbox-reject fast path via BoundsFromWKB. Per row: read row's
+  bbox zero-alloc, run BoundsCompatible against `other`'s bbox
+  under the predicate. Rows failing the necessary-condition emit
+  false without a ParseWKB. Bbox-compatible rows fall through to
+  the AoS Test path. PredDisjoint excluded (inverted polarity).
+
+- **[`expr_geom.go` `evalColumnRight`](expr_geom.go)** — same
+  bbox-reject fast path applied to the `Col('a').GeomIntersects(Col('b'))`
+  shape (column × column). Only the `evalConstantRight` shape
+  routed through `geomPredicateOp` before, so column×column
+  was still fully AoS.
+
+  **Measured on Apple M3 Pro, 5k rows × fixed AOI (10% of corpus
+  bbox by area — ~90% of rows expected to reject via bbox)**:
+
+  | Path                                | Legacy AoS               | Slice 14 SoA fast path    | Δ wall     | Δ mem       | Δ allocs   |
+  | ----------------------------------- | -----------------------: | ------------------------: | :--------- | :---------- | :--------- |
+  | `Series.GeomIntersects(aoi)`        | 802 μs / 2.37 MB / 20k   | **205 μs / 36 KB / 281**  | **−74%**   | **−98.5%**  | **71× fewer** |
+
+  The 98.5% memory drop is the dominant metric — the AoS
+  ParseWKB allocates a per-row `[]Point` object graph
+  proportional to vertex count; Slice 14's bbox-reject skips it
+  entirely on the majority of rows.
+
+  LazyFrame filter expressions
+  (`Frame.Lazy().Filter(Col("geom").GeomIntersects(x)).Collect()`)
+  inherit the win transparently via `evalConstantRight` →
+  `geomPredicateOp`.
+
+#### Remaining Series wire-ins (Slice 15)
+
+Sweeps the last non-clip AoS Series entry points onto their SoA
+counterparts.
+
+- **[`geometry.BoundsMinDistance(a, b Bounds) float64`](geometry/dwithin.go)**
+  — previously unexported `bboxMinDistance`; now public so the
+  Slice-15 GeomDWithin fast path can call it after reading row
+  bounds via `BoundsFromWKB`.
+
+- **[`Series.GeomType`](series_geom_metrics.go)** — direct wire
+  to `geometry.WKBTypeCode` + `geometry.Type.String()`. Zero-
+  alloc header peek; the OGC WKB type codes align 1:1 with the
+  `geometry.Type` enum values so no lookup table is needed.
+
+- **[`Series.GeomDWithin`](series_geom_predicates.go)** —
+  per-row bbox-min-distance reject. Read row bbox via
+  `BoundsFromWKB`, call `BoundsMinDistance` against `other`'s
+  bbox; rows farther than `distance` emit false without
+  ParseWKB. Same shape as the Slice 14 predicate wire-in.
+
+  **Measured on Apple M3 Pro, 5k rows × fixed AOI**:
+
+  | Path                              | Legacy AoS               | Slice 15 SoA               | Δ wall     | Δ mem       | Δ allocs      |
+  | --------------------------------- | -----------------------: | -------------------------: | :--------- | :---------- | :------------ |
+  | `Series.GeomDWithin(aoi, 50)`     | 949 μs / 2.44 MB / 21k   | **319 μs / 183 KB / 2.2k** | **−66%**   | **−93%**    | 10× fewer     |
+  | `Series.GeomType()`               | 692 μs / 2.27 MB / 15k   | **85 μs / 234 KB / 42**    | **−88%**   | **−90%**    | **358× fewer** |
+
+  `Series.GeomType` was pure ParseWKB waste — decoded the entire
+  geometry to read the type code. Now it reads a 5-byte WKB
+  header per row.
+
+- **SJoin fast-path deferred**: a Points × Polygons WKB-native
+  refine loop was scoped for this slice but skipped after review.
+  The AoS `intersectsPointPolygon` includes an on-boundary check
+  that `PIPFromWKB` doesn't provide (documented "undefined
+  containment" on boundaries) — replacing the refine kernel
+  would change SJoin semantics for grid-aligned point workloads.
+  Combined with the Slice 5 revert precedent (PreparedGeometry
+  under-amortized on real SJoin candidate ratios), SJoin stays
+  on the AoS path. Follow-up work would either extend
+  `PIPFromWKB` with a boundary-inclusive variant or SoA-ify
+  the intersects test end-to-end.
+
+#### Boundary-inclusive PIP + SJoin fast path (Slice 16)
+
+Unblocks the SJoin fast path deferred in Slice 15. The
+Slice-4 `PIPFromWKB` has documented undefined behavior on
+polygon boundaries — using it as the SJoin refine kernel
+would silently flip results for grid-aligned point workloads.
+Slice 16 adds a boundary-inclusive variant that matches
+AoS `pointInPolygon` semantics exactly, then wires the SJoin
+Points × Polygons refine onto it.
+
+- **[`geometry.PIPInclusiveFromWKB(data, tx, ty) (bool, error)`](geometry/wkb_pip.go)**
+  — extends the `PIPFromWKB` even-odd crossing walk with a
+  per-segment on-boundary check (collinearity + within-segment
+  bbox — matches `pointOnSegment` exactly). Any boundary hit on
+  any ring (exterior or hole) returns true immediately;
+  interior-of-hole containment still disqualifies. Zero-alloc
+  single WKB pass.
+
+- **[`gobi.sjoinPointsInPolygonsFastPath`](sjoin_fast.go)** —
+  SJoin fast path for the `Points × (Polygons | MultiPolygons)`
+  shape with `SPIntersects` or `SPWithin`. Skips both
+  `decodeGeometryColumn` passes:
+
+  - Left: extract `(x, y)` per row via a small WKB-Point coord
+    scanner (2 float64 reads per row).
+  - Right: keep raw WKB bytes + extract bounds via
+    `BoundsFromWKB`. R-tree feeds unchanged.
+  - Refine: `PIPInclusiveFromWKB(rightWKB, x, y)` per candidate.
+
+  Shape gate: any non-Point row on the left or non-Polygon/Multi-
+  Polygon row on the right falls back to the AoS path (no lazy
+  hybrid — keeps the fast path simple). `SPContains` also falls
+  back (trivially false on this shape, but the AoS path handles
+  it uniformly).
+
+  **Measured on Apple M3 Pro across the standard SJoin fixtures**:
+
+  | Bench                          | AoS (pre-16)             | SoA fast path (Slice 16)   | Δ wall   | Δ mem    | Δ allocs      |
+  | ------------------------------ | -----------------------: | -------------------------: | :------- | :------- | :------------ |
+  | `10kPointsIn100Polygons`       | 1.50 ms / 2.80 MB / 40k  | **1.18 ms / 2.20 MB / 30k** | **−21%** | **−21%** | 33%           |
+  | `10kPointsIn100LargePolygons`  | 584 μs / 1.50 MB / 10.6k | **224 μs / 452 KB / 317**   | **−62%** | **−70%** | **33× fewer** |
+  | `100kPointsIn10kPolygons`      | 18.9 ms / 52 MB / 622k   | **16.8 ms / 42 MB / 492k**  | **−11%** | **−18%** | 26%           |
+
+  The LargePolygons case is the standout — the AoS path decoded
+  100 large polygons to full `[]Point` structures upfront; the
+  fast path never touches them.
+
+#### Clip / difference bbox-reject fast paths (Slice 17)
+
+- **[`Series.GeomClip`](series_geom_clip.go)** and
+  **`Series.GeomDifference`** now bbox-reject at the Series
+  level before entering the AoS clip sweep. The geometry package's
+  `Boolean` already had a `trivialReject` shape internally (empty
+  Polygon on disjoint intersection; A unchanged on disjoint
+  difference); Slice 17 applies it at the Series level so
+  bbox-disjoint rows skip the ParseWKB entirely:
+
+  - `OpIntersection` + row bbox disjoint from mask bbox →
+    emit a pre-computed empty-Polygon WKB (9 bytes).
+  - `OpDifference` + row bbox disjoint from other bbox →
+    re-emit the row's own WKB bytes (a - b = a).
+
+  `OpUnion` / `OpSymDifference` don't have clean bbox
+  short-circuits (a ∪ b when disjoint is a MultiPolygon of both
+  operands — the AoS combineDisjoint path still runs to build
+  the combined output) and take the full AoS path.
+
+  **Measured on Apple M3 Pro, 5k rows × small mask (~1% of
+  corpus bbox by area — ~99% bbox-reject rate)**:
+
+  | Path                       | Legacy AoS                | Slice 17 SoA               | Δ wall    | Δ mem     | Δ allocs       |
+  | -------------------------- | ------------------------: | -------------------------: | :-------- | :-------- | :------------- |
+  | `Series.GeomClip(mask)`    | 1.27 ms / 3.04 MB / 35k   | **237 μs / 242 KB / 105**  | **−81%**  | **−92%**  | **334× fewer** |
+  | `Series.GeomDifference(o)` | 5.17 ms / 8.08 MB / 105k  | **337 μs / 1.19 MB / 198** | **−93%**  | **−85%**  | **530× fewer** |
+
+  The Difference win is the biggest — the AoS path ran the full
+  Martinez-Rueda sweep for every row (even when the answer was
+  just "row unchanged"). The Series-level bbox reject eliminates
+  the sweep entirely on disjoint rows.
+
+#### Convex-containment fast paths in the clip engine (Slice 18)
+
+Slice 17 shipped bbox-reject at the Series level; Slice 18 adds
+the complementary "return operand unchanged" fast paths INSIDE
+`geometry.Boolean()` itself, catching workloads that call
+`Clip(a, b)` directly (bypassing the Series layer).
+
+- **[`geometry.boundsInsideBounds(inner, outer)`](geometry/clip_convex.go)**
+  and **`allVerticesInsideConvexRing(pts, clip)`** —
+  the containment primitives. Bbox test is the cheap gate;
+  vertex-in-convex-ring runs a per-edge signed cross product with
+  the clip winding hoisted outside the loop.
+
+- **[`geometry.Boolean(a, b, OpIntersection, opts)`](geometry/clip.go)**
+  now dispatches:
+
+  1. Bbox disjoint → empty (unchanged trivial reject).
+  2. **b convex + a's bbox ⊆ b's bbox + every a-exterior vertex
+     inside b → intersection = a unchanged.** Skips the SH loop
+     and the output-ring allocation entirely.
+  3. Symmetric case: a convex + b ⊆ a → intersection = b.
+  4. Both convex → existing Sutherland-Hodgman fast path.
+
+  Correctness: `a ⊆ b` implies `a ∩ b = a`. For convex b, "every
+  a-exterior vertex inside b" is sufficient (line segments in
+  convex sets stay in convex sets). A with holes preserves its
+  holes in the returned polygon.
+
+  **Measured on Apple M3 Pro**:
+
+  | Bench                                | Before (SH-only) | After (containment) | Δ wall  | Δ mem      |
+  | ------------------------------------ | ---------------: | ------------------: | :------ | :--------- |
+  | `Clip_ContainmentFastPath` (cell ⊂ disc) | 2.56 μs / 5.46 KB / 4 allocs | **1.29 μs / 192 B / 3 allocs** | **−50%** | **−96%** |
+  | `Clip_MCellLoop` (user disc × 100 cells) | 187 μs / 1.02 MB / 632 allocs | **138 μs / 696 KB / 504 allocs** | **−26%** | **−30%** |
+
+  On MCellLoop, ~25-30 of the 100 cells are fully inside the disc
+  and hit the containment path; the remaining crossing-boundary
+  cells still run SH. The 96% memory drop on the isolated
+  containment bench is the output-ring allocation that SH would
+  otherwise materialize.
+
+#### Relaxed Sutherland-Hodgman (Slice 19)
+
+Extends the SH fast path from convex × convex to
+**convex clipper × any single-ring subject**, gated by a
+correctness check that the intersection is simply connected.
+The classic SH is only guaranteed correct when the intersection
+has ≤ 1 component; concave subjects can produce multi-component
+intersections that SH renders as "zero-width bridges" (degenerate
+output).
+
+- **[`geometry.intersectionSimplyConnected(subject, clip, ccw)`](geometry/clip_convex.go)**
+  — the safety gate. Counts subject-vertex-inside-status
+  transitions around the ring; returns `safe=true` when
+  transitions ≤ 2 (single enter/exit pair → 1 component).
+  Early-exits at transitions=4 (multi-component detected).
+  Zero-alloc single ring walk.
+
+  Correctness rests on convex geometry: for a convex clipper C,
+  any straight subject edge crosses C's boundary at most twice.
+  When both edge endpoints are inside C, the entire edge is
+  inside — no "hidden crossings" between same-status vertices.
+  That reduces the general edge-based crossing count to a
+  simple vertex-based one.
+
+- **[`geometry.Boolean(a, b, OpIntersection, opts)`](geometry/clip.go)**
+  now dispatches (in order):
+
+  1. Bbox disjoint → empty.
+  2. Convex containment (Slice 18) → operand unchanged.
+  3. **Convex clipper × single-ring subject + safe transitions
+     → SH** (new).
+  4. Multi-component intersection (transitions ≥ 4) or
+     unsafe shape → sweep.
+
+  Polygons with holes on the subject side fall through to
+  the sweep (SH doesn't preserve hole semantics).
+
+  **Measured on Apple M3 Pro, concave L-shape × convex AOI**:
+
+  | Bench                       | Sweep baseline (wrap AOI in Multi) | Slice 19 relaxed SH | Δ wall  | Δ mem     | Δ allocs   |
+  | --------------------------- | ---------------------------------: | ------------------: | :------ | :-------- | :--------- |
+  | `Clip_RelaxedSH_LShapeInAOI` | 3.26 μs / 2.92 KB / 31 allocs      | **551 ns / 1.75 KB / 7 allocs** | **−83%** | **−40%** | **77% fewer** |
+
+  Differential parity tests fuzz random star polygons × random
+  AOI positions and verify area agreement with the sweep across
+  100 iterations — the transition-count gate correctly identifies
+  safe vs unsafe shapes on non-convex subjects.
+
+#### Extended SJoin + Union/Difference containment (Slice 20)
+
+Sweeps the SJoin fast path from Points-only (Slice 16) to
+LineString and single-ring Polygon left sides, and adds the
+Union/Difference containment fast paths that Slice 18 introduced
+for Intersection.
+
+**Slice 20a — [`geometry.Boolean(op=OpUnion)` containment](geometry/clip.go)**:
+- Convex operand fully containing the other → union = the
+  convex (containing) operand unchanged. Skips the sweep.
+
+**Slice 20b — [`geometry.Boolean(op=OpDifference)` containment](geometry/clip.go)**:
+- `a ⊆ convex b` → `a − b = empty`. Skips the sweep and returns
+  an empty polygon directly.
+- The `a ⊇ b → a − b = a with b-hole` case is NOT a fast path —
+  constructing the polygon-with-hole result requires ring
+  reconnection logic that would duplicate the sweep.
+
+**Slice 20c — [`gobi.sjoinLinesInPolygonsFastPath`](sjoin_fast.go)**:
+LineString × (Polygon | MultiPolygon) with SPIntersects.
+- Extract left as `LineStringViewFromWKB` slabs; right as WKB +
+  bounds. R-tree over right bounds.
+- Refine: any line vertex inside right polygon via
+  `PIPInclusiveFromWKB` → match. Miss → AoS fallback (line
+  segments might cross polygon boundary without any vertex
+  being inside).
+- Right-side AoS geometry cached lazily on first fallback.
+
+**Slice 20d — [`gobi.sjoinPolygonsInPolygonsFastPath`](sjoin_fast.go)**:
+Single-ring Polygon × single-ring Polygon with SPIntersects.
+- Extract both sides as exterior-ring slabs via
+  `PolygonRingViewsFromWKB` + bounds.
+- Refine: bilateral vertex-inside check (either polygon's
+  exterior vertex inside the other → match). Miss → AoS
+  fallback for edge-crossing-only pairs.
+- Polygons with holes and MultiPolygons fall back to AoS.
+
+**Measured on Apple M3 Pro** (large-polygon workload where
+per-row decode dominates AoS cost):
+
+| Bench                                     | AoS baseline            | Slice 20 SoA             | Δ wall  | Δ mem      |
+| ----------------------------------------- | ----------------------: | -----------------------: | :------ | :--------- |
+| `SJoin_1kLinesIn100LargePolygons`         | 192 μs / 739 KB / 2.4k  | **123 μs / 210 KB / 2.1k** | **−36%** | **−72%**  |
+| `SJoin_1kPolysIn100LargePolygons`         | 270 μs / 891 KB / 3.4k  | **248 μs / 620 KB / 3.5k** | **−8%**  | **−30%**  |
+| `SJoin_1kLinesIn100Polygons` (5-vert)     | 407 μs / 613 KB         | 408 μs / 588 KB          | flat    | −4%        |
+| `SJoin_1kPolysIn100Polygons` (5-vert)     | 727 μs / 1.17 MB        | 619 μs / 1.29 MB         | **−15%** | +10%      |
+
+On small (5-vertex) right polygons the LineString fast path is
+essentially flat — the AoS ParseWKB cost is small enough that
+the extract-to-slabs step nearly cancels it. On 64-vertex right
+polygons the fast path wins clearly on both memory and (for
+LineStrings) wall time.
+
+**Deliberately deferred**:
+- LineString × Polygon `SPWithin` — requires all-vertices-inside
+  check plus convexity-aware guarantee. AoS handles correctly.
+- Polygon × Polygon with `SPWithin` or `SPContains` — similar.
+- MultiPolygon and Polygon-with-holes on either side of Slice 20d.
+
+#### Union/SymDifference bbox concat + SJoin SPWithin/SPContains (Slice 21)
+
+Two families of fast paths that finish coverage of the Series-
+level clip surface and extend the SJoin predicate matrix.
+
+**Slice 21a/b — [`Series.GeomUnion` / `Series.GeomSymDifference`
+bbox-disjoint MultiPolygon concat](series_geom_clip.go)**:
+- Row bbox disjoint from `other`'s bbox AND both are
+  Polygon/MultiPolygon → construct a MultiPolygon WKB inline
+  by concatenating the row's WKB and other's WKB. Matches
+  AoS `combineDisjoint` shape exactly.
+- Slice 17 shipped the same bbox-disjoint shortcut for
+  Intersection (→ empty) and Difference (→ row unchanged);
+  Slice 21 closes the missing Union and SymDifference cases
+  which need the constructed-MultiPolygon output.
+- Non-polygon `other` or non-polygon row → fall back to AoS
+  (can't build the combined MultiPolygon inline without
+  understanding the geometry types).
+
+  **Measured on Apple M3 Pro, 5k rows × small mask
+  (~99% bbox-reject)**:
+
+  | Path                    | Legacy AoS               | Slice 21 SoA               | Δ wall   | Δ mem    | Δ allocs      |
+  | ----------------------- | -----------------------: | -------------------------: | :------- | :------- | :------------ |
+  | `Series.GeomUnion(o)`   | 5.50 ms / 11.06 MB / 115k | **597 μs / 3.29 MB / 5.2k** | **−89%** | **−70%** | **22× fewer** |
+
+**Slice 21c/d/e — [SJoin SPWithin / SPContains fast paths](sjoin_fast.go)**:
+- **21c — `sjoinPolysScanRange` SPWithin**: A ⊆ B fast path
+  when B is convex — every A-vertex inside B → match (segments
+  in convex sets stay in convex sets). Non-convex B falls back.
+- **21d — SPContains**: symmetric — A ⊇ B fast path when A is
+  convex.
+- **21e — LineString × Polygon SPWithin**: every line vertex
+  inside convex polygon → within. Same convex-container gate.
+
+  Convexity of each polygon is pre-computed once during the
+  `extractSingleRingPolygons` / `extractRightPolygonsWithConvexity`
+  extract pass and cached on `sjoinPoly.convex`. The refine
+  loop dispatches per-predicate via `polyPolyRefine` /
+  `lineInPolyRefine` helpers.
+
+  Parity: three new parity tests
+  (`TestSJoin_PolysInPolygons_SPWithin_ParityWithAoS`,
+  `_SPContains_ParityWithAoS`,
+  `TestSJoin_LinesInPolygons_SPWithin_ParityWithAoS`)
+  verify row counts match the AoS `legacySJoinAoS` reference.
+
+#### LazyFrame AND fusion + SIMD scalar-compare wire-in (Slice 22)
+
+The first non-geometry SoA-shaped work. Gobi outside the geometry
+package is already columnar via Arrow, so there's no `[]Point`-style
+AoS wart to correct — but the expression executor was still doing
+per-op boolean-column materialization on chained filter predicates,
+and the scalar-comparison Series ops weren't wired to the existing
+`compute/` SIMD kernels.
+
+- **[`Series.cmpScalarF64` SIMD wire-in](series_ops.go)** —
+  Float64-column-vs-scalar comparisons (`GtScalar` / `GeScalar` /
+  `LtScalar` / `LeScalar`) now dispatch to `compute.CmpF64Gt/Ge/Lt/Le`
+  when the input is single-chunk non-null. `EqScalar` / `NeScalar`
+  stay scalar because `compute/` doesn't ship SIMD equality
+  kernels (float NaN + tolerance gates make them a separate
+  design). Same pattern as the Slice-6 explicit SIMD dispatch —
+  builds on the `compute/` cmp kernels already shipped in
+  [compute/cmp_simd.go](compute/cmp_simd.go).
+
+- **[`tryAndFusionFastPath`](expr_and_fusion.go)** — pattern-
+  matches AND-chained scalar comparisons in the LazyFrame
+  expression tree and dispatches to fused compute kernels:
+
+  - `Col(x) op1 lit1 AND Col(x) op2 lit2` (same column,
+    two-sided range) → `compute.AndChainF64Range` in a single
+    pass. No intermediate boolean columns.
+  - `Col(a) BETWEEN aLo AND aHi AND Col(b) BETWEEN bLo AND bHi`
+    (four-cmp bbox filter) → `compute.AndChainF64BBox`.
+
+  Both kernels use inclusive bounds; strict `>` / `<` inputs are
+  converted via `math.Nextafter` so the fused output matches the
+  naive two-step composition bit-for-bit. Null-heavy columns and
+  non-order comparison ops (Eq / Ne) fall through to the general
+  AND path.
+
+  **Measured on Apple M3 Pro, 100k rows**:
+
+  | Bench                             | Naive (per-op + AND) | Fused (SoA)              | Δ wall  | Δ allocs   |
+  | --------------------------------- | -------------------: | -----------------------: | :------ | :--------- |
+  | Range: `x >= lo AND x <= hi`      | 1.92 ms / 65 allocs  | **1.79 ms / 31 allocs**  | **−6%** | **−52%**   |
+  | BBox:  `xR AND yR` (4 cmps AND'd) | 4.23 ms / 151 allocs | **2.16 ms / 44 allocs**  | **−49%** | **−71%**  |
+
+  The BBox win is the standout — naive four-cmp composition
+  materializes 4 intermediate boolean columns + 3 ANDs = 7
+  bool allocations before Filter. Fused kernel does 4 scalar
+  broadcasts and a single-pass mask store.
+
+  Range win is modest because the naive path already benefits
+  from the Slice-22a SIMD scalar-compare wire-in above — the
+  fused kernel saves the third boolean allocation and the AND
+  step, but the per-cmp cost is already low.
+
+#### Int64 comparison kernels + CountTrue + SIMD gate (Slice 23)
+
+Adds compute-package coverage for Int64 columns to match the
+Float64 kernels shipped in Slices 6 / 22, plus a foundational
+CountTrue bool-reduce primitive. Also fixes a pre-existing Apple
+2-lane NEON regression that Slice 22a exposed.
+
+- **[`compute.CmpI64Ge / Le / Gt / Lt`](compute/cmp_scalar.go /
+  cmp_simd.go)** — Int64 sibling of the Float64 compare kernels.
+  Same shape: scalar column vs scalar literal → `[]bool` output.
+  SIMD variant uses `simd.Int64s.GreaterEqual` / `Less` / etc.
+
+- **[`compute.CountTrue`](compute/cmp_scalar.go)** — foundational
+  bool-reduce. Scalar body only (Go's compiler auto-vectorizes
+  byte-sum loops on modern arm64 / amd64 tightly enough that a
+  hand-written SIMD popcount doesn't win on realistic mask sizes;
+  the SIMD-build variant shares the same body and can be
+  replaced with an explicit popcount later if a bench justifies).
+
+- **[`Series.cmpScalar` Int64 fast path](series_ops.go)** —
+  routes `Series.GtScalar` / `GeScalar` / `LtScalar` / `LeScalar`
+  on Int64 single-chunk columns to `compute.CmpI64*` when the
+  scalar literal is a losslessly-representable int64. Non-integer
+  literals (e.g. `col > 0.5`) fall through to the widen-and-loop
+  path.
+
+- **[`Series.CountTrue`](series_ops.go)** — public wrap of
+  `compute.CountTrue` for Boolean columns. The natural
+  aggregation on filter masks — `mask.CountTrue()` returns the
+  number of surviving rows without materializing a full slice
+  or going through the generic Aggregate driver.
+
+- **SIMD compare kernel Apple 2-lane NEON regression fix**
+  ([compute/cmp_simd.go](compute/cmp_simd.go)) — measurement
+  during Slice 23 bench revealed the existing `CmpF64*` SIMD
+  kernels (from Slice 22a's dispatch surface) run **~3× slower
+  than scalar on Apple M3** because the per-lane
+  `Masked→Store→bool-convert` tail dominates when Go's
+  auto-vectorizer already handles the scalar loop well. Same
+  shape as the Slice-8 PIP SIMD regression on 2-lane NEON.
+  Fix: `cmpKernelSIMDEligible()` gate — SIMD path only fires
+  on `lane ≥ 4` (amd64 AVX2 / AVX-512); 2-lane NEON falls
+  back to the same tight scalar loop the default build takes.
+
+  Under the gate, the Slice 22a / 23b wire-ins stay safe on
+  Apple (scalar path, fast) while amd64 gets the SIMD win
+  (unmeasured on this dev machine but architecturally sound).
+
+  **Post-fix bench on Apple M3, 1M rows**:
+
+  | Bench                | Default (scalar) | GOEXPERIMENT=simd | Ratio  |
+  | -------------------- | ---------------: | ----------------: | :----- |
+  | `CmpF64Ge_1M`        | 328 μs           | 391 μs            | ~parity |
+  | `CmpI64Ge_1M`        | 313 μs           | 381 μs            | ~parity |
+  | `CountTrue_1M`       | 292 μs           | 465 μs            | scalar body, small noise |
+
+  Pre-fix the SIMD build was 997 μs / 1019 μs / — for the same
+  three benches. Same-file constant `cmpKernelSIMDEligible`
+  makes the arch-split explicit; future SIMD kernels can adopt
+  the same pattern.
+
+#### R-tree internal SoA rewrite
+
+- **[`geometry.RTree`](geometry/rtree.go)** — internal storage
+  refactored from AoS `[]rtreeNode` to parallel `[]float64` bbox
+  arrays. Public API unchanged (`NewRTree`, `Search`, `SearchInto`,
+  `Nearest`, `NearestOne`, `Len`, `Bounds`); only unexported fields
+  changed.
+
+  **Measured on 100k-item / 1k-query workload**:
+  `RTree.Search` −27% wall time (346 μs → 251 μs). `NearestOne` and
+  `Nearest_k1` unchanged (dominated by non-bbox costs).
+
+### Changed
+
+- **[`hilbert_covering_bench_test.go`](hilbert_covering_bench_test.go)**
+  — added `BenchmarkBboxCoveringColumns`, `BenchmarkSortByHilbert`,
+  `BenchmarkHilbertSortWithCovering` on 100k-row 9-vertex-polygon
+  grids for end-to-end tracking of Slices 2 + 3 wins.
+
+- **[`sjoin_bench_test.go`](sjoin_bench_test.go)** — added
+  `BenchmarkSJoin_10kPointsIn100LargePolygons` (64-vertex polygons)
+  as the shape Slice 5's PreparedGeometry API was measured against.
+  Baseline preserved as the "R-tree pre-filter dominates" reference.
+
+### Notes on cross-arch behavior
+
+The Slice 6 measurements exposed a real gotcha: SIMD wins are
+per-kernel AND per-arch, not a strict improvement. Apple M-series
+(deep-OOO cores) and AWS Graviton 2 / Ampere Altra (Neoverse N-class,
+throughput-tuned) produce **opposite outcomes** on the same 2-lane
+NEON hardware category for the vector `Float64.Min/Max` intrinsic.
+Users targeting production ARM64 server workloads (Graviton 2,
+Ampere Altra) should:
+
+- Build with `GOEXPERIMENT=simd` — no downside now that the
+  regressing `BoundsFromXY` wire-in is reverted.
+- Call `compute.PolygonCentroidShoelace` directly when they have
+  materialized `PointsView` slabs (via `polygon.RingViews()`). The
+  Ampere measurement shows 28% wall-time reduction × per-core
+  throughput multiplied by however many cores their workload uses.
+- **Do NOT** call `compute.BoundsF64` explicitly on Neoverse-class
+  hardware — it regresses. Portable `geometry.BoundsFromXY` is
+  faster on that hardware.
+- Apple-silicon dev machines are NOT a valid proxy for production
+  ARM64 SIMD behavior. CI-side benchmarks on the target instance
+  class are the honest measurement.
+
+Full arch-vs-kernel decision table + example workloads live in the
+"Slice 6" section of [`.vscode/CLAUDE.md`](.vscode/CLAUDE.md).
+
 ## [v0.4.0]
 
 Go 1.27 release cycle work: adopt the promoted `encoding/json/v2`,

@@ -227,11 +227,17 @@ func computeBboxColumns(pool memory.Allocator, s Series) (xmin, ymin, xmax, ymax
 				ymaxB.Append(nan)
 				continue
 			}
-			g, perr := geometry.ParseWKB(bin.Value(i))
+			// Fast path: BoundsFromWKB walks the WKB byte stream
+			// tracking min/max without materializing []Point / Polygon
+			// / etc. — the geometry would be discarded immediately
+			// anyway. Zero-alloc per row on well-formed input; matches
+			// ParseWKB(bin.Value(i)).Bounds() exactly on every OGC
+			// geometry type (see BoundsFromWKB's semantic contract +
+			// its correctness test).
+			b, perr := geometry.BoundsFromWKB(bin.Value(i))
 			if perr != nil {
 				return nil, nil, nil, nil, perr
 			}
-			b := g.Bounds()
 			if b.Empty() {
 				xminB.Append(nan)
 				yminB.Append(nan)

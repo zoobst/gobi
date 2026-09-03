@@ -12,41 +12,61 @@ const RTreeNodeSize = 16
 // RTree is a static, bulk-loaded Sort-Tile-Recursive R-tree over 2D
 // bounding boxes. Once built with NewRTree the tree is immutable and safe
 // for concurrent readers.
+//
+// Internal layout: struct-of-arrays. Node bboxes live in four parallel
+// []float64s (nodeMinX/Y/MaxX/MaxY); item bboxes get the same treatment.
+// The query hot paths (Search, NearestOne) read tightly-packed contiguous
+// slices instead of walking through a []struct where each 48-byte
+// node dragged in 16 unused padding bytes per cache line.
 type RTree struct {
-	// itemBounds is the caller's bounds, indexed by caller-facing ID.
-	itemBounds []Bounds
+	// Item bboxes, indexed by the caller-facing item ID. Parallel
+	// arrays — itemMinX[id], itemMinY[id], itemMaxX[id], itemMaxY[id]
+	// together describe item id's bbox.
+	itemMinX, itemMinY, itemMaxX, itemMaxY []float64
+
 	// itemIDs is a permutation: itemIDs[i] is the caller ID at leaf slot i.
 	itemIDs []int32
 	// childRefs stores child node indexes for internal nodes.
 	childRefs []int32
-	// nodes are laid out with leaves first, then internal levels; root is last.
-	nodes []rtreeNode
-	root  int32
-}
 
-type rtreeNode struct {
-	bounds Bounds
-	// first + count point into itemIDs if isLeaf, otherwise into childRefs.
-	first  int32
-	count  int32
-	isLeaf bool
+	// Node bboxes, indexed by internal node index. Parallel arrays.
+	// Leaves and internal nodes share the same node-index space; nodes
+	// are laid out with leaves first, then internal levels, root last.
+	nodeMinX, nodeMinY, nodeMaxX, nodeMaxY []float64
+	// nodeFirst[i] + nodeCount[i] index into itemIDs if nodeIsLeaf[i],
+	// otherwise into childRefs.
+	nodeFirst  []int32
+	nodeCount  []int32
+	nodeIsLeaf []bool
+
+	root int32
 }
 
 // NewRTree builds an R-tree over the given bounding boxes. Item IDs
 // returned by queries are indexes into bounds.
 func NewRTree(bounds []Bounds) *RTree {
-	t := &RTree{itemBounds: append([]Bounds(nil), bounds...)}
-	if len(bounds) == 0 {
+	n := len(bounds)
+	t := &RTree{
+		itemMinX: make([]float64, n),
+		itemMinY: make([]float64, n),
+		itemMaxX: make([]float64, n),
+		itemMaxY: make([]float64, n),
+	}
+	for i, b := range bounds {
+		t.itemMinX[i] = b.MinX
+		t.itemMinY[i] = b.MinY
+		t.itemMaxX[i] = b.MaxX
+		t.itemMaxY[i] = b.MaxY
+	}
+	if n == 0 {
 		t.root = -1
 		return t
 	}
-	ids := make([]int32, len(bounds))
+	ids := make([]int32, n)
 	for i := range ids {
 		ids[i] = int32(i)
 	}
-	// Leaf level: sort/tile items, pack them into leaf nodes.
 	leaves := t.buildLeafLevel(ids)
-	// Recursively build internal levels until one root.
 	for len(leaves) > 1 {
 		leaves = t.buildInternalLevel(leaves)
 	}
@@ -55,14 +75,17 @@ func NewRTree(bounds []Bounds) *RTree {
 }
 
 // Len returns the number of items indexed.
-func (t *RTree) Len() int { return len(t.itemBounds) }
+func (t *RTree) Len() int { return len(t.itemMinX) }
 
 // Bounds returns the R-tree's overall bounding box.
 func (t *RTree) Bounds() Bounds {
 	if t.root < 0 {
 		return EmptyBounds()
 	}
-	return t.nodes[t.root].bounds
+	return Bounds{
+		MinX: t.nodeMinX[t.root], MinY: t.nodeMinY[t.root],
+		MaxX: t.nodeMaxX[t.root], MaxY: t.nodeMaxY[t.root],
+	}
 }
 
 // Search returns the IDs of every item whose bounding box intersects q.
@@ -77,28 +100,28 @@ func (t *RTree) Search(q Bounds) []int32 {
 // allocation each time.
 func (t *RTree) SearchInto(buf []int32, q Bounds) []int32 {
 	out := buf[:0]
-	if t.root < 0 || !q.Intersects(t.Bounds()) {
+	if t.root < 0 || !t.nodeIntersectsQ(t.root, q) {
 		return out
 	}
 	stack := []int32{t.root}
 	for len(stack) > 0 {
 		idx := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		n := t.nodes[idx]
-		if !n.bounds.Intersects(q) {
+		if !t.nodeIntersectsQ(idx, q) {
 			continue
 		}
-		if n.isLeaf {
-			for i := range n.count {
-				id := t.itemIDs[n.first+i]
-				if t.itemBounds[id].Intersects(q) {
+		first, count := t.nodeFirst[idx], t.nodeCount[idx]
+		if t.nodeIsLeaf[idx] {
+			for i := range count {
+				id := t.itemIDs[first+i]
+				if t.itemIntersectsQ(id, q) {
 					out = append(out, id)
 				}
 			}
 			continue
 		}
-		for i := range n.count {
-			stack = append(stack, t.childRefs[n.first+i])
+		for i := range count {
+			stack = append(stack, t.childRefs[first+i])
 		}
 	}
 	return out
@@ -115,7 +138,7 @@ func (t *RTree) Nearest(x, y float64, k int) []int32 {
 		return nil
 	}
 	var pq rtreePQ
-	pq.push(rtreeQueue{node: t.root, dist: bboxDist(t.nodes[t.root].bounds, x, y)})
+	pq.push(rtreeQueue{node: t.root, dist: t.nodeBboxDist(t.root, x, y)})
 
 	out := make([]int32, 0, k)
 	for len(pq) > 0 && len(out) < k {
@@ -124,16 +147,16 @@ func (t *RTree) Nearest(x, y float64, k int) []int32 {
 			out = append(out, top.item)
 			continue
 		}
-		n := t.nodes[top.node]
-		if n.isLeaf {
-			for i := range n.count {
-				id := t.itemIDs[n.first+i]
-				pq.push(rtreeQueue{isItem: true, item: id, dist: bboxDist(t.itemBounds[id], x, y)})
+		first, count := t.nodeFirst[top.node], t.nodeCount[top.node]
+		if t.nodeIsLeaf[top.node] {
+			for i := range count {
+				id := t.itemIDs[first+i]
+				pq.push(rtreeQueue{isItem: true, item: id, dist: t.itemBboxDist(id, x, y)})
 			}
 		} else {
-			for i := range n.count {
-				child := t.childRefs[n.first+i]
-				pq.push(rtreeQueue{node: child, dist: bboxDist(t.nodes[child].bounds, x, y)})
+			for i := range count {
+				child := t.childRefs[first+i]
+				pq.push(rtreeQueue{node: child, dist: t.nodeBboxDist(child, x, y)})
 			}
 		}
 	}
@@ -176,14 +199,14 @@ type rtreeNearestState struct {
 // billion items that's about 8. Well within Go's default goroutine
 // stack; no risk of blow-up.
 func (t *RTree) nearestOneDescend(nodeIdx int32, x, y float64, best *rtreeNearestState) {
-	n := t.nodes[nodeIdx]
-	if bboxDist(n.bounds, x, y) >= best.dist {
+	if t.nodeBboxDist(nodeIdx, x, y) >= best.dist {
 		return
 	}
-	if n.isLeaf {
-		for i := range n.count {
-			id := t.itemIDs[n.first+i]
-			d := bboxDist(t.itemBounds[id], x, y)
+	first, count := t.nodeFirst[nodeIdx], t.nodeCount[nodeIdx]
+	if t.nodeIsLeaf[nodeIdx] {
+		for i := range count {
+			id := t.itemIDs[first+i]
+			d := t.itemBboxDist(id, x, y)
 			if d < best.dist {
 				best.dist = d
 				best.id = id
@@ -199,12 +222,12 @@ func (t *RTree) nearestOneDescend(nodeIdx int32, x, y float64, best *rtreeNeares
 		child int32
 		dist  float64
 	}
-	for i := range n.count {
-		c := t.childRefs[n.first+i]
+	for i := range count {
+		c := t.childRefs[first+i]
 		buf[i].child = c
-		buf[i].dist = bboxDist(t.nodes[c].bounds, x, y)
+		buf[i].dist = t.nodeBboxDist(c, x, y)
 	}
-	entries := buf[:n.count]
+	entries := buf[:count]
 	for i := 1; i < len(entries); i++ {
 		cur := entries[i]
 		j := i
@@ -215,8 +238,6 @@ func (t *RTree) nearestOneDescend(nodeIdx int32, x, y float64, best *rtreeNeares
 		entries[j] = cur
 	}
 	for _, e := range entries {
-		// Remaining children are further away than any that
-		// couldn't improve, so all of them prune. Stop here.
 		if e.dist >= best.dist {
 			break
 		}
@@ -224,17 +245,64 @@ func (t *RTree) nearestOneDescend(nodeIdx int32, x, y float64, best *rtreeNeares
 	}
 }
 
+// nodeIntersectsQ tests whether node idx's bbox intersects q. Reads
+// the four bbox arrays directly rather than materializing a Bounds
+// struct — keeps the hot query loop's memory accesses on contiguous
+// slices that the compiler can lower to sequential loads.
+func (t *RTree) nodeIntersectsQ(idx int32, q Bounds) bool {
+	return !(q.MinX > t.nodeMaxX[idx] || t.nodeMinX[idx] > q.MaxX ||
+		q.MinY > t.nodeMaxY[idx] || t.nodeMinY[idx] > q.MaxY)
+}
+
+// itemIntersectsQ is the leaf-level companion to nodeIntersectsQ,
+// reading from the item bbox arrays instead.
+func (t *RTree) itemIntersectsQ(id int32, q Bounds) bool {
+	return !(q.MinX > t.itemMaxX[id] || t.itemMinX[id] > q.MaxX ||
+		q.MinY > t.itemMaxY[id] || t.itemMinY[id] > q.MaxY)
+}
+
+// nodeBboxDist returns the squared Euclidean distance from (x, y) to
+// node idx's bbox. Zero if the point is inside the bbox.
+func (t *RTree) nodeBboxDist(idx int32, x, y float64) float64 {
+	var dx, dy float64
+	if x < t.nodeMinX[idx] {
+		dx = t.nodeMinX[idx] - x
+	} else if x > t.nodeMaxX[idx] {
+		dx = x - t.nodeMaxX[idx]
+	}
+	if y < t.nodeMinY[idx] {
+		dy = t.nodeMinY[idx] - y
+	} else if y > t.nodeMaxY[idx] {
+		dy = y - t.nodeMaxY[idx]
+	}
+	return dx*dx + dy*dy
+}
+
+// itemBboxDist is the leaf-level counterpart to nodeBboxDist.
+func (t *RTree) itemBboxDist(id int32, x, y float64) float64 {
+	var dx, dy float64
+	if x < t.itemMinX[id] {
+		dx = t.itemMinX[id] - x
+	} else if x > t.itemMaxX[id] {
+		dx = x - t.itemMaxX[id]
+	}
+	if y < t.itemMinY[id] {
+		dy = t.itemMinY[id] - y
+	} else if y > t.itemMaxY[id] {
+		dy = y - t.itemMaxY[id]
+	}
+	return dx*dx + dy*dy
+}
+
 // --- build ---
 
 func (t *RTree) buildLeafLevel(ids []int32) []int32 {
 	sort.Slice(ids, func(i, j int) bool {
-		return xCenter(t.itemBounds[ids[i]]) < xCenter(t.itemBounds[ids[j]])
+		return t.itemXCenter(ids[i]) < t.itemXCenter(ids[j])
 	})
 	M := RTreeNodeSize
 	P := int(math.Ceil(float64(len(ids)) / float64(M))) // total leaves
-	S := max(
-		// stripes
-		int(math.Ceil(math.Sqrt(float64(P)))), 1)
+	S := max(int(math.Ceil(math.Sqrt(float64(P)))), 1)
 	stripeSize := max(int(math.Ceil(float64(len(ids))/float64(S))), M)
 
 	var leaves []int32
@@ -242,20 +310,21 @@ func (t *RTree) buildLeafLevel(ids []int32) []int32 {
 		end := min(i+stripeSize, len(ids))
 		stripe := ids[i:end]
 		sort.Slice(stripe, func(i, j int) bool {
-			return yCenter(t.itemBounds[stripe[i]]) < yCenter(t.itemBounds[stripe[j]])
+			return t.itemYCenter(stripe[i]) < t.itemYCenter(stripe[j])
 		})
 		for j := 0; j < len(stripe); j += M {
 			e := min(j+M, len(stripe))
 			group := stripe[j:e]
 			b := EmptyBounds()
 			for _, id := range group {
-				b = b.Union(t.itemBounds[id])
+				b = b.Union(Bounds{
+					MinX: t.itemMinX[id], MinY: t.itemMinY[id],
+					MaxX: t.itemMaxX[id], MaxY: t.itemMaxY[id],
+				})
 			}
 			offset := int32(len(t.itemIDs))
 			t.itemIDs = append(t.itemIDs, group...)
-			leaves = append(leaves, t.appendNode(rtreeNode{
-				bounds: b, first: offset, count: int32(len(group)), isLeaf: true,
-			}))
+			leaves = append(leaves, t.appendNode(b, offset, int32(len(group)), true))
 		}
 	}
 	return leaves
@@ -263,7 +332,7 @@ func (t *RTree) buildLeafLevel(ids []int32) []int32 {
 
 func (t *RTree) buildInternalLevel(children []int32) []int32 {
 	sort.Slice(children, func(i, j int) bool {
-		return xCenter(t.nodes[children[i]].bounds) < xCenter(t.nodes[children[j]].bounds)
+		return t.nodeXCenter(children[i]) < t.nodeXCenter(children[j])
 	})
 	M := RTreeNodeSize
 	P := int(math.Ceil(float64(len(children)) / float64(M)))
@@ -275,49 +344,44 @@ func (t *RTree) buildInternalLevel(children []int32) []int32 {
 		end := min(i+stripeSize, len(children))
 		stripe := children[i:end]
 		sort.Slice(stripe, func(i, j int) bool {
-			return yCenter(t.nodes[stripe[i]].bounds) < yCenter(t.nodes[stripe[j]].bounds)
+			return t.nodeYCenter(stripe[i]) < t.nodeYCenter(stripe[j])
 		})
 		for j := 0; j < len(stripe); j += M {
 			e := min(j+M, len(stripe))
 			group := stripe[j:e]
 			b := EmptyBounds()
 			for _, id := range group {
-				b = b.Union(t.nodes[id].bounds)
+				b = b.Union(Bounds{
+					MinX: t.nodeMinX[id], MinY: t.nodeMinY[id],
+					MaxX: t.nodeMaxX[id], MaxY: t.nodeMaxY[id],
+				})
 			}
 			offset := int32(len(t.childRefs))
 			t.childRefs = append(t.childRefs, group...)
-			next = append(next, t.appendNode(rtreeNode{
-				bounds: b, first: offset, count: int32(len(group)), isLeaf: false,
-			}))
+			next = append(next, t.appendNode(b, offset, int32(len(group)), false))
 		}
 	}
 	return next
 }
 
-func (t *RTree) appendNode(n rtreeNode) int32 {
-	t.nodes = append(t.nodes, n)
-	return int32(len(t.nodes) - 1)
+// appendNode writes a new node into the parallel arrays and returns
+// its index.
+func (t *RTree) appendNode(b Bounds, first, count int32, isLeaf bool) int32 {
+	idx := int32(len(t.nodeMinX))
+	t.nodeMinX = append(t.nodeMinX, b.MinX)
+	t.nodeMinY = append(t.nodeMinY, b.MinY)
+	t.nodeMaxX = append(t.nodeMaxX, b.MaxX)
+	t.nodeMaxY = append(t.nodeMaxY, b.MaxY)
+	t.nodeFirst = append(t.nodeFirst, first)
+	t.nodeCount = append(t.nodeCount, count)
+	t.nodeIsLeaf = append(t.nodeIsLeaf, isLeaf)
+	return idx
 }
 
-func xCenter(b Bounds) float64 { return (b.MinX + b.MaxX) / 2 }
-func yCenter(b Bounds) float64 { return (b.MinY + b.MaxY) / 2 }
-
-// bboxDist returns the squared Euclidean distance from (x, y) to the
-// closest point on b. Zero if the point lies inside b.
-func bboxDist(b Bounds, x, y float64) float64 {
-	var dx, dy float64
-	if x < b.MinX {
-		dx = b.MinX - x
-	} else if x > b.MaxX {
-		dx = x - b.MaxX
-	}
-	if y < b.MinY {
-		dy = b.MinY - y
-	} else if y > b.MaxY {
-		dy = y - b.MaxY
-	}
-	return dx*dx + dy*dy
-}
+func (t *RTree) itemXCenter(id int32) float64 { return (t.itemMinX[id] + t.itemMaxX[id]) / 2 }
+func (t *RTree) itemYCenter(id int32) float64 { return (t.itemMinY[id] + t.itemMaxY[id]) / 2 }
+func (t *RTree) nodeXCenter(id int32) float64 { return (t.nodeMinX[id] + t.nodeMaxX[id]) / 2 }
+func (t *RTree) nodeYCenter(id int32) float64 { return (t.nodeMinY[id] + t.nodeMaxY[id]) / 2 }
 
 // --- priority queue for Nearest ---
 

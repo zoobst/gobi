@@ -1,6 +1,7 @@
 package gobi
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -173,10 +174,92 @@ func (s Series) GeomDissolve() (geometry.Geometry, error) {
 	return geometry.Dissolve(geoms)
 }
 
+// combineDisjointMultiPolygonWKB builds a MultiPolygon WKB
+// containing the polygon components of `a` and `b`. Used by the
+// Slice-21 Series-level Union / SymDifference bbox-disjoint fast
+// path where the correct algebraic result is a MultiPolygon of
+// both operands.
+//
+// Both inputs must be well-formed Polygon or MultiPolygon WKB
+// blobs (checked by the caller via WKBTypeCode == 3 or 6). Any
+// nested MultiPolygon has its inner polygons flattened into the
+// output. Result is LE-encoded regardless of input byte order —
+// matches gobi's `appendUint32LE` output convention.
+func combineDisjointMultiPolygonWKB(a, b []byte) []byte {
+	nA, aBodyOff := multiPolygonBodyOffset(a)
+	nB, bBodyOff := multiPolygonBodyOffset(b)
+	total := nA + nB
+	// Header: 1 byte order + 4 type code + 4 numPolys = 9 bytes.
+	out := make([]byte, 9, 9+len(a)+len(b))
+	out[0] = 1                             // LE byte order
+	binary.LittleEndian.PutUint32(out[1:5], 6) // MultiPolygon type
+	binary.LittleEndian.PutUint32(out[5:9], uint32(total))
+	// Append `a`'s polygon members.
+	if aIsPolygon(a) {
+		out = append(out, a...)
+	} else {
+		out = append(out, a[aBodyOff:]...)
+	}
+	if aIsPolygon(b) {
+		out = append(out, b...)
+	} else {
+		out = append(out, b[bBodyOff:]...)
+	}
+	return out
+}
+
+// multiPolygonBodyOffset returns (n_polys, offset_of_first_inner_polygon_wkb)
+// for a MultiPolygon WKB blob, or (1, 0) for a Polygon (n=1, no
+// inner-body offset needed — the whole blob IS the polygon).
+func multiPolygonBodyOffset(data []byte) (int, int) {
+	typ, _, err := geometry.WKBTypeCode(data)
+	if err != nil || typ == 3 {
+		return 1, 0
+	}
+	// MultiPolygon: header 5 bytes + 4-byte count.
+	if len(data) < 9 {
+		return 0, 9
+	}
+	// Byte order determines endianness of the count field.
+	var n uint32
+	if data[0] == 1 {
+		n = binary.LittleEndian.Uint32(data[5:9])
+	} else {
+		n = binary.BigEndian.Uint32(data[5:9])
+	}
+	return int(n), 9
+}
+
+// aIsPolygon reports whether wkb encodes a single Polygon (not a
+// MultiPolygon). Used to pick the append shape for the Slice-21
+// concat helper.
+func aIsPolygon(wkb []byte) bool {
+	typ, _, err := geometry.WKBTypeCode(wkb)
+	return err == nil && typ == 3
+}
+
 // geomBinaryOp is the shared driver for row-wise geometry × scalar-mask
 // boolean operations. Writes results as WKB into a new Binary column that
 // inherits s's CRS metadata. Follows the release pattern from
 // GeomCentroid to keep Arrow refcounts balanced on every path.
+//
+// # Slice 17 + 21 SoA bbox fast paths
+//
+// For all four ops (Intersection / Union / Difference /
+// SymDifference), the geometry package's `trivialReject` shape
+// (Slice 17 for Int/Diff, Slice 21 for Union/SymDiff) is applied
+// at the Series level via a per-row `BoundsFromWKB` check:
+//
+//   - OpIntersection + row bbox disjoint → emit pre-computed empty
+//     Polygon WKB.
+//   - OpDifference + row bbox disjoint → re-emit the row's own
+//     WKB bytes unchanged (a - b = a when a and b don't touch).
+//   - OpUnion + row bbox disjoint → emit a MultiPolygon WKB
+//     built by concatenating row's WKB and other's WKB (both
+//     must be Polygon or MultiPolygon — otherwise fall through).
+//     Matches AoS `combineDisjoint` shape.
+//   - OpSymDifference + row bbox disjoint → same as Union (a △ b
+//     when disjoint = a ∪ b = MultiPolygon[a, b]).
 func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuffix string) (Series, error) {
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
@@ -184,6 +267,27 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 	epsg := geometryCRSFromField(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
 	other = attachCRS(other, crs)
+	otherBounds := other.Bounds()
+	// Pre-compute canonical outputs for the bbox-disjoint fast paths.
+	var (
+		emptyPolygonWKB []byte
+		otherWKB        []byte
+		otherIsPoly     bool
+	)
+	fastPathEligible := !otherBounds.Empty()
+	if op == geometry.OpIntersection {
+		emptyPolygonWKB = geometry.WKB(geometry.Polygon{CRSValue: crs})
+	}
+	if op == geometry.OpUnion || op == geometry.OpSymDifference {
+		otherWKB = geometry.WKB(other)
+		if typ, _, err := geometry.WKBTypeCode(otherWKB); err == nil && (typ == 3 || typ == 6) {
+			otherIsPoly = true
+		} else {
+			// Non-polygon `other` — fast path can't build the
+			// MultiPolygon inline; fall through to AoS for every row.
+			fastPathEligible = false
+		}
+	}
 	pool := memory.DefaultAllocator
 	b := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
 	defer b.Release()
@@ -198,7 +302,34 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 				b.AppendNull()
 				continue
 			}
-			g, err := geometry.ParseWKB(bin.Value(i))
+			wkb := bin.Value(i)
+			if fastPathEligible {
+				rowBounds, err := geometry.BoundsFromWKB(wkb)
+				if err != nil {
+					return Series{}, err
+				}
+				if !rowBounds.Empty() && !rowBounds.Intersects(otherBounds) {
+					switch op {
+					case geometry.OpIntersection:
+						b.Append(emptyPolygonWKB)
+						continue
+					case geometry.OpDifference:
+						b.Append(wkb)
+						continue
+					case geometry.OpUnion, geometry.OpSymDifference:
+						if otherIsPoly {
+							rowTyp, _, err := geometry.WKBTypeCode(wkb)
+							if err == nil && (rowTyp == 3 || rowTyp == 6) {
+								combined := combineDisjointMultiPolygonWKB(wkb, otherWKB)
+								b.Append(combined)
+								continue
+							}
+						}
+						// Row is a non-polygon type — fall through.
+					}
+				}
+			}
+			g, err := geometry.ParseWKB(wkb)
 			if err != nil {
 				return Series{}, err
 			}

@@ -42,18 +42,136 @@ func Boolean(a, b Geometry, op BoolOp, opts ClipOptions) (Geometry, error) {
 		return nil, err
 	}
 	crs := resolveClipCRS(a, b)
-	// Fast path: intersection of two convex single-ring polygons. The
-	// Sutherland-Hodgman clipper is O(n+m) with no allocations for the
-	// sweep-line status structure or event queue, versus the general
-	// Martinez-Rueda sweep's O((n+m) log (n+m)). Both inputs must be
-	// single-ring Polygons; MultiPolygon inputs fall through.
+	// Fast paths for OpIntersection on Polygon × Polygon.
+	//
+	//   1. Bbox disjoint → empty (trivial reject, before either
+	//      IsConvex walk).
+	//   2. Convex containment (Slice 18): if either operand is a
+	//      convex single-ring polygon AND the OTHER operand's
+	//      exterior is fully inside the convex one, the
+	//      intersection is the other operand unchanged.
+	//   3. Relaxed Sutherland-Hodgman (Slice 19): if either
+	//      operand is a convex single-ring polygon AND the OTHER
+	//      operand is a single-ring polygon (may be concave) AND
+	//      the intersection is guaranteed simply connected
+	//      (subject-vertex transition count ≤ 2 against the
+	//      convex clipper), run SH directly. Extends the fast
+	//      path from convex×convex to convex×concave for the
+	//      "AOI cuts through a coastline peninsula" shape.
+	//
+	// MultiPolygon inputs and cases where the intersection has
+	// multiple components (transitions ≥ 4) fall through to the
+	// general sweep.
 	if op == OpIntersection {
-		if aPoly, ok := a.(Polygon); ok {
-			if bPoly, ok := b.(Polygon); ok && aPoly.IsConvex() && bPoly.IsConvex() {
-				if !aPoly.Bounds().Intersects(bPoly.Bounds()) {
+		aPoly, aOK := a.(Polygon)
+		bPoly, bOK := b.(Polygon)
+		if aOK && bOK {
+			ab, bb := aPoly.Bounds(), bPoly.Bounds()
+			if !ab.Intersects(bb) {
+				return Polygon{CRSValue: crs}, nil
+			}
+			bConvex := bPoly.IsConvex()
+			// Case 1: b convex, a's exterior ⊆ b → intersection = a.
+			if bConvex && boundsInsideBounds(ab, bb) {
+				if aExt := aPoly.Exterior(); len(aExt) > 0 &&
+					allVerticesInsideConvexRing(aExt, bPoly.Rings[0]) {
+					out := aPoly
+					out.CRSValue = crs
+					return out, nil
+				}
+			}
+			aConvex := aPoly.IsConvex()
+			// Case 2: a convex, b's exterior ⊆ a → intersection = b.
+			if aConvex && boundsInsideBounds(bb, ab) {
+				if bExt := bPoly.Exterior(); len(bExt) > 0 &&
+					allVerticesInsideConvexRing(bExt, aPoly.Rings[0]) {
+					out := bPoly
+					out.CRSValue = crs
+					return out, nil
+				}
+			}
+			// Case 3 (Slice 19): relaxed SH. Fires when exactly one
+			// side is a convex single-ring clipper and the other is
+			// single-ring (concavity permitted). SH is correct iff
+			// the intersection is simply connected — verified via
+			// intersectionSimplyConnected before running SH.
+			//
+			// Polygons with holes fall through (SH doesn't preserve
+			// hole semantics on the subject side). aPoly / bPoly
+			// single-ring check via len(Rings) == 1.
+			if bConvex && len(aPoly.Rings) == 1 {
+				clip := openRing(bPoly.Rings[0])
+				ccw := ringSignedArea(clip) > 0
+				_, safe := intersectionSimplyConnected(aPoly.Rings[0], clip, ccw)
+				if safe {
+					return sutherlandHodgman(aPoly.Rings[0], bPoly.Rings[0], crs), nil
+				}
+			}
+			if aConvex && len(bPoly.Rings) == 1 {
+				clip := openRing(aPoly.Rings[0])
+				ccw := ringSignedArea(clip) > 0
+				_, safe := intersectionSimplyConnected(bPoly.Rings[0], clip, ccw)
+				if safe {
+					return sutherlandHodgman(bPoly.Rings[0], aPoly.Rings[0], crs), nil
+				}
+			}
+		}
+	}
+	// Fast paths for OpUnion on Polygon × Polygon (Slice 20a).
+	//
+	// Convex containment: if either operand is a convex single-
+	// ring polygon that fully contains the other operand's
+	// exterior, the union is the containing (convex) operand
+	// unchanged. Union with any subset of a convex region is
+	// still that region. Skips the sweep entirely.
+	//
+	// Holes on the contained side are absorbed — the union
+	// swallows the hole shape (a point in b's hole is not in b
+	// but IS in a, so it stays in the union = a). Correct
+	// semantics preserved.
+	if op == OpUnion {
+		aPoly, aOK := a.(Polygon)
+		bPoly, bOK := b.(Polygon)
+		if aOK && bOK {
+			ab, bb := aPoly.Bounds(), bPoly.Bounds()
+			if bPoly.IsConvex() && boundsInsideBounds(ab, bb) {
+				if aExt := aPoly.Exterior(); len(aExt) > 0 &&
+					allVerticesInsideConvexRing(aExt, bPoly.Rings[0]) {
+					out := bPoly
+					out.CRSValue = crs
+					return out, nil
+				}
+			}
+			if aPoly.IsConvex() && boundsInsideBounds(bb, ab) {
+				if bExt := bPoly.Exterior(); len(bExt) > 0 &&
+					allVerticesInsideConvexRing(bExt, aPoly.Rings[0]) {
+					out := aPoly
+					out.CRSValue = crs
+					return out, nil
+				}
+			}
+		}
+	}
+	// Fast path for OpDifference on Polygon × Polygon (Slice 20b).
+	//
+	// If b is convex AND a's exterior is fully inside b → a ⊆ b →
+	// a - b = empty. Skips the sweep.
+	//
+	// The "a ⊇ b → a - b = a with a b-shaped hole" case is NOT a
+	// fast path — constructing the result polygon-with-hole
+	// requires the sweep's ring reconnection logic (or a
+	// duplicate implementation), and the wins wouldn't justify
+	// the code.
+	if op == OpDifference {
+		aPoly, aOK := a.(Polygon)
+		bPoly, bOK := b.(Polygon)
+		if aOK && bOK {
+			ab, bb := aPoly.Bounds(), bPoly.Bounds()
+			if bPoly.IsConvex() && boundsInsideBounds(ab, bb) {
+				if aExt := aPoly.Exterior(); len(aExt) > 0 &&
+					allVerticesInsideConvexRing(aExt, bPoly.Rings[0]) {
 					return Polygon{CRSValue: crs}, nil
 				}
-				return sutherlandHodgman(aPoly.Rings[0], bPoly.Rings[0], crs), nil
 			}
 		}
 	}

@@ -10,6 +10,61 @@ import (
 	"github.com/zoobst/gobi/geometry"
 )
 
+// BenchmarkBboxCoveringColumns quantifies the write-path bbox
+// compute isolated from any sort work. This is the parquetio
+// bbox-covering-column write hot path — one call per gobi-written
+// geo-parquet file, over every row. Slice 2's BoundsFromWKB fast
+// path targets this benchmark directly.
+func BenchmarkBboxCoveringColumns(b *testing.B) {
+	f := benchGrid(b, 316) // 316×316 = 99,856 ≈ 100k rows
+	defer f.Release()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		aug, _, err := WithBboxCoveringColumns(f)
+		if err != nil {
+			b.Fatal(err)
+		}
+		aug.Release()
+	}
+}
+
+// BenchmarkSortByHilbert exercises the two-pass SortByHilbertWith
+// path — one Hilbert-index-per-row centroid extract via WKB.
+// Slice 3's CentroidFromWKB fast path targets this benchmark.
+func BenchmarkSortByHilbert(b *testing.B) {
+	f := benchGrid(b, 316) // ~100k rows
+	defer f.Release()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		sorted, err := f.SortByHilbert("geometry")
+		if err != nil {
+			b.Fatal(err)
+		}
+		sorted.Release()
+	}
+}
+
+// BenchmarkHilbertSortWithCovering exercises the fused single-pass
+// path — the sort's centroid extract AND the bbox-covering columns
+// share one WKB scan per row. Slice 3's CentroidAndBoundsFromWKB
+// fast path targets this benchmark; on parquetio HilbertSort writes
+// this is the primary user-visible cost.
+func BenchmarkHilbertSortWithCovering(b *testing.B) {
+	f := benchGrid(b, 316) // ~100k rows
+	defer f.Release()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		aug, _, err := HilbertSortWithCovering(f, "geometry")
+		if err != nil {
+			b.Fatal(err)
+		}
+		aug.Release()
+	}
+}
+
 // BenchmarkHilbertSort_TwoPassVsFused quantifies the write-path
 // speedup from fusing the sort's centroid parse with the bbox-
 // covering column parse. Two-pass form parses every row's WKB

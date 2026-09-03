@@ -565,6 +565,47 @@ func sumI64(a []int64, arr *array.Int64) float64 {
 	return float64(total)
 }
 
+// CountTrue returns the number of true (and non-null) entries in a
+// Boolean Series. The natural aggregation on filter masks — a user
+// running `frame.FilterExpr(...)` and wanting to know how many
+// rows survived can call `mask.CountTrue()` without materializing
+// a full slice or paying the generic-aggregation path.
+//
+// Non-Boolean input returns ErrNotBoolean. Null entries are
+// counted as false (they aren't "true" — matches shapely /
+// pandas convention where nulls don't satisfy predicates).
+//
+// Uses compute.CountTrue per chunk; SIMD-friendly on the
+// non-null hot path.
+func (s Series) CountTrue() (int, error) {
+	if s.DataType() == nil || s.DataType().ID() != arrow.BOOL {
+		return 0, ErrMaskNotBoolean
+	}
+	var total int
+	for _, chunk := range s.col.Data().Chunks() {
+		b := chunk.(*array.Boolean)
+		if b.NullN() == 0 {
+			// Copy the bool values into a []bool so the compute
+			// kernel can process them contiguously. For very short
+			// chunks the copy dominates; for large chunks the
+			// compute kernel's vectorization amortizes it.
+			buf := make([]bool, b.Len())
+			for i := range b.Len() {
+				buf[i] = b.Value(i)
+			}
+			total += compute.CountTrue(buf)
+			continue
+		}
+		// Null-aware path: skip nulls, count true.
+		for i := range b.Len() {
+			if !b.IsNull(i) && b.Value(i) {
+				total++
+			}
+		}
+	}
+	return total, nil
+}
+
 // Mean returns the arithmetic mean of non-null numeric values, or NaN when
 // the series has no non-null rows.
 func (s Series) Mean() (float64, error) {
@@ -953,6 +994,15 @@ func (s Series) cmpScalar(v float64, op cmpOp) (Series, error) {
 	if vals, arr, ok := s.singleF64(); ok {
 		return cmpScalarF64(vals, arr, v, op, s.name), nil
 	}
+	// Slice 23b: Int64 fast path via compute.CmpI64* SIMD kernels.
+	// Only fires when the scalar literal is a losslessly-representable
+	// int64 — otherwise the per-row numericAt loop (which widens both
+	// sides to float64) is the correct fallback for e.g. `col > 0.5`.
+	if vals, arr, ok := s.singleI64(); ok {
+		if iv := int64(v); float64(iv) == v {
+			return cmpScalarI64(vals, arr, iv, op, s.name), nil
+		}
+	}
 	b := array.NewBooleanBuilder(memory.DefaultAllocator)
 	defer b.Release()
 	for i := range s.Len() {
@@ -973,7 +1023,25 @@ func cmpScalarF64(a []float64, arr *array.Float64, v float64, op cmpOp, name str
 	n := len(a)
 	out := make([]bool, n)
 	if arr.NullN() == 0 {
+		// Slice 22a: dispatch order-comparison ops (Gt / Ge / Lt / Le)
+		// to the SIMD kernels in compute/ which pack the compare +
+		// mask store in a single lane-parallel pass. Eq / Ne stay on
+		// the scalar path because compute/ doesn't ship SIMD
+		// equality kernels today (float NaN semantics + tolerance
+		// gates make them a separate design).
 		switch op {
+		case cmpGe:
+			compute.CmpF64Ge(a, v, out)
+			return buildBoolSeries(name, out, nil)
+		case cmpLe:
+			compute.CmpF64Le(a, v, out)
+			return buildBoolSeries(name, out, nil)
+		case cmpGt:
+			compute.CmpF64Gt(a, v, out)
+			return buildBoolSeries(name, out, nil)
+		case cmpLt:
+			compute.CmpF64Lt(a, v, out)
+			return buildBoolSeries(name, out, nil)
 		case cmpEq:
 			for i := range n {
 				out[i] = a[i] == v
@@ -982,21 +1050,62 @@ func cmpScalarF64(a []float64, arr *array.Float64, v float64, op cmpOp, name str
 			for i := range n {
 				out[i] = a[i] != v
 			}
+		}
+		return buildBoolSeries(name, out, nil)
+	}
+	validity := make([]bool, n)
+	for i := range n {
+		if arr.IsNull(i) {
+			continue
+		}
+		switch op {
+		case cmpEq:
+			out[i] = a[i] == v
+		case cmpNe:
+			out[i] = a[i] != v
 		case cmpLt:
-			for i := range n {
-				out[i] = a[i] < v
-			}
+			out[i] = a[i] < v
 		case cmpLe:
-			for i := range n {
-				out[i] = a[i] <= v
-			}
+			out[i] = a[i] <= v
 		case cmpGt:
-			for i := range n {
-				out[i] = a[i] > v
-			}
+			out[i] = a[i] > v
 		case cmpGe:
+			out[i] = a[i] >= v
+		}
+		validity[i] = true
+	}
+	return buildBoolSeries(name, out, validity)
+}
+
+// cmpScalarI64 is the Int64 sibling of cmpScalarF64. Dispatches
+// Ge / Le / Gt / Lt to the compute SIMD kernels; Eq / Ne stay on
+// the scalar path (parity with cmpScalarF64 — no SIMD equality
+// kernel in compute/ today). Null handling walks the array's null
+// bitmap for the has-nulls branch.
+func cmpScalarI64(a []int64, arr *array.Int64, v int64, op cmpOp, name string) Series {
+	n := len(a)
+	out := make([]bool, n)
+	if arr.NullN() == 0 {
+		switch op {
+		case cmpGe:
+			compute.CmpI64Ge(a, v, out)
+			return buildBoolSeries(name, out, nil)
+		case cmpLe:
+			compute.CmpI64Le(a, v, out)
+			return buildBoolSeries(name, out, nil)
+		case cmpGt:
+			compute.CmpI64Gt(a, v, out)
+			return buildBoolSeries(name, out, nil)
+		case cmpLt:
+			compute.CmpI64Lt(a, v, out)
+			return buildBoolSeries(name, out, nil)
+		case cmpEq:
 			for i := range n {
-				out[i] = a[i] >= v
+				out[i] = a[i] == v
+			}
+		case cmpNe:
+			for i := range n {
+				out[i] = a[i] != v
 			}
 		}
 		return buildBoolSeries(name, out, nil)

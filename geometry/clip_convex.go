@@ -38,7 +38,7 @@ func ringIsConvex(ring []Point) bool {
 		return false
 	}
 	sign := 0
-	for i := 0; i < n; i++ {
+	for i := range n {
 		a := ring[i]
 		b := ring[(i+1)%n]
 		c := ring[(i+2)%n]
@@ -76,7 +76,7 @@ func sutherlandHodgman(subject, clip []Point, crs CRS) Polygon {
 	output := append([]Point(nil), subject...)
 	scratch := make([]Point, 0, len(subject)+len(clip))
 
-	for i := 0; i < len(clip); i++ {
+	for i := range len(clip) {
 		if len(output) == 0 {
 			break
 		}
@@ -112,6 +112,143 @@ func sutherlandHodgman(subject, clip []Point, crs CRS) Polygon {
 	return Polygon{Rings: [][]Point{closed}, CRSValue: crs}
 }
 
+// boundsInsideBounds reports whether inner is fully contained by
+// outer. Used by the Slice-18 convex-containment fast path in
+// Boolean(): if the subject bbox is inside the convex clipper's
+// bbox, the (expensive) per-vertex containment check runs; if
+// not, the fast path bails immediately.
+func boundsInsideBounds(inner, outer Bounds) bool {
+	if inner.Empty() || outer.Empty() {
+		return false
+	}
+	return outer.MinX <= inner.MinX && outer.MinY <= inner.MinY &&
+		outer.MaxX >= inner.MaxX && outer.MaxY >= inner.MaxY
+}
+
+// allVerticesInsideConvexRing reports whether every point in pts
+// lies inside (or on the boundary of) the convex clip ring. Clip
+// must be convex per the caller's IsConvex check. Determines
+// clip winding once via ringSignedArea, then runs the standard
+// signed-cross-product test against each clip edge. Early exits
+// on the first outside vertex.
+//
+// Reads directly off the []Point slabs — no Point allocations or
+// Bounds materialization per vertex.
+func allVerticesInsideConvexRing(pts []Point, clipRing []Point) bool {
+	clip := openRing(clipRing)
+	if len(clip) < 3 {
+		return false
+	}
+	ccw := ringSignedArea(clip) > 0
+	for _, p := range pts {
+		if !pointInsideConvexRing(p, clip, ccw) {
+			return false
+		}
+	}
+	return true
+}
+
+// intersectionSimplyConnected reports whether the intersection
+// of a simple subject ring with a convex clip ring has exactly
+// one connected component. Necessary+sufficient condition for
+// Sutherland-Hodgman correctness on a convex clipper × concave
+// subject (Slice 19).
+//
+// # The math
+//
+// For a simple closed subject S and a convex clipper C:
+//
+//	number of components of (S ∩ C) = transitions / 2
+//
+// where `transitions` counts subject-vertex-inside-status flips
+// as we walk S's boundary once. Convexity of C guarantees that
+// any straight subject edge crosses C's boundary at most twice,
+// and when both endpoints of an edge are inside a convex set
+// the entire edge is inside — so no "hidden crossings" between
+// same-status vertices. That collapses the general case
+// (edge-based crossing count) to a simple vertex-based one.
+//
+// Cases:
+//
+//   - `transitions == 0` AND `allInside` → subject ⊆ C, single
+//     component (matches the Slice-18 containment path; still
+//     returned safe here for symmetry).
+//   - `transitions == 0` AND `!allInside` → subject entirely
+//     outside C; components = 0 iff C is also outside subject.
+//     Not safe for SH (SH assumes non-empty intersection).
+//   - `transitions == 2` → one enter + one exit → 1 component,
+//     SH safe.
+//   - `transitions >= 4` → multi-component, SH degenerate — fall
+//     back to sweep.
+//
+// Returns (allInside, safe). `allInside` lets the caller skip
+// SH entirely for the fully-contained case (return subject).
+// Early-exits at transitions=4 to avoid the full ring walk for
+// clearly-unsafe inputs.
+func intersectionSimplyConnected(subject []Point, clip []Point, ccw bool) (allInside, safe bool) {
+	sub := openRing(subject)
+	n := len(sub)
+	if n < 3 {
+		return false, false
+	}
+	prevInside := pointInsideConvexRing(sub[n-1], clip, ccw)
+	insideCount := 0
+	transitions := 0
+	if prevInside {
+		insideCount = 1
+	}
+	for i := range n {
+		inside := pointInsideConvexRing(sub[i], clip, ccw)
+		if inside {
+			insideCount++
+		}
+		if inside != prevInside {
+			transitions++
+			if transitions > 2 {
+				return false, false
+			}
+		}
+		prevInside = inside
+	}
+	// The closing wrap already accounted for above (started walk
+	// from the last vertex, so the "closing edge" transition is
+	// the first-iteration comparison).
+	allInside = insideCount == n
+	// Safe when either fully contained (transitions == 0) OR a
+	// single enter/exit pair (transitions == 2).
+	safe = transitions == 0 || transitions == 2
+	// Additional guard for the transitions==0 all-outside case:
+	// we don't have a non-empty intersection to feed SH; caller
+	// must not use SH there. Fold into allInside check.
+	if transitions == 0 && !allInside {
+		safe = false
+	}
+	return allInside, safe
+}
+
+// pointInsideConvexRing reports whether p lies on the interior
+// (or boundary) of the convex clip ring. Ring winding is provided
+// via ccw so the caller can hoist ringSignedArea outside a per-
+// vertex loop.
+func pointInsideConvexRing(p Point, clip []Point, ccw bool) bool {
+	n := len(clip)
+	for i := range n {
+		a := clip[i]
+		b := clip[(i+1)%n]
+		cross := (b.X-a.X)*(p.Y-a.Y) - (b.Y-a.Y)*(p.X-a.X)
+		if ccw {
+			if cross < 0 {
+				return false
+			}
+		} else {
+			if cross > 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // openRing returns ring without a trailing closing vertex (if present).
 // The returned slice may alias the input.
 func openRing(ring []Point) []Point {
@@ -133,7 +270,7 @@ func ringSignedArea(ring []Point) float64 {
 	}
 	var a float64
 	n := len(ring)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		j := (i + 1) % n
 		a += ring[i].X*ring[j].Y - ring[j].X*ring[i].Y
 	}

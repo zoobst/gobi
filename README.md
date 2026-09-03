@@ -49,9 +49,125 @@ built around a strongly-typed schema.
   using the ellipsoidal Redfearn/Snyder formulas. Sub-cm round-trip
   accuracy verified against reference cities worldwide.
 - **Spatial index and join.** Static Sort-Tile-Recursive R-tree with
-  bounding-box and k-nearest queries. `Frame.SJoin(right, ..., pred)`
-  with `SPIntersects` / `SPContains` / `SPWithin` predicates,
-  multi-threaded across left rows, tunable via `Workers(n)`.
+  bounding-box and k-nearest queries. Internal storage is struct-of-
+  arrays (parallel `[]float64` bbox arrays) — measured **−27% wall
+  time on bbox-intersect Search** (100k-item tree, 1k queries)
+  compared to the AoS shape it replaces. Public API unchanged.
+  `Frame.SJoin(right, ..., pred)` with `SPIntersects` / `SPContains` /
+  `SPWithin` predicates, multi-threaded across left rows, tunable via
+  `Workers(n)`.
+- **SoA geometry kernels (v0.4.1).** For hot-path callers that touch
+  a geometry's coordinates without needing the full `[]Point` /
+  `Polygon` object graph — a common shape on the parquetio write
+  path, spatial-sort pipelines, and per-polygon many-candidate
+  refine loops. `PointsView{Xs, Ys []float64, …}` materializes
+  parallel coordinate slabs via `LineString.View()`,
+  `Polygon.RingViews()`, and friends. Zero-allocation WKB
+  byte-stream scanners (`BoundsFromWKB`, `CentroidFromWKB`,
+  `CentroidAndBoundsFromWKB`, `PIPFromWKB`, `PlanarLengthFromWKB`,
+  `PlanarAreaFromWKB`) walk WKB bytes tracking running accumulators —
+  semantics match `ParseWKB(data).<op>()` exactly on projected CRSes.
+  `PIPRingFromXY` / `PIPPolygonFromRings` deliver a measured **3×
+  held-view speedup** vs. `Polygon.Contains(pt)` on the SJoin-refine
+  shape (64-vertex polygon × 100 candidates). Wired into
+  `geoparquet.computeBboxColumns` (**−31% wall time, −47% memory**
+  on 100k-row GeoParquet writes), both Hilbert sort paths (**−24%
+  wall time, essentially zero-alloc WKB pass** on 100k-row sorts),
+  and `Series.GeomArea` / `Series.GeomLength` on projected CRSes
+  (**−48% / −67% wall time** on 1M-vertex WKB blobs, zero
+  allocations per row). Iterative Douglas-Peucker on parallel
+  slabs (`SimplifyDPFromXY`, `PointsView.SimplifyDP`) replaces the
+  recursive AoS `[]Point` splice+append pattern — wired into every
+  `Simplify` entry point transparently. **−81% wall time and 24k×
+  fewer allocations** on a 1M-vertex polyline (3.85 s → 0.75 s,
+  260k allocs → 11). WKB → PointsView direct-parse
+  (`PolygonRingViewsFromWKB`, `MultiPolygonRingViewsFromWKB`,
+  `LineStringViewFromWKB`, `PrepareFromWKB`) skips the `[]Point`
+  intermediate for polygon-family types — **2.3× faster and 5×
+  less memory** than `ParseWKB(data).RingViews()` on a 1M-vertex
+  polygon. SoA min-distance kernels
+  (`PointToSegmentDistanceSqXY`, `PointToPolylineMinDistanceSq`)
+  power an internal rewrite of `planarMinDistance` — every
+  `GeomDistance` / `WithinDistance` caller gets **−80% wall time**
+  on a 64-vertex Polygon×Polygon and **−82%** at 1024 vertices,
+  from deferring `math.Sqrt` to a single call at the end instead
+  of paying one per (vertex, segment) pair. Andrew's monotone-chain
+  convex hull on slabs (`ConvexHullFromXY`,
+  `PointsView.ConvexHull`) replaces the Graham-scan polar-angle
+  sort — every `Polygon.ConvexHull` / `geometry.ConvexHull(g)`
+  caller sees **−30 to −54% wall time** at n≥1024 and **3-4× lower
+  memory** (index sort on `[]int` instead of `[]Point` structs).
+  WKB-direct `Series.GeomDistance` fast path
+  (`PlanarMinDistanceFromWKB`) skips the AoS `ParseWKB` on
+  bbox-disjoint rows — **−73% memory** on 10k rows of 64-vertex
+  polygons vs a fixed target (65 MB → 17.6 MB per call, −12%
+  wall time). Slice 14 extends the same bbox-reject pattern to
+  `Series.GeomIntersects` / `GeomContains` / `GeomWithin` and the
+  LazyFrame `Col('geom').GeomIntersects(x)` filter expression —
+  **−74% wall time and 98.5% less memory** on a 5k-row × fixed-AOI
+  benchmark (802 μs → 205 μs, 2.37 MB → 36 KB). `Series.GeomBounds`
+  and `Series.GeomCentroid` also wired to the byte-stream scanners.
+  Slice 15 sweeps the last non-clip Series entry points:
+  `Series.GeomDWithin` (bbox-min-distance reject: **−66% wall,
+  −93% memory**) and `Series.GeomType` (WKB-header peek: **−88%
+  wall, 358× fewer allocs** — was pure ParseWKB waste).
+  Slice 16 adds boundary-inclusive `PIPInclusiveFromWKB` and
+  wires an SJoin `Points × Polygons` fast path that skips both
+  `decodeGeometryColumn` passes — **−62% wall, −70% memory, 33×
+  fewer allocs** on the 10k-points × 100-large-polygons bench.
+  Slice 17 adds Series-level bbox reject for `GeomClip` (empty
+  on disjoint intersection) and `GeomDifference` (row unchanged
+  on disjoint difference) — **−81% / −93% wall time** and
+  **334× / 530× fewer allocs** on 5k rows × small mask.
+  Slice 18 adds convex-containment fast paths inside
+  `geometry.Boolean()` itself — when either operand is a convex
+  polygon that fully contains the other, intersection returns
+  the contained operand unchanged. **−50% wall and −96% memory**
+  on the isolated containment case; **−26% wall, −30% memory**
+  on the M-cell loop (100 cells × user disc). Slice 19 extends
+  the Sutherland-Hodgman fast path from convex×convex to
+  **convex clipper × any single-ring subject** when the
+  intersection is guaranteed simply connected (transition-count
+  gate on vertex containment) — **−83% wall time** on the
+  concave-L-shape-clipped-by-AOI shape. Slice 20 extends the
+  SJoin fast path from Points-only to **LineString × Polygon**
+  and **single-ring Polygon × single-ring Polygon** (bilateral
+  vertex-inside + AoS fallback for edge crossings) — **−36% wall
+  and −72% memory** on 1k lines × 100 large polygons. Plus
+  Union/Difference containment fast paths in `geometry.Boolean()`
+  (union with a convex containing operand → operand unchanged;
+  `a ⊆ convex b` difference → empty without the sweep). Slice 21
+  finishes clip coverage: `Series.GeomUnion` and
+  `Series.GeomSymDifference` now build the combined MultiPolygon
+  inline for bbox-disjoint rows (**−89% wall, 22× fewer allocs**
+  on 5k rows × small mask), and SJoin gains **SPWithin /
+  SPContains fast paths** for Polygon×Polygon and LineString×Polygon
+  (convex-container gate; convexity precomputed during extract).
+  Slice 22 pushes the same shape into the LazyFrame executor:
+  Series scalar-comparison ops (`GtScalar` / `LtScalar` / etc.)
+  now dispatch to `compute.CmpF64*` SIMD kernels, and the
+  expression executor recognizes AND-chained range and bbox
+  filters, dispatching to fused kernels
+  (`compute.AndChainF64Range` / `AndChainF64BBox`) that skip
+  intermediate boolean-column materialization — **−49% wall
+  and 71% fewer allocs** on a 100k-row 4-comparison bbox filter.
+  Slice 23 adds Int64 comparison kernels
+  (`compute.CmpI64Ge/Le/Gt/Lt`) with matching Series wire-in,
+  a foundational `compute.CountTrue` bool-reduce + `Series.CountTrue()`
+  wrap, and a lane-count gate on the SIMD compare kernels that
+  fixes a pre-existing Apple 2-lane NEON regression the Slice 22a
+  dispatch had exposed (SIMD build now matches scalar build on
+  Apple, wins expected on amd64 AVX2 / AVX-512).
+- **Prepared-geometry predicate API.** `PreparedGeometry` +
+  `Prepare(g)` + `TestPrepared(pred, a, b)` amortize the AoS→SoA
+  materialization tax across many predicate calls — the shape
+  spatial-index-free refine loops need. Fast paths for
+  Point×Polygon and Point×MultiPolygon; other pair shapes fall
+  through to `Test()` transparently. Not used by gobi's built-in
+  SJoin (measurement showed R-tree pre-filter drives candidate
+  count too low for amortization to pay off); designed for
+  advanced callers with dense overlapping polygons or many
+  candidates per prepared geometry.
 - **DataFrame ops.** `Filter`, `Take`, `Head`, `Tail`, `SortBy`
   (multi-key stable, nulls-last), `WithColumn`, `DropColumn`,
   `SelectCols`, `Rename`, `Explode` (also as a `LazyFrame` streaming
@@ -544,6 +660,12 @@ hits    := tree.Search(query)      // IDs whose bounds intersect query
 nearest := tree.Nearest(x, y, k)   // k closest bounds, sorted
 ```
 
+Internal storage is struct-of-arrays: parallel `[]float64` bbox
+arrays for both item and node bboxes. `Search` sees a measured
+27% wall-time reduction on 100k-item / 1k-query workloads vs. the
+AoS shape it replaces. Public API is unchanged from earlier
+releases.
+
 ### Datetime + timezone
 
 ```go
@@ -811,6 +933,21 @@ architectural (NumPy's arena allocator, Polars' cache-blocked kernels)
 rather than kernel-level SIMD. See [compute/](compute/) for the full
 per-op arrow-go vs gobi kernel positioning.
 
+**Cross-arch SIMD note** (v0.4.1): the SIMD wins in this table are on
+Apple M-series (deep out-of-order execution engines). Measured on
+AWS Graviton 2 / Ampere Altra (Neoverse-N-class server ARM64), the
+`compute.BoundsF64` kernel actually **regresses ~48%** because
+Neoverse's NEON `Float64.Min/Max` instructions cost more per lane
+than scalar compare-branch. Other kernels (`SumF64`, and the
+new-in-v0.4.1 `PolygonCentroidShoelace`) win on both architectures
+— shoelace measures **−28% wall time on Ampere** at every size ≥64,
+while flat on Apple silicon. The rule: `GOEXPERIMENT=simd` is safe
+to enable on server ARM64, but call `compute.BoundsF64` explicitly
+only when targeting Apple silicon. `geometry.BoundsFromXY` stays
+portable scalar so it's fast everywhere. See the "Slice 6" section
+in [.vscode/CLAUDE.md](.vscode/CLAUDE.md) for the arch-vs-kernel
+decision table + measured numbers.
+
 ### CSV read (38.6 MB / 1M rows)
 
 | Reader                          |    per-read | notes                                              |
@@ -928,6 +1065,96 @@ alignment work is 49% faster on multi-batch Inner joins.
 Polars still wins in absolute terms — the aligned fast paths close a
 1.6× gap on Over and cut a 3.3× gap on GroupBy to 4.8× overall. If
 the workload can carry alignment metadata, taking it is nearly free.
+
+### GeoParquet write + Hilbert sort (v0.4.1 SoA push)
+
+Two write-path measurements on a 100k-row 9-vertex-polygon Frame,
+before/after the Slice 2 + Slice 3 wire-ins (`BoundsFromWKB`,
+`CentroidAndBoundsFromWKB`). No config change required — the
+scanners are the default path on every build.
+
+| Path                              | before (v0.4.0) | after (v0.4.1) | delta |
+|-----------------------------------|----------------:|---------------:|:------|
+| `WithBboxCoveringColumns` (write) | 31.7 ms / 154 MB / 600k allocs | **21.9 ms / 81 MB / 300k allocs** | **−31% wall, −47% mem** |
+| `SortByHilbert`                   | 33.6 ms / 115.6 MB / 300k allocs | **25.5 ms / 42.9 MB / 66 allocs** | **−24% wall, −63% mem, essentially zero-alloc pass** |
+| `HilbertSortWithCovering`         | 51.1 ms / 203.5 MB / 600k allocs | **41.8 ms / 131 MB / 300k allocs** | **−18% wall, −36% mem** |
+
+The wins come from skipping the `ParseWKB` full-geometry
+allocation on every row when the caller immediately discards the
+geometry after `.Bounds()` / `.Centroid()`. Byte-stream scanners
+walk the WKB blob tracking running accumulators — zero allocation
+per row on well-formed input.
+
+Slice 7 extends the same shape to `Series.GeomArea` /
+`Series.GeomLength` on projected CRSes via `PlanarAreaFromWKB` /
+`PlanarLengthFromWKB`. Microbench on Apple M3 Pro:
+
+| Path                              | n     | ParseWKB + AoS | Scanner   | delta wall | allocs/op    |
+|-----------------------------------|------:|---------------:|----------:|:-----------|:-------------|
+| `PlanarLengthFromWKB`             | 1M    | 12.2 ms        | **4.0 ms** | **−67%**   | 2 → **0**    |
+| `PlanarLengthFromWKB`             | 1K    | 14.5 μs        | **3.4 μs** | **−76%**   | 2 → **0**    |
+| `PlanarAreaFromWKB`               | 1M    |  6.6 ms        | **3.5 ms** | **−48%**   | 3 → **0**    |
+| `PlanarAreaFromWKB`               | 1K    |  8.9 μs        | **3.5 μs** | **−61%**   | 3 → **0**    |
+
+Geographic CRSes still take the AoS haversine / spherical-excess
+path (the scanner has no CRS context from the WKB blob alone).
+
+Slice 9 replaces the recursive AoS `douglasPeucker` with an
+iterative SoA form (`SimplifyDPFromXY` /
+`PointsView.SimplifyDP`). Every `Simplify` entry point routes
+through the shared internal helper, so `LineString.Simplify` /
+`Polygon.Simplify` / `MultiLineString.Simplify` /
+`MultiPolygon.Simplify` / `series.GeomSimplify` all benefit
+transparently. Wiggly-sine polyline benchmark, Apple M3 Pro:
+
+| Path (`Simplify`)     | n    | AoS recursive             | SoA iterative           | delta wall | allocs/op    |
+|-----------------------|-----:|---------------------------|-------------------------|:-----------|:-------------|
+| `SimplifyDP`          | 64   | 1.80 μs / 17 allocs       | **302 ns / 3 allocs**   | **−83%**   | 17 → **3**   |
+| `SimplifyDP`          | 1K   | 126 μs / 259 allocs       | **25 μs / 4 allocs**    | **−80%**   | 259 → **4**  |
+| `SimplifyDP`          | 64K  | 81.5 ms / 17k / 122 MB    | **16.7 ms / 8 / 242 KB**| **−80%**   | 17k → **8**  |
+| `SimplifyDP`          | 1M   | 3.85 s / 260k / 5.75 GB   | **0.75 s / 11 / 3.2 MB**| **−81%**   | 260k → **11** |
+
+The 24k× allocation reduction on 1M-vertex input is the killer
+metric — the AoS recursion appends O(log n) intermediate `[]Point`
+slices at every split, which the SoA form skips entirely with a
+retain-bitmap + argmax-of-cross-squared inner loop that defers
+the per-split `sqrt` to a single compare.
+
+Slice 10 closes the remaining AoS gap in the `PreparedGeometry`
+build path. Before: `Prepare(ParseWKB(data))` walked the WKB
+bytes to `[]Point`, then walked `[]Point` to `[]float64` slabs —
+two full O(n) passes and two allocations per ring. After:
+`PolygonRingViewsFromWKB` / `PrepareFromWKB` walk the WKB bytes
+once into slabs. On a 1M-vertex polygon (Apple M3 Pro):
+
+| Path                                | `ParseWKB + RingViews` | direct parse            | delta wall | delta mem  |
+|-------------------------------------|-----------------------:|------------------------:|:-----------|:-----------|
+| `PolygonRingViewsFromWKB`           | 8.4 ms / 80 MB / 6a    | **3.7 ms / 16 MB / 3a** | **−56%**   | **−80%**   |
+| `PrepareFromWKB` (retains AoS G)    | 9.5 ms / 80 MB / 6a    | **7.4 ms / 80 MB / 6a** | **−22%**   | flat       |
+
+The `PrepareFromWKB` gap is smaller because it still materializes
+the AoS `Polygon` for `TestPrepared`'s non-fast-path fall-through
+contract — but that materialization is a cheap slab-to-`Point`
+copy, not a second WKB byte walk. Advanced callers wanting the
+full slab-only win can build `PreparedGeometry` directly with
+`PolygonRingViewsFromWKB`.
+
+Slice 11 targets a different hot loop: `planarMinDistance`, the
+internal driver behind `GeomDistance` and `WithinDistance`. The
+pre-Slice-11 shape walked geometries via `forEachVertex` /
+`forEachSegment` closures and called `math.Hypot` per (vertex,
+segment) pair — for a Polygon×Polygon distance at n=1024 that's
+~1M `Hypot` calls (each doing a `sqrt`) per row. The rewrite
+extracts each input's polylines into slab form once, then tracks
+running-min *squared* distance on flat coordinate arrays; the
+final `sqrt` runs exactly once at the end.
+
+| n     | Legacy AoS (closure + per-pair Hypot) | Slab-form SoA    | delta wall |
+| ----- | -----------------------------------:  | ---------------: | :--------- |
+| 16    | 6.9 μs                                | **1.7 μs**       | **−76%**   |
+| 64    | 106 μs                                | **21 μs**        | **−80%**   |
+| 256   | 1.60 ms                               | **272 μs**       | **−83%**   |
+| 1024  | 28.8 ms                               | **5.3 ms**       | **−82%**   |
 
 ### h3-agg (bbox filter + groupby-h3 + aggregate, 2M rows)
 

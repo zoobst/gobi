@@ -82,8 +82,44 @@ func (f *Frame) SJoin(right *Frame, leftGeomCol, rightGeomCol string, pred Spati
 			ErrNotGeometry, rightGeomCol)
 	}
 
-	// Decode every geometry column once. Right geometries feed the R-tree;
-	// left geometries are cached so we never re-decode them across rows.
+	workers := resolveWorkers(opts...)
+
+	// Slice 16 SoA fast path: Points × Polygons with Intersects/
+	// Within routes through a WKB-native refine that skips both
+	// decodeGeometryColumn passes. Returns ok=false when the
+	// shape/predicate doesn't match; the AoS path below handles
+	// everything else uniformly.
+	if leftIdxs, rightIdxs, ok := sjoinPointsInPolygonsFastPath(lGeom, rGeom, pred, workers); ok {
+		return assembleJoinedFrame(f, right, leftIdxs, rightIdxs, rightGeomCol)
+	}
+	// Slice 20c SoA fast path: LineString × Polygons with
+	// SPIntersects. Vertex-inside check plus AoS fallback for
+	// grazing lines.
+	if leftIdxs, rightIdxs, ok := sjoinLinesInPolygonsFastPath(lGeom, rGeom, pred, workers); ok {
+		return assembleJoinedFrame(f, right, leftIdxs, rightIdxs, rightGeomCol)
+	}
+	// Slice 20d SoA fast path: single-ring Polygon × single-ring
+	// Polygon with SPIntersects. Bilateral vertex-inside check
+	// plus AoS fallback for edge-crossing-only pairs.
+	if leftIdxs, rightIdxs, ok := sjoinPolygonsInPolygonsFastPath(lGeom, rGeom, pred, workers); ok {
+		return assembleJoinedFrame(f, right, leftIdxs, rightIdxs, rightGeomCol)
+	}
+
+	// AoS path: decode every geometry column once. Right geometries
+	// feed the R-tree; left geometries are cached so we never
+	// re-decode them across rows.
+	//
+	// Note: geometry.PreparedGeometry (Slice 5) is deliberately NOT
+	// used here. Measured on the standard SJoin fixtures (100 non-
+	// overlapping polygons × 10k points and 10k non-overlapping
+	// polygons × 100k points), the R-tree pre-filter is effective
+	// enough that each polygon gets ~1 candidate point on average,
+	// so the SoA amortization ratio never justifies the Prepare
+	// cost (which is proportional to polygon count). The
+	// PreparedGeometry API is available to callers whose workload
+	// actually has many candidates per polygon (dense overlapping
+	// polygons, spatial-index-free refine loops) — see its
+	// docstring for the amortization guidance.
 	rightGeoms, err := decodeGeometryColumn(rGeom)
 	if err != nil {
 		return nil, err
@@ -103,8 +139,6 @@ func (f *Frame) SJoin(right *Frame, leftGeomCol, rightGeomCol string, pred Spati
 	}
 
 	geomPred := pred.toGeometry()
-
-	workers := resolveWorkers(opts...)
 	leftIdxs, rightIdxs := sjoinScan(leftGeoms, rightGeoms, tree, geomPred, workers)
 
 	return assembleJoinedFrame(f, right, leftIdxs, rightIdxs, rightGeomCol)

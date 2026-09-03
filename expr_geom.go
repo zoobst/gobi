@@ -257,6 +257,12 @@ func (n *geomPredicateNode) evalColumnRight(left, right Series) (Series, error) 
 	lcrs, _ := geometry.LookupCRS(geometryCRSFromField(left.field))
 	rcrs, _ := geometry.LookupCRS(geometryCRSFromField(right.field))
 
+	// Slice 14: bbox-reject fast path. Skip ParseWKB on both sides
+	// when the row's paired bboxes fail the predicate's necessary
+	// condition. PredDisjoint is excluded (inverted polarity —
+	// bbox-mismatch → true, not false).
+	bboxReject := n.pred != geometry.PredDisjoint
+
 	pool := memory.DefaultAllocator
 	b := array.NewBooleanBuilder(pool)
 	defer b.Release()
@@ -265,11 +271,27 @@ func (n *geomPredicateNode) evalColumnRight(left, right Series) (Series, error) 
 			b.AppendNull()
 			continue
 		}
-		lg, err := geometry.ParseWKB(leftBin.Value(i))
+		leftWKB := leftBin.Value(i)
+		rightWKB := rightBin.Value(i)
+		if bboxReject {
+			lb, err := geometry.BoundsFromWKB(leftWKB)
+			if err != nil {
+				return Series{}, err
+			}
+			rb, err := geometry.BoundsFromWKB(rightWKB)
+			if err != nil {
+				return Series{}, err
+			}
+			if !geometry.BoundsCompatible(n.pred, lb, rb) {
+				b.Append(false)
+				continue
+			}
+		}
+		lg, err := geometry.ParseWKB(leftWKB)
 		if err != nil {
 			return Series{}, err
 		}
-		rg, err := geometry.ParseWKB(rightBin.Value(i))
+		rg, err := geometry.ParseWKB(rightWKB)
 		if err != nil {
 			return Series{}, err
 		}

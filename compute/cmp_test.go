@@ -84,3 +84,77 @@ func TestCmpParity(t *testing.T) {
 		}
 	}
 }
+
+// TestCmpI64Parity — Slice 23a Int64 comparison kernels vs a
+// scalar oracle across the same size grid as the F64 test (so
+// the SIMD build's non-aligned tail path is exercised on both
+// 2-lane NEON and 4-lane AVX2).
+func TestCmpI64Parity(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 4))
+	sizes := []int{0, 1, 2, 3, 7, 8, 15, 16, 100, 4097}
+	for _, n := range sizes {
+		a := make([]int64, n)
+		for i := range a {
+			a[i] = int64(rng.Uint64()) % 200 // spread of -200..200 after signing
+		}
+		var b int64 = 42
+
+		wantGe := make([]bool, n)
+		wantLe := make([]bool, n)
+		wantGt := make([]bool, n)
+		wantLt := make([]bool, n)
+		for i, v := range a {
+			wantGe[i] = v >= b
+			wantLe[i] = v <= b
+			wantGt[i] = v > b
+			wantLt[i] = v < b
+		}
+
+		gotGe := make([]bool, n)
+		gotLe := make([]bool, n)
+		gotGt := make([]bool, n)
+		gotLt := make([]bool, n)
+		CmpI64Ge(a, b, gotGe)
+		CmpI64Le(a, b, gotLe)
+		CmpI64Gt(a, b, gotGt)
+		CmpI64Lt(a, b, gotLt)
+
+		for i := range n {
+			if gotGe[i] != wantGe[i] {
+				t.Fatalf("n=%d CmpI64Ge[%d]: got %v, want %v (a=%d)", n, i, gotGe[i], wantGe[i], a[i])
+			}
+			if gotLe[i] != wantLe[i] {
+				t.Fatalf("n=%d CmpI64Le[%d]: got %v, want %v", n, i, gotLe[i], wantLe[i])
+			}
+			if gotGt[i] != wantGt[i] {
+				t.Fatalf("n=%d CmpI64Gt[%d]: got %v, want %v", n, i, gotGt[i], wantGt[i])
+			}
+			if gotLt[i] != wantLt[i] {
+				t.Fatalf("n=%d CmpI64Lt[%d]: got %v, want %v", n, i, gotLt[i], wantLt[i])
+			}
+		}
+	}
+}
+
+// TestCountTrue — Slice 23c CountTrue against a scalar oracle
+// across size + selectivity combinations.
+func TestCountTrue(t *testing.T) {
+	rng := rand.New(rand.NewPCG(5, 6))
+	sizes := []int{0, 1, 15, 16, 1023, 1024}
+	for _, n := range sizes {
+		a := make([]bool, n)
+		for i := range a {
+			a[i] = rng.Float64() < 0.3
+		}
+		var want int
+		for _, v := range a {
+			if v {
+				want++
+			}
+		}
+		got := CountTrue(a)
+		if got != want {
+			t.Errorf("n=%d: got %d want %d", n, got, want)
+		}
+	}
+}
