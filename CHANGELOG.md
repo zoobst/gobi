@@ -5,6 +5,176 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.2]
+
+Prepared-geometry MultiPolygon rework + K=1 SJoin fast path. The
+v0.4.1 `PreparedGeometry` eagerly materialized every ring of every
+sub-polygon at `Prepare(MP)` time — a strict regression on
+many-small-polys shapes ("landMP" with hundreds of islands under a
+single feature), because the upfront view materialization dwarfed
+the per-query savings. This release restructures MP prep to lazy
+per-sub-polygon slots + an inner R-tree, adds a batch query entry
+point (`TestPointsPrepared`), wires the Points × Polygons SJoin
+refine kernel onto the new API, and gates a K=1 fast path that
+skips both R-trees when the right side has exactly one non-null
+polygon.
+
+Every entry below is a **pure addition or internal refactor with
+unchanged public signatures** on the AoS surface. The new prepared
+APIs (`TestPointPrepared`, `TestPointsPrepared`) sit alongside the
+existing `TestPrepared` — no callers forced to migrate.
+
+### Added
+
+#### Prepared-geometry batch API
+
+- **[`geometry.TestPointPrepared(pred, x, y, prep) bool`](geometry/prepared.go)**
+  — single-point entry point that skips the `Prepare(Point{...})`
+  interface-boxing that `TestPrepared` would incur. Same fast-path
+  shapes as `TestPrepared` (Point × Polygon and Point × MultiPolygon
+  for `PredIntersects` / `PredWithin`); every other pred/shape
+  transparently falls through to per-call `Test`.
+
+- **[`geometry.TestPointsPrepared(pred, xs, ys, prep, out)`](geometry/prepared.go)**
+  — batch API for evaluating a predicate over N points against a
+  single prepared geometry. Semantics match a per-index
+  `Test(pred, Point{X: xs[i], Y: ys[i]}, prep.G)`. Batch wins:
+  ring views / R-tree / bounds materialized once; no per-point
+  interface-boxing; MultiPolygon R-tree search scratch held for
+  the whole batch (single `Pool.Get` at entry, not per point);
+  bbox reject inlined into the loop with no dispatch overhead.
+
+  ```go
+  prep := geometry.Prepare(landMP)
+  out := make([]bool, len(xs))
+  geometry.TestPointsPrepared(geometry.PredIntersects, xs, ys, prep, out)
+  ```
+
+  Panics on `len(xs) != len(ys)` or `len(out) < len(xs)` — matches
+  the compute-package convention.
+
+### Changed
+
+#### PreparedGeometry MultiPolygon layout
+
+- **Eager `multiPolyRings [][]PointsView` → lazy per-slot fields.**
+  `PreparedGeometry` now carries `mpSubBounds []Bounds` (always
+  populated, ~32 bytes per sub-poly), `mpSubRings []atomic.Pointer[mpRingSlot]`
+  (nil until a query touches the slot), and `mpTree *RTree` (built
+  when N ≥ `mpTreeMinSubPolys=16`; below that the linear bbox-reject
+  scan is faster on the cache-friendly slab).
+
+  Query cost model:
+
+  - **N < 16**: O(N) bbox-compares + k PIPs via linear scan.
+  - **N ≥ 16**: O(log N + k) via inner R-tree; ring views for the
+    hit sub-polygons materialize on-demand via
+    `atomic.Pointer.Store` publish. Concurrent readers on the same
+    slot may both allocate — the winning `Store` is observed by
+    every reader; the loser's slice is garbage-collected. Both
+    writes are semantically identical (same slabs, same order), so
+    the race is benign.
+
+  Motivating shape: `Prepare(landMP)` with 200 disjoint island
+  squares now pays a bounded upfront cost (200 bounds + 200 atomic
+  pointer slots + one R-tree build) plus per-query ring-view
+  materialization proportional to hits (~1 per query), not to N.
+  The pre-review path materialized 200 sub-polygons' ring views up
+  front regardless of query pattern.
+
+- **[`geometry.PrepareFromWKB`](geometry/wkb_view.go)** for
+  MultiPolygon inputs now populates the atomic slots eagerly using
+  the ring views already produced by the WKB walk, then builds the
+  inner R-tree when N ≥ 16. Same slot layout as `Prepare(MP)` so
+  downstream `TestPointPrepared` / `TestPointsPrepared` calls
+  route identically.
+
+#### SJoin Points × Polygons refine kernel
+
+- **`sjoinPointsScanRange` refine: `PIPInclusiveFromWKB(wkb)` →
+  `TestPointPrepared(prep)`.** Right-side polygons are prepared
+  once via `PrepareFromWKB` in a sequential pass before the worker
+  fan-out; workers then only READ prep. Each candidate hit reads
+  pre-materialized SoA slabs instead of re-walking the WKB blob
+  per call. Concurrent-safe against the shared prep (lazy MP slots
+  use atomic publish per above); the per-worker RTree search
+  scratch remains local.
+
+- **K=1 right-driven fast path
+  ([`sjoinPointsSinglePrepBatch`](sjoin_fast.go)).** When the right
+  frame has exactly one non-null polygon (the common landMP shape:
+  millions of query points × one MultiPolygon-with-hundreds-of-islands),
+  skip both R-trees and dispatch straight to `TestPointsPrepared`.
+  The pre-review path built a 1-item right R-tree, queried it N
+  times returning the same candidate each call, then refined via
+  `PIPInclusiveFromWKB` — pure overhead vs a direct batch call.
+  Parallel shards partition the compacted `(xs, ys, rows)` slabs
+  into `out[s:e]` ranges — no cross-worker synchronization.
+  Break-even for K > 1 stays on the left-driven path (right-driven
+  with a left R-tree does strictly more tree work at typical N ≫ K
+  ratios); K=1 is the only shape where skipping both trees wins.
+
+### Performance
+
+- **RTree DFS traversal stack pool
+  ([`rtreeSearchStackPool`](geometry/rtree.go)).** Every
+  `RTree.SearchInto` call previously allocated a fresh `[]int32`
+  stack for the DFS traversal. Now pooled as `*[]int32` (per
+  sync.Pool best practice — storing `[]T` directly re-boxes the
+  slice header on every `Put`), with initial cap 64 covering
+  `RTreeNodeSize * ~4 levels` for typical tree depths. Reset to
+  `[:0]` before `Put`, preserving grown capacity. Hot-loop callers
+  (SJoin refine, prepared MP query, dissolve) converge on a single
+  reused backing array per goroutine.
+
+- **Prepared MP tree-search buffer pool
+  ([`mpTreeSearchBufPool`](geometry/prepared.go)).** Amortizes the
+  inner-R-tree search scratch across per-call MP queries. Same
+  `*[]int32` shape. Batch callers (`TestPointsPrepared`) invoke
+  the core with a locally-held scratch to avoid pool `Get`/`Put`
+  per point — the pool is held once at batch entry.
+
+### Fixed
+
+- **`multiPolyRings` no longer materialized for MP inputs at
+  `Prepare` time**, closing the pre-review regression on
+  many-small-polys shapes where eager ring materialization
+  dwarfed per-query savings.
+
+### Tests
+
+- Threshold contract
+  ([`TestPrepare_MultiPolygon_TreeThreshold`](geometry/prepared_test.go))
+  — Prepare(MP) with N < 16 builds no tree; N ≥ 16 builds one.
+- Laziness contract
+  ([`TestPrepare_MultiPolygon_LazyRingViews`](geometry/prepared_test.go))
+  — after one query hitting sub-polygon `i`, only slot `i` is
+  populated; every other `mpSubRings` slot stays nil.
+- Concurrent-publish contracts
+  ([`TestTestPrepared_MP_ConcurrentPublish_NoRace`](geometry/prepared_test.go)
+  + `_ConcurrentSameSlot_NoRace`) — 4 goroutines on distinct
+  slots + 8 goroutines racing on the SAME slot. `-race` flags
+  any regression to a plain assignment; the post-join populated-
+  slot invariant catches slot-mixup bugs `-race` can't see.
+- Parity across all four SJoin K=1 dispatch paths
+  ([sjoin_fast_test.go](sjoin_fast_test.go)):
+  `TestSJoin_PointsInSingleMP_ParityWithAoS` (tree branch of
+  `mpQueryPointCore`), `_SPWithin_ParityWithAoS` (predicate
+  mapping), `_SubThreshold_ParityWithAoS` (linear branch,
+  N < 16), `TestSJoin_PointsInSinglePolygon_ParityWithAoS`
+  (`testPointsVsPolygonBatch` route). Each uses the indexed-name
+  frame builders so pair identity is `(name, name_right)`
+  tuple-compared, not just row-counted.
+- Parallel K=1 race guard
+  ([`TestSJoin_PointsInSingleMP_ParallelPath_NoRace`](sjoin_fast_test.go))
+  — `SJoinMinParallelRows + 500` left points force the shard
+  fan-out; workers write to disjoint `out[s:e]` sub-slices.
+- Benchmarks:
+  [`BenchmarkPrepare_MP_LandShape`](geometry/prepared_test.go),
+  [`BenchmarkTestPointsPrepared_MP_LandShape`](geometry/prepared_test.go),
+  [`BenchmarkSJoin_10kPointsInSingleLandMP`](sjoin_fast_test.go)
+  — quantify the eager→lazy transition and the K=1 batch win.
+
 ## [v0.4.1]
 
 Geometry-package struct-of-arrays push (Slices 1–4), spatial-predicate

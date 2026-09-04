@@ -55,11 +55,72 @@ func sjoinPointsInPolygonsFastPath(
 		return nil, nil, false
 	}
 
-	tree := geometry.NewRTree(rightBounds)
 	n := len(leftPts)
 
+	// Prep each right polygon once. PrepareFromWKB materializes the
+	// SoA views + (for MultiPolygons ≥ 16 sub-polys) an inner R-tree
+	// over sub-poly bboxes. Sharing prep across left rows means each
+	// candidate hit uses cached slabs instead of re-walking WKB via
+	// PIPInclusiveFromWKB (which was the pre-batch-API refine
+	// kernel). Nil-slotted for null / parse-error rows.
+	//
+	// Built sequentially before worker fan-out: workers then only
+	// READ prep, and the MultiPolygon lazy ring-view slots use
+	// atomic publish so concurrent readers race benignly. Sequential
+	// build cost is O(sum right-side vertices) — cheap compared to
+	// N × refine work for typical N >> K workloads.
+	rightPreps := make([]geometry.PreparedGeometry, len(rightWKBs))
+	nonNullRightCount := 0
+	soleRightIdx := -1
+	for i, wkb := range rightWKBs {
+		if wkb == nil {
+			continue
+		}
+		prep, perr := geometry.PrepareFromWKB(wkb)
+		if perr != nil {
+			// Skip this row — it'll contribute no pairs. The
+			// left-driven scan skips prep.G == nil slots.
+			continue
+		}
+		rightPreps[i] = prep
+		nonNullRightCount++
+		soleRightIdx = i
+	}
+
+	geomPred := pred.toGeometry()
+
+	// K = 1 right-driven fast path. When there's exactly one non-null
+	// right polygon, both R-trees are pointless work — we can't
+	// prune anything on the right (one candidate always), and
+	// building a right R-tree of size 1 wastes an allocation.
+	// Batch-test every left point against the sole prep directly.
+	// Emits pairs in left-row order, matching the left-driven output.
+	//
+	// This is the shape that motivated the batch API: a single
+	// prepared MultiPolygon (e.g., landMP with hundreds of islands
+	// under one row) against millions of query points. The
+	// left-driven path would build a 1-item R-tree, query it N
+	// times returning the same 1 candidate each time, then refine —
+	// pure overhead vs a straight batch call.
+	//
+	// Break-even analysis for K > 1:
+	//   - Right-driven with left R-tree: O(N log N + K log N) tree +
+	//     O(N + hits) refine.
+	//   - Left-driven with right R-tree (current): O(K log K + N log K)
+	//     tree + O(N + hits) refine.
+	// For N ≫ K, N log N > N log K, so right-driven does strictly
+	// more tree work. The batch API's efficiency wins (cache-hot
+	// polygon SoA, no pool churn) can't offset the extra tree work
+	// at typical N/K ratios. Gate stays at K == 1.
+	if nonNullRightCount == 1 {
+		l, r := sjoinPointsSinglePrepBatch(leftPts, rightPreps[soleRightIdx], soleRightIdx, geomPred, workers)
+		return l, r, true
+	}
+
+	tree := geometry.NewRTree(rightBounds)
+
 	if workers <= 1 || n < SJoinMinParallelRows {
-		l, r := sjoinPointsScanRange(leftPts, rightWKBs, tree, 0, n, nil)
+		l, r := sjoinPointsScanRange(leftPts, rightPreps, tree, geomPred, 0, n, nil)
 		return l, r, true
 	}
 
@@ -78,7 +139,7 @@ func sjoinPointsInPolygonsFastPath(
 		idx, s, e := w, start, end
 		wg.Go(func() {
 			var scratch []int32
-			l, r := sjoinPointsScanRange(leftPts, rightWKBs, tree, s, e, scratch)
+			l, r := sjoinPointsScanRange(leftPts, rightPreps, tree, geomPred, s, e, scratch)
 			shards[idx] = shard{l: l, r: r}
 		})
 	}
@@ -104,12 +165,25 @@ type sjoinPoint struct {
 	null bool
 }
 
-// sjoinPointsScanRange evaluates PIPInclusiveFromWKB for each
-// left-point × R-tree-candidate pair in [start, end).
+// sjoinPointsScanRange evaluates TestPointPrepared for each
+// left-point × R-tree-candidate pair in [start, end). Refine
+// kernel is the prepared-geometry batch API's single-point
+// entry — reads pre-materialized SoA slabs instead of re-walking
+// the WKB blob per hit (the pre-wire kernel was
+// geometry.PIPInclusiveFromWKB per candidate, which paid the
+// WKB parse cost every call).
+//
+// PredWithin(point, poly) ≡ PredIntersects(point, poly) for the
+// Points × Polygons shape (both reduce to "does the polygon
+// contain the point, boundary-inclusive"), so we always call
+// TestPointPrepared with the caller's original predicate; the
+// prepared layer maps both to the same qContainsOrBoundary
+// question internally.
 func sjoinPointsScanRange(
 	leftPts []sjoinPoint,
-	rightWKBs [][]byte,
+	rightPreps []geometry.PreparedGeometry,
 	tree *geometry.RTree,
+	pred geometry.Predicate,
 	start, end int,
 	scratch []int32,
 ) (leftIdxs, rightIdxs []int) {
@@ -124,16 +198,95 @@ func sjoinPointsScanRange(
 		q := geometry.Bounds{MinX: p.x, MinY: p.y, MaxX: p.x, MaxY: p.y}
 		scratch = tree.SearchInto(scratch, q)
 		for _, rIdx := range scratch {
-			wkb := rightWKBs[rIdx]
-			if wkb == nil {
+			prep := rightPreps[rIdx]
+			if prep.G == nil {
+				// Null / parse-error row from the upstream Prep
+				// pass — skip.
 				continue
 			}
-			inside, err := geometry.PIPInclusiveFromWKB(wkb, p.x, p.y)
-			if err != nil || !inside {
+			if !geometry.TestPointPrepared(pred, p.x, p.y, prep) {
 				continue
 			}
 			leftIdxs = append(leftIdxs, lRow)
 			rightIdxs = append(rightIdxs, int(rIdx))
+		}
+	}
+	return leftIdxs, rightIdxs
+}
+
+// sjoinPointsSinglePrepBatch runs the K=1 right-driven fast path:
+// batch-tests every non-null left point against a single prepared
+// right polygon and emits (leftRow, rIdx) pairs for hits.
+//
+// Compacts non-null (x, y) + parallel row IDs into contiguous
+// slabs sequentially, then dispatches TestPointsPrepared over
+// disjoint slab ranges to worker goroutines. Each shard writes
+// to its own slice of the shared `out` buffer — no cross-worker
+// synchronization needed. Pair emission runs sequentially after
+// all shards join.
+//
+// Sequential compact is O(N) with 3 slab allocs (~24 bytes per
+// left row). For N = 1M that's ~24 MB of transient scratch, on
+// the order of the leftPts slice itself — acceptable overhead
+// for the batch shape. If future memory pressure demands it, a
+// mask-aware variant of TestPointsPrepared could skip the
+// compact entirely.
+func sjoinPointsSinglePrepBatch(
+	leftPts []sjoinPoint,
+	prep geometry.PreparedGeometry,
+	rIdx int,
+	pred geometry.Predicate,
+	workers int,
+) (leftIdxs, rightIdxs []int) {
+	// prep.G == nil is unreachable from the SJoin caller — it
+	// only invokes this after counting nonNullRightCount == 1
+	// off the same rightPreps slice. TestPointsPrepared handles
+	// nil-G defensively (writes false to every out) so even a
+	// caller mistake degrades to a correct empty result, not a
+	// panic.
+	n := len(leftPts)
+	xs := make([]float64, 0, n)
+	ys := make([]float64, 0, n)
+	rows := make([]int32, 0, n)
+	for i, p := range leftPts {
+		if p.null {
+			continue
+		}
+		xs = append(xs, p.x)
+		ys = append(ys, p.y)
+		rows = append(rows, int32(i))
+	}
+	if len(xs) == 0 {
+		return nil, nil
+	}
+	out := make([]bool, len(xs))
+
+	if workers <= 1 || len(xs) < SJoinMinParallelRows {
+		geometry.TestPointsPrepared(pred, xs, ys, prep, out)
+	} else {
+		w := min(workers, len(xs))
+		chunk := (len(xs) + w - 1) / w
+		var wg sync.WaitGroup
+		for i := range w {
+			start := i * chunk
+			end := min(start+chunk, len(xs))
+			if start >= end {
+				continue
+			}
+			s, e := start, end
+			wg.Go(func() {
+				geometry.TestPointsPrepared(pred, xs[s:e], ys[s:e], prep, out[s:e])
+			})
+		}
+		wg.Wait()
+	}
+
+	// Emit hit pairs in left-row order (rows[] is monotonically
+	// non-decreasing since compact preserved order).
+	for k, hit := range out {
+		if hit {
+			leftIdxs = append(leftIdxs, int(rows[k]))
+			rightIdxs = append(rightIdxs, rIdx)
 		}
 	}
 	return leftIdxs, rightIdxs

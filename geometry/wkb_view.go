@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sync/atomic"
 )
 
 // LineStringViewFromWKB parses a LineString or LineStringZ WKB
@@ -266,10 +267,32 @@ func PrepareFromWKB(data []byte) (PreparedGeometry, error) {
 			return PreparedGeometry{}, err
 		}
 		mp := multiPolygonFromRingViews(polys, hasZ)
+		// The WKB walk already produced every sub-polygon's ring
+		// views — pre-populate the atomic slots so bbox-hits skip
+		// re-materialization. Sub-polygons that queries never touch
+		// still cost the tree-build + bbox-slab; we can't skip those
+		// without a second pass, and the WKB parse already paid the
+		// ring-alloc cost anyway. Compared to the pre-review code
+		// this saves nothing in the "all polygons queried" case but
+		// gains the tree/bbox-reject skip everywhere else.
+		n := len(polys)
+		subBounds := make([]Bounds, n)
+		subRings := make([]atomic.Pointer[mpRingSlot], n)
+		for i, rings := range polys {
+			subBounds[i] = boundsFromRingViews(rings)
+			slot := &mpRingSlot{rings: rings}
+			subRings[i].Store(slot)
+		}
+		var tree *RTree
+		if n >= mpTreeMinSubPolys {
+			tree = NewRTree(subBounds)
+		}
 		return PreparedGeometry{
-			G:              mp,
-			Bounds:         boundsFromMultiPolygonViews(polys),
-			multiPolyRings: polys,
+			G:           mp,
+			Bounds:      boundsFromMultiPolygonViews(polys),
+			mpSubBounds: subBounds,
+			mpSubRings:  subRings,
+			mpTree:      tree,
 		}, nil
 	default:
 		g, err := ParseWKB(data)

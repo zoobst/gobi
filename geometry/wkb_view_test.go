@@ -191,8 +191,11 @@ func TestPrepareFromWKB_NonPolygonFallsThrough(t *testing.T) {
 	if p.polyRings != nil {
 		t.Errorf("polyRings should be nil for LineString, got %+v", p.polyRings)
 	}
-	if p.multiPolyRings != nil {
-		t.Errorf("multiPolyRings should be nil for LineString")
+	if p.mpSubBounds != nil {
+		t.Errorf("mpSubBounds should be nil for LineString")
+	}
+	if p.mpTree != nil {
+		t.Errorf("mpTree should be nil for LineString")
 	}
 	if _, ok := p.G.(LineString); !ok {
 		t.Errorf("G should be LineString, got %T", p.G)

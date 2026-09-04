@@ -289,3 +289,176 @@ func pairStrLess(a, b [2]string) bool {
 }
 
 var _ = geometry.WKB // keep import stable
+
+// buildIndexedPointCloud — n uniformly random points in [0, extent)²
+// with unique names. Shared helper for the K=1 SJoin fast path
+// where the left side is a large point cloud and the right side
+// is a single (multi)polygon.
+func buildIndexedPointCloud(t testing.TB, n int, extent float64, prefix string, seed1, seed2 uint64) *Frame {
+	t.Helper()
+	pool := memory.DefaultAllocator
+	nameB := array.NewStringBuilder(pool)
+	defer nameB.Release()
+	geomB := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
+	defer geomB.Release()
+	rng := rand.New(rand.NewPCG(seed1, seed2))
+	for i := range n {
+		nameB.Append(fmt.Sprintf("%s-%d", prefix, i))
+		pt := geometry.Point{
+			X:        rng.Float64() * extent,
+			Y:        rng.Float64() * extent,
+			CRSValue: geometry.WGS84,
+		}
+		geomB.Append(geometry.WKB(pt))
+	}
+	return newIndexedFrame(t, nameB, geomB)
+}
+
+// buildSinglePolygonFrame — right side with EXACTLY ONE Polygon
+// row (not MultiPolygon). Exercises the testPointsVsPolygonBatch
+// path inside the K=1 SJoin fast path, which the MultiPolygon
+// fixtures don't hit (they route through
+// testPointsVsMultiPolygonBatch → mpQueryPointCore).
+func buildSinglePolygonFrame(t testing.TB, extent float64, prefix string) *Frame {
+	t.Helper()
+	pool := memory.DefaultAllocator
+	nameB := array.NewStringBuilder(pool)
+	defer nameB.Release()
+	geomB := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
+	defer geomB.Release()
+	// One big square centered at (extent/2, extent/2) covering the
+	// middle 60% of the extent. Guarantees a mix of hits, boundary
+	// contacts, and misses when queried against a uniform point
+	// cloud over [0, extent).
+	c := extent / 2
+	h := extent * 0.3
+	poly := geometry.Polygon{Rings: [][]geometry.Point{{
+		{X: c - h, Y: c - h},
+		{X: c + h, Y: c - h},
+		{X: c + h, Y: c + h},
+		{X: c - h, Y: c + h},
+		{X: c - h, Y: c - h},
+	}}, CRSValue: geometry.WGS84}
+	nameB.Append(prefix + "-poly")
+	geomB.Append(geometry.WKB(poly))
+	return newIndexedFrame(t, nameB, geomB)
+}
+
+// buildSingleMultiPolygonFrame — right side with EXACTLY ONE
+// MultiPolygon row, laid out as `nSubPolys` unit squares striding
+// across the extent. Approximates the landMP shape (Mediterranean
+// islands as a single feature).
+func buildSingleMultiPolygonFrame(t testing.TB, nSubPolys int, extent float64, prefix string) *Frame {
+	t.Helper()
+	pool := memory.DefaultAllocator
+	nameB := array.NewStringBuilder(pool)
+	defer nameB.Release()
+	geomB := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
+	defer geomB.Release()
+	polys := make([]geometry.Polygon, nSubPolys)
+	stride := extent / float64(nSubPolys)
+	for i := range nSubPolys {
+		cx := (float64(i) + 0.5) * stride
+		cy := extent / 2
+		h := stride * 0.3
+		polys[i] = geometry.Polygon{Rings: [][]geometry.Point{{
+			{X: cx - h, Y: cy - h},
+			{X: cx + h, Y: cy - h},
+			{X: cx + h, Y: cy + h},
+			{X: cx - h, Y: cy + h},
+			{X: cx - h, Y: cy - h},
+		}}}
+	}
+	mp := geometry.MultiPolygon{Polygons: polys, CRSValue: geometry.WGS84}
+	nameB.Append(prefix + "-mp")
+	geomB.Append(geometry.WKB(mp))
+	return newIndexedFrame(t, nameB, geomB)
+}
+
+// TestSJoin_PointsInSingleMP_ParityWithAoS — K=1 right-driven
+// fast path parity. Constructs a many-small-polys MultiPolygon
+// (≥ mpTreeMinSubPolys, so mpQueryPointCore takes the tree
+// branch) as a single right row and joins against a point cloud.
+// The sjoinPointsSinglePrepBatch path fires when the right frame
+// has exactly one non-null polygon; results must match the AoS
+// oracle exactly (order-insensitive multiset compare).
+func TestSJoin_PointsInSingleMP_ParityWithAoS(t *testing.T) {
+	right := buildSingleMultiPolygonFrame(t, 32, 10, "R")
+	left := buildIndexedPointCloud(t, 500, 10, "L", 0xAAAA, 0xBBBB)
+	compareSJoinAgainstAoS(t, left, right, "PointsInSingleMP")
+}
+
+// TestSJoin_PointsInSingleMP_SPWithin_ParityWithAoS — same shape
+// with SPWithin. Both SPIntersects and SPWithin reduce to
+// qContainsOrBoundary inside TestPointPrepared for the
+// Point×MultiPolygon shape, but they take different branches in
+// the SJoin dispatcher and AoS oracle — parity has to hold for
+// both.
+func TestSJoin_PointsInSingleMP_SPWithin_ParityWithAoS(t *testing.T) {
+	right := buildSingleMultiPolygonFrame(t, 32, 10, "R")
+	left := buildIndexedPointCloud(t, 500, 10, "L", 0xC0C0, 0xB0B0)
+	compareSJoinAgainstAoSPred(t, left, right, SPWithin, "PointsInSingleMP_Within")
+}
+
+// TestSJoin_PointsInSingleMP_SubThreshold_ParityWithAoS — K=1 with
+// a sub-threshold MultiPolygon (nSubPolys < mpTreeMinSubPolys=16),
+// so mpQueryPointCore's linear bbox-reject scan runs instead of
+// the R-tree path. Previously exercised only by the geometry-
+// package prepared tests; this test locks it in at the SJoin
+// level so a future refactor that flips the threshold or drops
+// the linear branch has to break this parity check.
+func TestSJoin_PointsInSingleMP_SubThreshold_ParityWithAoS(t *testing.T) {
+	right := buildSingleMultiPolygonFrame(t, 8, 10, "R") // < 16
+	left := buildIndexedPointCloud(t, 500, 10, "L", 0xDEAD, 0xBEEF)
+	compareSJoinAgainstAoS(t, left, right, "PointsInSingleMP_Sub")
+}
+
+// TestSJoin_PointsInSinglePolygon_ParityWithAoS — K=1 fast path
+// over a plain Polygon (not MultiPolygon) right row. Exercises
+// testPointsVsPolygonBatch, which the MP fixtures never reach.
+// Parity has to hold against the AoS oracle for both interior
+// and boundary-inclusive hits.
+func TestSJoin_PointsInSinglePolygon_ParityWithAoS(t *testing.T) {
+	right := buildSinglePolygonFrame(t, 10, "R")
+	left := buildIndexedPointCloud(t, 500, 10, "L", 0xFEED, 0xFACE)
+	compareSJoinAgainstAoS(t, left, right, "PointsInSinglePolygon")
+}
+
+// TestSJoin_PointsInSingleMP_ParallelPath_NoRace — exercises the
+// K=1 parallel shard path with the race detector. Uses >
+// SJoinMinParallelRows so TestPointsPrepared gets dispatched
+// across worker goroutines writing to disjoint slices of a
+// shared out buffer.
+func TestSJoin_PointsInSingleMP_ParallelPath_NoRace(t *testing.T) {
+	right := buildSingleMultiPolygonFrame(t, 20, 10, "R")
+	n := SJoinMinParallelRows + 500
+	left := buildIndexedPointCloud(t, n, 10, "L", 0x1234, 0x5678)
+	got, err := left.SJoin(right, "geometry", "geometry", SPIntersects)
+	if err != nil {
+		t.Fatalf("SJoin: %v", err)
+	}
+	if got.NumRows() == 0 {
+		t.Fatal("expected some matches on point-cloud × landMP shape")
+	}
+}
+
+// BenchmarkSJoin_10kPointsInSingleLandMP measures the K=1
+// right-driven fast path on the landMP-shaped workload that
+// motivated the batch API: many points × one MultiPolygon
+// carrying hundreds of small sub-polygons. The pre-K=1-gate
+// path built a 1-item right R-tree, queried it 10k times
+// returning the same candidate each call, then refined via
+// PIPInclusiveFromWKB — pure overhead vs a direct batch call.
+func BenchmarkSJoin_10kPointsInSingleLandMP(b *testing.B) {
+	right := buildSingleMultiPolygonFrame(b, 100, 10, "R")
+	left := buildIndexedPointCloud(b, 10_000, 10, "L", 0xC0DE, 0xBEEF)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		got, err := left.SJoin(right, "geometry", "geometry", SPIntersects)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = got
+	}
+}

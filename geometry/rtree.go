@@ -3,7 +3,29 @@ package geometry
 import (
 	"math"
 	"sort"
+	"sync"
 )
+
+// rtreeSearchStackPool amortizes the DFS traversal stack alloc
+// inside SearchInto across queries. Each Get returns a *[]int32
+// (pointer-to-slice, per sync.Pool best practice — storing []T
+// directly boxes the slice header on every Put).
+//
+// The initial cap of 64 covers RTreeNodeSize (16) × ~4 levels
+// of pending-descent nodes, which is the worst-case active
+// stack size for typical tree depths (N up to ~65k items). Deeper
+// trees grow the stack via append and the pool retains the grown
+// capacity.
+//
+// Tree traversal is stack-local to each SearchInto call — no
+// cross-goroutine sharing needed — so the pool cleanly parallels
+// the concurrent-Search use case.
+var rtreeSearchStackPool = sync.Pool{
+	New: func() any {
+		s := make([]int32, 0, 64)
+		return &s
+	},
+}
 
 // RTreeNodeSize is the maximum number of children in an R-tree node. Values
 // around 16 balance memory density and traversal cost.
@@ -103,7 +125,15 @@ func (t *RTree) SearchInto(buf []int32, q Bounds) []int32 {
 	if t.root < 0 || !t.nodeIntersectsQ(t.root, q) {
 		return out
 	}
-	stack := []int32{t.root}
+	// Pool the DFS stack. Pool-Put restores len to 0 but preserves
+	// grown cap; hot-loop callers (SJoin refine, prepared MP query)
+	// converge on a single reused backing array per goroutine.
+	stackPtr := rtreeSearchStackPool.Get().(*[]int32)
+	stack := append(*stackPtr, t.root)
+	defer func() {
+		*stackPtr = stack[:0]
+		rtreeSearchStackPool.Put(stackPtr)
+	}()
 	for len(stack) > 0 {
 		idx := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
