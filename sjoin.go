@@ -64,6 +64,16 @@ func (p SpatialPredicate) toGeometry() geometry.Predicate {
 // so each left row scans only overlapping candidates. Parallelism follows
 // the priority order documented on resolveWorkers: Workers(n) > package
 // SetMaxParallelism > GOMAXPROCS.
+//
+// # CRS handling
+//
+// SJoin does NOT validate that left and right geometries share a CRS. Both
+// the AoS and SoA fast paths compare coordinates in whatever native unit the
+// WKB carries; joining WGS84 lat/lon against a projected EPSG:3857 column
+// silently produces bogus matches. Callers must reproject upstream (e.g.
+// Series.To(crs)) to ensure the two columns are in the same CRS before
+// calling SJoin. This is a known limitation, tracked as a future correctness
+// hardening pass — surfacing here so tests + callers can plan for it.
 func (f *Frame) SJoin(right *Frame, leftGeomCol, rightGeomCol string, pred SpatialPredicate, opts ...Option) (*Frame, error) {
 	lGeom, err := f.Column(leftGeomCol)
 	if err != nil {

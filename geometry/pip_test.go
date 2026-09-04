@@ -140,7 +140,11 @@ func TestPIPFromWKB_MatchesPolygonContains(t *testing.T) {
 	data := WKB(p)
 
 	rng := rand.New(rand.NewSource(42))
-	for range 200 {
+	// Iteration count raised from 200 → 2000. Boundary-adjacent
+	// query points hit at ~1/1000 on the L-shape's cavity edges;
+	// 200 iters wouldn't catch a scanner divergence on those, and
+	// 2000 still runs in ~1ms.
+	for range 2000 {
 		tx := rng.Float64()*14 - 2 // -2..12
 		ty := rng.Float64()*14 - 2
 		want := p.Contains(Point{X: tx, Y: ty})

@@ -328,11 +328,6 @@ func ringCrossingAndBoundary(data []byte, bo binary.ByteOrder, n, cs int, tx, ty
 	}
 	fx := math.Float64frombits(bo.Uint64(data[0:8]))
 	fy := math.Float64frombits(bo.Uint64(data[8:16]))
-	// A single-vertex ring is degenerate; the point-equality check
-	// covers the case where (tx,ty) coincides with the vertex.
-	if n == 1 {
-		return false, tx == fx && ty == fy
-	}
 	inside := false
 	px, py := fx, fy
 	for i := 1; i < n; i++ {

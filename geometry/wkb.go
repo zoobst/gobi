@@ -38,6 +38,20 @@ func coordSize(hasZ bool) int {
 	return 16
 }
 
+// coordsFit reports whether n coordinate tuples of size cs bytes fit in
+// remaining bytes. Overflow-safe: on 32-bit int (max ~2^31-1), an
+// attacker-controlled WKB count field (uint32, up to ~4.3B) times
+// cs=24 wraps int and silently passes a plain `remaining >= n*cs`
+// check, panicking on the subsequent slice. Since cs is always ≥16
+// (never 0), the equivalent `remaining/cs ≥ n` form is safe and cheap.
+// Caller guarantees cs > 0.
+func coordsFit(remaining, n, cs int) bool {
+	if n < 0 || remaining < 0 {
+		return false
+	}
+	return remaining/cs >= n
+}
+
 // ParseWKB decodes a Well-Known Binary geometry. The resulting geometry has
 // no CRS set; callers must supply one from context (e.g. a GeoParquet schema).
 func ParseWKB(data []byte) (Geometry, error) {

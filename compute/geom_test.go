@@ -308,6 +308,61 @@ func TestPIPCrossingCount_ScalarSimdParity(t *testing.T) {
 	}
 }
 
+// TestPolygonCentroidShoelace_NaNInput — a single NaN vertex
+// poisons the shoelace accumulators, so the centroid comes out
+// NaN. Both scalar and SIMD paths agree (NaN Min/Max/Add/Mul
+// all propagate NaN). This test locks in the current
+// NaN-propagates semantics — the alternative (NaN-safe skip)
+// would need explicit filtering in the hot loop and hasn't
+// been argued for.
+func TestPolygonCentroidShoelace_NaNInput(t *testing.T) {
+	// Small ring, one NaN in the middle. Both paths route
+	// through the same body/scalar dispatch depending on n vs
+	// simdMinSize — we only care that the result is NaN, not
+	// which path handled it.
+	xs := []float64{0, 1, 1, math.NaN(), 0}
+	ys := []float64{0, 0, 1, 1, 0}
+	cx, cy, ok := PolygonCentroidShoelace(xs, ys)
+	if !ok {
+		t.Fatal("ok=false on NaN input, want true (kernel doesn't gate on NaN)")
+	}
+	if !math.IsNaN(cx) || !math.IsNaN(cy) {
+		t.Errorf("NaN input produced non-NaN centroid: (%v, %v)", cx, cy)
+	}
+}
+
+// TestBoundsF64_NaNInput — Min/Max propagate NaN (any comparison
+// against NaN is false, so the scalar and SIMD-body paths both
+// leave NaN in the reduced value if it lands in scratch[0]).
+// This locks in the shared behavior — if a future refactor
+// switches to a NaN-skip reduce, the change should be explicit.
+func TestBoundsF64_NaNInput(t *testing.T) {
+	// First lane holds NaN → scratch[0] after Min/Max reduce
+	// will hold NaN and propagate to minX/maxX.
+	xs := []float64{math.NaN(), 1, 2, 3, 4, 5, 6, 7, 8}
+	ys := []float64{0, 1, 2, 3, 4, 5, 6, 7, 8}
+	_, _, mx, my, ok := BoundsF64(xs, ys)
+	if !ok {
+		t.Fatal("ok=false, want true")
+	}
+	// The min-of-xs reduce starts from xs[0]=NaN. Every subsequent
+	// simd.Min(NaN, v) preserves NaN (SIMD hardware) or leaves the
+	// scalar min at NaN because `v < NaN` is false. Either way,
+	// the reduced minX is NaN — that's the shared semantic.
+	// (maxX has the same shape.) We assert the "or NaN" outcome
+	// on X only, since Y is NaN-free and must produce 8.
+	if my != 8 {
+		t.Errorf("maxY: got %v, want 8", my)
+	}
+	// Just verify the X reduce didn't silently drop NaN and
+	// produce a false "safe" bounds — either NaN propagated
+	// (correct) or the reduce would have returned 8 (bug). Test
+	// only the former.
+	if !math.IsNaN(mx) {
+		t.Errorf("NaN input silently dropped: maxX=%v, want NaN (propagation)", mx)
+	}
+}
+
 // oracleToggle is the reference even-odd toggle form (matches
 // geometry.PIPRingFromXY exactly).
 func oracleToggle(xs, ys []float64, tx, ty float64) bool {

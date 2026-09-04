@@ -97,13 +97,19 @@ func (p Polygon) Simplify(tolerance float64) Polygon {
 // that every discarded point lies within tolerance of the segment
 // between its nearest retained neighbors.
 //
-// Backed by SimplifyDPFromXY (Slice 9): converts the []Point input
-// to parallel XY slabs, runs the iterative SoA kernel, and
-// reconstructs the []Point output. On measured workloads this is
+// Backed by simplifyDPKeep (Slice 9 SoA kernel): converts the
+// []Point input to parallel XY slabs, runs the iterative
+// stack+bitmap kernel, and walks the retained-index bitmap to
+// rebuild the []Point output. On measured workloads this is
 // ~5× faster than the classic recursive implementation at n=1M
 // (3.85 s → 0.75 s) and drops memory by three orders of magnitude
 // (5.75 GB → 3.2 MB, 260k allocs → 11 allocs) — the AoS
 // recursion appends O(log n) intermediate slices per split.
+//
+// Preserves Point.Z / HasZ / CRSValue on retained points (post-
+// review fix: the earlier SimplifyDPFromXY-based body silently
+// dropped Z, regressing 3D LineStrings / Polygons that carried
+// altitude through the AoS recursion).
 //
 // Semantics + tie-breaking match the recursive form exactly:
 // argmax uses strict `>` (first occurrence wins), and split order
@@ -118,10 +124,18 @@ func douglasPeucker(points []Point, tolerance float64) []Point {
 		xs[i] = p.X
 		ys[i] = p.Y
 	}
-	outXs, outYs := SimplifyDPFromXY(xs, ys, tolerance)
-	out := make([]Point, len(outXs))
-	for i := range outXs {
-		out[i] = Point{X: outXs[i], Y: outYs[i]}
+	keep := simplifyDPKeep(xs, ys, tolerance)
+	m := 0
+	for _, k := range keep {
+		if k {
+			m++
+		}
+	}
+	out := make([]Point, 0, m)
+	for i, k := range keep {
+		if k {
+			out = append(out, points[i])
+		}
 	}
 	return out
 }

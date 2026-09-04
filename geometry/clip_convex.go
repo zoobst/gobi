@@ -191,12 +191,17 @@ func intersectionSimplyConnected(subject []Point, clip []Point, ccw bool) (allIn
 	if n < 3 {
 		return false, false
 	}
+	// Seed prevInside from the last vertex so the closing edge
+	// (sub[n-1] → sub[0]) is counted by the first loop iteration.
+	// insideCount is populated ONLY by the loop below — the pre-
+	// review body double-counted sub[n-1] by initializing to 1
+	// when prevInside=true and then adding again on iter n-1.
+	// That silently made allInside unreachable-true and only
+	// stayed correct because Slice-18's earlier containment
+	// fast path caught the all-inside case first.
 	prevInside := pointInsideConvexRing(sub[n-1], clip, ccw)
 	insideCount := 0
 	transitions := 0
-	if prevInside {
-		insideCount = 1
-	}
 	for i := range n {
 		inside := pointInsideConvexRing(sub[i], clip, ccw)
 		if inside {
@@ -210,9 +215,6 @@ func intersectionSimplyConnected(subject []Point, clip []Point, ccw bool) (allIn
 		}
 		prevInside = inside
 	}
-	// The closing wrap already accounted for above (started walk
-	// from the last vertex, so the "closing edge" transition is
-	// the first-iteration comparison).
 	allInside = insideCount == n
 	// Safe when either fully contained (transitions == 0) OR a
 	// single enter/exit pair (transitions == 2).

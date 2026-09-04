@@ -136,6 +136,56 @@ func TestCmpI64Parity(t *testing.T) {
 	}
 }
 
+// TestAndChainF64BBox_LengthMismatchPanics — contract lock-in:
+// both scalar and SIMD builds panic on len(a) != len(b), even
+// when one side is empty. Pre-review the SIMD build silently
+// returned on len(a) == 0 (its empty-check preceded the mismatch
+// panic), diverging from the scalar contract; this test guards
+// against re-introducing that shape.
+func TestAndChainF64BBox_LengthMismatchPanics(t *testing.T) {
+	cases := []struct{ na, nb int }{
+		{0, 1}, // empty vs non-empty — the divergence case
+		{1, 0}, // non-empty vs empty
+		{3, 4},
+	}
+	for _, c := range cases {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("na=%d nb=%d: expected panic, got none", c.na, c.nb)
+				}
+			}()
+			a := make([]float64, c.na)
+			b := make([]float64, c.nb)
+			out := make([]bool, max(c.na, c.nb))
+			AndChainF64BBox(a, 0, 1, b, 0, 1, out)
+		}()
+	}
+}
+
+// TestWithinSqDistF64_LengthMismatchPanics — same contract as
+// TestAndChainF64BBox_LengthMismatchPanics for the distance kernel.
+func TestWithinSqDistF64_LengthMismatchPanics(t *testing.T) {
+	cases := []struct{ na, nb int }{
+		{0, 1},
+		{1, 0},
+		{3, 4},
+	}
+	for _, c := range cases {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("na=%d nb=%d: expected panic, got none", c.na, c.nb)
+				}
+			}()
+			lats := make([]float64, c.na)
+			lons := make([]float64, c.nb)
+			out := make([]bool, max(c.na, c.nb))
+			WithinSqDistF64(lats, lons, 0, 0, 1, 1, out)
+		}()
+	}
+}
+
 // TestCountTrue — Slice 23c CountTrue against a scalar oracle
 // across size + selectivity combinations.
 func TestCountTrue(t *testing.T) {

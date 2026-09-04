@@ -12,6 +12,14 @@ import (
 // and runs the Slice-11 min-distance nested loop with a single
 // `math.Sqrt` at the end.
 //
+// # Allocation shape
+//
+// The parse skips `[]Point` materialization but does `append` onto
+// per-role slabs (pointXs/pointYs, polylines). For most workloads
+// this amortizes to a small constant number of `growslice` calls;
+// callers that need strict zero-alloc must pre-scan geometry
+// counts and pass hinted slabs — not a supported entry point today.
+//
 // # Non-intersection assumption
 //
 // This function is a fast path for the (bbox-disjoint → definitely
@@ -28,10 +36,10 @@ import (
 // segment to compare against). Malformed WKB returns an error.
 func PlanarMinDistanceFromWKB(a, b []byte) (float64, error) {
 	var ag, bg distanceGeometry
-	if err := distanceGeometryFromWKB(a, &ag); err != nil {
+	if _, err := distanceGeometryFromWKB(a, &ag); err != nil {
 		return 0, err
 	}
-	if err := distanceGeometryFromWKB(b, &bg); err != nil {
+	if _, err := distanceGeometryFromWKB(b, &bg); err != nil {
 		return 0, err
 	}
 	d2 := planarMinDistanceSquared(&ag, &bg)
@@ -43,66 +51,74 @@ func PlanarMinDistanceFromWKB(a, b []byte) (float64, error) {
 
 // distanceGeometryFromWKB parses a WKB blob directly into the
 // polylines-plus-standalone-vertices representation used by
-// planarMinDistanceSquared. No `[]Point` intermediate — extracts
-// coord slabs while walking the byte stream.
-func distanceGeometryFromWKB(data []byte, dst *distanceGeometry) error {
+// planarMinDistanceSquared. Returns bytes consumed so the caller
+// (top-level or GeometryCollection loop) can advance the cursor
+// without re-parsing the header.
+func distanceGeometryFromWKB(data []byte, dst *distanceGeometry) (int, error) {
 	if len(data) < 5 {
-		return ErrShortWKB
+		return 0, ErrShortWKB
 	}
 	bo, err := byteOrder(data[0])
 	if err != nil {
-		return err
+		return 0, err
 	}
 	typ := bo.Uint32(data[1:5])
 	body := data[5:]
 	switch typ {
 	case wkbPoint:
-		return distancePointFromWKB(body, bo, false, dst)
+		sz, err := distancePointFromWKB(body, bo, false, dst)
+		return 5 + sz, err
 	case wkbPointZ:
-		return distancePointFromWKB(body, bo, true, dst)
+		sz, err := distancePointFromWKB(body, bo, true, dst)
+		return 5 + sz, err
 	case wkbLineString, wkbLineStringZ:
 		hasZ := typ == wkbLineStringZ
-		return distanceLineStringFromWKB(body, bo, hasZ, dst)
+		sz, err := distanceLineStringFromWKB(body, bo, hasZ, dst)
+		return 5 + sz, err
 	case wkbPolygon, wkbPolygonZ:
 		hasZ := typ == wkbPolygonZ
-		_, err := distancePolygonFromWKB(body, bo, hasZ, dst)
-		return err
+		sz, err := distancePolygonFromWKB(body, bo, hasZ, dst)
+		return 5 + sz, err
 	case wkbMultiPoint, wkbMultiPointZ:
 		hasZ := typ == wkbMultiPointZ
-		return distanceMultiPointFromWKB(body, bo, hasZ, dst)
+		sz, err := distanceMultiPointFromWKB(body, bo, hasZ, dst)
+		return 5 + sz, err
 	case wkbMultiLineString, wkbMultiLineStringZ:
 		hasZ := typ == wkbMultiLineStringZ
-		return distanceMultiLineStringFromWKB(body, bo, hasZ, dst)
+		sz, err := distanceMultiLineStringFromWKB(body, bo, hasZ, dst)
+		return 5 + sz, err
 	case wkbMultiPolygon, wkbMultiPolygonZ:
 		hasZ := typ == wkbMultiPolygonZ
-		return distanceMultiPolygonFromWKB(body, bo, hasZ, dst)
+		sz, err := distanceMultiPolygonFromWKB(body, bo, hasZ, dst)
+		return 5 + sz, err
 	case wkbGeometryCollection, wkbGeometryCollectionZ:
-		return distanceGeometryCollectionFromWKB(body, bo, dst)
+		sz, err := distanceGeometryCollectionFromWKB(body, bo, dst)
+		return 5 + sz, err
 	default:
-		return fmt.Errorf("%w: %d", ErrUnsupportedWKB, typ)
+		return 0, fmt.Errorf("%w: %d", ErrUnsupportedWKB, typ)
 	}
 }
 
-func distancePointFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) error {
+func distancePointFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) (int, error) {
 	need := coordSize(hasZ)
 	if len(data) < need {
-		return ErrShortWKB
+		return 0, ErrShortWKB
 	}
 	x := math.Float64frombits(bo.Uint64(data[0:8]))
 	y := math.Float64frombits(bo.Uint64(data[8:16]))
 	dst.pointXs = append(dst.pointXs, x)
 	dst.pointYs = append(dst.pointYs, y)
-	return nil
+	return need, nil
 }
 
-func distanceLineStringFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) error {
+func distanceLineStringFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) (int, error) {
 	if len(data) < 4 {
-		return ErrShortWKB
+		return 0, ErrShortWKB
 	}
 	n := int(bo.Uint32(data[0:4]))
 	cs := coordSize(hasZ)
-	if len(data) < 4+n*cs {
-		return ErrShortWKB
+	if !coordsFit(len(data)-4, n, cs) {
+		return 0, ErrShortWKB
 	}
 	if n < 2 {
 		// Degenerate — treat any lone points as vertex contributions.
@@ -113,15 +129,15 @@ func distanceLineStringFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst 
 			dst.pointXs = append(dst.pointXs, x)
 			dst.pointYs = append(dst.pointYs, y)
 		}
-		return nil
+		return 4 + n*cs, nil
 	}
 	v, err := lineStringViewBody(data, bo, hasZ)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	dst.polylines = append(dst.polylines, v)
 	dst.closed = append(dst.closed, false)
-	return nil
+	return 4 + n*cs, nil
 }
 
 func distancePolygonFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) (int, error) {
@@ -144,9 +160,9 @@ func distancePolygonFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *di
 	return sz, nil
 }
 
-func distanceMultiPointFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) error {
+func distanceMultiPointFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) (int, error) {
 	if len(data) < 4 {
-		return ErrShortWKB
+		return 0, ErrShortWKB
 	}
 	n := int(bo.Uint32(data[0:4]))
 	off := 4
@@ -157,26 +173,26 @@ func distanceMultiPointFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst 
 	}
 	for range n {
 		if len(data) < off+elemSize {
-			return ErrShortWKB
+			return 0, ErrShortWKB
 		}
 		innerBO, err := byteOrder(data[off])
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if innerBO.Uint32(data[off+1:off+5]) != innerType {
-			return fmt.Errorf("%w: expected Point inside MultiPoint", ErrTypeMismatch)
+			return 0, fmt.Errorf("%w: expected Point inside MultiPoint", ErrTypeMismatch)
 		}
-		if err := distancePointFromWKB(data[off+5:off+elemSize], innerBO, hasZ, dst); err != nil {
-			return err
+		if _, err := distancePointFromWKB(data[off+5:off+elemSize], innerBO, hasZ, dst); err != nil {
+			return 0, err
 		}
 		off += elemSize
 	}
-	return nil
+	return off, nil
 }
 
-func distanceMultiLineStringFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) error {
+func distanceMultiLineStringFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) (int, error) {
 	if len(data) < 4 {
-		return ErrShortWKB
+		return 0, ErrShortWKB
 	}
 	n := int(bo.Uint32(data[0:4]))
 	off := 4
@@ -184,33 +200,29 @@ func distanceMultiLineStringFromWKB(data []byte, bo binary.ByteOrder, hasZ bool,
 	if hasZ {
 		innerType = wkbLineStringZ
 	}
-	cs := coordSize(hasZ)
 	for range n {
 		if len(data) < off+5 {
-			return ErrShortWKB
+			return 0, ErrShortWKB
 		}
 		innerBO, err := byteOrder(data[off])
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if innerBO.Uint32(data[off+1:off+5]) != innerType {
-			return fmt.Errorf("%w: expected LineString inside MultiLineString", ErrTypeMismatch)
+			return 0, fmt.Errorf("%w: expected LineString inside MultiLineString", ErrTypeMismatch)
 		}
-		if len(data) < off+5+4 {
-			return ErrShortWKB
+		sz, err := distanceLineStringFromWKB(data[off+5:], innerBO, hasZ, dst)
+		if err != nil {
+			return 0, err
 		}
-		nPts := int(innerBO.Uint32(data[off+5 : off+9]))
-		if err := distanceLineStringFromWKB(data[off+5:], innerBO, hasZ, dst); err != nil {
-			return err
-		}
-		off += 5 + 4 + nPts*cs
+		off += 5 + sz
 	}
-	return nil
+	return off, nil
 }
 
-func distanceMultiPolygonFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) error {
+func distanceMultiPolygonFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, dst *distanceGeometry) (int, error) {
 	if len(data) < 4 {
-		return ErrShortWKB
+		return 0, ErrShortWKB
 	}
 	n := int(bo.Uint32(data[0:4]))
 	off := 4
@@ -220,95 +232,53 @@ func distanceMultiPolygonFromWKB(data []byte, bo binary.ByteOrder, hasZ bool, ds
 	}
 	for range n {
 		if len(data) < off+5 {
-			return ErrShortWKB
+			return 0, ErrShortWKB
 		}
 		innerBO, err := byteOrder(data[off])
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if innerBO.Uint32(data[off+1:off+5]) != innerType {
-			return fmt.Errorf("%w: expected Polygon inside MultiPolygon", ErrTypeMismatch)
+			return 0, fmt.Errorf("%w: expected Polygon inside MultiPolygon", ErrTypeMismatch)
 		}
 		sz, err := distancePolygonFromWKB(data[off+5:], innerBO, hasZ, dst)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		off += 5 + sz
 	}
-	return nil
+	return off, nil
 }
 
-func distanceGeometryCollectionFromWKB(data []byte, bo binary.ByteOrder, dst *distanceGeometry) error {
+func distanceGeometryCollectionFromWKB(data []byte, bo binary.ByteOrder, dst *distanceGeometry) (int, error) {
 	if len(data) < 4 {
-		return ErrShortWKB
+		return 0, ErrShortWKB
 	}
 	n := int(bo.Uint32(data[0:4]))
 	off := 4
 	for range n {
 		if len(data) < off+5 {
-			return ErrShortWKB
+			return 0, ErrShortWKB
 		}
-		// Recurse via the top-level parser. Nested
-		// GeometryCollections are rejected there.
-		remainder := data[off:]
-		if err := distanceGeometryFromWKB(remainder, dst); err != nil {
-			return err
-		}
-		// Advance offset by the size of the consumed inner geometry.
-		// Simplest: re-scan the byte range via a size helper. Since
-		// distanceGeometryFromWKB doesn't return bytes-consumed, use
-		// the WKB-size skip helper family.
-		innerBO, err := byteOrder(remainder[0])
+		// Reject nested GeometryCollection to match ParseWKB's
+		// contract (see decodeGeometryCollectionWKBSized in wkb.go).
+		// Only the type code is inspected — cheaper than recursing
+		// and then unwinding on failure, and avoids mutating dst
+		// with points from the nested collection before the error.
+		innerTyp, _, err := WKBTypeCode(data[off:])
 		if err != nil {
-			return err
+			return 0, err
 		}
-		typ := innerBO.Uint32(remainder[1:5])
-		var innerSize int
-		switch typ {
-		case wkbPoint:
-			innerSize = 5 + 16
-		case wkbPointZ:
-			innerSize = 5 + 24
-		case wkbLineString, wkbLineStringZ:
-			hasZ := typ == wkbLineStringZ
-			sz, err := skipLineString(remainder[5:], innerBO, hasZ)
-			if err != nil {
-				return err
-			}
-			innerSize = 5 + sz
-		case wkbPolygon, wkbPolygonZ:
-			hasZ := typ == wkbPolygonZ
-			sz, err := skipPolygon(remainder[5:], innerBO, hasZ)
-			if err != nil {
-				return err
-			}
-			innerSize = 5 + sz
-		case wkbMultiPoint, wkbMultiPointZ:
-			hasZ := typ == wkbMultiPointZ
-			sz, err := skipMultiPoint(remainder[5:], innerBO, hasZ)
-			if err != nil {
-				return err
-			}
-			innerSize = 5 + sz
-		case wkbMultiLineString, wkbMultiLineStringZ:
-			hasZ := typ == wkbMultiLineStringZ
-			sz, err := skipMultiLineString(remainder[5:], innerBO, hasZ)
-			if err != nil {
-				return err
-			}
-			innerSize = 5 + sz
-		case wkbMultiPolygon, wkbMultiPolygonZ:
-			hasZ := typ == wkbMultiPolygonZ
-			sz, err := skipMultiPolygon(remainder[5:], innerBO, hasZ)
-			if err != nil {
-				return err
-			}
-			innerSize = 5 + sz
-		default:
-			return fmt.Errorf("%w: nested collection or unsupported type %d in GeometryCollection",
-				ErrUnsupportedWKB, typ)
+		if innerTyp == wkbGeometryCollection {
+			return 0, fmt.Errorf("%w: nested GeometryCollection", ErrUnsupportedWKB)
 		}
-		off += innerSize
+		// Recurse via the top-level parser, which now reports the
+		// size consumed — no header re-scan needed here.
+		sz, err := distanceGeometryFromWKB(data[off:], dst)
+		if err != nil {
+			return 0, err
+		}
+		off += sz
 	}
-	return nil
+	return off, nil
 }

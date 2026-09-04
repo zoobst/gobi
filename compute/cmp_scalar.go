@@ -107,10 +107,10 @@ func CmpI64Lt(a []int64, b int64, out []bool) {
 // of over-allocating to full mask length) and any bool-column
 // count/sum reduction.
 //
-// Scalar loop; the SIMD variant in cmp_simd.go uses a packed
-// popcount when the target has one available. Both variants
-// treat any non-false byte value in `a` as true — bool slices
-// from Go are byte-per-element with 0/1 values.
+// Scalar loop over `bool` values — Go's `bool` is a distinct type,
+// not a byte to be truth-tested. The SIMD file (cmp_simd.go) shares
+// this implementation today; if a benchmark ever justifies it, a
+// hand-written popcount would go there.
 func CountTrue(a []bool) int {
 	var n int
 	for _, v := range a {

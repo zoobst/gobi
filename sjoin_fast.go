@@ -213,6 +213,46 @@ func extractRightPolygons(s Series) (wkbs [][]byte, bounds []geometry.Bounds, fa
 	return wkbs, bounds, true, nil
 }
 
+// rightGeomCache is a race-safe lazy cache of the right-side AoS
+// Geometry per row. Each slot's `once` guarantees ParseWKB runs at
+// most once, and the geom / err fields are only ever read after
+// once.Do has returned — so concurrent workers hitting the same
+// slot see the same fully-initialized values without torn reads.
+//
+// Replaces the pre-review "shared []geometry.Geometry with
+// last-writer-wins" pattern, which was incorrect: a
+// geometry.Geometry interface value is two words (type + data
+// pointer), and unsynchronized writes can be observed torn by a
+// concurrent reader — the two words are not guaranteed to update
+// atomically, and even if the same underlying WKB were parsed
+// twice, ParseWKB returns fresh distinct structs each call, so
+// the data pointers differ.
+type rightGeomCache struct {
+	slots []rightGeomSlot
+}
+
+type rightGeomSlot struct {
+	once sync.Once
+	geom geometry.Geometry
+	err  error
+}
+
+func newRightGeomCache(n int) *rightGeomCache {
+	return &rightGeomCache{slots: make([]rightGeomSlot, n)}
+}
+
+// get returns the parsed Geometry for slot i, running ParseWKB
+// via once.Do the first time (concurrent callers block until the
+// first completes). Subsequent calls return the cached value with
+// no synchronization cost beyond the once fast-path.
+func (c *rightGeomCache) get(i int, wkb []byte) (geometry.Geometry, error) {
+	s := &c.slots[i]
+	s.once.Do(func() {
+		s.geom, s.err = geometry.ParseWKB(wkb)
+	})
+	return s.geom, s.err
+}
+
 // sjoinLine is the compact left-row representation for the
 // LineString × Polygon SJoin fast path (Slice 20c). Holds the
 // line's coord slabs plus its bounding box; the WKB blob is
@@ -267,9 +307,10 @@ func sjoinLinesInPolygonsFastPath(
 		return nil, nil, false
 	}
 
-	// Right-side geometry cache — populated lazily on the first
-	// AoS fallback for a given right row. Reused across left rows.
-	rightGeoms := make([]geometry.Geometry, len(rightWKBs))
+	// Right-side geometry cache — lazily populated on the first
+	// AoS fallback for a given right row via sync.Once per slot
+	// (race-safe under concurrent workers).
+	rightGeoms := newRightGeomCache(len(rightWKBs))
 
 	tree := geometry.NewRTree(rightBounds)
 	n := len(leftLines)
@@ -286,12 +327,6 @@ func sjoinLinesInPolygonsFastPath(
 	chunk := (n + workers - 1) / workers
 	type shard struct{ l, r []int }
 	shards := make([]shard, workers)
-	// Note: rightGeoms cache is shared across workers without
-	// mutex protection. ParseWKB is pure and idempotent — writing
-	// the same Geometry twice to a slot is safe (last writer
-	// wins with the same value). Reads see either nil or a valid
-	// Geometry; a nil-read triggers a re-parse. No data race
-	// visible to callers.
 	var wg sync.WaitGroup
 	for w := range workers {
 		start := w * chunk
@@ -332,7 +367,7 @@ func sjoinLinesScanRange(
 	leftLines []sjoinLine,
 	rightWKBs [][]byte,
 	rightConvex []bool,
-	rightGeoms []geometry.Geometry,
+	rightGeoms *rightGeomCache,
 	tree *geometry.RTree,
 	pred SpatialPredicate,
 	start, end int,
@@ -358,14 +393,9 @@ func sjoinLinesScanRange(
 				// AoS fallback — either line grazes polygon
 				// boundary (Intersects) or right polygon is
 				// non-convex (Within).
-				rg := rightGeoms[rIdx]
-				if rg == nil {
-					parsed, err := geometry.ParseWKB(wkb)
-					if err != nil {
-						continue
-					}
-					rg = parsed
-					rightGeoms[rIdx] = rg
+				rg, err := rightGeoms.get(int(rIdx), wkb)
+				if err != nil {
+					continue
 				}
 				lg := geometry.LineString{
 					Points: pointsFromXY(line.xs, line.ys),
@@ -549,16 +579,25 @@ func sjoinPolygonsInPolygonsFastPath(
 
 	rightBounds := make([]geometry.Bounds, len(rightPolys))
 	for i, p := range rightPolys {
-		if !p.null {
-			rightBounds[i] = p.bounds
+		if p.null {
+			// Bounds{} is NOT Empty() — Empty() requires MinX > MaxX
+			// while the zero value has MinX == MaxX == 0. Without
+			// an explicit empty sentinel, the R-tree treats null
+			// rows as a real bbox at the origin and returns them
+			// as candidates for any query touching (0,0), forcing
+			// the refine loop to reject them via `rp.null`. Wasted
+			// CPU. Set the sentinel so the R-tree skips them.
+			rightBounds[i] = geometry.EmptyBounds()
+			continue
 		}
+		rightBounds[i] = p.bounds
 	}
 	tree := geometry.NewRTree(rightBounds)
 
 	// Lazy AoS cache — populated on the first fallback for a given
 	// right row. Reused across workers (see note in
 	// sjoinLinesInPolygonsFastPath about ParseWKB idempotence).
-	rightGeoms := make([]geometry.Geometry, len(rightPolys))
+	rightGeoms := newRightGeomCache(len(rightPolys))
 	n := len(leftPolys)
 
 	scan := func(start, end int, scratch []int32) (l, r []int) {
@@ -606,7 +645,7 @@ func sjoinPolygonsInPolygonsFastPath(
 // fallback shape.
 func sjoinPolysScanRange(
 	leftPolys, rightPolys []sjoinPoly,
-	rightGeoms []geometry.Geometry,
+	rightGeoms *rightGeomCache,
 	tree *geometry.RTree,
 	pred SpatialPredicate,
 	start, end int,
@@ -632,14 +671,9 @@ func sjoinPolysScanRange(
 				// AoS fallback: parse both sides and run the AoS
 				// predicate. The vertex-inside fast paths above
 				// couldn't resolve this pair.
-				rg := rightGeoms[rIdx]
-				if rg == nil {
-					parsed, err := geometry.ParseWKB(rp.wkb)
-					if err != nil {
-						continue
-					}
-					rg = parsed
-					rightGeoms[rIdx] = rg
+				rg, err := rightGeoms.get(int(rIdx), rp.wkb)
+				if err != nil {
+					continue
 				}
 				lg, err := geometry.ParseWKB(lp.wkb)
 				if err != nil {

@@ -1,9 +1,34 @@
 package geometry
 
 import (
+	"runtime"
 	"sort"
 	"sync"
 )
+
+// dissolveGoroutineSem caps the total number of concurrent
+// dissolve fan-out goroutines to GOMAXPROCS. Without this cap,
+// dissolveMergeParallel spawns two goroutines per recursive
+// split, and on a 100k-polygon corpus that means O(N/threshold)
+// blocked goroutines simultaneously — enough to hit the runtime's
+// per-P work-queue limits and starve unrelated work. The
+// semaphore uses a non-blocking `select` acquire: if a slot is
+// free we fan out; otherwise the caller stays on the sequential
+// recursion path (which itself may fan out from a deeper split
+// once slots free up). Sized once at package init from
+// GOMAXPROCS.
+var dissolveGoroutineSem = make(chan struct{}, runtime.GOMAXPROCS(0))
+
+// tryAcquireDissolveGoroutine attempts a non-blocking acquire.
+// Returns a release function on success, nil on failure.
+func tryAcquireDissolveGoroutine() func() {
+	select {
+	case dissolveGoroutineSem <- struct{}{}:
+		return func() { <-dissolveGoroutineSem }
+	default:
+		return nil
+	}
+}
 
 // dissolveParallelThreshold is the smallest subtree size that
 // spawns a goroutine in dissolveMerge. Below this the recursive
@@ -88,11 +113,20 @@ func Dissolve(geoms []Geometry) (Geometry, error) {
 			results[i].merged, results[i].err = dissolveGroup(geoms, idxs, crs)
 			continue
 		}
+		// Same GOMAXPROCS-sized cap as dissolveMergeParallel; if the
+		// semaphore is saturated (heavy inner fan-out already
+		// running) run the cluster inline.
+		release := tryAcquireDissolveGoroutine()
+		if release == nil {
+			results[i].merged, results[i].err = dissolveGroup(geoms, idxs, crs)
+			continue
+		}
 		wg.Add(1)
-		go func(idx int, ids []int) {
+		go func(idx int, ids []int, rel func()) {
 			defer wg.Done()
+			defer rel()
 			results[idx].merged, results[idx].err = dissolveGroup(geoms, ids, crs)
-		}(i, idxs)
+		}(i, idxs, release)
 	}
 	wg.Wait()
 	var polys []Polygon
@@ -250,21 +284,32 @@ func dissolveMerge(geoms []Geometry, idxs []int) (Geometry, error) {
 // into dissolveMerge which itself may fan out further — until
 // each subtree drops below dissolveParallelThreshold and takes
 // the sequential path.
+//
+// Goroutine cap: acquires from dissolveGoroutineSem (sized to
+// GOMAXPROCS). If the semaphore is saturated the right-half
+// runs inline on the caller's goroutine; the left-half still
+// tries for a slot, falling back to inline. Prevents O(N/threshold)
+// goroutine explosion on 100k-polygon corpora.
 func dissolveMergeParallel(geoms []Geometry, idxs []int, mid int) (Geometry, error) {
 	var (
 		leftGeom, rightGeom Geometry
 		leftErr, rightErr   error
 		wg                  sync.WaitGroup
 	)
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
+	leftRelease := tryAcquireDissolveGoroutine()
+	if leftRelease != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer leftRelease()
+			leftGeom, leftErr = dissolveMerge(geoms, idxs[:mid])
+		}()
+	} else {
 		leftGeom, leftErr = dissolveMerge(geoms, idxs[:mid])
-	}()
-	go func() {
-		defer wg.Done()
-		rightGeom, rightErr = dissolveMerge(geoms, idxs[mid:])
-	}()
+	}
+	// Right-half stays inline on the caller — spawning a second
+	// goroutine here would double the semaphore pressure per split.
+	rightGeom, rightErr = dissolveMerge(geoms, idxs[mid:])
 	wg.Wait()
 	if leftErr != nil {
 		return nil, leftErr

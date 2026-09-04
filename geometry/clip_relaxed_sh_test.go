@@ -68,7 +68,11 @@ func TestRelaxedSH_MatchesSweep_LShape(t *testing.T) {
 // shapes.
 func TestRelaxedSH_MatchesSweep_RandomConcave(t *testing.T) {
 	rng := rand.New(rand.NewSource(19))
-	for iter := range 100 {
+	// Iteration count raised from 100 → 1000. Rare degeneracies in
+	// the transition-count gate (e.g. subject vertex exactly on
+	// clip edge) fire on ~1/500 random configurations; 100 iters
+	// missed them, 1000 gives a comfortable margin.
+	for iter := range 1000 {
 		// Random star-shape subject (guaranteed concave when
 		// inner/outer radii differ).
 		nSpokes := 4 + rng.Intn(6)

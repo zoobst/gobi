@@ -97,6 +97,13 @@ func MultiPolygonRingViewsFromWKB(data []byte) ([][]PointsView, error) {
 		return nil, ErrShortWKB
 	}
 	n := int(bo.Uint32(body[0:4]))
+	// Pre-bound n by the byte budget: each inner Polygon WKB is at
+	// least 9 bytes (1 endian + 4 type + 4 numRings=0), so a hostile
+	// 2^30 count field can never fit and would wrap int on 32-bit
+	// during `make([][]PointsView, n)`.
+	if n < 0 || n > (len(body)-4)/9 {
+		return nil, ErrShortWKB
+	}
 	off := 4
 	innerType := wkbPolygon
 	if hasZ {
@@ -134,7 +141,9 @@ func lineStringViewBody(data []byte, bo binary.ByteOrder, hasZ bool) (PointsView
 	}
 	n := int(bo.Uint32(data[0:4]))
 	cs := coordSize(hasZ)
-	if len(data) < 4+n*cs {
+	// coordsFit guards against `n * cs` overflowing int on 32-bit
+	// when a hostile WKB carries a huge count field.
+	if !coordsFit(len(data)-4, n, cs) {
 		return PointsView{}, ErrShortWKB
 	}
 	v := PointsView{
@@ -174,6 +183,13 @@ func polygonRingViewsBody(data []byte, bo binary.ByteOrder, hasZ bool) ([]Points
 	numRings := int(bo.Uint32(data[0:4]))
 	off := 4
 	cs := coordSize(hasZ)
+	// Pre-bound numRings by the byte budget: a Polygon body is at
+	// least 4 bytes (nPts=0 ring) per ring, so numRings can never
+	// exceed (len(data)-4)/4. Guards `make([]PointsView, numRings)`
+	// against a hostile 2^30 count field wrapping int on 32-bit.
+	if numRings < 0 || numRings > (len(data)-4)/4 {
+		return nil, 0, ErrShortWKB
+	}
 	rings := make([]PointsView, numRings)
 	for r := range numRings {
 		if len(data) < off+4 {
@@ -181,7 +197,7 @@ func polygonRingViewsBody(data []byte, bo binary.ByteOrder, hasZ bool) ([]Points
 		}
 		nPts := int(bo.Uint32(data[off : off+4]))
 		off += 4
-		if len(data) < off+nPts*cs {
+		if !coordsFit(len(data)-off, nPts, cs) {
 			return nil, 0, ErrShortWKB
 		}
 		v := PointsView{

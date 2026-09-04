@@ -34,8 +34,6 @@ func SumF64(a []float64) float64 {
 	// lane slice would panic, and we want SumF64([]float64{1,2,3})
 	// to work on 2-lane NEON.
 	laneCount := simd.BroadcastFloat64s(0).Len()
-	scratch := make([]float64, laneCount)
-
 	if len(a) < laneCount {
 		var s float64
 		for _, v := range a {
@@ -43,6 +41,10 @@ func SumF64(a []float64) float64 {
 		}
 		return s
 	}
+	// Stack-allocated scratch, sized for the largest supported
+	// lane count (8 = AVX-512). Matches the cmp_simd.go pattern.
+	var scratchArr [8]float64
+	scratch := scratchArr[:laneCount]
 
 	acc := simd.LoadFloat64s(a)
 	i := laneCount
@@ -69,8 +71,6 @@ func SumI64(a []int64) int64 {
 		return 0
 	}
 	laneCount := simd.BroadcastInt64s(0).Len()
-	scratch := make([]int64, laneCount)
-
 	if len(a) < laneCount {
 		var s int64
 		for _, v := range a {
@@ -78,6 +78,8 @@ func SumI64(a []int64) int64 {
 		}
 		return s
 	}
+	var scratchArr [8]int64
+	scratch := scratchArr[:laneCount]
 
 	acc := simd.LoadInt64s(a)
 	i := laneCount
@@ -114,7 +116,8 @@ func MinF64(a []float64) (float64, bool) {
 		return m, true
 	}
 
-	scratch := make([]float64, laneCount)
+	var scratchArr [8]float64
+	scratch := scratchArr[:laneCount]
 	acc := simd.LoadFloat64s(a)
 	i := laneCount
 	for ; i+laneCount <= len(a); i += laneCount {
@@ -151,7 +154,8 @@ func MaxF64(a []float64) (float64, bool) {
 		return m, true
 	}
 
-	scratch := make([]float64, laneCount)
+	var scratchArr [8]float64
+	scratch := scratchArr[:laneCount]
 	acc := simd.LoadFloat64s(a)
 	i := laneCount
 	for ; i+laneCount <= len(a); i += laneCount {

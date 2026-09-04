@@ -182,8 +182,6 @@ func viewFromPoints(pts []Point, hasZ bool, crs CRS) PointsView {
 	}
 	if hasZ {
 		v.Zs = make([]float64, len(pts))
-	}
-	if hasZ {
 		for i, p := range pts {
 			v.Xs[i] = p.X
 			v.Ys[i] = p.Y

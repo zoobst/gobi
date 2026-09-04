@@ -183,18 +183,50 @@ func (s Series) GeomDissolve() (geometry.Geometry, error) {
 // Both inputs must be well-formed Polygon or MultiPolygon WKB
 // blobs (checked by the caller via WKBTypeCode == 3 or 6). Any
 // nested MultiPolygon has its inner polygons flattened into the
-// output. Result is LE-encoded regardless of input byte order —
-// matches gobi's `appendUint32LE` output convention.
-func combineDisjointMultiPolygonWKB(a, b []byte) []byte {
-	nA, aBodyOff := multiPolygonBodyOffset(a)
-	nB, bBodyOff := multiPolygonBodyOffset(b)
+// output.
+//
+// # Endianness
+//
+// Post-review fix: the fast path now requires both inputs to
+// carry the LE byte-order marker (`data[0] == 1`). The earlier
+// body force-normalized the outer header to LE but appended
+// inner polygon bytes verbatim — if a source was BE that
+// produced a mixed-endian blob. OGC spec allows per-member BOMs,
+// but many readers (gobi's own ParseWKB included, historically)
+// assume uniform endianness within a blob, so mixed output is
+// a foot-gun. Returns (result, ok). ok=false means the caller
+// must fall through to the AoS path (ParseWKB + combineDisjoint
+// + re-emit) so BE inputs still get correct output.
+//
+// Also validates the input length is sufficient to safely
+// slice the body offset — truncated inputs that pass
+// WKBTypeCode's 5-byte gate can still fail the 9-byte
+// MultiPolygon count read.
+func combineDisjointMultiPolygonWKB(a, b []byte) ([]byte, bool) {
+	// Both inputs must be LE. gobi writes LE by convention so
+	// this covers the common case; BE inputs (rare — mostly
+	// external files) fall through to the correct-but-slow AoS
+	// path.
+	if len(a) < 5 || a[0] != 1 || len(b) < 5 || b[0] != 1 {
+		return nil, false
+	}
+	nA, aBodyOff, aOK := multiPolygonBodyOffset(a)
+	if !aOK {
+		return nil, false
+	}
+	nB, bBodyOff, bOK := multiPolygonBodyOffset(b)
+	if !bOK {
+		return nil, false
+	}
 	total := nA + nB
 	// Header: 1 byte order + 4 type code + 4 numPolys = 9 bytes.
 	out := make([]byte, 9, 9+len(a)+len(b))
-	out[0] = 1                             // LE byte order
+	out[0] = 1                                 // LE byte order
 	binary.LittleEndian.PutUint32(out[1:5], 6) // MultiPolygon type
 	binary.LittleEndian.PutUint32(out[5:9], uint32(total))
-	// Append `a`'s polygon members.
+	// Append `a`'s polygon members. Both sides confirmed LE
+	// above, so appending inner bytes verbatim yields a
+	// uniformly-LE output.
 	if aIsPolygon(a) {
 		out = append(out, a...)
 	} else {
@@ -205,20 +237,29 @@ func combineDisjointMultiPolygonWKB(a, b []byte) []byte {
 	} else {
 		out = append(out, b[bBodyOff:]...)
 	}
-	return out
+	return out, true
 }
 
-// multiPolygonBodyOffset returns (n_polys, offset_of_first_inner_polygon_wkb)
-// for a MultiPolygon WKB blob, or (1, 0) for a Polygon (n=1, no
-// inner-body offset needed — the whole blob IS the polygon).
-func multiPolygonBodyOffset(data []byte) (int, int) {
+// multiPolygonBodyOffset returns (n_polys, offset_of_first_inner_polygon_wkb, ok).
+// A Polygon returns (1, 0, true). A MultiPolygon returns
+// (n, 9, true). Truncated / unrecognized inputs return (_, _, false)
+// so the caller can bail before slicing into short data (the
+// pre-review body returned (0, 9, _) on truncated input, which
+// caused the caller's `data[9:]` slice to panic).
+func multiPolygonBodyOffset(data []byte) (int, int, bool) {
 	typ, _, err := geometry.WKBTypeCode(data)
-	if err != nil || typ == 3 {
-		return 1, 0
+	if err != nil {
+		return 0, 0, false
+	}
+	if typ == 3 {
+		return 1, 0, true
+	}
+	if typ != 6 {
+		return 0, 0, false
 	}
 	// MultiPolygon: header 5 bytes + 4-byte count.
 	if len(data) < 9 {
-		return 0, 9
+		return 0, 0, false
 	}
 	// Byte order determines endianness of the count field.
 	var n uint32
@@ -227,7 +268,7 @@ func multiPolygonBodyOffset(data []byte) (int, int) {
 	} else {
 		n = binary.BigEndian.Uint32(data[5:9])
 	}
-	return int(n), 9
+	return int(n), 9, true
 }
 
 // aIsPolygon reports whether wkb encodes a single Polygon (not a
@@ -320,9 +361,11 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 						if otherIsPoly {
 							rowTyp, _, err := geometry.WKBTypeCode(wkb)
 							if err == nil && (rowTyp == 3 || rowTyp == 6) {
-								combined := combineDisjointMultiPolygonWKB(wkb, otherWKB)
-								b.Append(combined)
-								continue
+								if combined, ok := combineDisjointMultiPolygonWKB(wkb, otherWKB); ok {
+									b.Append(combined)
+									continue
+								}
+								// BE or truncated WKB — fall through to AoS.
 							}
 						}
 						// Row is a non-polygon type — fall through.

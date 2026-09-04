@@ -127,7 +127,9 @@ func scanLineStringBounds(data []byte, bo binary.ByteOrder, hasZ bool, b *Bounds
 	}
 	n := int(bo.Uint32(data[0:4]))
 	cs := coordSize(hasZ)
-	if len(data) < 4+n*cs {
+	// Overflow-safe check: `n*cs` can wrap int on 32-bit for a
+	// hostile 2^30 count. `coordsFit` uses division instead.
+	if !coordsFit(len(data)-4, n, cs) {
 		return 0, ErrShortWKB
 	}
 	base := data[4:]
@@ -155,7 +157,7 @@ func scanPolygonBounds(data []byte, bo binary.ByteOrder, hasZ bool, b *Bounds) (
 		}
 		nPts := int(bo.Uint32(data[off : off+4]))
 		off += 4
-		if len(data) < off+nPts*cs {
+		if !coordsFit(len(data)-off, nPts, cs) {
 			return 0, ErrShortWKB
 		}
 		for i := range nPts {

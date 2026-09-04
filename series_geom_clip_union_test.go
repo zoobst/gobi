@@ -93,6 +93,16 @@ func compareGeomSeriesAreas(t *testing.T, got, want Series, label string) {
 		t.Fatalf("%s: row count mismatch: got=%d want=%d", label, len(gotAreas), len(wantAreas))
 	}
 	for i := range gotAreas {
+		// NaN sentinel = "null cell"; both sides must agree on
+		// null-ness. Comparing NaNs via math.Abs would always fail,
+		// so branch on IsNaN.
+		if math.IsNaN(gotAreas[i]) || math.IsNaN(wantAreas[i]) {
+			if !math.IsNaN(gotAreas[i]) || !math.IsNaN(wantAreas[i]) {
+				t.Errorf("%s row %d: null-ness mismatch got=%v want=%v",
+					label, i, gotAreas[i], wantAreas[i])
+			}
+			continue
+		}
 		if math.Abs(gotAreas[i]-wantAreas[i]) > 1e-6*math.Max(1, math.Abs(wantAreas[i])) {
 			t.Errorf("%s row %d: got area=%v want area=%v", label, i, gotAreas[i], wantAreas[i])
 		}
@@ -106,7 +116,11 @@ func seriesRowAreas(t *testing.T, s Series) []float64 {
 		bin := chunk.(*array.Binary)
 		for i := range bin.Len() {
 			if bin.IsNull(i) {
-				out = append(out, 0)
+				// Sentinel NaN, not 0, so a future regression that
+				// silently turned a non-null cell into null wouldn't
+				// pass the area-equality check by coincidence
+				// (null-vs-empty-polygon both looked like 0 pre-fix).
+				out = append(out, math.NaN())
 				continue
 			}
 			g, err := geometry.ParseWKB(bin.Value(i))

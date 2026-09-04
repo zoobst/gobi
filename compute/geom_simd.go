@@ -39,33 +39,58 @@ import "simd"
 // BoundsF64 — lane-parallel min/max reduce on parallel Xs/Ys.
 // Matches the scalar signature; scalar tail handles the last
 // (n mod lane_count) coordinates.
+//
+// # Arch gate
+//
+// Slice-6a reverted the BoundsFromXY wire-in after Ampere / M3
+// regressions traced to the SIMD setup + horizontal-reduce
+// overhead dominating on 2-lane NEON. Gated to lane ≥ 4
+// (amd64 AVX2 / AVX-512) to match the PIP kernel's Slice-8 gate.
+// 2-lane callers get the compiler-auto-vectorized scalar reduce,
+// which measures at parity or faster on M3.
 func BoundsF64(xs, ys []float64) (minX, minY, maxX, maxY float64, ok bool) {
 	if len(xs) == 0 || len(ys) == 0 {
 		return 0, 0, 0, 0, false
 	}
 	n := min(len(ys), len(xs))
 	lane := simd.BroadcastFloat64s(0).Len()
-	if n < lane {
-		// Scalar path for tiny input — SIMD setup + horizontal
-		// reduce overhead would dominate.
-		minX, maxX = xs[0], xs[0]
-		minY, maxY = ys[0], ys[0]
-		for i := 1; i < n; i++ {
-			x := xs[i]
-			if x < minX {
-				minX = x
-			} else if x > maxX {
-				maxX = x
-			}
-			y := ys[i]
-			if y < minY {
-				minY = y
-			} else if y > maxY {
-				maxY = y
-			}
-		}
+	if lane < 4 || n < lane {
+		minX, minY, maxX, maxY = boundsF64Scalar(xs, ys, n)
 		return minX, minY, maxX, maxY, true
 	}
+	return boundsF64SIMDBody(xs, ys, n, lane)
+}
+
+// boundsF64Scalar is the 2-lane fallback: scalar min/max reduce
+// over parallel xs/ys. Preserves the original one-else-if shape
+// (which the Go compiler auto-vectorizes cleanly on 2-lane NEON,
+// matching or beating explicit SIMD).
+// Caller must ensure n > 0.
+func boundsF64Scalar(xs, ys []float64, n int) (minX, minY, maxX, maxY float64) {
+	minX, maxX = xs[0], xs[0]
+	minY, maxY = ys[0], ys[0]
+	for i := 1; i < n; i++ {
+		x := xs[i]
+		if x < minX {
+			minX = x
+		} else if x > maxX {
+			maxX = x
+		}
+		y := ys[i]
+		if y < minY {
+			minY = y
+		} else if y > maxY {
+			maxY = y
+		}
+	}
+	return
+}
+
+// boundsF64SIMDBody is the lane-parallel min/max reduce. Callable
+// from tests so the vector kernel is exercised on 2-lane hardware
+// where BoundsF64 would otherwise take the scalar path.
+// Caller must ensure n ≥ lane.
+func boundsF64SIMDBody(xs, ys []float64, n, lane int) (minX, minY, maxX, maxY float64, ok bool) {
 	// Load first lane group and use it to initialize all four
 	// accumulators (min-of-xs, min-of-ys, max-of-xs, max-of-ys).
 	xAcc := simd.LoadFloat64s(xs)
@@ -168,11 +193,24 @@ func PolygonCentroidShoelace(xs, ys []float64) (cx, cy float64, ok bool) {
 	// win. On amd64's wider lanes the crossover is lower;
 	// keeping a single threshold trades some potential amd64
 	// benefit for portable predictability.
+	//
+	// Arch gate (lane < 4): matches the PIP kernel's Slice-8
+	// gate. 2-lane NEON regresses per-segment-work-vs-setup
+	// even at large n; the scalar path is competitive there.
+	// amd64 AVX2 (4-lane) / AVX-512 (8-lane) go through the
+	// SIMD body.
 	const simdMinSize = 64
-	if n < simdMinSize || n < lane+1 {
+	if lane < 4 || n < simdMinSize || n < lane+1 {
 		return polygonCentroidShoelaceScalar(xs, ys, n)
 	}
+	return polygonCentroidShoelaceSIMDBody(xs, ys, n, lane)
+}
 
+// polygonCentroidShoelaceSIMDBody is the ungated shoelace kernel.
+// Callable from tests so the vector body is exercised on 2-lane
+// hardware where PolygonCentroidShoelace would otherwise take the
+// scalar path. Caller must ensure n ≥ max(simdMinSize, lane+1).
+func polygonCentroidShoelaceSIMDBody(xs, ys []float64, n, lane int) (cx, cy float64, ok bool) {
 	zero := simd.BroadcastFloat64s(0)
 	areaAcc, cxAcc, cyAcc, sxAcc, syAcc := zero, zero, zero, zero, zero
 
@@ -337,8 +375,15 @@ func PIPCrossingCount(xs, ys []float64, tx, ty float64) bool {
 
 // runtimeLane returns the Float64s SIMD lane count on the current
 // build target. Exposed so tests can query it without importing
-// the `simd` package themselves (which triggers a Go 1.27
-// compiler ICE when imported directly from a `_test.go` file).
+// the `simd` package themselves — importing `simd` from a
+// `_test.go` file triggers a Go 1.27 compiler ICE.
+//
+// TODO: file an upstream issue at https://github.com/golang/go/issues
+// once we have a reduced repro; drop this indirection once the
+// stdlib SIMD experiment stabilizes and the ICE is fixed. Until
+// then, this wrapper is the workaround: production code imports
+// `simd` freely, tests go through runtimeLane and the exported
+// SIMDBody helpers.
 func runtimeLane() int { return simd.BroadcastFloat64s(0).Len() }
 
 // pipCrossingCountSIMDBody is the divless SIMD kernel body. Kept

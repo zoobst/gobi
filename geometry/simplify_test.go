@@ -5,6 +5,37 @@ import (
 	"testing"
 )
 
+// TestSimplify_LineString_PreservesZ — regression guard for the
+// review-caught bug where the SoA-backed douglasPeucker silently
+// dropped Point.Z (rebuilt Point{X, Y} without Z / HasZ). 3D
+// linestrings must preserve altitude on retained vertices.
+func TestSimplify_LineString_PreservesZ(t *testing.T) {
+	l := LineString{
+		Points: []Point{
+			{X: 0, Y: 0, Z: 100, HasZ: true},
+			{X: 1, Y: 0, Z: 101, HasZ: true},
+			{X: 2, Y: 0, Z: 102, HasZ: true},
+			{X: 3, Y: 0, Z: 103, HasZ: true},
+			{X: 4, Y: 0, Z: 104, HasZ: true},
+		},
+		HasZ: true,
+	}
+	simp := l.Simplify(0.001)
+	if len(simp.Points) != 2 {
+		t.Fatalf("collinear collapse: %d points, want 2", len(simp.Points))
+	}
+	// Endpoints must retain Z and HasZ.
+	for i, p := range simp.Points {
+		if !p.HasZ {
+			t.Errorf("point %d: HasZ = false, want true", i)
+		}
+	}
+	if simp.Points[0].Z != 100 || simp.Points[1].Z != 104 {
+		t.Errorf("Z not preserved: got Z0=%v Z1=%v, want 100/104",
+			simp.Points[0].Z, simp.Points[1].Z)
+	}
+}
+
 func TestSimplify_LineString_CollinearPointsRemoved(t *testing.T) {
 	// Five collinear points along y=0. Any tolerance > 0 should collapse
 	// them to the endpoints.

@@ -1,6 +1,6 @@
 package geometry
 
-import "sort"
+import "slices"
 
 // ConvexHullFromXY runs Andrew's monotone-chain algorithm on
 // parallel Xs / Ys slabs and returns the convex hull as a fresh
@@ -22,10 +22,11 @@ import "sort"
 // index sort by (x, y) lex — the resulting order is the same
 // linear structure for the two half-hulls. Two O(n) stack scans
 // over an index permutation (lower hull, then upper hull) produce
-// the CCW output. Sort is on `[]int` indices instead of `[]Point`
-// structs (8-byte swaps vs 40-byte swaps); the hull-scan reads
-// coordinates directly from the input slabs so the inner-loop
-// arithmetic operates on cache-friendly float64 arrays.
+// the CCW output. Sort is on `[]int` indices via `slices.SortFunc`
+// (8-byte swaps + typed callback — no closure boxing that
+// `sort.Slice` would incur); the hull-scan reads coordinates
+// directly from the input slabs so the inner-loop arithmetic
+// operates on cache-friendly float64 arrays.
 //
 // # Semantics
 //
@@ -33,9 +34,12 @@ import "sort"
 //     (no closing vertex appended — matches the AoS shape which
 //     also returns the input unchanged when Exterior() has <3
 //     points).
-//   - Duplicate points are tolerated; the sort is stable and
-//     collinear points on the hull edge are dropped via strict `<= 0`
-//     cross-product rejection (matches the AoS behavior).
+//   - Duplicate points are tolerated. Since the (x,y) lex order is
+//     a total order over distinct points, sort stability is
+//     irrelevant — equal keys mean the same point, and the CCW
+//     scan drops the extra via strict `<= 0` cross-product
+//     rejection just like collinear points on the hull edge
+//     (matches the AoS behavior).
 //   - Output vertex count includes the closing repeat, so a hull
 //     with k unique vertices has k+1 entries.
 func ConvexHullFromXY(xs, ys []float64) (hullXs, hullYs []float64) {
@@ -54,12 +58,20 @@ func ConvexHullFromXY(xs, ys []float64) (hullXs, hullYs []float64) {
 	for i := range idx {
 		idx[i] = i
 	}
-	sort.Slice(idx, func(i, j int) bool {
-		a, b := idx[i], idx[j]
+	slices.SortFunc(idx, func(a, b int) int {
 		if xs[a] != xs[b] {
-			return xs[a] < xs[b]
+			if xs[a] < xs[b] {
+				return -1
+			}
+			return 1
 		}
-		return ys[a] < ys[b]
+		if ys[a] < ys[b] {
+			return -1
+		}
+		if ys[a] > ys[b] {
+			return 1
+		}
+		return 0
 	})
 
 	// Lower hull: iterate sorted indices left-to-right, maintaining
@@ -195,12 +207,20 @@ func convexHullIndicesFromXY(xs, ys []float64) []int {
 	for i := range idx {
 		idx[i] = i
 	}
-	sort.Slice(idx, func(i, j int) bool {
-		a, b := idx[i], idx[j]
+	slices.SortFunc(idx, func(a, b int) int {
 		if xs[a] != xs[b] {
-			return xs[a] < xs[b]
+			if xs[a] < xs[b] {
+				return -1
+			}
+			return 1
 		}
-		return ys[a] < ys[b]
+		if ys[a] < ys[b] {
+			return -1
+		}
+		if ys[a] > ys[b] {
+			return 1
+		}
+		return 0
 	})
 
 	hull := make([]int, 0, n)

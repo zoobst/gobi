@@ -167,5 +167,12 @@ func frameFromArrays(t testing.TB, fields []arrow.Field, arrs []arrow.Array) *Fr
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Frame owns one ref per Column (transferred via NewColumn +
+	// chunked.Release above). Without Release, the underlying
+	// chunked buffer stays alive until the process exits — a
+	// per-frame test-only leak that hides under Arrow's
+	// process-lifetime pool. Wire it to the test's cleanup so
+	// -race + -count=100 doesn't grow RSS with every rerun.
+	t.Cleanup(f.Release)
 	return f
 }

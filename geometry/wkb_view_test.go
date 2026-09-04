@@ -1,10 +1,45 @@
 package geometry
 
 import (
+	"encoding/binary"
 	"errors"
 	"math/rand"
 	"testing"
 )
+
+// TestWKBView_HostileCountFieldDoesNotPanic — regression for the
+// review-caught overflow: a hostile WKB with a huge count field
+// (2^30) times cs=24 wraps int on 32-bit past a plain n*cs guard,
+// then panics on the coordinate slice read. Fixed by `coordsFit`
+// using division. Even on 64-bit this must return a clean
+// ErrShortWKB error rather than allocating or panicking.
+func TestWKBView_HostileCountFieldDoesNotPanic(t *testing.T) {
+	// LineString: valid 5-byte header + count=2^30, no coord bytes.
+	// 2^30 * 24 (XYZ) = 24GB — must be rejected as ErrShortWKB.
+	data := make([]byte, 9)
+	data[0] = 1
+	binary.LittleEndian.PutUint32(data[1:5], wkbLineString)
+	binary.LittleEndian.PutUint32(data[5:9], 1<<30)
+	if _, err := LineStringViewFromWKB(data); !errors.Is(err, ErrShortWKB) {
+		t.Errorf("hostile LineString count: err=%v, want ErrShortWKB", err)
+	}
+	// Polygon: numRings=2^30 with no ring bytes.
+	pdata := make([]byte, 9)
+	pdata[0] = 1
+	binary.LittleEndian.PutUint32(pdata[1:5], wkbPolygon)
+	binary.LittleEndian.PutUint32(pdata[5:9], 1<<30)
+	if _, err := PolygonRingViewsFromWKB(pdata); !errors.Is(err, ErrShortWKB) {
+		t.Errorf("hostile Polygon numRings: err=%v, want ErrShortWKB", err)
+	}
+	// MultiPolygon: n=2^30 with no inner polygons.
+	mdata := make([]byte, 9)
+	mdata[0] = 1
+	binary.LittleEndian.PutUint32(mdata[1:5], wkbMultiPolygon)
+	binary.LittleEndian.PutUint32(mdata[5:9], 1<<30)
+	if _, err := MultiPolygonRingViewsFromWKB(mdata); !errors.Is(err, ErrShortWKB) {
+		t.Errorf("hostile MultiPolygon count: err=%v, want ErrShortWKB", err)
+	}
+}
 
 // TestLineStringViewFromWKB_MatchesAoS — direct-parse view must
 // match ParseWKB + .View() exactly (both XY and XYZ).

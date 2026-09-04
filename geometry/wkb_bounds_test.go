@@ -210,3 +210,60 @@ func TestBoundsFromWKB_ZeroAllocations(t *testing.T) {
 func marshalWKB(g Geometry) ([]byte, error) {
 	return WKB(g), nil
 }
+
+// TestBoundsFromWKB_NaNCoordsDontNarrow locks in the current
+// extendBoundsInline semantics: NaN coordinates are silently
+// ignored (every comparison against NaN is false, so the
+// running bounds stay untouched). This is a NaN-safe reduce —
+// the alternative (poisoning the bounds with NaN) would break
+// downstream R-tree inserts. If a future refactor changes the
+// comparison shape, this test guards against accidental drift.
+func TestBoundsFromWKB_NaNCoordsDontNarrow(t *testing.T) {
+	// Mix real + NaN vertices in a LineString. Expected bounds
+	// span only the real vertices (per-axis — a point with NaN X
+	// but real Y still contributes its Y).
+	pts := []Point{
+		{X: 0, Y: 0},
+		{X: math.NaN(), Y: math.NaN()},
+		{X: 10, Y: 5},
+		{X: math.NaN(), Y: 3},
+		{X: 2, Y: math.NaN()},
+	}
+	data, err := marshalWKB(LineString{Points: pts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := BoundsFromWKB(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Real X contributions: {0, 10, 2}. Real Y: {0, 5, 3}.
+	if b.MinX != 0 || b.MaxX != 10 || b.MinY != 0 || b.MaxY != 5 {
+		t.Errorf("NaN-mixed bounds = %+v, want {0,0,10,5}", b)
+	}
+	if math.IsNaN(b.MinX) || math.IsNaN(b.MinY) ||
+		math.IsNaN(b.MaxX) || math.IsNaN(b.MaxY) {
+		t.Errorf("bounds contain NaN: %+v", b)
+	}
+}
+
+// TestBoundsFromWKB_AllNaNStaysEmpty — if every vertex is NaN,
+// the running bounds retain the EmptyBounds sentinel (MinX >
+// MaxX), signaling "no valid extent" to downstream callers.
+func TestBoundsFromWKB_AllNaNStaysEmpty(t *testing.T) {
+	pts := []Point{
+		{X: math.NaN(), Y: math.NaN()},
+		{X: math.NaN(), Y: math.NaN()},
+	}
+	data, err := marshalWKB(LineString{Points: pts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := BoundsFromWKB(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b.Empty() {
+		t.Errorf("all-NaN bounds = %+v, want Empty()", b)
+	}
+}

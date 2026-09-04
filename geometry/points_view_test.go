@@ -204,3 +204,38 @@ func TestBoundsFromXY_LengthMismatch(t *testing.T) {
 		t.Errorf("got %+v, want %+v (derived from shorter slice)", got, want)
 	}
 }
+
+// TestBoundsFromXY_NaN — locks in the NaN semantics of the SoA
+// scalar reduce: every comparison against NaN is false, so
+// isolated NaN coords are silently ignored (they neither narrow
+// nor poison the bounds). If a future refactor swaps in
+// compute.BoundsF64 with the SIMD Min/Max reduce, NaN in the
+// first-lane slot would propagate — tests in compute/geom_test.go
+// lock that separate semantic in. This test covers the current
+// entry point that geometry callers see.
+func TestBoundsFromXY_NaN(t *testing.T) {
+	// Mixed real + NaN with the FIRST coord finite (so the
+	// running min/max is initialized from a real number).
+	xs := []float64{0, math.NaN(), 10, math.NaN(), 2}
+	ys := []float64{0, math.NaN(), 5, 3, math.NaN()}
+	b := BoundsFromXY(xs, ys)
+	if b.MinX != 0 || b.MaxX != 10 || b.MinY != 0 || b.MaxY != 5 {
+		t.Errorf("mixed-NaN bounds = %+v, want {0,0,10,5}", b)
+	}
+	if math.IsNaN(b.MinX) || math.IsNaN(b.MinY) ||
+		math.IsNaN(b.MaxX) || math.IsNaN(b.MaxY) {
+		t.Errorf("bounds contain NaN: %+v", b)
+	}
+
+	// All-NaN input keeps the bounds anchored on xs[0]/ys[0] =
+	// NaN; the return-value equality contract is: MinX=NaN,
+	// MaxX=NaN. NaN != NaN, so Empty() is *not* well-defined
+	// here — callers dealing with poisoned inputs must guard
+	// upstream. Test only that we didn't crash and that the
+	// result is not silently a valid bbox.
+	all := []float64{math.NaN(), math.NaN(), math.NaN()}
+	nan := BoundsFromXY(all, all)
+	if !math.IsNaN(nan.MinX) || !math.IsNaN(nan.MaxX) {
+		t.Errorf("all-NaN produced finite MinX/MaxX: %+v", nan)
+	}
+}
