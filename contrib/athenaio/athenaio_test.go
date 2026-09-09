@@ -1154,6 +1154,72 @@ func TestRawCTAS_HappyPath(t *testing.T) {
 	}
 }
 
+// TestRawCTASWithMetadata_ReturnsLocationAndQueryID — the
+// observability companion returns the resolved Glue-recorded
+// location + Athena query ID alongside the LazyFrame. Same
+// LazyFrame invariants as RawCTAS (metadata attachment, cleanup
+// registration) since both go through the shared rawCTAS body.
+func TestRawCTASWithMetadata_ReturnsLocationAndQueryID(t *testing.T) {
+	payload := buildMockParquet(t)
+	external := "s3://test-bucket/raw-ctas-meta/user-table/"
+
+	mockA := &mockCTASAthena{pollsBeforeDone: 0}
+	mockS := &mockS3{
+		objects: map[string][]byte{
+			"raw-ctas-meta/user-table/data/00000-0.parquet": payload,
+		},
+	}
+	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{
+		{Database: "test_db", Name: "user-table"}: {
+			Name: aws.String("user-table"),
+			StorageDescriptor: &gluetypes.StorageDescriptor{
+				Location: aws.String(external),
+			},
+		},
+	}}
+
+	c, err := NewClient(ClientConfig{
+		Workgroup:      "wg",
+		ResultLocation: "s3://test-bucket/results/",
+		Database:       "test_db",
+		Athena:         mockA,
+		S3:             mockS,
+		Glue:           mockG,
+		PollInterval:   1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lf, meta, err := c.RawCTASWithMetadata(context.Background(), RawCTASSpec{
+		SQL:              "CREATE TABLE test_db.\"user-table\" WITH (format='PARQUET') AS SELECT * FROM base",
+		TableName:        "user-table",
+		ExternalLocation: external,
+	})
+	if err != nil {
+		t.Fatalf("RawCTASWithMetadata: %v", err)
+	}
+	if lf == nil {
+		t.Fatal("LazyFrame is nil")
+	}
+	if meta.Location != external {
+		t.Errorf("Location = %q, want %q", meta.Location, external)
+	}
+	if meta.QueryID == "" {
+		t.Error("QueryID is empty — should be the Athena execution ID")
+	}
+	if meta.Duration <= 0 {
+		t.Errorf("Duration = %v, want > 0", meta.Duration)
+	}
+	// Cleanup registration must fire same as RawCTAS.
+	c.mu.Lock()
+	trackedCount := len(c.createdTables)
+	c.mu.Unlock()
+	if trackedCount != 1 {
+		t.Errorf("expected 1 tracked table, got %d", trackedCount)
+	}
+}
+
 func TestRawCTAS_NilMetadataStillWorks(t *testing.T) {
 	payload := buildMockParquet(t)
 	mockA := &mockCTASAthena{pollsBeforeDone: 0}

@@ -9,6 +9,58 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.13]
+
+### Added
+
+- **`BucketResult.Location string`** — the common S3 URI prefix
+  (e.g. `s3://bucket/prefix/`) the CTAS wrote to, populated from the
+  resolved Glue-recorded location (`resolveActualLocation`). Same
+  value on every entry in a returned slice, **including nil-Frame
+  slots for empty buckets**, so callers can find the prefix without
+  probing for a non-nil sibling or maintaining a side channel.
+
+  Populated on `UnloadAndReadBucketsWithMetadata` and
+  `RawCTASBuckets` returns. Denormalized deliberately: CTAS writes to
+  exactly one location, but per-entry storage keeps each
+  `BucketResult` self-contained. Empty on any freshly-constructed
+  `BucketResult{}` — only set when returned from the Client.
+
+- **`Client.RawCTASWithMetadata(ctx, spec) (*gobi.LazyFrame, CTASMetadata, error)`**
+  — observability companion to `RawCTAS`, mirroring the
+  `UnloadAndReadBucketsWithMetadata` shape. Returns the resolved S3
+  location + Athena query ID + submit-to-reader duration alongside
+  the LazyFrame. Same cleanup and metadata-attachment invariants as
+  `RawCTAS` since both go through a shared internal `rawCTAS` body.
+
+- **`CTASMetadata` struct** — payload for `RawCTASWithMetadata`:
+
+  ```go
+  type CTASMetadata struct {
+      Location string        // resolved Glue-recorded S3 prefix
+      QueryID  string        // Athena execution ID
+      Duration time.Duration // submit → reader-open wall clock
+  }
+  ```
+
+  `Location` may differ from `RawCTASSpec.ExternalLocation` when a
+  workgroup with `EnforceWorkGroupConfiguration=true` overrides the
+  output prefix — callers listing / deleting the CTAS output should
+  use this value, not the spec's ExternalLocation.
+
+### Internal
+
+- `populateBucketResults` now takes an explicit `location string`
+  parameter and pre-stamps `BucketResult.Location` on every slot
+  before the file-population loop. The per-file loop sets
+  `S3URI` / `Frame` / `Size` fields inline instead of reassigning the
+  whole struct — preserves `Location` on populated slots.
+
+- `RawCTAS` now delegates to an unexported `rawCTAS` helper that
+  returns `(*gobi.LazyFrame, CTASMetadata, error)`. Public `RawCTAS`
+  signature unchanged (still `(*gobi.LazyFrame, error)`); the
+  discarded `CTASMetadata` is what `RawCTASWithMetadata` returns.
+
 ## [v0.1.12]
 
 ### Fixed

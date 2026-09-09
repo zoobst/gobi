@@ -195,21 +195,63 @@ func (c *Client) UnloadAndRead(ctx context.Context, spec UnloadSpec) (*gobi.Lazy
 // Errors on submit / poll / read-back mirror UnloadAndRead's shape.
 // The composed SQL is included in error messages for debuggability.
 func (c *Client) RawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame, error) {
+	lf, _, err := c.rawCTAS(ctx, spec)
+	return lf, err
+}
+
+// CTASMetadata is the observability blob returned by
+// RawCTASWithMetadata alongside the LazyFrame. Every field is
+// derivable from what the Client already computes internally
+// during a RawCTAS call — surfacing it here spares callers a
+// second round-trip to Glue / Athena for correlation, logging,
+// or downstream location-aware operations (e.g. reading extra
+// non-CTAS-produced files that co-exist under the same prefix).
+type CTASMetadata struct {
+	// Location is the resolved S3 URI prefix Athena actually wrote
+	// to, as reported by Glue. May differ from
+	// RawCTASSpec.ExternalLocation when a workgroup with
+	// EnforceWorkGroupConfiguration=true overrides the output
+	// prefix. Callers listing / deleting the CTAS output should use
+	// this value, not the spec's ExternalLocation.
+	Location string
+	// QueryID is the Athena execution ID for the CTAS statement.
+	// Correlates with CloudTrail, Athena query history, and
+	// QueryStats attached to the returned LazyFrame.
+	QueryID string
+	// Duration is the wall-clock time from submit to reader-open.
+	// Same value stored in QueryStats.TotalTime.
+	Duration time.Duration
+}
+
+// RawCTASWithMetadata is the observability-friendly form of
+// RawCTAS — returns the resolved S3 location + Athena query ID
+// alongside the LazyFrame. Identical semantics and cleanup
+// contract otherwise. Same shape rationale as
+// UnloadAndReadBucketsWithMetadata: gives callers per-call
+// telemetry without a second Glue call.
+func (c *Client) RawCTASWithMetadata(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame, CTASMetadata, error) {
+	return c.rawCTAS(ctx, spec)
+}
+
+// rawCTAS is the shared body of RawCTAS + RawCTASWithMetadata.
+// Returns the LazyFrame + a fully-populated CTASMetadata; the
+// public RawCTAS discards the metadata.
+func (c *Client) rawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame, CTASMetadata, error) {
 	if spec.SQL == "" {
-		return nil, fmt.Errorf("athenaio: RawCTASSpec.SQL is empty")
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTASSpec.SQL is empty")
 	}
 	if spec.TableName == "" {
-		return nil, fmt.Errorf("athenaio: RawCTASSpec.TableName is required (athenaio doesn't parse SQL)")
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTASSpec.TableName is required (athenaio doesn't parse SQL)")
 	}
 	if spec.ExternalLocation == "" {
-		return nil, fmt.Errorf("athenaio: RawCTASSpec.ExternalLocation is required (athenaio doesn't parse SQL)")
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTASSpec.ExternalLocation is required (athenaio doesn't parse SQL)")
 	}
 	database := spec.Database
 	if database == "" {
 		database = c.cfg.Database
 	}
 	if database == "" {
-		return nil, fmt.Errorf("athenaio: RawCTAS requires Database (in spec or Client config)")
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS requires Database (in spec or Client config)")
 	}
 	cleanup := spec.Cleanup
 	if cleanup == CleanupInherit {
@@ -224,11 +266,11 @@ func (c *Client) RawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 	// what a workgroup-enforced setup will honor.
 	queryID, err := c.submitTo(ctx, spec.SQL, spec.ExternalLocation)
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: RawCTAS submit:\n---\n%s\n---\n%w", spec.SQL, err)
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS submit:\n---\n%s\n---\n%w", spec.SQL, err)
 	}
 	exec, err := c.pollUntilDone(ctx, queryID)
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: RawCTAS %s failed:\n---\n%s\n---\n%w",
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s failed:\n---\n%s\n---\n%w",
 			queryID, spec.SQL, err)
 	}
 
@@ -251,19 +293,19 @@ func (c *Client) RawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 	// claim; we don't second-guess.
 	actualLoc, err := c.resolveActualLocation(ctx, database, spec.TableName, spec.ExternalLocation)
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
 	}
 	files, err := listBucketFiles(ctx, c.s3, actualLoc)
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("athenaio: RawCTAS %s: no result files under %s",
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s: no result files under %s",
 			queryID, actualLoc)
 	}
 	frame, err := c.readBucketFiles(ctx, files, readOptsFromSpec(spec.Columns, spec.Predicate))
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
 	}
 
 	lf := frame.Lazy()
@@ -271,20 +313,25 @@ func (c *Client) RawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 		frame.WithPartitionMeta(spec.Metadata)
 		asserted, err := lf.WithPartitionAssertion(spec.Metadata)
 		if err != nil {
-			return nil, fmt.Errorf("athenaio: attach partition assertion: %w", err)
+			return nil, CTASMetadata{}, fmt.Errorf("athenaio: attach partition assertion: %w", err)
 		}
 		lf = asserted
 	}
 
+	dur := time.Since(start)
 	registerStats(lf, QueryStats{
 		QueryExecutionID: queryID,
 		ResultPrefix:     spec.ExternalLocation,
 		ScannedBytes:     scannedBytes(exec),
 		EngineTime:       engineTime(exec),
-		TotalTime:        time.Since(start),
+		TotalTime:        dur,
 		RowCount:         int64(frame.NumRows()),
 	})
-	return lf, nil
+	return lf, CTASMetadata{
+		Location: actualLoc,
+		QueryID:  queryID,
+		Duration: dur,
+	}, nil
 }
 
 // tryCTAS composes + submits + polls a CTAS in the given format
@@ -692,6 +739,17 @@ type BucketResult struct {
 	// len(results) — skew-empty buckets pull the average down
 	// spuriously otherwise.
 	Size int64
+	// Location is the common S3 URI prefix (e.g. `s3://bucket/prefix/`)
+	// the CTAS wrote to — the parent of every entry's S3URI in a
+	// returned slice. Same value on every entry, including nil-Frame
+	// slots, so callers can find the prefix without probing for a
+	// non-nil sibling or maintaining a side channel.
+	//
+	// Populated from the resolved Glue-recorded location (see
+	// resolveActualLocation), which may differ from spec.ExternalLocation
+	// when a workgroup with EnforceWorkGroupConfiguration=true
+	// overrides the output prefix.
+	Location string
 }
 
 // UnloadAndReadBuckets is the bucket-aware variant of UnloadAndRead.
@@ -836,7 +894,7 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 	// nil slots so len(result) == BucketCount and index i maps to
 	// bucket i consistently across peer calls.
 	results := make([]BucketResult, spec.BucketCount)
-	totalRows, err := c.populateBucketResults(ctx, files, results, meta, readOptsFromSpec(spec.Columns, spec.Predicate))
+	totalRows, err := c.populateBucketResults(ctx, files, results, actualLoc, meta, readOptsFromSpec(spec.Columns, spec.Predicate))
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: %w", queryID, err)
 	}
@@ -954,7 +1012,7 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 	// fully-empty results. Matches the UnloadAndReadBuckets shape.
 
 	results := make([]BucketResult, bucketCount)
-	totalRows, err := c.populateBucketResults(ctx, files, results, spec.Metadata, readOptsFromSpec(spec.Columns, spec.Predicate))
+	totalRows, err := c.populateBucketResults(ctx, files, results, actualLoc, spec.Metadata, readOptsFromSpec(spec.Columns, spec.Predicate))
 	if err != nil {
 		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
 	}
@@ -989,7 +1047,14 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 // variant) is parsed to extract the bucket index; if parsing fails
 // (RawCTAS output without a matching name), files fill slots in
 // listing order. Missing bucket indices stay nil.
-func (c *Client) populateBucketResults(ctx context.Context, files []bucketFileInfo, results []BucketResult, meta *gobi.PartitionMetadata, opts *parquetio.ReadOptions) (int64, error) {
+func (c *Client) populateBucketResults(ctx context.Context, files []bucketFileInfo, results []BucketResult, location string, meta *gobi.PartitionMetadata, opts *parquetio.ReadOptions) (int64, error) {
+	// Stamp Location on every slot — including nil-Frame ones —
+	// so callers can find the common prefix regardless of which
+	// slot they inspect. Written before the file-population loop
+	// so slots not touched by the loop still carry the value.
+	for i := range results {
+		results[i].Location = location
+	}
 	nSlots := len(results)
 	var totalRows int64
 	for i, fi := range files {
@@ -1028,7 +1093,12 @@ func (c *Client) populateBucketResults(ctx context.Context, files []bucketFileIn
 			return 0, fmt.Errorf("athenaio: duplicate bucket slot %d: %s and %s",
 				slot, results[slot].S3URI, fi.URI)
 		}
-		results[slot] = BucketResult{S3URI: fi.URI, Frame: lf, Size: fi.Size}
+		// Preserve Location that was pre-stamped above; set the
+		// per-file fields inline instead of reassigning the whole
+		// struct.
+		results[slot].S3URI = fi.URI
+		results[slot].Frame = lf
+		results[slot].Size = fi.Size
 	}
 	return totalRows, nil
 }

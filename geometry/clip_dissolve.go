@@ -103,30 +103,30 @@ func Dissolve(geoms []Geometry) (Geometry, error) {
 		groupList = append(groupList, idxs)
 	}
 	results := make([]clusterResult, len(groupList))
+	// Worker pool sized to GOMAXPROCS. Every cluster is topologically
+	// independent (union-find keeps bboxes disjoint across clusters),
+	// so cluster-level parallelism has no correctness constraint.
+	//
+	// The pre-fix code gated cluster fan-out on cluster size (≥ 32
+	// polys), which caused hundreds of small clusters — the shape a
+	// world-scattered polygon corpus produces — to run serially in
+	// the outer loop and pin one core at 100%. Now every cluster is
+	// dispatched to the pool; the within-cluster recursive fan-out
+	// keeps its size threshold since that's about per-cluster
+	// recursion depth, not the between-cluster shape.
+	nWorkers := max(min(runtime.GOMAXPROCS(0), len(groupList)), 1)
+	work := make(chan int, len(groupList))
+	for i := range groupList {
+		work <- i
+	}
+	close(work)
 	var wg sync.WaitGroup
-	// Trivially-small clusters aren't worth a goroutine — the
-	// group-loop's tiny per-iter cost dominates goroutine setup.
-	// Use the same threshold as dissolveMerge for consistency.
-	const clusterParallelThreshold = dissolveParallelThreshold
-	for i, idxs := range groupList {
-		if len(idxs) < clusterParallelThreshold {
-			results[i].merged, results[i].err = dissolveGroup(geoms, idxs, crs)
-			continue
-		}
-		// Same GOMAXPROCS-sized cap as dissolveMergeParallel; if the
-		// semaphore is saturated (heavy inner fan-out already
-		// running) run the cluster inline.
-		release := tryAcquireDissolveGoroutine()
-		if release == nil {
-			results[i].merged, results[i].err = dissolveGroup(geoms, idxs, crs)
-			continue
-		}
-		wg.Add(1)
-		go func(idx int, ids []int, rel func()) {
-			defer wg.Done()
-			defer rel()
-			results[idx].merged, results[idx].err = dissolveGroup(geoms, ids, crs)
-		}(i, idxs, release)
+	for range nWorkers {
+		wg.Go(func() {
+			for idx := range work {
+				results[idx].merged, results[idx].err = dissolveGroup(geoms, groupList[idx], crs)
+			}
+		})
 	}
 	wg.Wait()
 	var polys []Polygon
@@ -298,12 +298,10 @@ func dissolveMergeParallel(geoms []Geometry, idxs []int, mid int) (Geometry, err
 	)
 	leftRelease := tryAcquireDissolveGoroutine()
 	if leftRelease != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			defer leftRelease()
 			leftGeom, leftErr = dissolveMerge(geoms, idxs[:mid])
-		}()
+		})
 	} else {
 		leftGeom, leftErr = dissolveMerge(geoms, idxs[:mid])
 	}

@@ -499,6 +499,135 @@ func TestRawCTASBuckets_HappyPath(t *testing.T) {
 	}
 }
 
+// TestUnloadAndReadBucketsWithMetadata_LocationOnEverySlot —
+// BucketResult.Location must be populated on every returned entry,
+// including nil-Frame slots for empty buckets. This lets callers
+// find the common S3 prefix without probing for a non-nil sibling
+// or keeping the actualLoc on a side channel.
+func TestUnloadAndReadBucketsWithMetadata_LocationOnEverySlot(t *testing.T) {
+	payload := buildMockParquet(t)
+
+	mockA := &mockCTASAthena{pollsBeforeDone: 1}
+	mockS := &mockS3{objects: map[string][]byte{}}
+	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{}}
+	c, _ := NewClient(ClientConfig{
+		Workgroup: "wg", ResultLocation: "s3://test-bucket/results",
+		Database: "test_db", ClientID: "abcd1234",
+		Athena: mockA, S3: mockS, Glue: mockG,
+		PollInterval: 1 * time.Millisecond,
+	})
+
+	var recordedLocation string
+	wrapper := &mockCTASAthenaWithSideEffect{
+		inner: mockA,
+		onStart: func(sql, outputLoc string) {
+			tableName := extractCTASName(sql)
+			recordedLocation = outputLoc
+			_, keyPrefix, _ := parseS3URI(outputLoc)
+			// Only bucket 0 and 2 populated — bucket 1 stays nil-Frame.
+			// Location must still be set on all three slots.
+			mockS.objects[keyPrefix+"data/00000-0.parquet"] = payload
+			mockS.objects[keyPrefix+"data/00002-0.parquet"] = payload
+			mockG.tables[glueTableKey{Database: "test_db", Name: tableName}] = &gluetypes.Table{
+				Name: aws.String(tableName),
+				Parameters: map[string]string{
+					"table_type": "ICEBERG",
+				},
+				StorageDescriptor: &gluetypes.StorageDescriptor{
+					Location: aws.String(outputLoc),
+				},
+			}
+		},
+	}
+	c.athena = wrapper
+
+	results, err := c.UnloadAndReadBucketsWithMetadata(context.Background(), UnloadSpec{
+		SQL:         "SELECT id, v FROM base",
+		PartitionBy: []string{"id"},
+		BucketCount: 3,
+		TableFormat: FormatIceberg,
+	})
+	if err != nil {
+		t.Fatalf("UnloadAndReadBucketsWithMetadata: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results length = %d, want 3", len(results))
+	}
+	if recordedLocation == "" {
+		t.Fatal("test setup: outputLoc never recorded")
+	}
+	for i, r := range results {
+		if r.Location != recordedLocation {
+			t.Errorf("bucket %d: Location = %q, want %q (must match Glue-recorded location on every slot)",
+				i, r.Location, recordedLocation)
+		}
+	}
+	// Sanity: slot 1 IS nil-Frame; its Location is still populated.
+	if results[1].Frame != nil {
+		t.Errorf("bucket 1 expected nil Frame, got %+v", results[1].Frame)
+	}
+	if results[1].Location == "" {
+		t.Error("nil-Frame slot 1 has empty Location — must carry the common prefix")
+	}
+}
+
+// TestRawCTASBuckets_LocationOnEverySlot — RawCTASBuckets analog
+// of the above. Location comes from resolveActualLocation on the
+// user's ExternalLocation, so it should equal the caller-provided
+// value in the happy no-workgroup-override case.
+func TestRawCTASBuckets_LocationOnEverySlot(t *testing.T) {
+	payload := buildMockParquet(t)
+	external := "s3://test-bucket/raw-buckets/location-test/"
+
+	mockA := &mockCTASAthena{pollsBeforeDone: 0}
+	mockS := &mockS3{
+		objects: map[string][]byte{
+			"raw-buckets/location-test/000000_0.parquet": payload,
+			"raw-buckets/location-test/000002_0.parquet": payload,
+		},
+	}
+	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{
+		{Database: "test_db", Name: "location-test"}: {
+			Name: aws.String("location-test"),
+			StorageDescriptor: &gluetypes.StorageDescriptor{
+				NumberOfBuckets: 3,
+				Location:        aws.String(external),
+			},
+		},
+	}}
+	c, _ := NewClient(ClientConfig{
+		Workgroup: "wg", ResultLocation: "s3://test-bucket/results/",
+		Database: "test_db",
+		Athena:   mockA, S3: mockS, Glue: mockG,
+		PollInterval: 1 * time.Millisecond,
+	})
+
+	results, err := c.RawCTASBuckets(context.Background(), RawCTASSpec{
+		SQL:              "CREATE TABLE ... WITH (bucketed_by = ARRAY['x'], bucket_count = 3) AS SELECT ...",
+		TableName:        "location-test",
+		ExternalLocation: external,
+	})
+	if err != nil {
+		t.Fatalf("RawCTASBuckets: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results length = %d, want 3", len(results))
+	}
+	for i, r := range results {
+		if r.Location != external {
+			t.Errorf("bucket %d: Location = %q, want %q", i, r.Location, external)
+		}
+	}
+	// Slot 1 is nil-Frame (only 0 and 2 got files) but must still
+	// carry Location.
+	if results[1].Frame != nil {
+		t.Errorf("bucket 1 expected nil Frame, got %+v", results[1].Frame)
+	}
+	if results[1].Location != external {
+		t.Errorf("nil-Frame slot 1: Location = %q, want %q", results[1].Location, external)
+	}
+}
+
 // TestBucketIndexFromURI_ParsesAthenaShapes — direct exercise of the
 // filename → bucket-index parser. Covers Iceberg + Hive naming
 // conventions and rejects non-numeric tails.
