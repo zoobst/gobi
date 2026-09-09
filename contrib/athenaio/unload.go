@@ -13,6 +13,7 @@ import (
 	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	gluetypes "github.com/aws/aws-sdk-go-v2/service/glue/types"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/zoobst/gobi"
 	"github.com/zoobst/gobi/parquetio"
@@ -585,20 +586,27 @@ func locationMatches(a, b string) bool {
 // opts is passed to parquetio.ReadReader — Columns projects, Predicate
 // prunes row groups. nil means "read every column, no row-group
 // pruning" (the pre-v0.3.7 behavior).
-func (c *Client) openBucketFrame(ctx context.Context, uri string, opts *parquetio.ReadOptions) (*gobi.Frame, error) {
+//
+// Returns the object's ContentLength alongside the Frame. Existing
+// bucket-file readers (readBucketFiles, populateBucketResults) discard
+// it — they already have per-file sizes from the driving
+// ListObjectsV2 response. BucketResultsFromS3URIs uses it to surface
+// Size on the returned BucketResult without a second HeadObject
+// round-trip.
+func (c *Client) openBucketFrame(ctx context.Context, uri string, opts *parquetio.ReadOptions) (*gobi.Frame, int64, error) {
 	bucket, key, err := parseS3URI(uri)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	ra, size, err := newS3ReaderAt(ctx, c.s3, bucket, key)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	f, err := parquetio.ReadReader(ra, size, opts)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", uri, err)
+		return nil, 0, fmt.Errorf("read %s: %w", uri, err)
 	}
-	return f, nil
+	return f, size, nil
 }
 
 // readOptsFromSpec builds a *parquetio.ReadOptions carrying columns
@@ -633,7 +641,10 @@ func readOptsFromSpec(columns []string, predicate gobi.Expr) *parquetio.ReadOpti
 func (c *Client) readBucketFiles(ctx context.Context, files []bucketFileInfo, opts *parquetio.ReadOptions) (*gobi.Frame, error) {
 	frames := make([]*gobi.Frame, 0, len(files))
 	for _, fi := range files {
-		f, err := c.openBucketFrame(ctx, fi.URI, opts)
+		// Discard size: readBucketFiles callers already have fi.Size
+		// from ListObjectsV2; this path aggregates all files into one
+		// concat'd Frame anyway.
+		f, _, err := c.openBucketFrame(ctx, fi.URI, opts)
 		if err != nil {
 			for _, prev := range frames {
 				prev.Release()
@@ -814,14 +825,61 @@ func (c *Client) UnloadAndReadBucketsWithMetadata(ctx context.Context, spec Unlo
 // claim as the mainline variant. Missing bucket indices become nil
 // slots.
 func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSpec) ([]BucketResult, error) {
+	prep, meta, err := c.prepareUnloadBuckets(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	return c.hydrateBuckets(ctx, prep, meta, spec.Columns, spec.Predicate)
+}
+
+// UnloadAndReadBucketsManifest is the two-phase variant of
+// UnloadAndReadBuckets. See RawCTASBucketsManifest for the shape and
+// hand-off rationale; this method is the composed-CTAS-side
+// counterpart.
+func (c *Client) UnloadAndReadBucketsManifest(ctx context.Context, spec UnloadSpec) (
+	manifest []BucketResult,
+	meta CTASMetadata,
+	hydrate func(context.Context) ([]BucketResult, error),
+	err error,
+) {
+	if len(spec.PartitionBy) == 0 {
+		return nil, CTASMetadata{}, nil, fmt.Errorf("athenaio: UnloadAndReadBucketsManifest requires non-empty spec.PartitionBy")
+	}
+	if spec.BucketCount <= 0 {
+		return nil, CTASMetadata{}, nil, fmt.Errorf("athenaio: UnloadAndReadBucketsManifest requires spec.BucketCount > 0")
+	}
+	prep, pmeta, err := c.prepareUnloadBuckets(ctx, spec)
+	if err != nil {
+		return nil, CTASMetadata{}, nil, err
+	}
+	manifest, err = buildBucketManifest(prep)
+	if err != nil {
+		return nil, CTASMetadata{}, nil, fmt.Errorf("athenaio: UnloadAndReadBucketsManifest %s: %w", prep.queryID, err)
+	}
+	meta = CTASMetadata{
+		Location: prep.actualLoc,
+		QueryID:  prep.queryID,
+		Duration: time.Since(prep.start),
+	}
+	hydrate = func(hctx context.Context) ([]BucketResult, error) {
+		return c.hydrateBuckets(hctx, prep, pmeta, spec.Columns, spec.Predicate)
+	}
+	return manifest, meta, hydrate, nil
+}
+
+// prepareUnloadBuckets runs the composed-CTAS side of the Unload
+// path up through file listing. Returns the shared bucketPrep +
+// the derived PartitionMetadata (which needs the composed format
+// hashTagFor tag — not derivable from the raw spec alone).
+func (c *Client) prepareUnloadBuckets(ctx context.Context, spec UnloadSpec) (*bucketPrep, *gobi.PartitionMetadata, error) {
 	start := time.Now()
 	if spec.ValidatePartitionCols {
 		cols, err := c.runPrepass(ctx, spec.SQL)
 		if err != nil {
-			return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets prepass: %w", err)
+			return nil, nil, fmt.Errorf("athenaio: UnloadAndReadBuckets prepass: %w", err)
 		}
 		if err := verifyPartitionColsPresent(spec.PartitionBy, cols); err != nil {
-			return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets prepass: %w", err)
+			return nil, nil, fmt.Errorf("athenaio: UnloadAndReadBuckets prepass: %w", err)
 		}
 	}
 
@@ -838,10 +896,10 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 			c.setHiveFallbackOnly()
 			composed, queryID, exec, err = c.tryCTAS(ctx, spec, true)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		} else {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -853,7 +911,7 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 			Format:           composed.Format,
 			ExternalLocation: composed.ExternalLocation,
 		})
-		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s read-back verify: %w", queryID, err)
+		return nil, nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s read-back verify: %w", queryID, err)
 	}
 	c.registerTable(trackedTable{
 		Database:         c.cfg.Database,
@@ -863,24 +921,14 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 		ExternalLocation: composed.ExternalLocation,
 	})
 
-	// List files under the actual Glue-recorded location — see
-	// resolveActualLocation for the workgroup-override rationale.
 	actualLoc, err := c.resolveActualLocation(ctx, c.cfg.Database, composed.TableName, composed.ExternalLocation)
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: %w", queryID, err)
+		return nil, nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: %w", queryID, err)
 	}
 	files, err := listBucketFiles(ctx, c.s3, actualLoc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	// Empty file set is a legitimate outcome — the CTAS succeeded
-	// (verifyCTASOutput above passed) and the SELECT produced zero
-	// rows. Callers on small AOIs / narrow time windows hit this
-	// path when their input has genuinely no matching data. Return
-	// a BucketCount-length slice of nil-Frame results (same shape as
-	// per-bucket-empty at line 836 below) so caller code that
-	// iterates buckets stays uniform between "some buckets empty"
-	// and "all buckets empty."
 
 	meta := &gobi.PartitionMetadata{
 		Columns:      append([]string(nil), spec.PartitionBy...),
@@ -889,34 +937,14 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 		SortEnforced: composed.Format == FormatIceberg && len(spec.OrderBy) > 0,
 	}
 
-	// Build per-file LazyFrames. Missing bucket indices — where a
-	// bucket produced zero rows and Athena wrote no file — become
-	// nil slots so len(result) == BucketCount and index i maps to
-	// bucket i consistently across peer calls.
-	results := make([]BucketResult, spec.BucketCount)
-	totalRows, err := c.populateBucketResults(ctx, files, results, actualLoc, meta, readOptsFromSpec(spec.Columns, spec.Predicate))
-	if err != nil {
-		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: %w", queryID, err)
-	}
-
-	// Register stats on every non-nil frame so per-bucket callers
-	// can look them up individually. RowCount is the CTAS-wide total
-	// (same value on every bucket's stats blob) — per-bucket sizes
-	// are recoverable via Frame.NumRows() after Collect.
-	stats := QueryStats{
-		QueryExecutionID: queryID,
-		ResultPrefix:     composed.ExternalLocation,
-		ScannedBytes:     scannedBytes(exec),
-		EngineTime:       engineTime(exec),
-		TotalTime:        time.Since(start),
-		RowCount:         totalRows,
-	}
-	for _, r := range results {
-		if r.Frame != nil {
-			registerStats(r.Frame, stats)
-		}
-	}
-	return results, nil
+	return &bucketPrep{
+		files:       files,
+		actualLoc:   actualLoc,
+		bucketCount: spec.BucketCount,
+		queryID:     queryID,
+		exec:        exec,
+		start:       start,
+	}, meta, nil
 }
 
 // RawCTASBuckets is the bucket-aware variant of RawCTAS. Submits the
@@ -937,6 +965,86 @@ func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSp
 //     LazyFrames, nil slots for empty buckets when possible,
 //     independent Collect() errors.
 func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]BucketResult, error) {
+	prep, err := c.prepareRawCTASBuckets(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	return c.hydrateBuckets(ctx, prep, spec.Metadata, spec.Columns, spec.Predicate)
+}
+
+// RawCTASBucketsManifest is the two-phase variant of RawCTASBuckets.
+// Phase 1 (this call): submit + poll + verify + list — returns the
+// per-bucket manifest (S3URIs + Sizes + common Location) and query
+// metadata. Frame is nil on every entry.
+// Phase 2 (hydrate closure): construct LazyFrames from the listed
+// files on demand. Calling hydrate is optional — the manifest itself
+// is durable and can be serialized, handed to another process, and
+// fed into BucketResultsFromS3URIs later.
+//
+// The hydrator is same-process only: it captures a Client reference,
+// so it can't cross process boundaries. Cross-process consumers
+// should persist the manifest, then reconstruct via
+// BucketResultsFromS3URIs on the receiving side.
+//
+// Cleanup: same as RawCTASBuckets. The Glue table is registered for
+// cleanup on Client.Close, so the temp catalog entry gets dropped
+// as soon as this Client shuts down — the manifest URIs may outlive
+// the Glue entry, which is fine since BucketResultsFromS3URIs goes
+// directly to S3 without touching Glue.
+//
+// Hydrate contract:
+//
+//   - Idempotent-ish — each call re-runs `populateBucketResults`,
+//     returning FRESH LazyFrames. Two calls produce two independent
+//     result slices; sibling LazyFrame errors and PartitionMetadata
+//     assertions apply per-slice.
+//   - Takes its own ctx so a slow S3 read can be bounded
+//     independently of the ctx used for the submit/poll phase.
+//   - Runs the same code path as RawCTASBuckets — spec.Metadata,
+//     spec.Columns, spec.Predicate all applied identically.
+func (c *Client) RawCTASBucketsManifest(ctx context.Context, spec RawCTASSpec) (
+	manifest []BucketResult,
+	meta CTASMetadata,
+	hydrate func(context.Context) ([]BucketResult, error),
+	err error,
+) {
+	prep, err := c.prepareRawCTASBuckets(ctx, spec)
+	if err != nil {
+		return nil, CTASMetadata{}, nil, err
+	}
+	manifest, err = buildBucketManifest(prep)
+	if err != nil {
+		return nil, CTASMetadata{}, nil, fmt.Errorf("athenaio: RawCTASBucketsManifest %s: %w", prep.queryID, err)
+	}
+	meta = CTASMetadata{
+		Location: prep.actualLoc,
+		QueryID:  prep.queryID,
+		Duration: time.Since(prep.start),
+	}
+	hydrate = func(hctx context.Context) ([]BucketResult, error) {
+		return c.hydrateBuckets(hctx, prep, spec.Metadata, spec.Columns, spec.Predicate)
+	}
+	return manifest, meta, hydrate, nil
+}
+
+// bucketPrep captures the CTAS-side artifacts shared between the
+// eager and manifest RawCTAS/Unload variants. Populated by prepare*
+// helpers; consumed by hydrateBuckets and buildBucketManifest.
+type bucketPrep struct {
+	files       []bucketFileInfo
+	actualLoc   string
+	bucketCount int
+	queryID     string
+	exec        *athenatypes.QueryExecution
+	start       time.Time
+}
+
+// prepareRawCTASBuckets validates the spec, submits + polls the CTAS,
+// registers the table for cleanup, verifies bucketing, resolves the
+// actual Glue location, and lists the bucket files. All the work
+// RawCTASBuckets and RawCTASBucketsManifest share up through the
+// point where they diverge on hydration policy.
+func (c *Client) prepareRawCTASBuckets(ctx context.Context, spec RawCTASSpec) (*bucketPrep, error) {
 	if spec.SQL == "" {
 		return nil, fmt.Errorf("athenaio: RawCTASSpec.SQL is empty")
 	}
@@ -1010,18 +1118,40 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 	// bucketCount-length slice of nil-Frame results so caller code
 	// iterating buckets stays uniform between partially-empty and
 	// fully-empty results. Matches the UnloadAndReadBuckets shape.
+	return &bucketPrep{
+		files:       files,
+		actualLoc:   actualLoc,
+		bucketCount: bucketCount,
+		queryID:     queryID,
+		exec:        exec,
+		start:       start,
+	}, nil
+}
 
-	results := make([]BucketResult, bucketCount)
-	totalRows, err := c.populateBucketResults(ctx, files, results, actualLoc, spec.Metadata, readOptsFromSpec(spec.Columns, spec.Predicate))
+// hydrateBuckets fills a fresh []BucketResult from the prep + spec-derived
+// read options, registers QueryStats on every non-nil frame, and returns
+// the result. Shared by the eager RawCTASBuckets/UnloadAndReadBuckets
+// paths and by the manifest-hydrator closures. QueryID is the
+// disambiguator in error messages — the calling method's name isn't
+// needed since the QueryID uniquely identifies the failed CTAS.
+func (c *Client) hydrateBuckets(
+	ctx context.Context,
+	prep *bucketPrep,
+	metadata *gobi.PartitionMetadata,
+	columns []string,
+	predicate gobi.Expr,
+) ([]BucketResult, error) {
+	results := make([]BucketResult, prep.bucketCount)
+	totalRows, err := c.populateBucketResults(ctx, prep.files, results, prep.actualLoc, metadata, readOptsFromSpec(columns, predicate))
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
+		return nil, fmt.Errorf("athenaio: hydrateBuckets %s: %w", prep.queryID, err)
 	}
 	stats := QueryStats{
-		QueryExecutionID: queryID,
-		ResultPrefix:     spec.ExternalLocation,
-		ScannedBytes:     scannedBytes(exec),
-		EngineTime:       engineTime(exec),
-		TotalTime:        time.Since(start),
+		QueryExecutionID: prep.queryID,
+		ResultPrefix:     prep.actualLoc,
+		ScannedBytes:     scannedBytes(prep.exec),
+		EngineTime:       engineTime(prep.exec),
+		TotalTime:        time.Since(prep.start),
 		RowCount:         totalRows,
 	}
 	for _, r := range results {
@@ -1030,6 +1160,37 @@ func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]Bucket
 		}
 	}
 	return results, nil
+}
+
+// buildBucketManifest constructs a Frame-nil []BucketResult from the
+// prep. Each slot carries S3URI + Size + Location. Slotted via
+// bucketSlotFor — same logic populateBucketResults uses on the eager
+// path, so the manifest and any subsequent hydrate() call agree on
+// which URI lands in which slot.
+//
+// Surfaces the same slotting errors populateBucketResults would
+// (out-of-range slot, duplicate S3URI claim). Silently accepting
+// them here would produce a manifest that misrepresents the CTAS
+// output — the caller would then see hydrate() error on the same
+// underlying data, with no upstream signal about which URI caused it.
+func buildBucketManifest(prep *bucketPrep) ([]BucketResult, error) {
+	manifest := make([]BucketResult, prep.bucketCount)
+	for i := range manifest {
+		manifest[i].Location = prep.actualLoc
+	}
+	for i, fi := range prep.files {
+		slot, err := bucketSlotFor(fi.URI, i, prep.bucketCount)
+		if err != nil {
+			return nil, err
+		}
+		if manifest[slot].S3URI != "" {
+			return nil, fmt.Errorf("athenaio: duplicate bucket slot %d: %s and %s",
+				slot, manifest[slot].S3URI, fi.URI)
+		}
+		manifest[slot].S3URI = fi.URI
+		manifest[slot].Size = fi.Size
+	}
+	return manifest, nil
 }
 
 // populateBucketResults reads each file into a Frame, wraps it in a
@@ -1058,7 +1219,9 @@ func (c *Client) populateBucketResults(ctx context.Context, files []bucketFileIn
 	nSlots := len(results)
 	var totalRows int64
 	for i, fi := range files {
-		frame, err := c.openBucketFrame(ctx, fi.URI, opts)
+		// populateBucketResults uses fi.Size from ListObjectsV2 —
+		// no need for the openBucketFrame size return here.
+		frame, _, err := c.openBucketFrame(ctx, fi.URI, opts)
 		if err != nil {
 			return 0, err
 		}
@@ -1075,16 +1238,9 @@ func (c *Client) populateBucketResults(ctx context.Context, files []bucketFileIn
 			lf = asserted
 		}
 
-		// Prefer parsed bucket index; fall back to listing order for
-		// non-standard names. Out-of-range indices fall back too.
-		slot := bucketIndexFromURI(fi.URI)
-		if slot < 0 || slot >= nSlots {
-			slot = i
-			if slot >= nSlots {
-				// More files than expected buckets — should not happen
-				// with a valid bucket_count check, but stay defensive.
-				return 0, fmt.Errorf("athenaio: file %s exceeds expected bucket range [0,%d)", fi.URI, nSlots)
-			}
+		slot, err := bucketSlotFor(fi.URI, i, nSlots)
+		if err != nil {
+			return 0, err
 		}
 		if results[slot].Frame != nil {
 			// Two files claim the same slot — surface rather than
@@ -1101,6 +1257,31 @@ func (c *Client) populateBucketResults(ctx context.Context, files []bucketFileIn
 		results[slot].Size = fi.Size
 	}
 	return totalRows, nil
+}
+
+// bucketSlotFor returns the destination slot for a bucket file URI.
+// Prefers the parsed bucket index from bucketIndexFromURI; falls back
+// to listing order (`i`) for URIs whose basenames don't match Athena's
+// bucket-index naming shapes. Errors when both parsed and listing-
+// order indices exceed nSlots — that only happens with a
+// bucket-count/file-count mismatch which the caller should surface,
+// not silently drop.
+//
+// Shared by populateBucketResults (eager path, fills LazyFrames) and
+// buildBucketManifest (manifest path, fills only S3URI+Size). Keeping
+// the slotting logic in one place ensures the manifest and the
+// eventual hydrate() call agree on which URI lands in which slot —
+// otherwise a bucket-count-mismatch or duplicate-slot condition would
+// go undetected until hydrate ran and errored on the same data.
+func bucketSlotFor(uri string, i, nSlots int) (int, error) {
+	slot := bucketIndexFromURI(uri)
+	if slot < 0 || slot >= nSlots {
+		slot = i
+		if slot >= nSlots {
+			return 0, fmt.Errorf("athenaio: file %s exceeds expected bucket range [0,%d)", uri, nSlots)
+		}
+	}
+	return slot, nil
 }
 
 // bucketIndexFromURI extracts the bucket index from an Athena-shaped
@@ -1155,4 +1336,152 @@ func (c *Client) readGlueBucketCount(ctx context.Context, database, tableName st
 		return 0, nil
 	}
 	return int(sd.NumberOfBuckets), nil
+}
+
+// bucketResultsFromS3URIsMaxParallel bounds the concurrent
+// HeadObject+Parquet-footer round-trips inside
+// BucketResultsFromS3URIs. Sized to avoid overwhelming S3's
+// per-connection rate limits on large URI lists while still
+// giving hand-off callers meaningful speedup vs a sequential
+// walk. Adjust if a benchmark on a real workload shows the
+// ceiling is too low or the concurrency triggers throttling.
+const bucketResultsFromS3URIsMaxParallel = 32
+
+// BucketResultsFromS3URIs wraps existing S3 parquet URIs — typically
+// from a persisted RawCTASBucketsManifest — into a []BucketResult
+// ready for downstream LazyFrame consumption. Skips CTAS submit,
+// Glue reads, and cleanup registration entirely: these are borrowed
+// files that the Client does NOT own.
+//
+// Per URI:
+//   - S3URI populated verbatim from the input.
+//   - Size discovered via a single HeadObject (implicit inside
+//     openBucketFrame — one HTTP round-trip per URI).
+//   - Frame is a LazyFrame reading via S3 GetObject + Range at
+//     Collect() time; no local materialization.
+//   - Location is the longest common `s3://bucket/prefix/` string
+//     shared by every URI, ending at a `/`. Empty when the URIs
+//     don't share such a prefix (e.g. mixed buckets).
+//
+// Concurrency: HeadObject + Parquet footer reads run in parallel
+// with a bounded worker pool (see bucketResultsFromS3URIsMaxParallel).
+// The output slice preserves input order regardless of completion
+// order. Any single-URI failure aborts the whole call — partial
+// results are less useful than a hard error for the hand-off use
+// case.
+//
+// Slotting: listing-order, matching the input `uris` slice
+// one-for-one. Callers wanting bucket-index slotting (bucket N
+// at position N, with nil-Frame gaps for missing indices) should
+// pre-sort + pad their URI list before calling.
+//
+// opts controls Parquet-side column projection and row-group pruning;
+// nil means "read every column, no pruning". Mirrors the eager
+// path's spec.Columns / spec.Predicate capability so cross-process
+// hand-off consumers aren't strictly worse off than same-process
+// hydrate() callers.
+//
+// Cleanup: does NOT register the source files or any Glue table for
+// cleanup on Client.Close — these are borrowed files, deletion is
+// the caller's responsibility. No QueryStats attached to the
+// returned LazyFrames since no query was submitted; callers who
+// want stats should persist them alongside the manifest from the
+// original RawCTASBucketsManifest / RawCTASWithMetadata call.
+func (c *Client) BucketResultsFromS3URIs(ctx context.Context, uris []string, opts *parquetio.ReadOptions) ([]BucketResult, error) {
+	if len(uris) == 0 {
+		return nil, nil
+	}
+	location := longestCommonS3Prefix(uris)
+	results := make([]BucketResult, len(uris))
+
+	// Bounded-parallel HeadObject + footer read. Each worker writes
+	// to its own slot in `results` (distinct index per URI), so no
+	// cross-worker synchronization is needed on the output. First
+	// error wins via errgroup's ctx cancellation.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(bucketResultsFromS3URIsMaxParallel)
+	for i, uri := range uris {
+		i, uri := i, uri
+		g.Go(func() error {
+			frame, size, err := c.openBucketFrame(gctx, uri, opts)
+			if err != nil {
+				return fmt.Errorf("athenaio: BucketResultsFromS3URIs %s: %w", uri, err)
+			}
+			results[i] = BucketResult{
+				S3URI:    uri,
+				Frame:    frame.Lazy(),
+				Size:     size,
+				Location: location,
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		// Release any frames that landed before the error. LazyFrame
+		// doesn't expose Release directly; the underlying Frame's ref
+		// is held on the LazyFrame — dropping the slice is enough for
+		// GC to reclaim.
+		return nil, err
+	}
+	return results, nil
+}
+
+// longestCommonS3Prefix returns the longest `s3://bucket/prefix/`
+// shared by every URI in uris, trimmed at the last `/` boundary.
+// Returns "" when the URIs share no `/`-anchored prefix (e.g. mixed
+// buckets, or a trivial common prefix like `s3://`).
+//
+// Comparison is byte-wise but each pair-wise step trims the running
+// prefix to its last '/' inside the loop — that way `s3://bucket-a/x`
+// vs `s3://bucket-aa/x` reduces to `s3://` early (and gets rejected
+// as degenerate at the return check) rather than accidentally
+// producing a mid-name substring that the final trim has to clean up.
+func longestCommonS3Prefix(uris []string) string {
+	if len(uris) == 0 {
+		return ""
+	}
+	prefix := uris[0]
+	for _, u := range uris[1:] {
+		n := len(prefix)
+		if len(u) < n {
+			n = len(u)
+		}
+		i := 0
+		for ; i < n; i++ {
+			if prefix[i] != u[i] {
+				break
+			}
+		}
+		// Trim to the last '/' at or before the divergence point so
+		// the running prefix always ends on a segment boundary.
+		// Prevents `s3://bucket-a/x` vs `s3://bucket-aa/x` from
+		// carrying `s3://bucket-a` (which trims to `s3://` at the
+		// end) between iterations — with the segment trim, the
+		// running prefix is `s3://` after the first comparison, and
+		// subsequent iterations short-circuit on the empty check.
+		cut := strings.LastIndex(prefix[:i], "/")
+		if cut < 0 {
+			return ""
+		}
+		prefix = prefix[:cut+1]
+		if prefix == "" {
+			return ""
+		}
+	}
+	// Trim to last '/' — no-op after the loop's per-step trim on
+	// multi-URI inputs, but handles the single-URI case where the
+	// loop body didn't run.
+	idx := strings.LastIndex(prefix, "/")
+	if idx < 0 {
+		return ""
+	}
+	prefix = prefix[:idx+1]
+	// Guard against degenerate prefixes: `s3://` alone means the
+	// URIs only share the scheme, which is not a useful "common
+	// location". `s3://bucket/` with no key prefix is still valid
+	// (all objects at bucket root), so allow that.
+	if prefix == "s3://" || !strings.HasPrefix(prefix, "s3://") {
+		return ""
+	}
+	return prefix
 }

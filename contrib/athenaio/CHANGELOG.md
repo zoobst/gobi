@@ -9,6 +9,181 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.15]
+
+Review-cycle follow-up on the v0.1.14 manifest hand-off API. Adds
+column/predicate capability + bounded parallelism to
+`BucketResultsFromS3URIs`, hardens the manifest path to surface
+slotting errors that the initial version silently swallowed, and
+fixes a segment-boundary bug in the common-prefix helper.
+
+### Changed
+
+- **`Client.BucketResultsFromS3URIs` signature adds
+  `opts *parquetio.ReadOptions`**: `(ctx, uris) → (ctx, uris, opts)`.
+  Mirrors the eager path's `spec.Columns` / `spec.Predicate`
+  capability so cross-process hand-off consumers aren't strictly
+  worse off than same-process `hydrate()` callers. Pass `nil` to
+  match the previous behavior (read every column, no row-group
+  pruning). Breaking change against v0.1.14 — but the API is one
+  release old and had no external callers, so the migration is a
+  mechanical `nil`-append.
+
+- **`BucketResultsFromS3URIs` now runs HeadObject + Parquet footer
+  reads in a bounded parallel worker pool**
+  (`bucketResultsFromS3URIsMaxParallel = 32`). Output order
+  preserves input order regardless of completion order; first
+  error wins via errgroup ctx cancellation. Removes the "sequential
+  per URI" caveat from the v0.1.14 doc — hand-off callers with
+  100+ buckets no longer serialize on S3 round-trips.
+
+### Fixed
+
+- **`buildBucketManifest` surfaces slotting conflicts instead of
+  silently swallowing them.** The v0.1.14 version accepted
+  duplicate slot claims and files-exceed-bucket-count conditions
+  that `populateBucketResults` (the eager path) errors on. Since
+  both run on the same `prep.files`, the manifest hid a
+  divergence that would resurface on `hydrate()` with no upstream
+  signal about which URI caused it. Now both paths share a
+  `bucketSlotFor` helper and error identically.
+
+- **`longestCommonS3Prefix` now trims to segment boundaries inside
+  the pairwise-compare loop.** The v0.1.14 version byte-compared,
+  then trimmed at the last `/` post-hoc — which mostly worked but
+  produced spurious intermediate substrings for lookalike bucket
+  names like `bucket-a` vs `bucket-aa` (byte-compare stops at
+  `s3://bucket-a`, which trims to `s3://` and gets rejected as
+  degenerate). Same observable output on that input, but via the
+  correct segment-comparison path instead of the degenerate-prefix
+  guard. Added test case
+  `TestLongestCommonS3Prefix/similar-bucket-names` locks it in.
+
+### Internal
+
+- **`bucketSlotFor(uri, i, nSlots) (int, error)` helper** — shared
+  slotting logic between `populateBucketResults` (eager) and
+  `buildBucketManifest` (manifest). Ensures the two paths stay
+  in lockstep on parsed-index vs listing-order fallback and
+  out-of-range errors.
+
+- **`hydrateBuckets` no longer takes a `label string`.** Error
+  context comes from `prep.queryID` alone — the QueryID uniquely
+  identifies the failed CTAS; a caller-method label was dead
+  weight in a one-site-per-branch format string.
+
+- **`openBucketFrame` doc-comment corrected** to reflect actual
+  caller mix (2 discard the size, 1 uses it).
+
+- **`TestBucketResultsFromS3URIs_MixedBucketsGetEmptyLocation`
+  gained a mock-coverage caveat** noting the mock doesn't
+  distinguish objects by bucket, so this test exercises only the
+  Location-computation branch, not the read path against
+  genuinely-different S3 buckets.
+
+## [v0.1.14]
+
+Two-phase CTAS execution + S3-URI hand-off, for the "run Athena in
+process A, read the output in process B" workflow that Fargate-style
+pipelines want. Compose:
+
+```go
+// Process A: submit CTAS, persist manifest, exit.
+manifest, meta, _, _ := c.RawCTASBucketsManifest(ctx, spec)
+persist(manifest, meta)
+
+// Process B (later, elsewhere): reconstruct LazyFrames.
+manifest := load()
+uris := urisFromManifest(manifest)
+results, _ := c2.BucketResultsFromS3URIs(ctx, uris)
+```
+
+### Added
+
+- **`Client.BucketResultsFromS3URIs(ctx, uris) ([]BucketResult, error)`**
+  — wraps pre-existing S3 parquet URIs (typically from a persisted
+  `RawCTASBucketsManifest`) into ready-to-Collect `BucketResult`s.
+  Skips CTAS submit, Glue reads, and cleanup registration — these
+  are **borrowed files** the Client does NOT own. Sequential
+  HeadObject per URI (parallelism follow-up landed in v0.1.15).
+  No `QueryStats` attached — no query happened; callers who want
+  stats should persist them from the original
+  `RawCTASBucketsManifest` / `RawCTASWithMetadata` call. Listing-
+  order slotting (position `i` in output matches position `i` in
+  the input `uris`); callers wanting bucket-index slotting should
+  pre-sort and pad. `Location` is the longest common
+  `s3://bucket/prefix/` shared by every URI, or `""` when the URIs
+  straddle buckets or share only the scheme.
+
+- **`Client.RawCTASBucketsManifest(ctx, spec) (manifest, meta, hydrate, err)`**
+  — two-phase RawCTAS. Phase 1 (this call): submit + poll + verify
+  + list; returns the per-bucket manifest (S3URIs + Sizes +
+  Location) and `CTASMetadata` (Location + QueryID + Duration).
+  `Frame` is nil on every manifest entry. Phase 2 (the `hydrate`
+  closure): construct LazyFrames on demand — takes its own `ctx`
+  so slow S3 reads can be bounded independently of the
+  submit-phase ctx. Fresh LazyFrames per `hydrate` call.
+
+  ```go
+  manifest, meta, hydrate, err := c.RawCTASBucketsManifest(ctx, spec)
+  // ... inspect meta.Location / sum manifest[i].Size / decide ...
+  results, err := hydrate(ctx)
+  ```
+
+  The hydrator is **same-process only** (captures a `*Client`).
+  For cross-process hand-off, persist the manifest and reconstruct
+  via `BucketResultsFromS3URIs` on the receiving side.
+
+- **`Client.UnloadAndReadBucketsManifest(ctx, spec) (manifest, meta, hydrate, err)`**
+  — composed-CTAS-side companion to `RawCTASBucketsManifest`. Same
+  shape and hand-off rationale.
+
+### Changed
+
+- **`QueryStats.ResultPrefix` now carries the resolved Glue-recorded
+  location, not the caller-supplied `spec.ExternalLocation` /
+  `composed.ExternalLocation`.** Previously `RawCTASBuckets` used
+  `spec.ExternalLocation` and `unloadAndReadBucketsWithMeta` used
+  `composed.ExternalLocation`; the shared `hydrateBuckets` refactor
+  in this release unified both on `prep.actualLoc` (the value
+  returned by `resolveActualLocation`, matching `CTASMetadata.Location`
+  and `BucketResult.Location`). Under a workgroup with
+  `EnforceWorkGroupConfiguration=true` that overrides the output
+  prefix, `actualLoc` differs from the composed / spec value —
+  callers using `ResultPrefix` to correlate against S3 objects
+  should see the resolved value, which is the S3 prefix the CTAS
+  actually wrote to. Zero observable change on workgroups without
+  the override.
+
+- **`Client.openBucketFrame` return signature: `(*gobi.Frame, error)`
+  → `(*gobi.Frame, int64, error)`.** The extra `int64` is the S3
+  `ContentLength` from the internal `HeadObject`, exposed so
+  `BucketResultsFromS3URIs` can populate `BucketResult.Size` without
+  a second round-trip. Unexported method — no external callers to
+  break. The two existing internal callers now discard the size
+  (they already have it from `ListObjectsV2`).
+
+### Internal
+
+- **`bucketPrep` struct + `prepareRawCTASBuckets` / `prepareUnloadBuckets`
+  helpers** carry the CTAS-side artifacts (files, actualLoc,
+  bucketCount, queryID, exec, start) shared between the eager and
+  manifest variants of each. The eager `RawCTASBuckets` and the
+  `unloadAndReadBucketsWithMeta` paths now compose `prepare* +
+  hydrateBuckets` instead of duplicating the submit/list/populate
+  sequence inline.
+
+- **`hydrateBuckets`** is the shared "populate results + register
+  stats" body.
+
+- **`buildBucketManifest`** constructs the Frame-nil manifest from
+  a `bucketPrep`. Bucket-index slotting via `bucketIndexFromURI`
+  with listing-order fallback for non-standard names.
+
+- **`longestCommonS3Prefix`** helper — computes the longest
+  `s3://bucket/prefix/` shared by a URI slice, trimmed at the
+  last `/`. Rejects degenerate `s3://`-only matches.
+
 ## [v0.1.13]
 
 ### Added
