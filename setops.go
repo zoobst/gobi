@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
@@ -35,9 +36,12 @@ func Concat(frames ...*Frame) (*Frame, error) {
 // Each frame's Arrow buffers are kept alive as separate chunks of
 // the output — no memcpy of the underlying data. The resulting
 // Frame's columns are multi-chunk; downstream ops that assume
-// single-chunk (like some numeric fast paths) will fall back to
-// the general path. Call `.Coalesce()` (planned) if you need a
-// single-chunk output.
+// single-chunk (SortBy, Timestamp col-vs-col comparisons, ListUnion,
+// RecordBatch views) will error until compacted. Call
+// `.CompactChunks()` to materialize a single-chunk copy — cheap no-op
+// when the frame is already single-chunk, so callers can compact
+// defensively without checking. See also `Frame.IsSingleChunk()` /
+// `Frame.NumChunks()`.
 func (f *Frame) Concat(others ...*Frame) (*Frame, error) {
 	if f == nil {
 		return nil, fmt.Errorf("gobi: Frame.Concat on nil frame")
@@ -82,6 +86,98 @@ func (f *Frame) Concat(others ...*Frame) (*Frame, error) {
 		}
 	}
 	return NewFrame(f.schema, cols)
+}
+
+// CompactChunks returns f with every column re-chunked as a single
+// contiguous Arrow array. Concatenates each column's chunk list via
+// `array.Concatenate` and rebuilds the Frame with the same schema.
+//
+// Required before SortBy, Timestamp column-vs-column comparisons,
+// and ListUnion on Concat output — those code paths currently error
+// on multi-chunk input pending a chunk-walking rework. Also useful
+// before handing a Frame to code that expects the RecordBatch shape
+// (which is single-array-per-column by construction).
+//
+// # Cost
+//
+// One `array.Concatenate` per column: allocates a fresh contiguous
+// buffer sized to the total row count, then memcpies each chunk's
+// bytes in. Caller pays the compaction tax explicitly at the call
+// site — the Concat output stays cheap (chunk-list stitch, no
+// memcpy) for callers who don't need single-chunk downstream.
+//
+// # Idempotency
+//
+// When every column is already single-chunk (`f.IsSingleChunk()`
+// returns true), returns f itself with a matched Retain — no new
+// allocation. Callers can defensively `f.CompactChunks()` on every
+// Frame that might have come from Concat without paying for frames
+// that don't need it.
+//
+// # Errors
+//
+// Propagates errors from `array.Concatenate` (chunk-type mismatches,
+// unsupported types). In practice these only surface on malformed
+// Frames — the schema-alignment invariants that `NewFrame` enforces
+// prevent them on any Frame built through the public API.
+func (f *Frame) CompactChunks() (*Frame, error) {
+	if f == nil {
+		return nil, fmt.Errorf("gobi: Frame.CompactChunks on nil frame")
+	}
+	if f.IsSingleChunk() {
+		f.Retain()
+		return f, nil
+	}
+	pool := memory.DefaultAllocator
+	ncols := len(f.series)
+	cols := make([]arrow.Column, ncols)
+	// Explicit success flag drives the deferred cleanup: any exit
+	// before we flip `success` (mid-loop Concatenate failure OR
+	// NewFrame failure after the loop) releases every column we've
+	// already built. A `built < ncols` predicate looks similar but
+	// misses the NewFrame-error case, since by that point built ==
+	// ncols would short-circuit the release loop and leak all N
+	// columns' concatenated buffers.
+	built := 0
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		for i := 0; i < built; i++ {
+			cols[i].Release()
+		}
+	}()
+	for i, s := range f.series {
+		field := s.field
+		combined, err := array.Concatenate(s.col.Data().Chunks(), pool)
+		if err != nil {
+			return nil, fmt.Errorf("gobi: Frame.CompactChunks: column %q: %w", s.name, err)
+		}
+		chunked := arrow.NewChunked(combined.DataType(), []arrow.Array{combined})
+		cols[i] = *arrow.NewColumn(field, chunked)
+		// NewColumn retained chunked; NewChunked retained combined —
+		// release our local refs. The Column still holds the live
+		// reference to the concatenated buffer.
+		combined.Release()
+		chunked.Release()
+		built++
+	}
+	out, err := NewFrame(f.schema, cols)
+	if err != nil {
+		return nil, fmt.Errorf("gobi: Frame.CompactChunks: rebuild frame: %w", err)
+	}
+	// NewFrame transferred ownership of every column into the Frame;
+	// disarm the cleanup defer so we don't double-release.
+	success = true
+	// Propagate partition metadata — compaction preserves row order
+	// per-column, so any hash / sort claim the source carried still
+	// holds. Doing it inside CompactChunks rather than in NewFrame
+	// keeps NewFrame ignorant of the metadata concept.
+	if f.partitionMeta != nil {
+		out = out.WithPartitionMeta(f.partitionMeta)
+	}
+	return out, nil
 }
 
 // Union returns rows in either f or other, deduplicated over cols.

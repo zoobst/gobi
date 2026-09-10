@@ -137,6 +137,45 @@ func (f *Frame) ColumnAt(i int) (Series, error) {
 	return f.series[i], nil
 }
 
+// NumChunks returns the maximum Arrow chunk count across all columns.
+// A well-formed Frame typically has the same chunk count on every
+// column (chunk boundaries line up with row boundaries), so this is
+// almost always the per-column count — but taking max stays robust
+// against hand-constructed frames with mismatched chunk shapes.
+//
+// Returns 0 for an empty (no-column) frame. Returns 1 for the common
+// single-chunk shape produced by Collect, SortBy, Filter, etc.
+// Returns >1 primarily after Concat / append-style operations that
+// stitch existing chunks together without materialization.
+//
+// Useful for the defensive-compact pattern:
+//
+//	if f.NumChunks() > 1 {
+//	    f, err = f.CompactChunks()
+//	}
+//
+// but callers can just always call CompactChunks — it's a no-op on
+// already-single-chunk frames.
+func (f *Frame) NumChunks() int {
+	n := 0
+	for _, s := range f.series {
+		if s.col == nil {
+			continue
+		}
+		c := len(s.col.Data().Chunks())
+		if c > n {
+			n = c
+		}
+	}
+	return n
+}
+
+// IsSingleChunk reports whether every column is backed by exactly one
+// Arrow chunk. Equivalent to `f.NumChunks() == 1` but reads better at
+// call sites that gate on the invariant (e.g. code paths that require
+// a RecordBatch view via frameToBatch).
+func (f *Frame) IsSingleChunk() bool { return f.NumChunks() == 1 }
+
 // Head returns a Frame with the first n rows (default 5).
 func (f *Frame) Head(n int) *Frame {
 	if n <= 0 {

@@ -861,7 +861,9 @@ func (n *listUnionNode) Eval(input *Frame) (Series, error) {
 	lChunks := ls.col.Data().Chunks()
 	rChunks := rs.col.Data().Chunks()
 	if len(lChunks) != 1 || len(rChunks) != 1 {
-		return Series{}, fmt.Errorf("ListUnion: multi-chunk lists not yet supported")
+		return Series{}, fmt.Errorf("ListUnion: multi-chunk lists not yet supported directly (left=%d chunks, right=%d chunks); "+
+			"call Frame.CompactChunks() first",
+			len(lChunks), len(rChunks))
 	}
 	la, ok := lChunks[0].(*array.List)
 	if !ok {

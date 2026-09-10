@@ -320,6 +320,156 @@ func TestSeries_Concat_SingleSeries_RetainsOutput(t *testing.T) {
 	out.col.Release()
 }
 
+// TestFrame_NumChunks_SingleAndMulti — basic bookkeeping around the
+// NumChunks / IsSingleChunk pair, plus the invariant that Concat
+// output is multi-chunk when the inputs each contributed a chunk.
+func TestFrame_NumChunks_SingleAndMulti(t *testing.T) {
+	l, r := buildSetOpFixture(t)
+	if !l.IsSingleChunk() {
+		t.Fatalf("fixture left is not single-chunk (got NumChunks=%d)", l.NumChunks())
+	}
+	if !r.IsSingleChunk() {
+		t.Fatalf("fixture right is not single-chunk (got NumChunks=%d)", r.NumChunks())
+	}
+	stacked, err := l.Concat(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stacked.NumChunks(); got != 2 {
+		t.Errorf("Concat of 2 single-chunk frames: NumChunks=%d, want 2", got)
+	}
+	if stacked.IsSingleChunk() {
+		t.Error("Concat output should not be single-chunk")
+	}
+}
+
+// TestFrame_CompactChunks_ConcatRoundTrip — the motivating shape:
+// Concat produces multi-chunk output; CompactChunks flattens it so
+// SortBy can consume the result.
+func TestFrame_CompactChunks_ConcatRoundTrip(t *testing.T) {
+	l, r := buildSetOpFixture(t)
+	stacked, err := l.Concat(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-fix confirmation: SortBy on Concat output should error and
+	// the error should point at CompactChunks — the whole reason this
+	// feature exists.
+	if _, err := stacked.SortBy(SortKey{Column: "id"}); err == nil {
+		t.Fatal("SortBy on multi-chunk frame should error, got nil")
+	} else if !stringContains(err.Error(), "CompactChunks") {
+		t.Errorf("SortBy multi-chunk error should mention CompactChunks, got: %v", err)
+	}
+
+	compact, err := stacked.CompactChunks()
+	if err != nil {
+		t.Fatalf("CompactChunks: %v", err)
+	}
+	if !compact.IsSingleChunk() {
+		t.Fatalf("CompactChunks output should be single-chunk, got NumChunks=%d", compact.NumChunks())
+	}
+	// Same row count preserved.
+	if compact.NumRows() != stacked.NumRows() {
+		t.Errorf("row count mismatch: compact=%d, stacked=%d", compact.NumRows(), stacked.NumRows())
+	}
+	// SortBy now succeeds.
+	sorted, err := compact.SortBy(SortKey{Column: "id"})
+	if err != nil {
+		t.Fatalf("SortBy on compacted frame: %v", err)
+	}
+	// Read back the id column in sorted order and verify it's
+	// non-decreasing. Fixture has ids {1,2,3,2} + {2,3,4} = {1,2,2,2,3,3,4}.
+	idCol, err := sorted.Column("id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr := idCol.col.Data().Chunks()[0].(*array.Int64)
+	want := []int64{1, 2, 2, 2, 3, 3, 4}
+	if arr.Len() != len(want) {
+		t.Fatalf("sorted len=%d, want %d", arr.Len(), len(want))
+	}
+	for i, w := range want {
+		if arr.Value(i) != w {
+			t.Errorf("sorted[%d]=%d, want %d", i, arr.Value(i), w)
+		}
+	}
+}
+
+// TestFrame_CompactChunks_IdempotentNoOp — CompactChunks on an
+// already-single-chunk frame returns the same *Frame pointer with a
+// matched Retain (no fresh allocation). Contract for defensive
+// compaction: callers can always call CompactChunks without penalty
+// on frames that don't need it.
+func TestFrame_CompactChunks_IdempotentNoOp(t *testing.T) {
+	l, _ := buildSetOpFixture(t)
+	if !l.IsSingleChunk() {
+		t.Fatal("fixture is not single-chunk")
+	}
+	out, err := l.CompactChunks()
+	if err != nil {
+		t.Fatalf("CompactChunks: %v", err)
+	}
+	if out != l {
+		t.Errorf("CompactChunks on single-chunk frame should return same pointer (got %p, want %p)", out, l)
+	}
+}
+
+// TestFrame_CompactChunks_MultiConcat — three-frame Concat produces
+// 3 chunks per column; CompactChunks flattens to 1.
+func TestFrame_CompactChunks_MultiConcat(t *testing.T) {
+	a, b := buildSetOpFixture(t)
+	c, _ := buildSetOpFixture(t)
+	stacked, err := a.Concat(b, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stacked.NumChunks(); got != 3 {
+		t.Errorf("3-frame Concat: NumChunks=%d, want 3", got)
+	}
+	compact, err := stacked.CompactChunks()
+	if err != nil {
+		t.Fatalf("CompactChunks: %v", err)
+	}
+	if got := compact.NumChunks(); got != 1 {
+		t.Errorf("post-CompactChunks: NumChunks=%d, want 1", got)
+	}
+	// Row count preserved across the full stack + compaction.
+	wantRows := a.NumRows() + b.NumRows() + c.NumRows()
+	if compact.NumRows() != wantRows {
+		t.Errorf("row count: got %d, want %d", compact.NumRows(), wantRows)
+	}
+}
+
+// TestFrame_CompactChunks_PreservesPartitionMeta — a Concat output
+// with an attached PartitionMetadata carries it through compaction.
+// Compaction preserves row order per-column so any hash / sort claim
+// the source carried still holds; dropping the metadata would force
+// downstream ops to fall back off partition-aware fast paths.
+func TestFrame_CompactChunks_PreservesPartitionMeta(t *testing.T) {
+	l, r := buildSetOpFixture(t)
+	stacked, err := l.Concat(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := &PartitionMetadata{
+		Columns: []string{"id"},
+		HashFn:  "test/hash/v1",
+	}
+	stacked = stacked.WithPartitionMeta(meta)
+	compact, err := stacked.CompactChunks()
+	if err != nil {
+		t.Fatalf("CompactChunks: %v", err)
+	}
+	got := compact.PartitionMetadata()
+	if got == nil {
+		t.Fatal("PartitionMetadata dropped through CompactChunks")
+	}
+	if got.HashFn != "test/hash/v1" {
+		t.Errorf("HashFn = %q, want test/hash/v1", got.HashFn)
+	}
+}
+
 // containsAll returns true when s contains every substr. Cheaper
 // than pulling in strings.Contains chains inline.
 func containsAll(s string, subs []string) bool {

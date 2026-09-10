@@ -79,7 +79,9 @@ type rowComparator func(i, j int) int
 func newRowComparator(s Series, descending bool) (rowComparator, error) {
 	chunks := s.col.Data().Chunks()
 	if len(chunks) != 1 {
-		return nil, fmt.Errorf("multi-chunk sort keys not yet supported")
+		return nil, fmt.Errorf("sort key column %q is multi-chunk (%d chunks); call Frame.CompactChunks() first "+
+			"— multi-chunk sort keys not yet supported directly",
+			s.name, len(chunks))
 	}
 	switch a := chunks[0].(type) {
 	case *array.Int64:

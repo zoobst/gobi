@@ -5,6 +5,82 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.3]
+
+Small point release closing a documented gap: `Frame.Concat` produces
+multi-chunk output, but no public API existed to flatten that output
+back to single-chunk — so downstream ops that require single-chunk
+input (`SortBy`, Timestamp column-vs-column comparisons, `ListUnion`,
+`RecordBatch` views) errored on Concat output with no in-library
+remediation. The `setops.go` docstring even referenced a
+`.Coalesce()` method that never shipped (and would've collided with
+the existing SQL-semantic `gobi.Coalesce` expression anyway).
+
+### Added
+
+- **`Frame.CompactChunks() (*Frame, error)`** — returns a new Frame
+  with every column re-chunked as a single contiguous Arrow array.
+  Per-column `array.Concatenate` into a fresh buffer sized to the
+  total row count; caller pays the compaction tax explicitly at the
+  call site.
+
+  ```go
+  stacked, _ := a.Concat(b, c)  // multi-chunk
+  compact, _ := stacked.CompactChunks()
+  sorted, _  := compact.SortBy(SortKey{Column: "dt"})
+  ```
+
+  Idempotent short-circuit: on an already-single-chunk Frame, returns
+  the same `*Frame` pointer with a matched `Retain` — no fresh
+  allocation. Callers can defensively `f.CompactChunks()` on any
+  Frame that might have come from Concat without paying for frames
+  that don't need it.
+
+  Preserves `PartitionMetadata` on the returned Frame — compaction
+  preserves row order per-column, so any hash / sort claim the source
+  carried still holds.
+
+- **`Frame.NumChunks() int`** — max Arrow chunk count across all
+  columns. Typically the per-column count (chunk boundaries line
+  up with row boundaries), but `max` stays robust against hand-
+  constructed frames with mismatched chunk shapes. Returns 1 for
+  the common single-chunk shape produced by `Collect` / `SortBy` /
+  `Filter`; returns >1 primarily after `Concat`.
+
+- **`Frame.IsSingleChunk() bool`** — trivial wrapper on
+  `NumChunks() == 1`. Reads better at call sites that gate on the
+  invariant.
+
+### Changed
+
+- **Multi-chunk guard error messages now point at `CompactChunks`.**
+  Three call sites — `SortBy` (`newRowComparator` in `sort.go`),
+  Timestamp col-vs-col comparisons in `expr_eval.go`, and `ListUnion`
+  in `expr_list.go` — previously errored with variants of "multi-chunk
+  X not yet supported" that left callers to guess the fix. Error text
+  now spells out: `call Frame.CompactChunks() first`.
+
+- **`Frame.Concat` docstring updated** to reference `CompactChunks`
+  (and `IsSingleChunk` / `NumChunks`) instead of the never-shipped
+  `.Coalesce()` method. The old text described "planned" behavior;
+  the new text describes what actually exists.
+
+### Tests
+
+- `TestFrame_NumChunks_SingleAndMulti` — basic bookkeeping and the
+  invariant that Concat of two single-chunk frames produces
+  `NumChunks == 2`.
+- `TestFrame_CompactChunks_ConcatRoundTrip` — the motivating shape.
+  Verifies `SortBy` errors on multi-chunk input, error text mentions
+  `CompactChunks`, then `Concat → CompactChunks → SortBy` produces
+  the correctly-sorted output.
+- `TestFrame_CompactChunks_IdempotentNoOp` — same-pointer return on
+  already-single-chunk input.
+- `TestFrame_CompactChunks_MultiConcat` — 3-frame Concat flattens
+  correctly.
+- `TestFrame_CompactChunks_PreservesPartitionMeta` — hash / sort
+  claims survive compaction.
+
 ## [v0.4.2]
 
 Prepared-geometry MultiPolygon rework + K=1 SJoin fast path. The

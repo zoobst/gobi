@@ -494,7 +494,8 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 				// Multi-chunk Timestamp compare — fall through to
 				// error path below since Series.Eq etc. also reject.
 				return Series{}, fmt.Errorf(
-					"%w: multi-chunk Timestamp comparison not supported",
+					"%w: multi-chunk Timestamp comparison not supported directly; "+
+						"call Frame.CompactChunks() first",
 					ErrExprTypeMismatch)
 			}
 		}
