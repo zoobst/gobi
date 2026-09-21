@@ -22,6 +22,25 @@ built around a strongly-typed schema.
   with rounded OR square joins/caps, `EstimateUTMCRS` on every type,
   full topological predicates (`Intersects` / `Contains` / `Within` /
   `Touches` / `Overlaps` / `Crosses` / `Disjoint`).
+- **3D geodesic and volumetric geometry (v0.4.7).** `Point.Distance3D`
+  dispatches on CRS — projected → 3D Cartesian, geographic →
+  ECEF-Euclidean via WGS84 (through-Earth chord distance in
+  meters) — closing a gap that PostGIS `ST_3DDistance`, Shapely,
+  polars-st, and DuckDB Spatial all leave open (each is projected-
+  Cartesian only and silently mixes degrees with meters on
+  geographic input). `ExtrudedPolygon` (2D footprint × `[MinZ,
+  MaxZ]`) models buildings, airspace volumes, and bathymetric
+  prisms as a first-class shape with `Contains3D` / `Intersects3D`
+  / SoA `PointsInPrismFromXYZ`. `Sphere` and `Capsule` back
+  `Buffer3DPoint` / `Buffer3DLineString`; `ConvexHull3DFromXYZ`
+  returns the extruded-prism approximation. Series-level ops
+  (`GeomDistance3D`, `GeomLength3D`, `GeomZ`, `GeomIntersects3D`,
+  `GeomForce2D`, `GeomForceZ`) and matching `Expr` wire-in compose
+  3D operations into LazyFrame pipelines. Every primitive is
+  SoA-first — batch ECEF conversion, vectorized Z band-pass PIP,
+  scalar-target distance kernels — so a 1M-row `GeomDistance3D`
+  call never materializes `[]Point` or allocates broadcast slabs
+  for the target coordinate.
 - **Polygon boolean ops.** Pure-Go Martinez-Rueda sweepline:
   `Clip` / `Union` / `Difference` / `SymDifference` and a
   `Dissolve(geoms)` collection reducer using spatially-sorted
@@ -556,6 +575,39 @@ square, _ := geometry.Buffer(poly, 100, geometry.BufferOptions{
 simpler := poly.Simplify(5.0) // Douglas-Peucker at 5-unit tolerance
 ```
 
+### 3D distance and extruded polygons
+
+```go
+// 3D distance dispatches on CRS. Projected → 3D Cartesian;
+// geographic → ECEF-Euclidean via WGS84 (straight-line through-
+// Earth chord distance in meters). Pre-v0.4.7 the geographic path
+// errored; now it produces the honest answer.
+jfk := geometry.Point{X: -73.7789, Y: 40.6413, Z: 0, HasZ: true, CRSValue: geometry.WGS84}
+lax := geometry.Point{X: -118.4085, Y: 33.9425, Z: 0, HasZ: true, CRSValue: geometry.WGS84}
+chord, _ := jfk.Distance3D(lax, geometry.UnitKilometers) // ~3880 km (arc is ~3944)
+
+// Column-level: 3D distance from every row to a fixed target.
+d3, _ := points.GeomDistance3D(jfk, geometry.UnitMeters)
+
+// ExtrudedPolygon = 2D footprint × [MinZ, MaxZ] — the practical
+// 90% of 3D GIS (buildings, airspace, bathymetry) without a mesh
+// library. Point-in-prism composes 2D PIP with a Z band-pass; the
+// SoA kernel runs a whole column in one pass, no []Point.
+building, _ := geometry.NewExtrudedPolygon(footprint, 0, 120) // 120m tall
+inside, _ := points.GeomIntersects3D(building)
+
+// Buffer shapes for Point/LineString are Sphere and Capsule
+// respectively — Minkowski sum with a ball, projected-only today.
+sphere, _ := geometry.Buffer3DPoint(pt, 50)
+capsules, _ := geometry.Buffer3DLineString(ls, 10)
+
+// Coordinate-dimension promote/demote per PostGIS ST_Force2D /
+// ST_Force3DZ. Every branch defensively copies point slabs so the
+// returned geometry never aliases the caller's backing arrays.
+flat, _  := points.GeomForce2D()
+lifted, _ := flat.GeomForceZ(100)
+```
+
 ### Polygon boolean ops (Clip / Union / Dissolve)
 
 ```go
@@ -727,7 +779,7 @@ _ = shpio.WriteFile(counties, "counties_out", nil)  // writes all four files
 | Package                   | What it does                                                                                    |
 |---------------------------|-------------------------------------------------------------------------------------------------|
 | `github.com/zoobst/gobi`  | `Frame`, `Series`, `GroupBy`, `Join`, `SJoin`, `Explode`, datetime + rolling + resample, options |
-| `.../gobi/geometry`       | 2D + XYZ primitives, WKB / WKT, CRS + reprojection, predicates, R-tree, Buffer / Simplify / Centroid |
+| `.../gobi/geometry`       | 2D + 3D primitives (Point/LineString/Polygon + `ExtrudedPolygon`/`Sphere`/`Capsule`), WKB / WKT, CRS + reprojection (incl. WGS84 ECEF), predicates, R-tree, Buffer / Simplify / Centroid, geodesic 3D distance |
 | `.../gobi/csvio`          | Typed CSV read + streaming (`ReadFileChunksFunc`), gzip / zstd / bzip2 auto-detect              |
 | `.../gobi/parquetio`      | Parquet read/write + streaming + column projection + row-group + bloom-filter tuning; snappy/gzip/brotli/zstd/lz4 + GeoParquet 1.1 |
 | `.../gobi/geojsonio`      | Full RFC 7946 GeoJSON (all geometry types + XYZ) — Frame-level `ReadFile`/`WriteFile`/`ScanFile`, `.geojsonl` streaming |
