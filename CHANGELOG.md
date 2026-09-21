@@ -5,6 +5,79 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.6]
+
+Bug fix release: both `gpkgio` and `pgio` write paths were crashing
+on multi-chunk Frames — most visibly on Frames produced by
+`geojsonio.ReadFile` for FeatureCollections exceeding one batch
+(surfaced by the v0.4.5 fix that stopped `Concat` failing on those
+upstream). Same root cause and same fix shape in both packages:
+compact the incoming Frame up front so the per-column writers see
+the single-chunk shape they were built for.
+
+### Fixed
+
+- **`gpkgio.WriteFile` / `WriteMany` no longer error on multi-chunk
+  input.** `columnWriter` in [gpkgio/write.go](gpkgio/write.go) only
+  ever supported a single-chunk fast path — `chunks := s.Column().
+  Data().Chunks(); if len(chunks) == 1 { … }` — with the fallback
+  returning `unsupported column type %s for column %q`. Any Frame
+  with `NumChunks() > 1` (Concat output, streaming parquet reads,
+  multi-batch geojson FCs, hand-rolled `NewFrameFromTable` on a
+  multi-batch table) hit the fallback on the first non-numeric
+  column and aborted the write. The error text was misleading —
+  "unsupported column type binary" really meant "unsupported chunk
+  count for a binary column here." Fix: `writeLayerToDB` now calls
+  `Frame.CompactChunks()` (v0.4.4) up front, before the geometry-
+  column detection and DDL build. Single-chunk callers pay only a
+  `Retain` / `Release` pair (the idempotent short-circuit) — no
+  materialization. Multi-chunk callers pay one `array.Concatenate`
+  per column, once, and the writer's per-type fast path then works
+  as designed. Applied inside `writeLayerToDB` so both `WriteFile`
+  and `WriteMany` are covered by the single fix. Regression:
+  `TestRoundTrip_MultiChunkFrame` in
+  [gpkgio/roundtrip_test.go](gpkgio/roundtrip_test.go) writes a
+  Concat'd (guaranteed multi-chunk) frame and round-trips it back.
+
+- **`pgio.WriteTable` no longer errors on multi-chunk input.** Same
+  bug pattern as gpkgio — both `scalarExtractor` and
+  `geometryExtractor` in [pgio/write.go](pgio/write.go) rejected
+  multi-chunk with an error that even referenced the never-shipped
+  `frame.Coalesce first` method. Fix: `WriteTable` calls
+  `Frame.CompactChunks()` before dispatching to per-column
+  extractors. The extractors' `len(chunks) != 1` guards are now
+  unreachable through the public API but kept as defensive
+  invariant assertions (with the message reworded to reflect that
+  hitting them indicates an internal contract violation, not a
+  caller-remediable state).
+
+## [v0.4.5]
+
+Bug fix release: multi-batch GeoJSON FeatureCollection reads were
+crashing with a `gobi.Concat` schema-mismatch error whenever the FC
+exceeded one batch.
+
+### Fixed
+
+- **`geojsonio` FeatureCollection reads no longer crash on files
+  exceeding one batch.** `featureBatch.materialize` in
+  [geojsonio/frame.go](geojsonio/frame.go) built its property-column
+  key list by walking `map[string]any` with `for k := range p`, then
+  handed the resulting per-batch schemas to `gobi.Concat`. Because
+  Go randomizes map iteration order, two batches drawn from the same
+  file would land on different column orderings, and `Concat`'s
+  exact-schema check would then reject the concat with a
+  `column N name differs: "transit_hours" vs "dwell_hours"`-style
+  error. Only bit files whose FC exceeded `DefaultChunkRows`
+  (65 536 features) — single-batch reads happened to work because
+  there was nothing to concat. Fix: `sort.Strings(keyOrder)` after
+  the first-occurrence walk, so every batch produces a
+  lexicographically-ordered schema regardless of which key the map
+  iterator visited first. Comment updated to spell out why the sort
+  is load-bearing (the earlier comment claimed the walk was
+  "deterministic order — first-occurrence", which was aspirational,
+  not actual).
+
 ## [v0.4.4]
 
 Small point release closing a documented gap: `Frame.Concat` produces
@@ -64,27 +137,6 @@ the existing SQL-semantic `gobi.Coalesce` expression anyway).
   (and `IsSingleChunk` / `NumChunks`) instead of the never-shipped
   `.Coalesce()` method. The old text described "planned" behavior;
   the new text describes what actually exists.
-
-### Fixed
-
-- **`geojsonio` FeatureCollection reads no longer crash on files
-  exceeding one batch.** `featureBatch.materialize` in
-  [geojsonio/frame.go](geojsonio/frame.go) built its property-column
-  key list by walking `map[string]any` with `for k := range p`, then
-  handed the resulting per-batch schemas to `gobi.Concat`. Because
-  Go randomizes map iteration order, two batches drawn from the same
-  file would land on different column orderings, and `Concat`'s
-  exact-schema check would then reject the concat with a
-  `column N name differs: "transit_hours" vs "dwell_hours"`-style
-  error. Only bit files whose FC exceeded `DefaultChunkRows`
-  (65 536 features) — single-batch reads happened to work because
-  there was nothing to concat. Fix: `sort.Strings(keyOrder)` after
-  the first-occurrence walk, so every batch produces a
-  lexicographically-ordered schema regardless of which key the map
-  iterator visited first. Comment updated to spell out why the sort
-  is load-bearing (the earlier comment claimed the walk was
-  "deterministic order — first-occurrence", which was aspirational,
-  not actual).
 
 ### Tests
 

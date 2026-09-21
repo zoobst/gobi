@@ -266,6 +266,52 @@ func TestRoundTrip_Projection(t *testing.T) {
 	}
 }
 
+// TestRoundTrip_MultiChunkFrame — regression against the multi-chunk
+// write crash. Before the fix, WriteFile on a Concat'd (multi-chunk)
+// Frame errored out with "unsupported column type binary" as soon as
+// columnWriter's `len(chunks) == 1` fast path missed. This shape
+// arises naturally in geojsonio.ReadFile for any FC exceeding
+// DefaultChunkRows — the reader emits one chunk per batch and stitches
+// them with Concat. writeLayerToDB now calls CompactChunks up front,
+// so multi-chunk input round-trips correctly.
+func TestRoundTrip_MultiChunkFrame(t *testing.T) {
+	a := buildTestFrame(t)
+	b := buildTestFrame(t)
+	stacked, err := a.Concat(b)
+	if err != nil {
+		t.Fatalf("Concat: %v", err)
+	}
+	if stacked.IsSingleChunk() {
+		t.Fatal("Concat output should be multi-chunk — fixture invariant broken")
+	}
+	path := filepath.Join(t.TempDir(), "multichunk.gpkg")
+	if err := gpkgio.WriteFile(stacked, path, &gpkgio.WriteOptions{Layer: "features"}); err != nil {
+		t.Fatalf("WriteFile on multi-chunk frame: %v", err)
+	}
+	out, err := gpkgio.ReadFile(path, &gpkgio.ReadOptions{Layer: "features"})
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if out.NumRows() != 6 {
+		t.Fatalf("rows = %d, want 6 (3+3 stacked)", out.NumRows())
+	}
+	// Spot-check that both halves of the stacked frame made it through
+	// — the geometry column being present + decodable is the tightest
+	// assertion, since the original crash was on the geometry Binary
+	// column specifically.
+	geomS, err := out.Column("geom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !geomS.IsGeometry() {
+		t.Error("geometry tag lost through multi-chunk write")
+	}
+	geomArr := geomS.Column().Data().Chunks()[0].(*array.Binary)
+	if geomArr.Len() != 6 {
+		t.Fatalf("geom rows = %d, want 6", geomArr.Len())
+	}
+}
+
 // TestRoundTrip_ReplaceLayer confirms opts.Replace drops + recreates
 // the layer without leaving stale rows or RTree entries behind.
 func TestRoundTrip_ReplaceLayer(t *testing.T) {

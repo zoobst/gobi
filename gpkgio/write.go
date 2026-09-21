@@ -299,6 +299,20 @@ func writeLayerToDB(db *sql.DB, df *gobi.Frame, opts *WriteOptions) error {
 		return fmt.Errorf("gpkg: Layer %q is not a valid SQLite identifier", o.Layer)
 	}
 
+	// Normalize to single-chunk so columnWriter's per-type fast paths
+	// can index directly into one arrow.Array per column. gobi.Concat
+	// (including the FC-batch stitch inside geojsonio.ReadFile) leaves
+	// frames multi-chunk; without this, every non-numeric column
+	// would fall off the fast path and hit the "unsupported column
+	// type" error. Idempotent — same-pointer + Retain when the frame
+	// is already single-chunk, so callers who pass a hand-built or
+	// Collect'd frame pay only the extra Retain/Release pair.
+	df, err := df.CompactChunks()
+	if err != nil {
+		return fmt.Errorf("gpkg: compact frame: %w", err)
+	}
+	defer df.Release()
+
 	// Detect the geometry column if the caller didn't name one.
 	geomIdx := -1
 	if o.GeomCol != "" {

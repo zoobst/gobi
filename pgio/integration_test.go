@@ -170,6 +170,58 @@ func TestIntegration_ScanTable_PredicatePushdown(t *testing.T) {
 	}
 }
 
+// TestIntegration_WriteMultiChunkFrame — regression against the
+// multi-chunk write crash. Before the fix, WriteTable on a Concat'd
+// (multi-chunk) Frame errored inside scalarExtractor with
+// "multi-chunk columns not supported by WriteTable (call frame.Coalesce
+// first)". This shape arises naturally in geojsonio.ReadFile for any
+// FC exceeding DefaultChunkRows — the reader emits one chunk per
+// batch and stitches them with Concat. WriteTable now calls
+// CompactChunks up front, so multi-chunk input round-trips correctly.
+func TestIntegration_WriteMultiChunkFrame(t *testing.T) {
+	conn, done := mustConn(t)
+	defer done()
+	ctx := context.Background()
+
+	table := uniqueTable("pgio_mc")
+	defer func() {
+		conn.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %q`, table))
+	}()
+	if _, err := conn.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %q (
+			id BIGINT,
+			name TEXT,
+			value DOUBLE PRECISION,
+			geom GEOMETRY(POINT, 4326)
+		)`, table)); err != nil {
+		t.Fatalf("CREATE: %v", err)
+	}
+
+	a := buildTestFrame(t)
+	b := buildTestFrame(t)
+	stacked, err := a.Concat(b)
+	if err != nil {
+		t.Fatalf("Concat: %v", err)
+	}
+	if stacked.IsSingleChunk() {
+		t.Fatal("Concat output should be multi-chunk — fixture invariant broken")
+	}
+	if err := pgio.WriteTable(ctx, conn, table, stacked, &pgio.WriteOptions{
+		GeomCol: "geom",
+		SRID:    4326,
+	}); err != nil {
+		t.Fatalf("WriteTable on multi-chunk frame: %v", err)
+	}
+
+	out, err := pgio.ReadTable(ctx, conn, table, nil)
+	if err != nil {
+		t.Fatalf("ReadTable: %v", err)
+	}
+	if out.NumRows() != 6 {
+		t.Fatalf("rows = %d, want 6 (3+3 stacked)", out.NumRows())
+	}
+}
+
 // buildTestFrame — 3-row Frame with id/name/value/geom, matching
 // the CREATE TABLE above.
 func buildTestFrame(t *testing.T) *gobi.Frame {

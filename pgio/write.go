@@ -38,6 +38,17 @@ func WriteTable(ctx context.Context, conn Conn, table string, df *gobi.Frame, op
 	}
 	schema := defaultSchema(opts.Schema)
 
+	// Normalize to single-chunk before scalarExtractor /
+	// geometryExtractor reach in — both index into one concrete
+	// arrow.Array per column and reject multi-chunk input.
+	// Idempotent same-pointer + Retain when already single-chunk,
+	// so single-chunk callers pay only the paired Release.
+	df, err := df.CompactChunks()
+	if err != nil {
+		return fmt.Errorf("pgio: compact frame: %w", err)
+	}
+	defer df.Release()
+
 	// Detect the geometry column: explicit opts.GeomCol wins;
 	// otherwise the first is-geometry column in the Frame.
 	geomIdx := -1
@@ -109,7 +120,7 @@ func WriteTable(ctx context.Context, conn Conn, table string, df *gobi.Frame, op
 		nRows:      df.NumRows(),
 		extractors: extractors,
 	}
-	_, err := conn.CopyFrom(ctx,
+	_, err = conn.CopyFrom(ctx,
 		pgx.Identifier{schema, table},
 		names,
 		src)
@@ -131,7 +142,11 @@ type rowExtractor func(row int) (any, error)
 func scalarExtractor(s gobi.Series) (rowExtractor, error) {
 	chunks := s.Column().Data().Chunks()
 	if len(chunks) != 1 {
-		return nil, fmt.Errorf("multi-chunk columns not supported by WriteTable (call frame.Coalesce first)")
+		// Unreachable via WriteTable — the entry point calls
+		// CompactChunks before dispatching to extractors. Kept as a
+		// defensive assertion in case scalarExtractor picks up a new
+		// caller that skips the normalization.
+		return nil, fmt.Errorf("pgio: scalarExtractor invariant: expected single-chunk column, got %d chunks", len(chunks))
 	}
 	switch a := chunks[0].(type) {
 	case *array.Int16:
@@ -208,7 +223,9 @@ func scalarExtractor(s gobi.Series) (rowExtractor, error) {
 func geometryExtractor(s gobi.Series, srid int32) (rowExtractor, error) {
 	chunks := s.Column().Data().Chunks()
 	if len(chunks) != 1 {
-		return nil, fmt.Errorf("multi-chunk geometry columns not supported by WriteTable")
+		// Same invariant as scalarExtractor — WriteTable compacts up
+		// front, so this branch is unreachable through the public API.
+		return nil, fmt.Errorf("pgio: geometryExtractor invariant: expected single-chunk column, got %d chunks", len(chunks))
 	}
 	a, ok := chunks[0].(*array.Binary)
 	if !ok {
