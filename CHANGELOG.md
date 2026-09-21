@@ -5,6 +5,226 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.7]
+
+3D geodesic math + 3D spatial primitives. Fills a real gap in the
+ecosystem: no library (PostGIS, GeoPandas/Shapely, polars-st,
+DuckDB Spatial, Turf) exposes a first-class geodesic 3D distance
+today — the closest analog, PostGIS `ST_3DDistance`, is projected-
+Cartesian only and silently returns degrees-mixed-with-meters on
+geographic input. gobi's `Distance3D` now dispatches on CRS to
+compute the honest answer for either shape.
+
+Also lands the extruded-polygon volumetric model (3D shapes as 2D
+footprints × Z ranges — buildings, airspace volumes, bathymetric
+prisms), sphere/capsule buffer shapes, prism-approximation convex
+hull, and full Series + Expr wiring so 3D operations compose into
+LazyFrame pipelines. Every primitive is SoA-first (slab kernels
+under scalar wrappers) so Series-level 3D ops never allocate
+`[]Point` intermediates.
+
+### Added
+
+#### 3D distance primitives ([`geometry/geodesic3d.go`](geometry/geodesic3d.go))
+
+- **`Ellipsoid` + `WGS84Ellipsoid`** — reference ellipsoid
+  parameterization. Exposed as a type so a future release can plumb
+  the ellipsoid choice out to callers without an API break;
+  day-one is WGS84-only.
+- **`LonLatAltToECEFSlabs(...)`** — SoA WGS84 → ECEF conversion.
+  Zero-alloc.
+- **`Distance3DProjectedFromSlabs(...)`** — pair-wise 3D Cartesian
+  Euclidean distance. Zero-alloc.
+- **`Distance3DGeodesicFromSlabs(...)`** — pair-wise ECEF-Euclidean
+  distance between geographic points (lon/lat/alt inputs, meters
+  output). Optional `*ECEFScratch` pooling.
+- **`ECEFScratch`** — reusable 6-slab buffer for the geographic-3D
+  path.
+- **`LineString3DProjectedLengthFromXYZ` / `LineString3DGeodesicLengthFromXYZ`** —
+  slab-form line-length kernels.
+- **`SampleGeodesic3DFromSlabs(...)`** — N great-circle samples
+  with linearly-interpolated altitude (SLERP, endpoint-antipodal-
+  safe).
+
+#### Point extensions ([`geometry/point.go`](geometry/point.go))
+
+- **`Point.Distance3D` now dispatches on CRS** (Option C from the
+  design conversation):
+  - **Projected CRS**: unchanged Cartesian.
+  - **Geographic CRS**: NEW — ECEF Euclidean via WGS84. Pre-v0.4.7
+    this errored with `ErrCRSMismatch`.
+  - **Zero CRS**: unchanged Cartesian.
+  Mirrors the shape of the existing 2D `Point.Distance` (which
+  already dispatches Euclidean vs Haversine).
+- **`Point.Force2D() Point` / `Point.ForceZ(alt) Point`** —
+  coordinate-dimension promote/demote. Mirror PostGIS `ST_Force2D`
+  and `ST_Force3DZ`.
+
+#### 3D volumetric geometry ([`geometry/extruded_polygon.go`](geometry/extruded_polygon.go))
+
+- **`ExtrudedPolygon{Footprint Polygon; MinZ, MaxZ float64; CRSValue CRS}`** —
+  2D polygon footprint × vertical Z extent = prism. Covers the
+  practical majority of "3D GIS" workloads (buildings, airspace,
+  bathymetry) without a mesh library. `NewExtrudedPolygon`
+  validates `MinZ ≤ MaxZ` + non-empty footprint.
+- **`Bounds3D`** — axis-aligned 3D bounding box + `EmptyBounds3D()`
+  sentinel + `Contains(x, y, z)` + `Intersects(o Bounds3D)`.
+- **`ExtrudedPolygon.Contains3D(x, y, z)`** — 2D PIP on footprint
+  AND Z range.
+- **`ExtrudedPolygon.Intersects3D(o)`** — 2D bbox intersect AND Z
+  overlap (necessary-condition approximation).
+- **`PointsInPrismFromXYZ`** — SoA batch point-in-prism (rings
+  materialized once, vectorized Z band-pass + SoA 2D PIP).
+- **`PrismsIntersectFromBounds`** — batch 3D bbox intersect vs one
+  query bbox.
+
+#### 3D buffer shapes ([`geometry/buffer3d.go`](geometry/buffer3d.go))
+
+- **`Sphere{X, Y, Z, R, CRSValue}` + `Capsule{Ax…Bz, R, CRSValue}`** —
+  swept-sphere shapes for Point and LineString buffers.
+- **`Buffer3DPoint(p, r) Sphere`** — Minkowski-sum-with-ball.
+- **`Buffer3DLineString(ls, r) []Capsule`** — one Capsule per
+  segment.
+- **`Buffer3DExtrudedPolygon(p, r) ExtrudedPolygon`** — 2D-buffer
+  footprint + expand Z. Square-cornered approximation of the true
+  Minkowski sum.
+- **`PointsInSphereFromXYZ`** — SoA containment. Projected →
+  Cartesian; geographic → batch ECEF convert + Cartesian compare.
+- **`PointsInCapsuleFromXYZ` / `PointsInAnyCapsuleFromXYZ`** —
+  projected-only day-one.
+
+#### 3D convex hull ([`geometry/convexhull3d.go`](geometry/convexhull3d.go))
+
+- **`ConvexHull3DFromXYZ(xs, ys, zs, crs) Hull3D`** — extruded-
+  prism approximation: 2D hull of XY wrapped in `ExtrudedPolygon`
+  spanning `[min(zs), max(zs)]`. Super-set of the true polyhedral
+  hull; exact on coplanar-Z inputs.
+- **`Hull3D` + `Polyhedron3D`** — return type carries `*Prism`
+  (day one) or reserved `*Polyhedron3D`.
+- **`PointsInHull3DFromXYZ`** — SoA containment.
+
+#### Series 3D methods ([`series_geom_metrics.go`](series_geom_metrics.go))
+
+- **`Series.GeomDistance3D(other, u) → Float64`** — column of
+  Points × scalar Point, CRS-dispatched.
+- **`Series.GeomLength3D(u) → Float64`** — 3D arc length of
+  LineStrings.
+- **`Series.GeomZ() → Float64`** — extract altitude.
+- **`Series.GeomForce2D() → geometry`** / **`.GeomForceZ(alt) → geometry`**.
+- **`Series.GeomIntersects3D(prism) → Bool`** — point-in-prism
+  batch. SoA WKB pass + one `PointsInPrismFromXYZ` call.
+
+#### Expr 3D methods ([`expr_geom.go`](expr_geom.go))
+
+- **`Expr.GeomDistance3D`, `.GeomLength3D`, `.GeomZ`, `.GeomForce2D`,
+  `.GeomForceZ`, `.GeomIntersects3D`** — LazyFrame wiring for each
+  Series-level 3D method.
+
+### Changed
+
+- **`Point.Distance3D` on geographic CRS input** — pre-v0.4.7
+  returned `ErrCRSMismatch`; now dispatches to ECEF-Euclidean.
+  Callers that caught the error as "not supported" get correct
+  output; callers using the error to route to their own geodesic
+  calculation should remove the fallback. Projected and Zero-CRS
+  paths are unchanged.
+
+### Explicit non-goals (locked)
+
+- **Haversine-with-altitude approximation.** Wrong-shape footgun.
+- **Non-WGS84 geographic 3D.** Ellipsoid parameterization is
+  internal; API is WGS84-only day one.
+- **Vertical datum handling (EGM96/EGM2008 → ellipsoid heights).**
+  Callers convert upstream.
+- **Arbitrary polyhedral geometry.** `Polyhedron3D` is a reserved
+  return-type field; no operations implemented.
+- **Column-level 3D shape encoding.** `GeomBuffer3D` not wired at
+  the Series level — 3D shapes have no stable Arrow encoding.
+- **Full pairwise `Contains3D` at Series/Expr.** Only
+  point-in-prism today; polygon-vs-polygon 3D containment
+  deferred.
+- **Geographic capsule containment.** Projected-only day one.
+
+### Tests
+
+- **`geometry/geodesic3d_test.go`** — ECEF reference values,
+  known-pair distances, altitude sensitivity, sample-geodesic
+  endpoints, `Point.Distance3D` CRS-dispatch, `Force2D`/`ForceZ`
+  round-trip, ExtrudedPolygon Contains3D + SoA parity, Bounds3D
+  semantics, Sphere/Capsule containment, ConvexHull3D prism +
+  degenerate input (empty / single / collinear returns empty
+  Hull3D sentinel), `Buffer3DLineString` degenerate cases
+  (empty / single-vertex / 2D / negative radius),
+  `PointsInAnyCapsuleFromXYZ` multi-segment L-shape.
+- **`series_geom_3d_test.go`** — Series-level `GeomDistance3D`
+  (both dispatch paths + multi-chunk column), `GeomLength3D`
+  (projected + geographic), `GeomZ`, `GeomForce2D`/`GeomForceZ`,
+  `GeomIntersects3D`; Expr-level round-trip tests.
+
+### Review-cycle fixes (post-initial-implementation)
+
+Correctness:
+
+- **`forceGeometry2D` / `forceGeometryZ` no longer alias caller
+  backing arrays.** LineString / Polygon / MultiLineString /
+  MultiPolygon branches now defensively copy ring/point slabs
+  (matching the pre-existing MultiPoint pattern). Latent bug the
+  moment WKB parsing gained caching or interning — closed now
+  before it can bite. Factored into `force2DPoints` /
+  `forceZPoints` / `force2DRings` / `forceZRings` helpers so every
+  branch shares one copy shape.
+- **`GeomDistance3D` docstring reconciled with implementation** —
+  said non-Point rows returned an error; they actually pass
+  through as null. Docstring now describes null passthrough,
+  matching the Series geom-family null-propagation contract.
+- **`attachCRS` type assertion in `GeomDistance3D` is now
+  comma-ok**, not a hard cast. Silent panic path removed.
+- **`ConvexHull3DFromXYZ` degenerate-hull guard widened** from
+  `len(hullXs) == 0` to `< 4`. Empty / collinear / 2-vertex hulls
+  now return the empty `Hull3D{}` sentinel; previously they'd
+  produce a Polygon with an invalid open ring that
+  `PIPPolygonFromRings` couldn't walk safely.
+- **`ExtrudedPolygon` docstring corrected**: `NewExtrudedPolygon`
+  errors on inverted Z range or empty footprint; it doesn't panic
+  in downstream ops as the prior text claimed. Struct-literal
+  callers who bypass the constructor get the documented
+  silently-empty semantics.
+
+Perf:
+
+- **`Distance3DProjectedFromSlabsToPoint` +
+  `Distance3DGeodesicFromSlabsToPoint` scalar-target kernels
+  added.** `Series.GeomDistance3D` now dispatches to these
+  directly. Kills the 3 × N broadcast-slab allocation the
+  symmetric-kernel path was doing to promote the scalar `other`
+  Point to a column — on 1M rows that's ~24 MB of ephemeral heap
+  eliminated per call. The now-unused `fillSlab` helper is
+  removed.
+- **`lengthOfLineString3D` accepts a hoisted `*ECEFScratch`.**
+  `Series.GeomLength3D` allocates one scratch for the whole
+  column and captures it in the row closure; the ECEF slab
+  arrays grow-and-reuse across every row instead of alloc'ing
+  fresh per row. On a 1M-row column of 100-vertex LineStrings
+  that's the difference between 100M and ~100 float64s of ECEF
+  scratch churn.
+- **`readWKBPointXYZ` promoted to `geometry.PointXYZFromWKB`**
+  and moved to a new [`geometry/wkb_point.go`](geometry/wkb_point.go).
+  Uses `encoding/binary`'s `BigEndian` / `LittleEndian` directly
+  instead of the ~40 lines of hand-rolled Uint64 conversion the
+  gobi-root copy carried. The three Series-level call sites
+  (`GeomDistance3D`, `GeomZ`, `GeomIntersects3D`) now call the
+  geometry-package helper; the local `wkbByteOrder` +
+  `bigEndianOrder` + `littleEndianOrder` + `readF64` machinery is
+  deleted.
+
+Style:
+
+- **Dead reservations removed** — `var _ = math.Sqrt` in
+  buffer3d.go, `var _ = zRange` in convexhull3d.go, and the
+  unused `errRequiresGeographic` sentinel in geodesic3d.go.
+- **`ConvexHull3DFromXYZ` now uses `zRange`** instead of
+  duplicating the inline min/max walk.
+
 ## [v0.4.6]
 
 Bug fix release: both `gpkgio` and `pgio` write paths were crashing

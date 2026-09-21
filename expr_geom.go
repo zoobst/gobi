@@ -511,3 +511,244 @@ func allNullBool(n int, name string) (Series, error) {
 	field := arrow.Field{Name: name, Type: arrow.FixedWidthTypes.Boolean, Nullable: true}
 	return SeriesFromArray(field, b.NewArray()), nil
 }
+
+// -----------------------------------------------------------------------------
+// 3D Expr wiring — column-vs-scalar and unary 3D operations. Each
+// method wraps its Series-level counterpart in an Expr node so
+// LazyFrame pipelines can chain 3D ops through Select / WithColumn /
+// Filter. Same CRS-dispatch semantics as the Series methods
+// (projected → Cartesian; geographic → ECEF-Euclidean via WGS84).
+// -----------------------------------------------------------------------------
+
+// GeomDistance3D returns a Float64 expression: 3D distance from
+// each row's geometry to a constant `other` Point. Requires both
+// sides to be 3D Points; other predicates / shapes return an
+// error at evaluation time.
+//
+// `other` is a scalar geometry.Point, not an Expr — the current
+// 3D distance kernel is column-vs-scalar. Column-vs-column would
+// mirror Expr.GeomIntersects's column-right shape; not implemented
+// in the day-one Expr surface.
+func (e Expr) GeomDistance3D(other geometry.Geometry, u geometry.Unit) Expr {
+	return Expr{node: &geomDistance3DNode{
+		left:  e.node,
+		other: other,
+		unit:  u,
+	}}
+}
+
+// GeomLength3D returns a Float64 expression: 3D arc length of each
+// row's LineString / MultiLineString in the requested unit.
+// Non-line geometries produce null rows.
+func (e Expr) GeomLength3D(u geometry.Unit) Expr {
+	return Expr{node: &geomLength3DNode{left: e.node, unit: u}}
+}
+
+// GeomZ returns a Float64 expression: the Z (altitude) coordinate
+// of each row's Point. Null / non-Point / 2D-only rows produce null.
+func (e Expr) GeomZ() Expr {
+	return Expr{node: &geomZNode{left: e.node}}
+}
+
+// GeomForce2D returns a geometry expression with Z dropped from
+// every row. Mirrors PostGIS ST_Force2D.
+func (e Expr) GeomForce2D() Expr {
+	return Expr{node: &geomForce2DNode{left: e.node}}
+}
+
+// GeomForceZ returns a geometry expression with Z set to alt and
+// HasZ = true on every row. Mirrors PostGIS ST_Force3DZ.
+func (e Expr) GeomForceZ(alt float64) Expr {
+	return Expr{node: &geomForceZNode{left: e.node, alt: alt}}
+}
+
+// -----------------------------------------------------------------------------
+// Node types.
+// -----------------------------------------------------------------------------
+
+type geomDistance3DNode struct {
+	left  ExprNode
+	other geometry.Geometry
+	unit  geometry.Unit
+}
+
+func (n *geomDistance3DNode) Eval(input *Frame) (Series, error) {
+	left, err := n.left.Eval(input)
+	if err != nil {
+		return Series{}, err
+	}
+	out, err := left.GeomDistance3D(n.other, n.unit)
+	if err != nil {
+		return Series{}, err
+	}
+	return renameSeries(out, n.outputName(left.name)), nil
+}
+
+func (n *geomDistance3DNode) outputName(leftName string) string {
+	if leftName == "" {
+		return "distance_3d"
+	}
+	return leftName + "_distance_3d"
+}
+
+func (n *geomDistance3DNode) Children() []Expr { return []Expr{{node: n.left}} }
+func (n *geomDistance3DNode) Type(*arrow.Schema) (arrow.DataType, error) {
+	return arrow.PrimitiveTypes.Float64, nil
+}
+func (n *geomDistance3DNode) String() string {
+	return fmt.Sprintf("distance_3d(%s, <point>, %s)", n.left, n.unit)
+}
+
+type geomLength3DNode struct {
+	left ExprNode
+	unit geometry.Unit
+}
+
+func (n *geomLength3DNode) Eval(input *Frame) (Series, error) {
+	left, err := n.left.Eval(input)
+	if err != nil {
+		return Series{}, err
+	}
+	out, err := left.GeomLength3D(n.unit)
+	if err != nil {
+		return Series{}, err
+	}
+	return renameSeries(out, n.outputName(left.name)), nil
+}
+
+func (n *geomLength3DNode) outputName(leftName string) string {
+	if leftName == "" {
+		return "length_3d"
+	}
+	return leftName + "_length_3d"
+}
+
+func (n *geomLength3DNode) Children() []Expr { return []Expr{{node: n.left}} }
+func (n *geomLength3DNode) Type(*arrow.Schema) (arrow.DataType, error) {
+	return arrow.PrimitiveTypes.Float64, nil
+}
+func (n *geomLength3DNode) String() string { return fmt.Sprintf("length_3d(%s, %s)", n.left, n.unit) }
+
+type geomZNode struct{ left ExprNode }
+
+func (n *geomZNode) Eval(input *Frame) (Series, error) {
+	left, err := n.left.Eval(input)
+	if err != nil {
+		return Series{}, err
+	}
+	out, err := left.GeomZ()
+	if err != nil {
+		return Series{}, err
+	}
+	return renameSeries(out, n.outputName(left.name)), nil
+}
+
+func (n *geomZNode) outputName(leftName string) string {
+	if leftName == "" {
+		return "z"
+	}
+	return leftName + "_z"
+}
+
+func (n *geomZNode) Children() []Expr { return []Expr{{node: n.left}} }
+func (n *geomZNode) Type(*arrow.Schema) (arrow.DataType, error) {
+	return arrow.PrimitiveTypes.Float64, nil
+}
+func (n *geomZNode) String() string { return fmt.Sprintf("z(%s)", n.left) }
+
+type geomForce2DNode struct{ left ExprNode }
+
+func (n *geomForce2DNode) Eval(input *Frame) (Series, error) {
+	left, err := n.left.Eval(input)
+	if err != nil {
+		return Series{}, err
+	}
+	out, err := left.GeomForce2D()
+	if err != nil {
+		return Series{}, err
+	}
+	return renameSeries(out, n.outputName(left.name)), nil
+}
+
+func (n *geomForce2DNode) outputName(leftName string) string {
+	if leftName == "" {
+		return "force2d"
+	}
+	return leftName + "_force2d"
+}
+
+func (n *geomForce2DNode) Children() []Expr { return []Expr{{node: n.left}} }
+func (n *geomForce2DNode) Type(*arrow.Schema) (arrow.DataType, error) {
+	return arrow.BinaryTypes.Binary, nil
+}
+func (n *geomForce2DNode) String() string { return fmt.Sprintf("force2d(%s)", n.left) }
+
+type geomForceZNode struct {
+	left ExprNode
+	alt  float64
+}
+
+func (n *geomForceZNode) Eval(input *Frame) (Series, error) {
+	left, err := n.left.Eval(input)
+	if err != nil {
+		return Series{}, err
+	}
+	out, err := left.GeomForceZ(n.alt)
+	if err != nil {
+		return Series{}, err
+	}
+	return renameSeries(out, n.outputName(left.name)), nil
+}
+
+func (n *geomForceZNode) outputName(leftName string) string {
+	if leftName == "" {
+		return "forcez"
+	}
+	return leftName + "_forcez"
+}
+
+func (n *geomForceZNode) Children() []Expr { return []Expr{{node: n.left}} }
+func (n *geomForceZNode) Type(*arrow.Schema) (arrow.DataType, error) {
+	return arrow.BinaryTypes.Binary, nil
+}
+func (n *geomForceZNode) String() string { return fmt.Sprintf("forcez(%s, %g)", n.left, n.alt) }
+
+// GeomIntersects3D returns a Boolean expression: does each row's
+// Point lie inside the given ExtrudedPolygon prism? Column-vs-
+// scalar predicate; column-vs-column (prism-column) shape is
+// pending a 3D shape column encoding.
+func (e Expr) GeomIntersects3D(prism geometry.ExtrudedPolygon) Expr {
+	return Expr{node: &geomIntersects3DNode{left: e.node, prism: prism}}
+}
+
+type geomIntersects3DNode struct {
+	left  ExprNode
+	prism geometry.ExtrudedPolygon
+}
+
+func (n *geomIntersects3DNode) Eval(input *Frame) (Series, error) {
+	left, err := n.left.Eval(input)
+	if err != nil {
+		return Series{}, err
+	}
+	out, err := left.GeomIntersects3D(n.prism)
+	if err != nil {
+		return Series{}, err
+	}
+	return renameSeries(out, n.outputName(left.name)), nil
+}
+
+func (n *geomIntersects3DNode) outputName(leftName string) string {
+	if leftName == "" {
+		return "intersects_3d"
+	}
+	return leftName + "_intersects_3d"
+}
+
+func (n *geomIntersects3DNode) Children() []Expr { return []Expr{{node: n.left}} }
+func (n *geomIntersects3DNode) Type(*arrow.Schema) (arrow.DataType, error) {
+	return arrow.FixedWidthTypes.Boolean, nil
+}
+func (n *geomIntersects3DNode) String() string {
+	return fmt.Sprintf("intersects_3d(%s, <prism>)", n.left)
+}

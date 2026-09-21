@@ -103,11 +103,27 @@ func (p Point) Distance(o Point, u Unit) (float64, error) {
 	return Haversine(p, o, u)
 }
 
-// Distance3D returns the 3D Euclidean distance from p to o, treating Z as
-// coplanar with X/Y (i.e. as if measured in the same unit as the CRS's
-// linear unit). Requires both points to be in the same projected CRS and to
-// have HasZ set on both sides; otherwise returns ErrCRSMismatch or an error
-// noting the missing dimension.
+// Distance3D returns the 3D distance from p to o, dispatching on
+// CRS to match the 2D Distance method's shape:
+//
+//   - Projected CRS: 3D Cartesian Euclidean in the CRS's linear
+//     unit, converted to u. Treats Z as coplanar with X/Y (same
+//     unit).
+//   - Geographic CRS: ECEF Euclidean via the WGS84 ellipsoid, in
+//     meters, converted to u. Computes the straight-line
+//     (through-Earth chord) distance between the two 3D points.
+//     For altitude-agnostic surface arc distance use Distance /
+//     Haversine (2D).
+//   - Zero CRS: 3D Cartesian in the caller's units — assumes the
+//     coordinates are already in a common projected frame.
+//
+// Both sides must share the same CRS (ErrCRSMismatch on
+// disagreement) and have HasZ set (ErrTypeMismatch otherwise).
+//
+// Pre-v0.4.7 behavior was Cartesian-only, erroring on geographic
+// input. The new dispatch keeps the projected path bit-identical
+// (existing callers unaffected) and adds correct-math handling for
+// geographic 3D points that previously errored.
 func (p Point) Distance3D(o Point, u Unit) (float64, error) {
 	if !p.CRSValue.Equal(o.CRSValue) {
 		return 0, ErrCRSMismatch
@@ -115,11 +131,42 @@ func (p Point) Distance3D(o Point, u Unit) (float64, error) {
 	if !p.HasZ || !o.HasZ {
 		return 0, fmt.Errorf("%w: Distance3D requires 3D points on both sides", ErrTypeMismatch)
 	}
-	if !p.CRSValue.Projected && !p.CRSValue.Zero() {
-		return 0, fmt.Errorf("%w: Distance3D requires a projected CRS", ErrCRSMismatch)
+	if p.CRSValue.Projected || p.CRSValue.Zero() {
+		// Cartesian path — the pre-existing behavior. Z is
+		// coplanar with X/Y (same linear unit).
+		dx := o.X - p.X
+		dy := o.Y - p.Y
+		dz := o.Z - p.Z
+		return convertMeters(math.Sqrt(dx*dx+dy*dy+dz*dz), u)
 	}
-	dx := o.X - p.X
-	dy := o.Y - p.Y
-	dz := o.Z - p.Z
-	return convertMeters(math.Sqrt(dx*dx+dy*dy+dz*dz), u)
+	// Geographic path — ECEF Euclidean via WGS84.
+	//
+	// Dispatches into the SoA kernel with N=1 slabs so the scalar
+	// and Series-level paths share exactly one implementation of
+	// the math. Stack-allocated 1-element slabs — no heap use.
+	lons1 := [1]float64{p.X}
+	lats1 := [1]float64{p.Y}
+	alts1 := [1]float64{p.Z}
+	lons2 := [1]float64{o.X}
+	lats2 := [1]float64{o.Y}
+	alts2 := [1]float64{o.Z}
+	var out [1]float64
+	Distance3DGeodesicFromSlabs(lons1[:], lats1[:], alts1[:], lons2[:], lats2[:], alts2[:], out[:], nil)
+	return convertMeters(out[0], u)
+}
+
+// Force2D returns p with Z dropped and HasZ cleared. Idempotent on
+// 2D points. Mirrors PostGIS ST_Force2D semantics.
+func (p Point) Force2D() Point {
+	p.Z = 0
+	p.HasZ = false
+	return p
+}
+
+// ForceZ returns p with Z set to alt and HasZ = true. Overwrites any
+// existing Z value. Mirrors PostGIS ST_Force3D / ST_Force3DZ.
+func (p Point) ForceZ(alt float64) Point {
+	p.Z = alt
+	p.HasZ = true
+	return p
 }

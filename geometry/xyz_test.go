@@ -249,12 +249,20 @@ func TestPoint_Distance3D_RequiresBoth3D(t *testing.T) {
 	}
 }
 
-func TestPoint_Distance3D_RequiresProjected(t *testing.T) {
-	// Both geographic — should error.
+func TestPoint_Distance3D_GeographicDispatchesToECEF(t *testing.T) {
+	// Pre-v0.4.7 behavior: geographic input errored with
+	// ErrCRSMismatch. New behavior: dispatches to ECEF-Euclidean.
+	// See CHANGELOG v0.4.7 for the migration note.
 	p := Point{X: 0, Y: 0, Z: 0, CRSValue: WGS84, HasZ: true}
-	q := Point{X: 1, Y: 1, Z: 1, CRSValue: WGS84, HasZ: true}
-	if _, err := p.Distance3D(q, UnitMeters); !errors.Is(err, ErrCRSMismatch) {
-		t.Fatalf("expected ErrCRSMismatch, got %v", err)
+	q := Point{X: 0, Y: 0, Z: 100, CRSValue: WGS84, HasZ: true}
+	got, err := p.Distance3D(q, UnitMeters)
+	if err != nil {
+		t.Fatalf("expected geographic dispatch to succeed, got %v", err)
+	}
+	// 100m altitude difference at the same lat/lon → ~100m ECEF
+	// distance (sub-millimeter agreement).
+	if math.Abs(got-100) > 0.001 {
+		t.Errorf("100m altitude delta: got %v, want ~100", got)
 	}
 }
 
