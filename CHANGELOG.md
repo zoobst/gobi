@@ -65,6 +65,27 @@ the existing SQL-semantic `gobi.Coalesce` expression anyway).
   `.Coalesce()` method. The old text described "planned" behavior;
   the new text describes what actually exists.
 
+### Fixed
+
+- **`geojsonio` FeatureCollection reads no longer crash on files
+  exceeding one batch.** `featureBatch.materialize` in
+  [geojsonio/frame.go](geojsonio/frame.go) built its property-column
+  key list by walking `map[string]any` with `for k := range p`, then
+  handed the resulting per-batch schemas to `gobi.Concat`. Because
+  Go randomizes map iteration order, two batches drawn from the same
+  file would land on different column orderings, and `Concat`'s
+  exact-schema check would then reject the concat with a
+  `column N name differs: "transit_hours" vs "dwell_hours"`-style
+  error. Only bit files whose FC exceeded `DefaultChunkRows`
+  (65 536 features) — single-batch reads happened to work because
+  there was nothing to concat. Fix: `sort.Strings(keyOrder)` after
+  the first-occurrence walk, so every batch produces a
+  lexicographically-ordered schema regardless of which key the map
+  iterator visited first. Comment updated to spell out why the sort
+  is load-bearing (the earlier comment claimed the walk was
+  "deterministic order — first-occurrence", which was aspirational,
+  not actual).
+
 ### Tests
 
 - `TestFrame_NumChunks_SingleAndMulti` — basic bookkeeping and the

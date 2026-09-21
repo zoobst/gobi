@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -405,10 +406,12 @@ func (b *featureBatch) materialize(opts *ReadOptions) (*gobi.Frame, error) {
 		pool = memory.DefaultAllocator
 	}
 
-	// Collect the set of property keys (deterministic order — first-
-	// occurrence). Skipping this and using the first feature only
-	// would be faster but breaks when property keys are added later
-	// in the file.
+	// Collect the set of property keys and sort. Go's map iteration is
+	// randomized, so a first-occurrence walk of b.props produces a
+	// different column layout on every batch — which then trips
+	// gobi.Concat's exact-schema check once the FC exceeds one batch.
+	// Sorting gives every batch the same layout regardless of the
+	// order keys happen to be visited in.
 	keyOrder := make([]string, 0, 8)
 	keySeen := make(map[string]struct{}, 8)
 	for _, p := range b.props {
@@ -420,6 +423,7 @@ func (b *featureBatch) materialize(opts *ReadOptions) (*gobi.Frame, error) {
 			keyOrder = append(keyOrder, k)
 		}
 	}
+	sort.Strings(keyOrder)
 
 	// Column projection: honor opts.Columns, but always keep the
 	// geometry column (matches gpkgio's rule).
@@ -444,7 +448,7 @@ func (b *featureBatch) materialize(opts *ReadOptions) (*gobi.Frame, error) {
 	}
 
 	// Build the schema — geometry column first, then property
-	// columns in first-seen order.
+	// columns in sorted (lexicographic) order per keyOrder above.
 	fields := make([]arrow.Field, 0, len(keyOrder)+1)
 	fields = append(fields, gobi.GeometryField("geometry", 4326))
 	for _, k := range keyOrder {
