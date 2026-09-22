@@ -308,7 +308,9 @@ built around a strongly-typed schema.
 go get github.com/zoobst/gobi
 ```
 
-Requires Go **1.26** or newer.
+Requires Go **1.27** or newer (needed for the portable `simd` stdlib
+under `GOEXPERIMENT=simd`; the scalar build still works on any
+Go the module supports).
 
 ## Docs
 
@@ -970,10 +972,10 @@ and scripts live under [`benchmarks/`](benchmarks/) — regenerate with
 
 | Op                            | gobi (default) | gobi (SIMD) | pandas 2.3 | Polars 1T | Polars all |
 |-------------------------------|---------------:|------------:|-----------:|----------:|-----------:|
-| `Sum(value_a)`                |        1.04 ms | **0.43 ms** |    0.31 ms |   0.10 ms |    0.09 ms |
-| `value_a + value_b`           |        1.79 ms |     1.55 ms |    1.03 ms |   0.82 ms |    0.90 ms |
-| `Filter(value_a > 500k)`      |       15.9 ms  |    14.9 ms  |    6.83 ms |   1.96 ms |    1.60 ms |
-| `GroupBy(key).Agg(Sum,Mean)`  |       45.4 ms  |    42.6 ms  |   19.73 ms |   9.89 ms |    2.42 ms |
+| `Sum(value_a)`                |        0.98 ms | **0.37 ms** |    0.31 ms |   0.10 ms |    0.09 ms |
+| `value_a + value_b`           |        1.31 ms |     1.21 ms |    1.03 ms |   0.82 ms |    0.90 ms |
+| `Filter(value_a > 500k)`      |       15.87 ms |    15.40 ms |    6.83 ms |   1.96 ms |    1.60 ms |
+| `GroupBy(key).Agg(Sum,Mean)`  |       45.86 ms |    45.25 ms |   19.73 ms |   9.89 ms |    2.42 ms |
 
 Polars 1T = `POLARS_MAX_THREADS=1`; Polars all = default (all cores).
 gobi (SIMD) = compiled with `GOEXPERIMENT=simd` on Go 1.27+ arm64/amd64;
@@ -1032,6 +1034,47 @@ construct Shapely Python objects per row on load. The one gap is
 Sort-Tile-Recursive R-tree is pure Go. Landing within 40% of a
 GEOS-C++ index while staying cgo-free is the intended trade.
 
+### Spatial ops vs polars-st
+
+polars-st is polars' geometry extension, backed by geo-rust — pure
+Rust, cgo-free, the closer analog to gobi than shapely's GEOS-cgo
+path. Small / medium / large polygon fixtures at 600 / 300 / 100
+rows respectively, plus a 10k LineString fixture and a 1k-polygon
+Dissolve fixture.
+
+| Op                              |    gobi | polars-st | result             |
+|---------------------------------|--------:|----------:|:-------------------|
+| `Area` (600 small polys)        |    ~0 ms | 0.35 ms  | tied — both instant |
+| `Centroid` (600 small polys)    |  0.1 ms |  0.53 ms  | **gobi ~5×**       |
+| `Envelope` (600 small polys)    |  0.2 ms |  0.74 ms  | **gobi ~4×**       |
+| `Buffer(0.1)` (600 small polys) |  1.1 ms |   8.3 ms  | **gobi ~8×**       |
+| `Simplify(0.01)` (600 small)    |  0.3 ms |   3.7 ms  | **gobi ~12×**      |
+| `ConvexHull` (600 small polys)  |  0.5 ms |   1.4 ms  | **gobi ~3×**       |
+| `Area` (300 medium polys)       |  0.1 ms |  0.32 ms  | **gobi ~3×**       |
+| `Buffer(0.1)` (300 medium)      |  3.5 ms |  54.5 ms  | **gobi ~16×**      |
+| `Simplify(0.01)` (300 medium)   |  0.9 ms |  10.8 ms  | **gobi ~12×**      |
+| `ConvexHull` (300 medium polys) |  1.5 ms |   2.4 ms  | **gobi ~1.6×**     |
+| `Buffer(0.1)` (100 large polys) |    19 ms |  1389 ms | **gobi ~72×**      |
+| `Simplify(0.01)` (100 large)    |  7.1 ms |  99.8 ms  | **gobi ~14×**      |
+| `ConvexHull` (100 large polys)  | 11.1 ms |   6.6 ms  | polars-st ~1.7×    |
+| `Length` (10k LineStrings)      |  1.1 ms |   3.1 ms  | **gobi ~3×**       |
+| `Simplify` (10k LineStrings)    | 12.2 ms | 161.9 ms  | **gobi ~13×**      |
+| `union_all` (1k polys)          |    17 s |     271 s | **gobi ~16×**      |
+
+The wins cluster around `Buffer`, `Simplify`, and `union_all` — the
+ops where v0.4.1's SoA push moved the whole hot loop off per-row
+`[]Point` allocation. `Buffer` scales especially well on large
+polygons (**72×** at the large-polygon fixture). The one loss —
+`ConvexHull` on the large-polygon fixture — flips at 100 polys ×
+large vertex count: gobi's Andrew's monotone chain wins at ≤ 300
+polys but trails polars-st on the largest shape. `Length` and
+`Simplify` on 10k LineStrings show the SoA slab kernels
+(`SimplifyDPFromXY`, `LineStringViewFromWKB`) working end-to-end
+without a `[]Point` intermediate. `union_all` at 1k polys — 17 s
+vs 271 s — reflects the parallel divide-and-conquer dissolve merge
+composed with Martinez-Rueda's convex-containment fast paths
+cascading through the merge tree.
+
 ### LazyFrame + optimizer (projection pushdown)
 
 Same 1M-row parquet fixture, `Select(id, value_a)` — reading 2 of 4
@@ -1060,7 +1103,7 @@ M3 Pro, 11 GOMAXPROCS.
 
 | Engine                                   |     wall |  user CPU | peak RSS |
 |------------------------------------------|---------:|----------:|---------:|
-| **gobi streaming** (parallel scan + agg) | **12.7s** | **~88s** | **611 MB** |
+| **gobi streaming** (parallel scan + agg) | **14.0s** | **~93s** | **643 MB** |
 | Polars 1.42 streaming (reference)        |    3.0 s |      ~15s |  4.42 GB |
 | Polars 1.42 eager (reference)            |   12.0 s |     ~120s | 20.96 GB |
 
@@ -1079,7 +1122,7 @@ pooled payloads as `*[]int` through the channel path so
 per call (v0.3.9). gobi's own allocations across a full 1BRC run
 are ~540 MB total — down from ~13 GB pre-pool.
 
-Peak RSS is **7.2× lower than Polars streaming** and 34× lower than
+Peak RSS is **6.9× lower than Polars streaming** and 33× lower than
 Polars eager because gobi keeps at most one batch per worker in
 memory + recycles per-batch scratch through `sync.Pool` — Polars
 buffers larger working sets by design.
@@ -1257,42 +1300,100 @@ inverts at the 1BRC scale below.
 
 ### Why the remaining compute-op gap will shrink
 
-`Sum` / `Add` are already memory-bandwidth-bound. The remaining gap on
-`Sum` is SIMD reduction (Polars and numpy both use parallel-lane
-accumulators). Go 1.27 (August 2026) shipped the portable `simd`
+`Sum` / `Add` are already memory-bandwidth-bound. The remaining
+gap on `Sum` is SIMD reduction (Polars and numpy both use
+parallel-lane accumulators). Go 1.27 shipped the portable `simd`
 stdlib package with arm64 NEON + amd64 AVX2/AVX-512 backends under
-`GOEXPERIMENT=simd`. The `compute/` subpackage plus `series_ops_simd.go`
-(v0.4.0) ship SIMD kernels behind
-`//go:build goexperiment.simd && (arm64 || amd64)` — comparisons,
-reductions (`SumF64` / `MinF64` / `MaxF64`), and elementwise
-arithmetic all landed on portable `simd` (previously amd64-only via
-`simd/archsimd`).
+`GOEXPERIMENT=simd`, and the `compute/` subpackage plus
+`series_ops_simd.go` (v0.4.0) ship SIMD kernels behind
+`//go:build goexperiment.simd && (arm64 || amd64)`. Slices 22–23
+extended the wire-in past the raw kernels: `Series.GtScalar` /
+`LtScalar` / `Ge` / `Le` now dispatch to `compute.CmpF64*` /
+`CmpI64*` directly, and the expression executor recognizes
+AND-chained range and bbox filters and dispatches to fused
+kernels (`compute.AndChainF64Range` / `AndChainF64BBox`) that
+skip intermediate boolean-column materialization — measured
+**−49% wall, −71% allocs** on a 100k-row 4-comparison bbox
+filter. Slice 23 also added a lane-count gate on the compare
+kernels that fixed a pre-existing Apple 2-lane NEON regression
+(SIMD build now matches scalar build on Apple, wins expected on
+amd64 AVX2 / AVX-512).
 
-The remaining ~4.5× 1BRC gap vs Polars streaming breaks down (from
-CPU profile, post-v0.3.9):
+The compute-ops table above shows where that leaves single-op
+performance today: `Sum` in the SIMD build is 2.6× faster than
+the scalar build; `Add` is 8% faster; `Filter` and `GroupBy` are
+within 3%, because those two are aggregate-consume-bound rather
+than kernel-bound and the streaming aggregate's `Update` methods
+run per-group scalar loops that don't compose cleanly with the
+lane-parallel reducers (see the negative-result note below).
 
-- ~22% arrow-go parquet decode (not our code; a custom pooled
-  `memory.Allocator` wrapping arrow-go's decoder path is a
-  scoped-out future win — see Future Work in CLAUDE.md)
-- ~12% Go runtime `map[string]*aggGroup` probe (the fundamental
-  hash-by-string cost; possibly addressable with a specialized
-  Robin-Hood / Swiss-table impl)
-- ~30% runtime scheduling / idle wait between workers
-- ~14% GC background work (down proportionally with v0.3.9's alloc
-  churn cuts)
-- ~11% gobi's aggregate consume path (already tight per-batch
-  typed-slice loops; the fast-path type-switch already dispatches
-  once per chunk, not per row)
-- remainder: misc
+The remaining ~4.7× 1BRC gap vs Polars streaming (14.0s vs 3.0s)
+breaks down as follows, from a fresh CPU profile against current
+HEAD (Apple M3 Pro, 11 GOMAXPROCS, 84.85s total across workers):
 
-Wall-time gains from here need either (a) SIMD reduction kernels
-wired into the streaming aggregate's `Update` methods (Go 1.27),
-(b) a custom decoder-buffer allocator to cut arrow-go's contribution,
-or (c) a specialized hash-map for the string-keyed groupby probe.
-None are on a specific timeline; the v0.3.9 wins have already
-put gobi solidly ahead of pandas (matched exactly on h3-agg,
-substantially ahead on memory) and closed the wall-time gap to
-Polars from 6× to 4.5×.
+- ~42% runtime scheduling / worker parking
+  (`pthread_cond_wait` 20.6%, `usleep` 11.6%,
+  `pthread_cond_signal` 9.6%). Workers finish batches faster than
+  the parquet decoder can feed them — a scheduling-shape issue,
+  not raw compute cost. Cutting either the map probe or the
+  parquet decode below shifts this proportionally.
+- ~18% arrow-go parquet decode (`pqarrow.NextBatch` cum;
+  `s2Decode` snappy 2.1%). Not our code; a custom pooled
+  `memory.Allocator` wrapping arrow-go's decoder is a
+  scoped-out future win.
+- ~15% string-keyed map probe (`mapaccess2_faststr` 5.9% flat +
+  `memHashAES` 4.8% + `dispatchBatch` 3.0% + `fnvHashString1`
+  1.5%). Fundamental hash-by-string cost on 413 distinct station
+  keys × 1B rows; addressable with a specialized Robin-Hood /
+  Swiss-table impl but the general `map[string]` is fast enough
+  that the win would be modest.
+- ~10-13% GC (`scanObjectsSmall` 3.9%, `tryDeferToSpanScan`
+  2.1%). Down from ~14% in the v0.3.9-era profile, reflecting
+  the SoA push's allocation cuts.
+- ~10% aggregate consume (`minMaxAcc.updateFloat64` 1.6%,
+  `meanAcc.Update` 1.6%, `minMaxAcc.update` 1.6%). Tight typed-
+  slice loops; the SIMD-reduce wire-in that helps the aligned
+  path in `groupby_aligned.go` was tried here and regressed
+  (see the negative result below).
+- ~10% syscalls / memory ops (`rawsyscalln` 6.2%, `memmove`
+  2.4%, `madvise` 1.2%). Kernel accounting for arrow buffer
+  allocation.
+
+Wall-time gains from here fall into two levers:
+
+1. **Custom decoder-buffer allocator** to cut arrow-go's parquet
+   decode share. Pooled `memory.Allocator` wrapping the decoder
+   path; needs upstream changes to arrow-go, so timeline
+   depends on that landing first.
+2. **Specialized string-hash map** for the groupby probe.
+   Swiss-table variant tuned to gobi's arena-scoped key lifetime.
+   ~5-8% wall on 1BRC-shaped workloads.
+
+An earlier version of this section proposed a third lever — wiring
+`compute.SumF64` / `MinF64` / `MaxF64` into the streaming
+aggregate's `Update` methods, mirroring what `groupby_aligned.go`
+already does. That was attempted and measured: on Apple M3 Pro
+(2-lane NEON) it *regressed* 1BRC wall time by ~10%. The
+streaming aggregate's `Update` receives a scatter (group's row
+indices within the batch, non-contiguous), so using the SIMD
+reduce requires a gather step to materialize a contiguous slab.
+At the typical 1BRC per-group-per-batch cardinality (~220 rows /
+group), the gather cost plus the fixed per-call overhead of
+`compute.SumF64` exceeded the 2-lane NEON reduce speedup.
+The pattern may still pay on 8-lane AVX-512 amd64, but the code
+complexity isn't worth carrying for a hardware-conditional win —
+so the streaming aggregate stays on its scalar per-row loop, and
+this section documents the negative result so future readers
+don't retry the same shape.
+
+None are on a specific timeline; the v0.3.9 wins already put
+gobi solidly ahead of pandas on wall time (matched exactly on
+h3-agg, substantially ahead on memory), and the Slice 22–23
+compare-kernel wire-in landed a substantial fused-filter gain
+on `Filter`-heavy shapes. gobi's peak RSS at 1BRC scale is
+still **6.9× lower than Polars streaming** and 32× lower than
+Polars eager — the memory story remains the differentiator
+even where wall time trails.
 
 ## Development
 
