@@ -88,8 +88,11 @@ func (c *Client) OpenPartitionedTable(ctx context.Context, database, tableName s
 		return nil, err
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("athenaio: %s.%s: no result files under %s",
-			database, tableName, externalLoc)
+		return nil, &NoResultFilesError{
+			Op:       "OpenPartitionedTable",
+			Table:    database + "." + tableName,
+			Location: externalLoc,
+		}
 	}
 	var readOpts *parquetio.ReadOptions
 	if opts != nil {

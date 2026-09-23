@@ -9,6 +9,45 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.16]
+
+### Added
+
+- **`ErrNoResultFiles` sentinel + `*NoResultFilesError` type.** The
+  single-frame read paths — `UnloadAndRead`, `RawCTAS` /
+  `RawCTASWithMetadata`, and `OpenPartitionedTable` — used to
+  report "listing found zero data files" as an untyped
+  `fmt.Errorf`, so callers who wanted to treat an empty SELECT as
+  "no rows" rather than a failure had to string-match. They now
+  return a `*NoResultFilesError` that unwraps to `ErrNoResultFiles`:
+
+  ```go
+  lf, err := c.UnloadAndRead(ctx, spec)
+  if errors.Is(err, athenaio.ErrNoResultFiles) {
+      // query succeeded, no matching rows
+  }
+
+  var nrf *athenaio.NoResultFilesError
+  if errors.As(err, &nrf) {
+      log.Printf("empty at %s (query %s)", nrf.Location, nrf.QueryID)
+  }
+  ```
+
+  Fields: `Op` (`"UnloadAndRead"` / `"RawCTAS"` /
+  `"OpenPartitionedTable"`), `QueryID` (empty for
+  `OpenPartitionedTable`), `Table` (`"db.table"`, only for
+  `OpenPartitionedTable`), and `Location` (the resolved,
+  Glue-recorded S3 prefix that was listed).
+
+  **Message text is unchanged**, byte for byte, so existing log
+  searches and `strings.Contains(err.Error(), "no result files")`
+  checks keep working.
+
+  The bucketed paths (`UnloadAndReadBuckets`, `RawCTASBuckets`, and
+  the `*Manifest` variants) are unaffected. Since v0.1.12 they
+  return a slice of nil-Frame `BucketResult`s for an empty result
+  instead of an error.
+
 ## [v0.1.15]
 
 Review-cycle follow-up on the v0.1.14 manifest hand-off API. Adds

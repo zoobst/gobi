@@ -132,8 +132,7 @@ func (c *Client) UnloadAndRead(ctx context.Context, spec UnloadSpec) (*gobi.Lazy
 		return nil, err
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("athenaio: UnloadAndRead %s: no result files under %s",
-			queryID, actualLoc)
+		return nil, &NoResultFilesError{Op: "UnloadAndRead", QueryID: queryID, Location: actualLoc}
 	}
 	frame, err := c.readBucketFiles(ctx, files, readOptsFromSpec(spec.Columns, spec.Predicate))
 	if err != nil {
@@ -301,8 +300,7 @@ func (c *Client) rawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
 	}
 	if len(files) == 0 {
-		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s: no result files under %s",
-			queryID, actualLoc)
+		return nil, CTASMetadata{}, &NoResultFilesError{Op: "RawCTAS", QueryID: queryID, Location: actualLoc}
 	}
 	frame, err := c.readBucketFiles(ctx, files, readOptsFromSpec(spec.Columns, spec.Predicate))
 	if err != nil {

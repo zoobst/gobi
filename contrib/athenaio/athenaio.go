@@ -20,6 +20,7 @@ package athenaio
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -39,6 +40,63 @@ var ErrQueryFailed = errors.New("athenaio: query failed")
 // ErrQueryTimeout is returned when the poll loop exceeds
 // ClientConfig.MaxPollDuration without seeing a terminal state.
 var ErrQueryTimeout = errors.New("athenaio: query polling timed out")
+
+// ErrNoResultFiles is the sentinel matched (via errors.Is) by every
+// "listing found zero data files" failure from the single-frame read
+// paths: UnloadAndRead, RawCTAS / RawCTASWithMetadata, and
+// OpenPartitionedTable. The
+// query itself succeeded (or the table exists); the SELECT simply
+// produced no rows, so Athena wrote no files.
+//
+// Callers that want to treat this as an empty result rather than a
+// failure (the common case for small AOIs / narrow time windows)
+// can branch on it:
+//
+//	lf, err := c.UnloadAndRead(ctx, spec)
+//	if errors.Is(err, athenaio.ErrNoResultFiles) {
+//	    // no matching rows
+//	}
+//
+// The bucketed paths (UnloadAndReadBuckets, RawCTASBuckets, the
+// *Manifest variants) never return it — they represent an empty
+// result as a slice of nil-Frame BucketResults instead.
+var ErrNoResultFiles = errors.New("athenaio: no result files")
+
+// NoResultFilesError is the concrete error behind ErrNoResultFiles.
+// Use errors.As to recover the details:
+//
+//	var nrf *athenaio.NoResultFilesError
+//	if errors.As(err, &nrf) {
+//	    log.Printf("empty result at %s (query %s)", nrf.Location, nrf.QueryID)
+//	}
+type NoResultFilesError struct {
+	// Op names the entry point that failed: "UnloadAndRead",
+	// "RawCTAS", or "OpenPartitionedTable".
+	Op string
+	// QueryID is the Athena execution ID of the CTAS. Empty for
+	// OpenPartitionedTable, which reads an existing table without
+	// running a query.
+	QueryID string
+	// Table is "database.table" for OpenPartitionedTable; empty
+	// otherwise.
+	Table string
+	// Location is the S3 prefix that was listed and found empty —
+	// the resolved Glue-recorded location, not the spec's requested
+	// one (they differ under workgroup output-location override).
+	Location string
+}
+
+// Error keeps the exact message text the pre-v0.1.16 untyped errors
+// produced, so existing log searches and string matches still hit.
+func (e *NoResultFilesError) Error() string {
+	if e.Table != "" {
+		return fmt.Sprintf("athenaio: %s: no result files under %s", e.Table, e.Location)
+	}
+	return fmt.Sprintf("athenaio: %s %s: no result files under %s", e.Op, e.QueryID, e.Location)
+}
+
+// Unwrap makes errors.Is(err, ErrNoResultFiles) true.
+func (e *NoResultFilesError) Unwrap() error { return ErrNoResultFiles }
 
 // AthenaAPI is the subset of the aws-sdk-go-v2 Athena client that
 // athenaio uses. Defined here (rather than depending on the SDK's
