@@ -889,47 +889,26 @@ func (e *streamingAggregateExec) buildResultBatch() (arrow.RecordBatch, error) {
 	return array.NewRecordBatch(e.outSchema, arrs, nRows), nil
 }
 
-// readScalarAt extracts a Go-typed scalar from a Series at row for
-// use as a key value. Matches the types builderForType and
-// appendCustomValue expect.
+// readScalarAt extracts a Go-typed scalar from a Series at row. For
+// plain columns the value types match what builderForType and
+// appendCustomValue expect. Dictionary-encoded cells resolve to their
+// value type (see readArrayScalar), but builderForType and
+// keyOfAppend don't accept a dictionary *column* type, so grouping or
+// aggregating into a dictionary column still errors up front.
+//
+// Walks the chunk list from the start on every call — fine for a
+// one-off read, O(chunks) per row inside a loop. Row loops over
+// possibly multi-chunk columns should build a chunkCursor once and
+// call its scalarAt instead.
 func readScalarAt(s Series, row int) (any, error) {
 	if s.col == nil {
 		return nil, fmt.Errorf("readScalarAt: nil column")
 	}
-	offset := 0
-	for _, chunk := range s.col.Data().Chunks() {
-		if row < offset+chunk.Len() {
-			local := row - offset
-			if chunk.IsNull(local) {
-				return nil, nil
-			}
-			switch a := chunk.(type) {
-			case *array.Int64:
-				return a.Value(local), nil
-			case *array.Int32:
-				return a.Value(local), nil
-			case *array.Uint64:
-				return a.Value(local), nil
-			case *array.Uint32:
-				return a.Value(local), nil
-			case *array.Float64:
-				return a.Value(local), nil
-			case *array.Float32:
-				return a.Value(local), nil
-			case *array.Boolean:
-				return a.Value(local), nil
-			case *array.String:
-				return a.Value(local), nil
-			case *array.LargeString:
-				return a.Value(local), nil
-			case *array.Timestamp:
-				return a.Value(local), nil
-			}
-			return nil, fmt.Errorf("readScalarAt: unsupported type %T", chunk)
-		}
-		offset += chunk.Len()
+	chunk, local, ok := locateRowInChunks(s.col.Data().Chunks(), row)
+	if !ok {
+		return nil, fmt.Errorf("readScalarAt: row %d out of range", row)
 	}
-	return nil, fmt.Errorf("readScalarAt: row %d out of range", row)
+	return readArrayScalar(chunk, local)
 }
 
 // -----------------------------------------------------------------------------
@@ -1711,12 +1690,16 @@ func (a *modeAcc) OutputType() arrow.DataType { return arrow.PrimitiveTypes.Floa
 // type. Used by countAcc when the source is non-numeric (e.g.
 // counting non-null string values).
 func isNullAtSeries(s Series, row int) (bool, error) {
-	offset := 0
-	for _, chunk := range s.col.Data().Chunks() {
-		if row < offset+chunk.Len() {
-			return chunk.IsNull(row - offset), nil
-		}
-		offset += chunk.Len()
+	if s.col == nil {
+		return false, fmt.Errorf("isNullAtSeries: nil column")
 	}
-	return false, fmt.Errorf("isNullAtSeries: row %d out of range", row)
+	chunk, local, ok := locateRowInChunks(s.col.Data().Chunks(), row)
+	if !ok {
+		return false, fmt.Errorf("isNullAtSeries: row %d out of range", row)
+	}
+	// isNullArr, not chunk.IsNull: a dictionary cell whose index is
+	// valid but points at a null entry is null, and readScalarAt
+	// returns nil for it. Callers that check null then read must see
+	// the two agree.
+	return isNullArr(chunk, local), nil
 }

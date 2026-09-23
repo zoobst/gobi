@@ -452,9 +452,9 @@ func TestSJoin_PointsInSingleMP_ParallelPath_NoRace(t *testing.T) {
 func BenchmarkSJoin_10kPointsInSingleLandMP(b *testing.B) {
 	right := buildSingleMultiPolygonFrame(b, 100, 10, "R")
 	left := buildIndexedPointCloud(b, 10_000, 10, "L", 0xC0DE, 0xBEEF)
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for range b.N {
+	for b.Loop() {
 		got, err := left.SJoin(right, "geometry", "geometry", SPIntersects)
 		if err != nil {
 			b.Fatal(err)

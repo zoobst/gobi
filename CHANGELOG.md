@@ -5,6 +5,47 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.8]
+
+### Fixed
+
+- **`ToStructs` reads dictionary-encoded columns.** Spark and Trino
+  write low-cardinality string columns as `dictionary<int32, string>`;
+  before this, every row of such a file failed with
+  `readScalarAt: unsupported type *array.Dictionary`. The shared
+  scalar reader (`readScalarAt`, and through it every operator that
+  reads cells one at a time) now resolves dictionary indices through
+  the dictionary, so callers see the same Go value a plain column
+  gives. Dictionary-encoded list elements (`list<dictionary<…>>`)
+  resolve the same way, as do dictionary-encoded geometry (WKB)
+  columns. A valid index that points at a null dictionary entry reads
+  as null everywhere, so a `*string` field comes back nil. The shared
+  null check (`isNullAtSeries`) agrees with the reader, so
+  check-then-read paths such as `First` / `Last` and `Pivot` headers
+  no longer see "non-null" and then read nil. Grouping on a
+  dictionary-encoded key, or aggregating into a dictionary-typed
+  output, is still unsupported and fails up front as before.
+- **`ToStructs` honors the timestamp unit.** Timestamps were read as
+  nanoseconds regardless of the column's unit, so a
+  `TIMESTAMP_MICROS` column (the Spark / Trino default) came back
+  1000× too small, with 2024 dates landing in January 1970. This
+  affected `time.Time` fields, string fields with a time layout, and
+  `[]time.Time` list elements. All units (s / ms / µs / ns) now
+  convert correctly. `FromStructs` output is ns, so round-trips were
+  never affected.
+- **`ToStructs` reads 64-bit-offset types.** `LargeList` columns
+  (read into slice fields) and `LargeBinary` geometry columns now
+  read the same as `List` / `Binary`. `LargeString` / `LargeBinary`
+  list elements work too.
+- **`ToStructs` on a zero-row frame** no longer errors when a column
+  has no backing data.
+- **`ToStructs` no longer walks the chunk list for every cell.** Each
+  cell read used to scan the column's chunks from the start, costing
+  rows × fields × chunks. That cost shows up on parquet with many row
+  groups and on `Concat` output. `ToStructs` now builds one cursor per
+  column holding the cumulative chunk offsets. A sequential scan hits
+  the cached chunk in O(1), and a miss falls back to a binary search.
+
 ## [v0.4.7]
 
 3D geodesic math + 3D spatial primitives. Fills a real gap in the

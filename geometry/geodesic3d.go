@@ -403,4 +403,3 @@ func growSlab(s []float64, n int) []float64 {
 	}
 	return make([]float64, n)
 }
-

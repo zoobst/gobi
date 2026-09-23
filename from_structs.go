@@ -232,26 +232,27 @@ func ToStructs[T any](f *Frame, opts ...StructOption) ([]T, error) {
 		return nil, err
 	}
 
-	// Map each plan entry to a column index in f (or -1 if absent).
-	cols := make([]Series, len(plan))
-	present := make([]bool, len(plan))
+	// Map each plan entry to a column cursor (nil if absent). One
+	// cursor per column, built once: the row loop below touches every
+	// cell, and a per-cell chunk walk would cost rows × fields ×
+	// chunks on multi-row-group parquet input.
+	cols := make([]*chunkCursor, len(plan))
 	for i, p := range plan {
 		s, err := f.Column(p.name)
 		if err != nil {
 			// Column absent — that's OK, the field stays at zero.
 			continue
 		}
-		cols[i] = s
-		present[i] = true
+		cols[i] = newChunkCursor(s)
 	}
 
 	nRows := f.NumRows()
 	out := make([]T, nRows)
 	rowsVal := reflect.ValueOf(out)
-	for r := 0; r < nRows; r++ {
+	for r := range nRows {
 		row := rowsVal.Index(r)
 		for i, p := range plan {
-			if !present[i] {
+			if cols[i] == nil {
 				continue
 			}
 			fv := row.Field(p.fieldIndex)
@@ -571,8 +572,8 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 
 // readFieldValue populates one row's value on the struct side by
 // reading from the arrow column. Inverse of appendFieldValue.
-func readFieldValue(fv reflect.Value, s Series, row int, p structFieldPlan) error {
-	null, err := isNullAtSeries(s, row)
+func readFieldValue(fv reflect.Value, cur *chunkCursor, row int, p structFieldPlan) error {
+	null, err := cur.isNull(row)
 	if err != nil {
 		return err
 	}
@@ -595,16 +596,16 @@ func readFieldValue(fv reflect.Value, s Series, row int, p structFieldPlan) erro
 	}
 
 	if p.isGeometry {
-		return readGeomField(fv, s, row, p)
+		return readGeomField(fv, cur, row, p)
 	}
 	if p.isTimeTag {
-		return readTimeField(fv, s, row, p)
+		return readTimeField(fv, cur, row, p)
 	}
 	if p.arrowType.ID() == arrow.LIST {
-		return readListField(fv, s, row)
+		return readListField(fv, cur, row)
 	}
 
-	v, err := readScalarAt(s, row)
+	v, err := cur.scalarAt(row)
 	if err != nil {
 		return err
 	}
@@ -617,8 +618,8 @@ func readFieldValue(fv reflect.Value, s Series, row int, p structFieldPlan) erro
 // readGeomField reads a geometry column back into a string field
 // (as WKT) or a []byte field (raw WKB). Uses the plan's valueType
 // to disambiguate.
-func readGeomField(fv reflect.Value, s Series, row int, p structFieldPlan) error {
-	wkb, err := binaryAt(s, row)
+func readGeomField(fv reflect.Value, cur *chunkCursor, row int, p structFieldPlan) error {
+	wkb, err := binaryAt(cur, row)
 	if err != nil {
 		return err
 	}
@@ -644,16 +645,19 @@ func readGeomField(fv reflect.Value, s Series, row int, p structFieldPlan) error
 
 // readTimeField reads a Timestamp cell back to a time.Time field or
 // a string field with layout.
-func readTimeField(fv reflect.Value, s Series, row int, p structFieldPlan) error {
-	v, err := readScalarAt(s, row)
+func readTimeField(fv reflect.Value, cur *chunkCursor, row int, p structFieldPlan) error {
+	chunk, local, err := cur.locate(row)
 	if err != nil {
 		return err
 	}
-	ts, ok := v.(arrow.Timestamp)
+	arr, i := resolveDictionary(chunk, local)
+	ta, ok := arr.(*array.Timestamp)
 	if !ok {
-		return fmt.Errorf("time column not Timestamp: %T", v)
+		return fmt.Errorf("time column not Timestamp: %T", arr)
 	}
-	t := time.Unix(0, int64(ts)).UTC()
+	// Honor the column's unit: FromStructs writes ns, but Spark / Trino
+	// parquet is typically TIMESTAMP_MICROS.
+	t := ta.Value(i).ToTime(ta.DataType().(*arrow.TimestampType).Unit)
 	timeType := reflect.TypeFor[time.Time]()
 	if p.valueType == timeType {
 		fv.Set(reflect.ValueOf(t))
@@ -828,49 +832,51 @@ func appendListElement(b array.Builder, elem reflect.Value) error {
 // readListField reads a List cell into a Go slice field. Nil-list
 // rows already returned via the null-check in readFieldValue, so
 // this only handles non-null rows.
-func readListField(fv reflect.Value, s Series, row int) error {
-	offset := 0
-	for _, chunk := range s.col.Data().Chunks() {
-		if row < offset+chunk.Len() {
-			local := row - offset
-			la, ok := chunk.(*array.List)
-			if !ok {
-				return fmt.Errorf("list column not List, got %T", chunk)
-			}
-			start, end := la.ValueOffsets(local)
-			values := la.ListValues()
-			n := int(end - start)
-
-			sliceType := fv.Type()
-			elemType := sliceType.Elem()
-			elemIsPtr := elemType.Kind() == reflect.Pointer
-			sliceVal := reflect.MakeSlice(sliceType, n, n)
-			for i := range n {
-				idx := int(start) + i
-				target := sliceVal.Index(i)
-				if values.IsNull(idx) {
-					// Non-pointer elements stay at zero value; pointer
-					// elements stay nil (MakeSlice's default).
-					continue
-				}
-				if elemIsPtr {
-					nv := reflect.New(elemType.Elem())
-					if err := assignListElement(nv.Elem(), values, idx); err != nil {
-						return fmt.Errorf("elem %d: %w", i, err)
-					}
-					target.Set(nv)
-					continue
-				}
-				if err := assignListElement(target, values, idx); err != nil {
-					return fmt.Errorf("elem %d: %w", i, err)
-				}
-			}
-			fv.Set(sliceVal)
-			return nil
-		}
-		offset += chunk.Len()
+func readListField(fv reflect.Value, cur *chunkCursor, row int) error {
+	chunk, local, err := cur.locate(row)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("row %d out of range", row)
+	var start, end int64
+	var values arrow.Array
+	switch la := chunk.(type) {
+	case *array.List:
+		start, end = la.ValueOffsets(local)
+		values = la.ListValues()
+	case *array.LargeList:
+		start, end = la.ValueOffsets(local)
+		values = la.ListValues()
+	default:
+		return fmt.Errorf("list column not List, got %T", chunk)
+	}
+	n := int(end - start)
+
+	sliceType := fv.Type()
+	elemType := sliceType.Elem()
+	elemIsPtr := elemType.Kind() == reflect.Pointer
+	sliceVal := reflect.MakeSlice(sliceType, n, n)
+	for i := range n {
+		idx := int(start) + i
+		target := sliceVal.Index(i)
+		if isNullArr(values, idx) {
+			// Non-pointer elements stay at zero value; pointer
+			// elements stay nil (MakeSlice's default).
+			continue
+		}
+		if elemIsPtr {
+			nv := reflect.New(elemType.Elem())
+			if err := assignListElement(nv.Elem(), values, idx); err != nil {
+				return fmt.Errorf("elem %d: %w", i, err)
+			}
+			target.Set(nv)
+			continue
+		}
+		if err := assignListElement(target, values, idx); err != nil {
+			return fmt.Errorf("elem %d: %w", i, err)
+		}
+	}
+	fv.Set(sliceVal)
+	return nil
 }
 
 // assignListElement reads one element from a list's inner Array
@@ -903,9 +909,17 @@ func assignListElement(fv reflect.Value, arr arrow.Array, idx int) error {
 		fv.SetFloat(float64(a.Value(idx)))
 	case *array.Binary:
 		fv.SetBytes(a.Value(idx))
+	case *array.LargeBinary:
+		fv.SetBytes(a.Value(idx))
+	case *array.LargeString:
+		fv.SetString(a.Value(idx))
 	case *array.Timestamp:
-		t := time.Unix(0, int64(a.Value(idx))).UTC()
+		t := a.Value(idx).ToTime(a.DataType().(*arrow.TimestampType).Unit)
 		fv.Set(reflect.ValueOf(t))
+	case *array.Dictionary:
+		// Spark / Trino dictionary-encode low-cardinality list
+		// elements too; resolve through the dictionary.
+		return assignListElement(fv, a.Dictionary(), a.GetValueIndex(idx))
 	default:
 		return fmt.Errorf("%w: unsupported list element array %T", ErrUnsupportedStructField, arr)
 	}
@@ -914,21 +928,20 @@ func assignListElement(fv reflect.Value, arr arrow.Array, idx int) error {
 
 // binaryAt reads a Binary cell's raw bytes at row from a Series.
 // Returns nil for null cells.
-func binaryAt(s Series, row int) ([]byte, error) {
-	offset := 0
-	for _, chunk := range s.col.Data().Chunks() {
-		if row < offset+chunk.Len() {
-			local := row - offset
-			if chunk.IsNull(local) {
-				return nil, nil
-			}
-			ba, ok := chunk.(*array.Binary)
-			if !ok {
-				return nil, fmt.Errorf("column not Binary, got %T", chunk)
-			}
-			return ba.Value(local), nil
-		}
-		offset += chunk.Len()
+func binaryAt(cur *chunkCursor, row int) ([]byte, error) {
+	chunk, local, err := cur.locate(row)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("row %d out of range", row)
+	arr, i := resolveDictionary(chunk, local)
+	if arr.IsNull(i) {
+		return nil, nil
+	}
+	switch ba := arr.(type) {
+	case *array.Binary:
+		return ba.Value(i), nil
+	case *array.LargeBinary:
+		return ba.Value(i), nil
+	}
+	return nil, fmt.Errorf("column not Binary, got %T", arr)
 }

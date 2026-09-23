@@ -286,4 +286,3 @@ func PointsInAnyCapsuleFromXYZ(xs, ys, zs []float64, capsules []Capsule, out []b
 		}
 	}
 }
-
