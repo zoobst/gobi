@@ -9,6 +9,47 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.17]
+
+### Added
+
+- **`NoResultFilesError.Stats *QueryStats`**: query stats for
+  empty-result queries. When a CTAS succeeds but its SELECT
+  produces no rows, Athena still bills the scan. On success those
+  stats are reachable via `StatsFor(lf)`, but the empty-result
+  path returns an error and no LazyFrame, so in v0.1.16 the stats
+  were dropped. Callers summing `ScannedBytes` across queries
+  undercounted every empty result. They now travel on the error:
+
+  ```go
+  lf, err := c.UnloadAndRead(ctx, spec)
+  var nrf *athenaio.NoResultFilesError
+  switch {
+  case errors.As(err, &nrf):
+      totalScanned += nrf.Stats.ScannedBytes // no rows, but billed
+  case err == nil:
+      if s, ok := athenaio.StatsFor(lf); ok {
+          totalScanned += s.ScannedBytes
+      }
+  }
+  ```
+
+  Fields match the success path: the same `QueryExecutionID`, the
+  same `ResultPrefix` choice (composed location for
+  `UnloadAndRead`, `spec.ExternalLocation` for `RawCTAS`),
+  `ScannedBytes`, `EngineTime`, and `TotalTime`. `RowCount` is 0.
+  Populated for `UnloadAndRead` and `RawCTAS` /
+  `RawCTASWithMetadata`. Nil for `OpenPartitionedTable`, which runs
+  no query. Check for nil before dereferencing when handling all
+  three.
+
+### Changed
+
+- **`golang.org/x/sync` is now a direct dependency in `go.mod`.**
+  It has been imported directly (for `errgroup`) since v0.1.15;
+  `go.mod` still marked it `// indirect`. Housekeeping only; no
+  change to the version or the build.
+
 ## [v0.1.16]
 
 ### Added

@@ -29,6 +29,35 @@ func assertNoResultFiles(t *testing.T, err error) *NoResultFilesError {
 	return nrf
 }
 
+// assertEmptyResultStats checks that an empty-result error from a
+// CTAS path carries the billed scan. mockCTASAthena reports 2048
+// scanned bytes and 100ms engine time on every execution.
+func assertEmptyResultStats(t *testing.T, nrf *NoResultFilesError, wantPrefix string) {
+	t.Helper()
+	if nrf.Stats == nil {
+		t.Fatal("Stats is nil; a CTAS that ran must report its scan")
+	}
+	s := nrf.Stats
+	if s.ScannedBytes != 2048 {
+		t.Errorf("ScannedBytes = %d, want 2048", s.ScannedBytes)
+	}
+	if s.EngineTime != 100*time.Millisecond {
+		t.Errorf("EngineTime = %v, want 100ms", s.EngineTime)
+	}
+	if s.QueryExecutionID != nrf.QueryID {
+		t.Errorf("Stats.QueryExecutionID = %q, want %q", s.QueryExecutionID, nrf.QueryID)
+	}
+	if s.ResultPrefix != wantPrefix {
+		t.Errorf("Stats.ResultPrefix = %q, want %q", s.ResultPrefix, wantPrefix)
+	}
+	if s.RowCount != 0 {
+		t.Errorf("Stats.RowCount = %d, want 0", s.RowCount)
+	}
+	if s.TotalTime <= 0 {
+		t.Errorf("Stats.TotalTime = %v, want > 0", s.TotalTime)
+	}
+}
+
 // TestUnloadAndRead_NoResultFilesIsTyped — CTAS succeeds, Glue
 // records a location, the listing comes back empty.
 func TestUnloadAndRead_NoResultFilesIsTyped(t *testing.T) {
@@ -76,6 +105,9 @@ func TestUnloadAndRead_NoResultFilesIsTyped(t *testing.T) {
 	if nrf.Table != "" {
 		t.Errorf("Table = %q, want empty for a CTAS path", nrf.Table)
 	}
+	// UnloadAndRead's success path reports the composed location as
+	// ResultPrefix; in this fixture Glue records the same prefix.
+	assertEmptyResultStats(t, nrf, recordedLoc)
 }
 
 // TestRawCTAS_NoResultFilesIsTyped — both RawCTAS and
@@ -112,9 +144,10 @@ func TestRawCTAS_NoResultFilesIsTyped(t *testing.T) {
 	if nrf.Op != "RawCTAS" || nrf.Location != external || nrf.QueryID == "" {
 		t.Errorf("RawCTAS: got %+v", nrf)
 	}
+	assertEmptyResultStats(t, nrf, external)
 
 	_, _, err = newClient().RawCTASWithMetadata(context.Background(), spec)
-	assertNoResultFiles(t, err)
+	assertEmptyResultStats(t, assertNoResultFiles(t, err), external)
 }
 
 // TestOpenPartitionedTable_NoResultFilesIsTyped — existing Hive
@@ -148,6 +181,9 @@ func TestOpenPartitionedTable_NoResultFilesIsTyped(t *testing.T) {
 	}
 	if nrf.QueryID != "" {
 		t.Errorf("QueryID = %q, want empty (no query runs)", nrf.QueryID)
+	}
+	if nrf.Stats != nil {
+		t.Errorf("Stats = %+v, want nil (no query runs)", nrf.Stats)
 	}
 }
 

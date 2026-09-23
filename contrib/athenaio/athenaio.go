@@ -84,6 +84,17 @@ type NoResultFilesError struct {
 	// the resolved Glue-recorded location, not the spec's requested
 	// one (they differ under workgroup output-location override).
 	Location string
+	// Stats is the query's execution stats. The CTAS ran and Athena
+	// billed its scan even though the SELECT produced no rows, and
+	// on success these stats would be reachable via StatsFor on the
+	// returned LazyFrame. An error return has no LazyFrame, so they
+	// ride here instead. Callers aggregating ScannedBytes should add
+	// this in, or they undercount empty-result queries.
+	//
+	// Populated identically to the success path (same ResultPrefix
+	// choice, same timing), with RowCount = 0. Nil for
+	// OpenPartitionedTable, which runs no query.
+	Stats *QueryStats
 }
 
 // Error keeps the exact message text the pre-v0.1.16 untyped errors
