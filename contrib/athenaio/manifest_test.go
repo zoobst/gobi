@@ -270,6 +270,9 @@ func TestRawCTASBucketsManifest_HappyPath(t *testing.T) {
 	if meta.Duration <= 0 {
 		t.Errorf("meta.Duration = %v, want > 0", meta.Duration)
 	}
+	if meta.ScannedBytes != 2048 {
+		t.Errorf("meta.ScannedBytes = %d, want 2048 (mockCTASAthena)", meta.ScannedBytes)
+	}
 
 	// Cleanup registration still fires on the CTAS-side path.
 	c.mu.Lock()
@@ -416,6 +419,9 @@ func TestUnloadAndReadBucketsManifest_HappyPath(t *testing.T) {
 	}
 	if meta.QueryID == "" {
 		t.Error("meta.QueryID is empty")
+	}
+	if meta.ScannedBytes != 2048 {
+		t.Errorf("meta.ScannedBytes = %d, want 2048 (mockCTASAthena)", meta.ScannedBytes)
 	}
 
 	hydrated, err := hydrate(context.Background())

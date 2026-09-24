@@ -1211,6 +1211,10 @@ func TestRawCTASWithMetadata_ReturnsLocationAndQueryID(t *testing.T) {
 	if meta.Duration <= 0 {
 		t.Errorf("Duration = %v, want > 0", meta.Duration)
 	}
+	// mockCTASAthena reports 2048 scanned bytes per execution.
+	if meta.ScannedBytes != 2048 {
+		t.Errorf("ScannedBytes = %d, want 2048", meta.ScannedBytes)
+	}
 	// Cleanup registration must fire same as RawCTAS.
 	c.mu.Lock()
 	trackedCount := len(c.createdTables)

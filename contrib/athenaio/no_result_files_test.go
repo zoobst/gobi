@@ -219,3 +219,96 @@ func TestNoResultFilesError_MessageUnchanged(t *testing.T) {
 		t.Error("errors.Is lost through fmt.Errorf %w wrapping")
 	}
 }
+
+// TestBucketsWithMetadata_AllEmptyReportsScan — a bucketed CTAS whose
+// listing is empty returns all-nil slots (not an error), so no Frame
+// carries QueryStats. The CTASMetadata must still report the billed
+// scan.
+func TestBucketsWithMetadata_AllEmptyReportsScan(t *testing.T) {
+	t.Run("UnloadAndReadBucketsWithMetadata", func(t *testing.T) {
+		mockA := &mockCTASAthena{pollsBeforeDone: 0}
+		mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{}}
+		c, err := NewClient(ClientConfig{
+			Workgroup: "wg", ResultLocation: "s3://test-bucket/results",
+			Database: "test_db",
+			Athena:   mockA, S3: &mockS3{objects: map[string][]byte{}}, Glue: mockG,
+			PollInterval: 1 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.athena = &mockCTASAthenaWithSideEffect{
+			inner: mockA,
+			onStart: func(sql, outputLoc string) {
+				name := extractCTASName(sql)
+				mockG.tables[glueTableKey{Database: "test_db", Name: name}] = &gluetypes.Table{
+					Name:              aws.String(name),
+					Parameters:        map[string]string{"table_type": "ICEBERG"},
+					StorageDescriptor: &gluetypes.StorageDescriptor{Location: aws.String(outputLoc)},
+				}
+			},
+		}
+		results, meta, err := c.UnloadAndReadBucketsWithMetadata(context.Background(), UnloadSpec{
+			SQL: "SELECT id FROM t", PartitionBy: []string{"id"}, BucketCount: 4,
+		})
+		if err != nil {
+			t.Fatalf("UnloadAndReadBucketsWithMetadata: %v", err)
+		}
+		assertAllEmptyWithScan(t, results, meta, 4)
+	})
+
+	t.Run("RawCTASBucketsWithMetadata", func(t *testing.T) {
+		external := "s3://test-bucket/raw-bucketed-empty/"
+		c, err := NewClient(ClientConfig{
+			Workgroup: "wg", ResultLocation: "s3://test-bucket/results/",
+			Database: "test_db",
+			Athena:   &mockCTASAthena{pollsBeforeDone: 0},
+			S3:       &mockS3{objects: map[string][]byte{}},
+			Glue: &mockGlue{tables: map[glueTableKey]*gluetypes.Table{
+				{Database: "test_db", Name: "bucketed_empty"}: {
+					Name: aws.String("bucketed_empty"),
+					StorageDescriptor: &gluetypes.StorageDescriptor{
+						Location:        aws.String(external),
+						NumberOfBuckets: 4,
+						BucketColumns:   []string{"id"},
+					},
+				},
+			}},
+			PollInterval: 1 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		results, meta, err := c.RawCTASBucketsWithMetadata(context.Background(), RawCTASSpec{
+			SQL:              "CREATE TABLE ... AS SELECT ...",
+			TableName:        "bucketed_empty",
+			ExternalLocation: external,
+		})
+		if err != nil {
+			t.Fatalf("RawCTASBucketsWithMetadata: %v", err)
+		}
+		assertAllEmptyWithScan(t, results, meta, 4)
+		if meta.Location != external {
+			t.Errorf("meta.Location = %q, want %q", meta.Location, external)
+		}
+	})
+}
+
+func assertAllEmptyWithScan(t *testing.T, results []BucketResult, meta CTASMetadata, wantLen int) {
+	t.Helper()
+	if len(results) != wantLen {
+		t.Fatalf("len(results) = %d, want %d", len(results), wantLen)
+	}
+	for i, r := range results {
+		if r.Frame != nil {
+			t.Errorf("slot %d: Frame = non-nil, want nil (empty listing)", i)
+		}
+	}
+	// mockCTASAthena reports 2048 scanned bytes per execution.
+	if meta.ScannedBytes != 2048 {
+		t.Errorf("meta.ScannedBytes = %d, want 2048", meta.ScannedBytes)
+	}
+	if meta.QueryID == "" || meta.Location == "" || meta.Duration <= 0 {
+		t.Errorf("CTASMetadata not populated: %+v", meta)
+	}
+}

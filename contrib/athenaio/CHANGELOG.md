@@ -9,6 +9,76 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.18]
+
+### Added
+
+- **`CTASMetadata.ScannedBytes`**: the bytes Athena scanned for the
+  CTAS, which is what Athena bills. It's the same value as
+  `QueryStats.ScannedBytes`, and it's filled in by every method that
+  returns `CTASMetadata`: `RawCTASWithMetadata`,
+  `UnloadAndReadBucketsManifest`, and `RawCTASBucketsManifest`.
+  Previously the scan was only reachable through `QueryStats` on a
+  returned Frame. So a manifest read before `hydrate`, or a
+  CTAS whose buckets all came back empty, gave no way to account for
+  the scan.
+
+  ```go
+  manifest, meta, hydrate, err := c.RawCTASBucketsManifest(ctx, spec)
+  if err != nil { return err }
+  billing.Record(meta.QueryID, meta.ScannedBytes) // before any S3 read
+  ```
+- **`RawCTASBucketsWithMetadata`** is `RawCTASBuckets` plus the
+  query-level `CTASMetadata`. It completes the set: every bucketed
+  path now has a form that reports the scan even when all buckets
+  come back empty. `RawCTASBuckets` itself is unchanged.
+- **`CTASMetadata` is returned alongside errors once the CTAS has
+  completed.** Athena bills the scan even if a later step fails:
+  Glue read-back verify, the bucketing check (a missing
+  `bucketed_by`), location resolution, the S3 listing, or reading a
+  bucket file. Every method that returns `CTASMetadata` now fills in
+  `QueryID` and `ScannedBytes` on those errors. `Location` is filled
+  in if Glue resolved it before the failure. Failures before the
+  CTAS completes (bad spec, submit error, failed query) still return
+  a zero `CTASMetadata`. Record billing before checking the error:
+
+  ```go
+  results, meta, err := c.RawCTASBucketsWithMetadata(ctx, spec)
+  if meta.QueryID != "" {
+      billing.Record(meta.QueryID, meta.ScannedBytes)
+  }
+  if err != nil { return err }
+  ```
+
+### Fixed
+
+- **`CTASMetadata.Duration` now matches `QueryStats.TotalTime` on the
+  eager paths.** Both values come from one timestamp. Before, the
+  bucketed paths took two separate readings, so the numbers differed
+  slightly. On the manifest paths, `Duration` runs from submit to the
+  file listing. Frames from a later `hydrate()` carry their own,
+  later `TotalTime`, and the `Duration` doc comment now says so.
+
+### Changed (breaking)
+
+- **`UnloadAndReadBucketsWithMetadata` now also returns
+  `CTASMetadata`**, so its signature goes from
+  `([]BucketResult, error)` to `([]BucketResult, CTASMetadata, error)`.
+  This matches `RawCTASWithMetadata` and `RawCTASBucketsWithMetadata`.
+  An empty bucket gets a nil Frame with no `QueryStats` attached, so
+  when every bucket was empty the scan wasn't reported anywhere. The
+  returned `meta.ScannedBytes` now reports it. To migrate, add a
+  blank identifier:
+
+  ```go
+  results, _, err := c.UnloadAndReadBucketsWithMetadata(ctx, spec)
+  ```
+
+  For billing, read `meta.ScannedBytes` once per call. Don't sum
+  `QueryStats.ScannedBytes` across bucket Frames: each one carries the
+  same query-level total, so a sum counts it once per non-empty
+  bucket.
+
 ## [v0.1.17]
 
 ### Added

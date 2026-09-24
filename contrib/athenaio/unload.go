@@ -132,17 +132,12 @@ func (c *Client) UnloadAndRead(ctx context.Context, spec UnloadSpec) (*gobi.Lazy
 		return nil, err
 	}
 	if len(files) == 0 {
+		stats := completedStats(queryID, composed.ExternalLocation, exec, start, 0)
 		return nil, &NoResultFilesError{
 			Op:       "UnloadAndRead",
 			QueryID:  queryID,
 			Location: actualLoc,
-			Stats: &QueryStats{
-				QueryExecutionID: queryID,
-				ResultPrefix:     composed.ExternalLocation,
-				ScannedBytes:     scannedBytes(exec),
-				EngineTime:       engineTime(exec),
-				TotalTime:        time.Since(start),
-			},
+			Stats:    &stats,
 		}
 	}
 	frame, err := c.readBucketFiles(ctx, files, readOptsFromSpec(spec.Columns, spec.Predicate))
@@ -173,14 +168,7 @@ func (c *Client) UnloadAndRead(ctx context.Context, spec UnloadSpec) (*gobi.Lazy
 		return nil, fmt.Errorf("athenaio: attach partition assertion: %w", err)
 	}
 
-	registerStats(asserted, QueryStats{
-		QueryExecutionID: queryID,
-		ResultPrefix:     composed.ExternalLocation,
-		ScannedBytes:     scannedBytes(exec),
-		EngineTime:       engineTime(exec),
-		TotalTime:        time.Since(start),
-		RowCount:         int64(frame.NumRows()),
-	})
+	registerStats(asserted, completedStats(queryID, composed.ExternalLocation, exec, start, int64(frame.NumRows())))
 	return asserted, nil
 }
 
@@ -229,9 +217,56 @@ type CTASMetadata struct {
 	// Correlates with CloudTrail, Athena query history, and
 	// QueryStats attached to the returned LazyFrame.
 	QueryID string
-	// Duration is the wall-clock time from submit to reader-open.
-	// Same value stored in QueryStats.TotalTime.
+	// Duration is wall-clock time from submit to when the metadata
+	// was taken:
+	//   - eager paths (RawCTASWithMetadata, *BucketsWithMetadata):
+	//     submit → reader-open, the same value as QueryStats.TotalTime
+	//     on the returned Frames;
+	//   - manifest paths: submit → file listing. Frames from a later
+	//     hydrate() carry their own, larger TotalTime;
+	//   - error returns: submit → failure.
 	Duration time.Duration
+	// ScannedBytes is the data Athena scanned for the CTAS — the
+	// billed quantity. Same value as QueryStats.ScannedBytes, but
+	// available on paths with no Frame to attach stats to (a
+	// manifest before hydrate, a CTAS whose buckets are all empty,
+	// or a failure after the CTAS completed).
+	ScannedBytes int64
+}
+
+// CTASMetadata on error. Every method returning CTASMetadata also
+// returns it alongside a non-nil error when the CTAS itself
+// completed — Athena billed the scan even if a later step (Glue
+// verify, bucketing check, S3 listing, a bucket read) failed. In that
+// case QueryID and ScannedBytes are set; Location is set once it was
+// resolved from Glue and empty if the failure came first. When the
+// failure precedes completion (bad spec, submit error, failed query)
+// the CTASMetadata is zero.
+
+// completedStats builds the QueryStats for a CTAS that finished
+// polling, stamping TotalTime once. Every query-level report on the
+// CTAS paths — Frame QueryStats, CTASMetadata, NoResultFilesError.Stats
+// — derives from one call so their numbers agree.
+func completedStats(queryID, resultPrefix string, exec *athenatypes.QueryExecution, start time.Time, rows int64) QueryStats {
+	return QueryStats{
+		QueryExecutionID: queryID,
+		ResultPrefix:     resultPrefix,
+		ScannedBytes:     scannedBytes(exec),
+		EngineTime:       engineTime(exec),
+		TotalTime:        time.Since(start),
+		RowCount:         rows,
+	}
+}
+
+// metadataFromStats projects s onto CTASMetadata. location is the
+// resolved Glue location, "" when the failure preceded resolution.
+func metadataFromStats(location string, s QueryStats) CTASMetadata {
+	return CTASMetadata{
+		Location:     location,
+		QueryID:      s.QueryExecutionID,
+		Duration:     s.TotalTime,
+		ScannedBytes: s.ScannedBytes,
+	}
 }
 
 // RawCTASWithMetadata is the observability-friendly form of
@@ -284,6 +319,12 @@ func (c *Client) rawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s failed:\n---\n%s\n---\n%w",
 			queryID, spec.SQL, err)
 	}
+	// From here on the CTAS is complete and billed: every error
+	// return carries the metadata (see "CTASMetadata on error").
+	var actualLoc string
+	failed := func(err error) (*gobi.LazyFrame, CTASMetadata, error) {
+		return nil, metadataFromStats(actualLoc, completedStats(queryID, spec.ExternalLocation, exec, start, 0)), err
+	}
 
 	// Register the table for cleanup on Close. Do this before the
 	// read step so a read-side failure still lets Close reap the
@@ -302,31 +343,26 @@ func (c *Client) rawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 	// (workgroup override with EnforceWorkGroupConfiguration=true).
 	// No read-back verification of metadata — the user asserted the
 	// claim; we don't second-guess.
-	actualLoc, err := c.resolveActualLocation(ctx, database, spec.TableName, spec.ExternalLocation)
+	actualLoc, err = c.resolveActualLocation(ctx, database, spec.TableName, spec.ExternalLocation)
 	if err != nil {
-		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
+		return failed(fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err))
 	}
 	files, err := listBucketFiles(ctx, c.s3, actualLoc)
 	if err != nil {
-		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
+		return failed(fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err))
 	}
 	if len(files) == 0 {
-		return nil, CTASMetadata{}, &NoResultFilesError{
+		stats := completedStats(queryID, spec.ExternalLocation, exec, start, 0)
+		return nil, metadataFromStats(actualLoc, stats), &NoResultFilesError{
 			Op:       "RawCTAS",
 			QueryID:  queryID,
 			Location: actualLoc,
-			Stats: &QueryStats{
-				QueryExecutionID: queryID,
-				ResultPrefix:     spec.ExternalLocation,
-				ScannedBytes:     scannedBytes(exec),
-				EngineTime:       engineTime(exec),
-				TotalTime:        time.Since(start),
-			},
+			Stats:    &stats,
 		}
 	}
 	frame, err := c.readBucketFiles(ctx, files, readOptsFromSpec(spec.Columns, spec.Predicate))
 	if err != nil {
-		return nil, CTASMetadata{}, fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err)
+		return failed(fmt.Errorf("athenaio: RawCTAS %s: %w", queryID, err))
 	}
 
 	lf := frame.Lazy()
@@ -334,25 +370,14 @@ func (c *Client) rawCTAS(ctx context.Context, spec RawCTASSpec) (*gobi.LazyFrame
 		frame.WithPartitionMeta(spec.Metadata)
 		asserted, err := lf.WithPartitionAssertion(spec.Metadata)
 		if err != nil {
-			return nil, CTASMetadata{}, fmt.Errorf("athenaio: attach partition assertion: %w", err)
+			return failed(fmt.Errorf("athenaio: attach partition assertion: %w", err))
 		}
 		lf = asserted
 	}
 
-	dur := time.Since(start)
-	registerStats(lf, QueryStats{
-		QueryExecutionID: queryID,
-		ResultPrefix:     spec.ExternalLocation,
-		ScannedBytes:     scannedBytes(exec),
-		EngineTime:       engineTime(exec),
-		TotalTime:        dur,
-		RowCount:         int64(frame.NumRows()),
-	})
-	return lf, CTASMetadata{
-		Location: actualLoc,
-		QueryID:  queryID,
-		Duration: dur,
-	}, nil
+	stats := completedStats(queryID, spec.ExternalLocation, exec, start, int64(frame.NumRows()))
+	registerStats(lf, stats)
+	return lf, metadataFromStats(actualLoc, stats), nil
 }
 
 // tryCTAS composes + submits + polls a CTAS in the given format
@@ -815,7 +840,7 @@ func (c *Client) UnloadAndReadBuckets(ctx context.Context, spec UnloadSpec) ([]*
 	if spec.BucketCount <= 0 {
 		return nil, fmt.Errorf("athenaio: UnloadAndReadBuckets requires spec.BucketCount > 0")
 	}
-	results, err := c.unloadAndReadBucketsWithMeta(ctx, spec)
+	results, _, err := c.unloadAndReadBucketsWithMeta(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -828,13 +853,22 @@ func (c *Client) UnloadAndReadBuckets(ctx context.Context, spec UnloadSpec) ([]*
 
 // UnloadAndReadBucketsWithMetadata is the observability-friendly form
 // of UnloadAndReadBuckets — returns per-bucket S3 URIs alongside the
-// LazyFrames. Same contract otherwise.
-func (c *Client) UnloadAndReadBucketsWithMetadata(ctx context.Context, spec UnloadSpec) ([]BucketResult, error) {
+// LazyFrames, plus the query-level CTASMetadata (resolved location,
+// query ID, duration, scanned bytes). Same contract otherwise.
+//
+// The CTASMetadata is the only place the scan is reported when every
+// bucket comes back empty: QueryStats ride on non-nil Frames, and an
+// all-nil result has none. Account billing from meta.ScannedBytes,
+// not by summing per-Frame stats — every non-nil Frame carries the
+// same query-level ScannedBytes, so a sum overcounts by the number of
+// non-empty buckets. On error, meta still reports the scan when the
+// CTAS completed (see "CTASMetadata on error").
+func (c *Client) UnloadAndReadBucketsWithMetadata(ctx context.Context, spec UnloadSpec) ([]BucketResult, CTASMetadata, error) {
 	if len(spec.PartitionBy) == 0 {
-		return nil, fmt.Errorf("athenaio: UnloadAndReadBucketsWithMetadata requires non-empty spec.PartitionBy")
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: UnloadAndReadBucketsWithMetadata requires non-empty spec.PartitionBy")
 	}
 	if spec.BucketCount <= 0 {
-		return nil, fmt.Errorf("athenaio: UnloadAndReadBucketsWithMetadata requires spec.BucketCount > 0")
+		return nil, CTASMetadata{}, fmt.Errorf("athenaio: UnloadAndReadBucketsWithMetadata requires spec.BucketCount > 0")
 	}
 	return c.unloadAndReadBucketsWithMeta(ctx, spec)
 }
@@ -844,12 +878,16 @@ func (c *Client) UnloadAndReadBucketsWithMetadata(ctx context.Context, spec Unlo
 // per-file constructs a LazyFrame with the same PartitionMetadata
 // claim as the mainline variant. Missing bucket indices become nil
 // slots.
-func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSpec) ([]BucketResult, error) {
+func (c *Client) unloadAndReadBucketsWithMeta(ctx context.Context, spec UnloadSpec) ([]BucketResult, CTASMetadata, error) {
 	prep, meta, err := c.prepareUnloadBuckets(ctx, spec)
 	if err != nil {
-		return nil, err
+		return nil, prep.metadata(), err
 	}
-	return c.hydrateBuckets(ctx, prep, meta, spec.Columns, spec.Predicate)
+	results, stats, err := c.hydrateBuckets(ctx, prep, meta, spec.Columns, spec.Predicate)
+	if err != nil {
+		return nil, prep.metadata(), err
+	}
+	return results, metadataFromStats(prep.actualLoc, stats), nil
 }
 
 // UnloadAndReadBucketsManifest is the two-phase variant of
@@ -870,19 +908,16 @@ func (c *Client) UnloadAndReadBucketsManifest(ctx context.Context, spec UnloadSp
 	}
 	prep, pmeta, err := c.prepareUnloadBuckets(ctx, spec)
 	if err != nil {
-		return nil, CTASMetadata{}, nil, err
+		return nil, prep.metadata(), nil, err
 	}
 	manifest, err = buildBucketManifest(prep)
 	if err != nil {
-		return nil, CTASMetadata{}, nil, fmt.Errorf("athenaio: UnloadAndReadBucketsManifest %s: %w", prep.queryID, err)
+		return nil, prep.metadata(), nil, fmt.Errorf("athenaio: UnloadAndReadBucketsManifest %s: %w", prep.queryID, err)
 	}
-	meta = CTASMetadata{
-		Location: prep.actualLoc,
-		QueryID:  prep.queryID,
-		Duration: time.Since(prep.start),
-	}
+	meta = prep.metadata()
 	hydrate = func(hctx context.Context) ([]BucketResult, error) {
-		return c.hydrateBuckets(hctx, prep, pmeta, spec.Columns, spec.Predicate)
+		results, _, err := c.hydrateBuckets(hctx, prep, pmeta, spec.Columns, spec.Predicate)
+		return results, err
 	}
 	return manifest, meta, hydrate, nil
 }
@@ -923,6 +958,11 @@ func (c *Client) prepareUnloadBuckets(ctx context.Context, spec UnloadSpec) (*bu
 		}
 	}
 
+	// CTAS complete and billed. Post-completion failures return this
+	// partial prep alongside the error so callers can still report
+	// the scan (see bucketPrep).
+	partial := &bucketPrep{bucketCount: spec.BucketCount, queryID: queryID, exec: exec, start: start}
+
 	if err := c.verifyCTASOutput(ctx, composed, spec); err != nil {
 		c.registerTable(trackedTable{
 			Database:         c.cfg.Database,
@@ -931,7 +971,7 @@ func (c *Client) prepareUnloadBuckets(ctx context.Context, spec UnloadSpec) (*bu
 			Format:           composed.Format,
 			ExternalLocation: composed.ExternalLocation,
 		})
-		return nil, nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s read-back verify: %w", queryID, err)
+		return partial, nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s read-back verify: %w", queryID, err)
 	}
 	c.registerTable(trackedTable{
 		Database:         c.cfg.Database,
@@ -943,11 +983,12 @@ func (c *Client) prepareUnloadBuckets(ctx context.Context, spec UnloadSpec) (*bu
 
 	actualLoc, err := c.resolveActualLocation(ctx, c.cfg.Database, composed.TableName, composed.ExternalLocation)
 	if err != nil {
-		return nil, nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: %w", queryID, err)
+		return partial, nil, fmt.Errorf("athenaio: UnloadAndReadBuckets %s: %w", queryID, err)
 	}
+	partial.actualLoc = actualLoc
 	files, err := listBucketFiles(ctx, c.s3, actualLoc)
 	if err != nil {
-		return nil, nil, err
+		return partial, nil, err
 	}
 
 	meta := &gobi.PartitionMetadata{
@@ -985,11 +1026,31 @@ func (c *Client) prepareUnloadBuckets(ctx context.Context, spec UnloadSpec) (*bu
 //     LazyFrames, nil slots for empty buckets when possible,
 //     independent Collect() errors.
 func (c *Client) RawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]BucketResult, error) {
+	results, _, err := c.rawCTASBuckets(ctx, spec)
+	return results, err
+}
+
+// RawCTASBucketsWithMetadata is RawCTASBuckets plus the query-level
+// CTASMetadata (resolved location, query ID, duration, scanned
+// bytes). Same contract otherwise. See
+// UnloadAndReadBucketsWithMetadata for why billing should read
+// meta.ScannedBytes rather than per-Frame stats.
+func (c *Client) RawCTASBucketsWithMetadata(ctx context.Context, spec RawCTASSpec) ([]BucketResult, CTASMetadata, error) {
+	return c.rawCTASBuckets(ctx, spec)
+}
+
+// rawCTASBuckets is the shared body of RawCTASBuckets +
+// RawCTASBucketsWithMetadata.
+func (c *Client) rawCTASBuckets(ctx context.Context, spec RawCTASSpec) ([]BucketResult, CTASMetadata, error) {
 	prep, err := c.prepareRawCTASBuckets(ctx, spec)
 	if err != nil {
-		return nil, err
+		return nil, prep.metadata(), err
 	}
-	return c.hydrateBuckets(ctx, prep, spec.Metadata, spec.Columns, spec.Predicate)
+	results, stats, err := c.hydrateBuckets(ctx, prep, spec.Metadata, spec.Columns, spec.Predicate)
+	if err != nil {
+		return nil, prep.metadata(), err
+	}
+	return results, metadataFromStats(prep.actualLoc, stats), nil
 }
 
 // RawCTASBucketsManifest is the two-phase variant of RawCTASBuckets.
@@ -1030,19 +1091,16 @@ func (c *Client) RawCTASBucketsManifest(ctx context.Context, spec RawCTASSpec) (
 ) {
 	prep, err := c.prepareRawCTASBuckets(ctx, spec)
 	if err != nil {
-		return nil, CTASMetadata{}, nil, err
+		return nil, prep.metadata(), nil, err
 	}
 	manifest, err = buildBucketManifest(prep)
 	if err != nil {
-		return nil, CTASMetadata{}, nil, fmt.Errorf("athenaio: RawCTASBucketsManifest %s: %w", prep.queryID, err)
+		return nil, prep.metadata(), nil, fmt.Errorf("athenaio: RawCTASBucketsManifest %s: %w", prep.queryID, err)
 	}
-	meta = CTASMetadata{
-		Location: prep.actualLoc,
-		QueryID:  prep.queryID,
-		Duration: time.Since(prep.start),
-	}
+	meta = prep.metadata()
 	hydrate = func(hctx context.Context) ([]BucketResult, error) {
-		return c.hydrateBuckets(hctx, prep, spec.Metadata, spec.Columns, spec.Predicate)
+		results, _, err := c.hydrateBuckets(hctx, prep, spec.Metadata, spec.Columns, spec.Predicate)
+		return results, err
 	}
 	return manifest, meta, hydrate, nil
 }
@@ -1050,6 +1108,13 @@ func (c *Client) RawCTASBucketsManifest(ctx context.Context, spec RawCTASSpec) (
 // bucketPrep captures the CTAS-side artifacts shared between the
 // eager and manifest RawCTAS/Unload variants. Populated by prepare*
 // helpers; consumed by hydrateBuckets and buildBucketManifest.
+//
+// Partial preps: once the CTAS has completed (and been billed),
+// prepareUnloadBuckets / prepareRawCTASBuckets return a partial prep
+// — queryID, exec, start, and actualLoc if resolved; no files —
+// alongside any later error, so the caller can still return
+// prep.metadata(). Never hydrate or build a manifest from a prep
+// returned with an error. Before completion they return nil.
 type bucketPrep struct {
 	files       []bucketFileInfo
 	actualLoc   string
@@ -1057,6 +1122,23 @@ type bucketPrep struct {
 	queryID     string
 	exec        *athenatypes.QueryExecution
 	start       time.Time
+}
+
+// stats builds the query-level QueryStats for the prepared CTAS,
+// stamping TotalTime now.
+func (p *bucketPrep) stats(rows int64) QueryStats {
+	return completedStats(p.queryID, p.actualLoc, p.exec, p.start, rows)
+}
+
+// metadata is the CTASMetadata for the prepared CTAS as of now. Safe
+// on a nil prep (pre-completion failure → zero value) and on a
+// partial one (post-completion failure → QueryID + ScannedBytes, and
+// Location if it was resolved). See "CTASMetadata on error".
+func (p *bucketPrep) metadata() CTASMetadata {
+	if p == nil || p.exec == nil {
+		return CTASMetadata{}
+	}
+	return metadataFromStats(p.actualLoc, p.stats(0))
 }
 
 // prepareRawCTASBuckets validates the spec, submits + polls the CTAS,
@@ -1096,6 +1178,8 @@ func (c *Client) prepareRawCTASBuckets(ctx context.Context, spec RawCTASSpec) (*
 		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s failed:\n---\n%s\n---\n%w",
 			queryID, spec.SQL, err)
 	}
+	// CTAS complete and billed; see the partial-prep note on bucketPrep.
+	partial := &bucketPrep{queryID: queryID, exec: exec, start: start}
 
 	// Register the table for cleanup before the bucketing verification —
 	// otherwise an unbucketed table would be orphaned in Glue when we
@@ -1114,10 +1198,10 @@ func (c *Client) prepareRawCTASBuckets(ctx context.Context, spec RawCTASSpec) (*
 	// clause" before any LazyFrame is handed back.
 	bucketCount, err := c.readGlueBucketCount(ctx, database, spec.TableName)
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: verify bucketing: %w", queryID, err)
+		return partial, fmt.Errorf("athenaio: RawCTASBuckets %s: verify bucketing: %w", queryID, err)
 	}
 	if bucketCount <= 0 {
-		return nil, fmt.Errorf(
+		return partial, fmt.Errorf(
 			"athenaio: RawCTASBuckets %s: table %s.%s is not bucketed (bucket_count=%d) — use RawCTAS for non-bucketed output",
 			queryID, database, spec.TableName, bucketCount)
 	}
@@ -1126,11 +1210,12 @@ func (c *Client) prepareRawCTASBuckets(ctx context.Context, spec RawCTASSpec) (*
 	// see resolveActualLocation for the workgroup-override rationale.
 	actualLoc, err := c.resolveActualLocation(ctx, database, spec.TableName, spec.ExternalLocation)
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
+		return partial, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
 	}
+	partial.actualLoc = actualLoc
 	files, err := listBucketFiles(ctx, c.s3, actualLoc)
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
+		return partial, fmt.Errorf("athenaio: RawCTASBuckets %s: %w", queryID, err)
 	}
 	// Empty file set is a legitimate outcome — the CTAS succeeded
 	// (readGlueBucketCount above confirmed bucket_count > 0) and
@@ -1150,7 +1235,8 @@ func (c *Client) prepareRawCTASBuckets(ctx context.Context, spec RawCTASSpec) (*
 
 // hydrateBuckets fills a fresh []BucketResult from the prep + spec-derived
 // read options, registers QueryStats on every non-nil frame, and returns
-// the result. Shared by the eager RawCTASBuckets/UnloadAndReadBuckets
+// the result plus the registered stats (so eager callers build
+// CTASMetadata from the same TotalTime stamp). Shared by the eager RawCTASBuckets/UnloadAndReadBuckets
 // paths and by the manifest-hydrator closures. QueryID is the
 // disambiguator in error messages — the calling method's name isn't
 // needed since the QueryID uniquely identifies the failed CTAS.
@@ -1160,26 +1246,19 @@ func (c *Client) hydrateBuckets(
 	metadata *gobi.PartitionMetadata,
 	columns []string,
 	predicate gobi.Expr,
-) ([]BucketResult, error) {
+) ([]BucketResult, QueryStats, error) {
 	results := make([]BucketResult, prep.bucketCount)
 	totalRows, err := c.populateBucketResults(ctx, prep.files, results, prep.actualLoc, metadata, readOptsFromSpec(columns, predicate))
 	if err != nil {
-		return nil, fmt.Errorf("athenaio: hydrateBuckets %s: %w", prep.queryID, err)
+		return nil, QueryStats{}, fmt.Errorf("athenaio: hydrateBuckets %s: %w", prep.queryID, err)
 	}
-	stats := QueryStats{
-		QueryExecutionID: prep.queryID,
-		ResultPrefix:     prep.actualLoc,
-		ScannedBytes:     scannedBytes(prep.exec),
-		EngineTime:       engineTime(prep.exec),
-		TotalTime:        time.Since(prep.start),
-		RowCount:         totalRows,
-	}
+	stats := prep.stats(totalRows)
 	for _, r := range results {
 		if r.Frame != nil {
 			registerStats(r.Frame, stats)
 		}
 	}
-	return results, nil
+	return results, stats, nil
 }
 
 // buildBucketManifest constructs a Frame-nil []BucketResult from the

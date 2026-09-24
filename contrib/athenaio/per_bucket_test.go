@@ -347,7 +347,7 @@ func TestUnloadAndReadBucketsWithMetadata_ReturnsPerBucketURIs(t *testing.T) {
 	}
 	c.athena = wrapper
 
-	results, err := c.UnloadAndReadBucketsWithMetadata(context.Background(), UnloadSpec{
+	results, meta, err := c.UnloadAndReadBucketsWithMetadata(context.Background(), UnloadSpec{
 		SQL:         "SELECT id, v FROM base",
 		PartitionBy: []string{"id"},
 		BucketCount: 2,
@@ -358,6 +358,9 @@ func TestUnloadAndReadBucketsWithMetadata_ReturnsPerBucketURIs(t *testing.T) {
 	}
 	if len(results) != 2 {
 		t.Fatalf("results length = %d, want 2", len(results))
+	}
+	if meta.QueryID == "" || meta.Location == "" || meta.Duration <= 0 {
+		t.Errorf("CTASMetadata not populated: %+v", meta)
 	}
 	for i, r := range results {
 		if r.Frame == nil {
@@ -541,7 +544,7 @@ func TestUnloadAndReadBucketsWithMetadata_LocationOnEverySlot(t *testing.T) {
 	}
 	c.athena = wrapper
 
-	results, err := c.UnloadAndReadBucketsWithMetadata(context.Background(), UnloadSpec{
+	results, _, err := c.UnloadAndReadBucketsWithMetadata(context.Background(), UnloadSpec{
 		SQL:         "SELECT id, v FROM base",
 		PartitionBy: []string{"id"},
 		BucketCount: 3,
