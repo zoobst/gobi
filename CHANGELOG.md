@@ -5,6 +5,47 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.9]
+
+### Added
+
+- **`FromStructs` honors parquet-go's `timestamp` tag option.**
+  Before, `parquet:"ts,timestamp(microsecond)"` was silently ignored:
+  every `time.Time` field became `Timestamp[ns]` with no zone, and
+  the file got parquet `TIMESTAMP(NANOS, isAdjustedToUTC=false)`. The
+  option now sets the arrow unit and zone with parquet-go's meaning,
+  so existing parquet-go structs port unchanged:
+
+  | Tag option                    | Arrow type             | Parquet                                  |
+  |-------------------------------|------------------------|------------------------------------------|
+  | *(none)*                      | `Timestamp[ns]`        | `TIMESTAMP(NANOS, adjusted=false)`       |
+  | `timestamp`                   | `Timestamp[ms, UTC]`   | `TIMESTAMP(MILLIS, adjusted=true)`       |
+  | `timestamp(microsecond)`      | `Timestamp[us, UTC]`   | `TIMESTAMP(MICROS, adjusted=true)`       |
+  | `timestamp(nanosecond:local)` | `Timestamp[ns]`        | `TIMESTAMP(NANOS, adjusted=false)`       |
+
+  The option is read from the same tag that supplies the column name
+  (`<format>`, then `gobi`, then `csv`). It also works with an empty
+  name part (`parquet:",timestamp(microsecond)"`). It applies to
+  `time.Time`, `*time.Time`, time-layout `string` fields, and
+  `[]time.Time` / `[]*time.Time` elements, and values are truncated
+  to the unit. An unknown unit or zone is an
+  `ErrUnsupportedStructField` error. On other field types (such as
+  `int64`) the option is still ignored. Untagged fields are
+  unchanged.
+- **`parquetio.WriteOptions.CoerceTimestamps`** (`TimestampMillis` /
+  `TimestampMicros` / `TimestampNanos`) converts every timestamp
+  column to one unit on write. This covers frames that don't come
+  from structs, such as csvio or Expr output, which are
+  `Timestamp[ns]`. Each column keeps its zone. A conversion that
+  would drop precision fails unless `AllowTruncatedTimestamps` is
+  set, and the file reads back at the new unit.
+
+### Fixed
+
+- `FromStructs` with a ms / µs timestamp unit accepts dates outside
+  the int64-nanosecond range (1677–2262).
+- `parquetio.WriteStructs` now releases its intermediate Frame.
+
 ## [v0.4.8]
 
 ### Fixed

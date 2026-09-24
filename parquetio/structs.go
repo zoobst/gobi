@@ -25,6 +25,10 @@ func ReadStructs[T any](path string, opts *ReadOptions) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
+	// No f.Release(): ToStructs' string / []byte fields alias the
+	// frame's buffers (zero-copy), so releasing into a pooling
+	// ReadOptions.Allocator would hand callers recycled memory. With
+	// the default Go allocator the GC reclaims f once rows drop it.
 	return gobi.ToStructs[T](f, gobi.StructTagFormat("parquet"))
 }
 
@@ -38,5 +42,6 @@ func WriteStructs[T any](rows []T, path string, opts *WriteOptions) error {
 	if err != nil {
 		return err
 	}
+	defer f.Release()
 	return WriteFile(f, path, opts)
 }

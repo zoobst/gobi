@@ -105,6 +105,66 @@ func resolveFieldName(sf reflect.StructField, o *structOpts) (name string, skip 
 	return ResolveFieldName(sf, format)
 }
 
+// timestampTypeFromTag reads a parquet-go-style timestamp option off
+// sf's name tag: `timestamp`, `timestamp(unit)`, or
+// `timestamp(unit:utc|local)`. Options come from the first tag in the
+// resolution chain (<format>, gobi, csv) with a non-empty value, so
+// `parquet:",timestamp(microsecond)"` works with an empty name part.
+// Returns nil when the tag carries no timestamp option.
+func timestampTypeFromTag(sf reflect.StructField, o *structOpts) (*arrow.TimestampType, error) {
+	tags := make([]string, 0, 3)
+	if o != nil && o.tagFormat != "" {
+		tags = append(tags, o.tagFormat)
+	}
+	tags = append(tags, "gobi", "csv")
+	var v string
+	for _, tag := range tags {
+		if v = sf.Tag.Get(tag); v != "" {
+			break
+		}
+	}
+	opts := strings.Split(v, ",")
+	for _, opt := range opts[1:] {
+		opt = strings.TrimSpace(opt)
+		if opt != "timestamp" && !strings.HasPrefix(opt, "timestamp(") {
+			continue
+		}
+		// parquet-go defaults: millisecond, adjusted to UTC.
+		tt := &arrow.TimestampType{Unit: arrow.Millisecond, TimeZone: "UTC"}
+		if opt == "timestamp" {
+			return tt, nil
+		}
+		if !strings.HasSuffix(opt, ")") {
+			return nil, fmt.Errorf("%w: malformed timestamp option %q", ErrUnsupportedStructField, opt)
+		}
+		args := opt[len("timestamp(") : len(opt)-1]
+		unit, zone, hasZone := strings.Cut(args, ":")
+		switch unit {
+		case "millisecond":
+			tt.Unit = arrow.Millisecond
+		case "microsecond":
+			tt.Unit = arrow.Microsecond
+		case "nanosecond":
+			tt.Unit = arrow.Nanosecond
+		default:
+			return nil, fmt.Errorf("%w: timestamp unit %q (want millisecond, microsecond, or nanosecond)",
+				ErrUnsupportedStructField, unit)
+		}
+		if hasZone {
+			switch zone {
+			case "utc":
+			case "local":
+				tt.TimeZone = ""
+			default:
+				return nil, fmt.Errorf("%w: timestamp zone %q (want utc or local)",
+					ErrUnsupportedStructField, zone)
+			}
+		}
+		return tt, nil
+	}
+	return nil, nil
+}
+
 // ErrUnsupportedStructField is returned when FromStructs / ToStructs
 // encounters a struct field type it can't map to an arrow column.
 // The error is wrap-friendly: errors.Is(err, ErrUnsupportedStructField)
@@ -128,6 +188,25 @@ var ErrUnsupportedStructField = errors.New("gobi: unsupported struct field type"
 //	geom:"true"         geometry column — see below for value handling
 //	time:"2006-01-02"   parse string field as time.Time using the layout;
 //	                    ignored for time.Time-typed fields
+//	<tag>:"col,timestamp(unit[:utc|local])"
+//	                    timestamp precision + UTC adjustment, same
+//	                    syntax as parquet-go — see below
+//
+// Timestamp precision. time.Time fields (and time-layout string
+// fields) default to Timestamp[ns] with no time zone. A `timestamp`
+// option on the name tag — whichever namespace supplies it — picks the
+// unit and zone instead, following parquet-go's tag syntax so
+// existing parquet-go structs keep their meaning:
+//
+//	timestamp                      Timestamp[ms, UTC] (parquet-go default)
+//	timestamp(microsecond)         Timestamp[us, UTC]
+//	timestamp(nanosecond:local)    Timestamp[ns], no zone
+//
+// Units are millisecond / microsecond / nanosecond; the zone is utc
+// (the default: isAdjustedToUTC=true in parquet) or local
+// (isAdjustedToUTC=false). Values are truncated to the unit. The
+// option also applies to the elements of []time.Time / []*time.Time
+// fields. On any other field type it is ignored.
 //
 // Geometry handling. A field tagged `geom:"true"` becomes a Binary
 // arrow column tagged with GeometryField metadata:
@@ -147,7 +226,7 @@ var ErrUnsupportedStructField = errors.New("gobi: unsupported struct field type"
 //	uint, uint8, uint16, uint32, uint64
 //	float32, float64
 //	[]byte           (arrow Binary)
-//	time.Time        (arrow Timestamp[ns])
+//	time.Time        (arrow Timestamp[ns]; see "Timestamp precision")
 //	*T of any above  (nullable)
 func FromStructs[T any](rows []T, opts ...StructOption) (*Frame, error) {
 	var zero T
@@ -328,6 +407,15 @@ func planStructFields(tp reflect.Type, o *structOpts) ([]structFieldPlan, error)
 				ErrUnsupportedStructField, name)
 		}
 
+		tsType, err := timestampTypeFromTag(sf, o)
+		if err != nil {
+			return nil, fmt.Errorf("field %q: %w", name, err)
+		}
+		fieldTS := tsType
+		if fieldTS == nil {
+			fieldTS = &arrow.TimestampType{Unit: arrow.Nanosecond}
+		}
+
 		// geom:"true" — geometry column.
 		if sf.Tag.Get("geom") == "true" {
 			if ft.Kind() != reflect.String && !(ft.Kind() == reflect.Slice && ft.Elem().Kind() == reflect.Uint8) {
@@ -349,7 +437,7 @@ func planStructFields(tp reflect.Type, o *structOpts) ([]structFieldPlan, error)
 			layout := sf.Tag.Get("time")
 			out = append(out, structFieldPlan{
 				name: name, fieldIndex: i,
-				arrowType:  &arrow.TimestampType{Unit: arrow.Nanosecond},
+				arrowType:  fieldTS,
 				isTimeTag:  true,
 				timeLayout: layout,
 				isPointer:  isPtr,
@@ -362,13 +450,28 @@ func planStructFields(tp reflect.Type, o *structOpts) ([]structFieldPlan, error)
 		if ft.Kind() == reflect.String && sf.Tag.Get("time") != "" {
 			out = append(out, structFieldPlan{
 				name: name, fieldIndex: i,
-				arrowType:  &arrow.TimestampType{Unit: arrow.Nanosecond},
+				arrowType:  fieldTS,
 				isTimeTag:  true,
 				timeLayout: sf.Tag.Get("time"),
 				isPointer:  isPtr,
 				valueType:  ft,
 			})
 			continue
+		}
+
+		// []time.Time / []*time.Time with a timestamp option.
+		if tsType != nil && ft.Kind() == reflect.Slice {
+			elem := ft.Elem()
+			if elem.Kind() == reflect.Pointer {
+				elem = elem.Elem()
+			}
+			if elem == timeType {
+				out = append(out, structFieldPlan{
+					name: name, fieldIndex: i,
+					arrowType: arrow.ListOf(tsType), isPointer: isPtr, valueType: ft,
+				})
+				continue
+			}
 		}
 
 		dt, err := arrowTypeForField(ft)
@@ -546,6 +649,7 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 	if !ok {
 		return fmt.Errorf("time builder isn't Timestamp: %T", b)
 	}
+	unit := p.arrowType.(*arrow.TimestampType).Unit
 	timeType := reflect.TypeFor[time.Time]()
 	if p.valueType == timeType {
 		t := fv.Interface().(time.Time)
@@ -553,7 +657,11 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 			tb.AppendNull()
 			return nil
 		}
-		tb.Append(arrow.Timestamp(t.UnixNano()))
+		ts, err := arrow.TimestampFromTime(t, unit)
+		if err != nil {
+			return err
+		}
+		tb.Append(ts)
 		return nil
 	}
 	// String field with time:"layout" tag.
@@ -566,7 +674,11 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 	if err != nil {
 		return fmt.Errorf("parse time: %w", err)
 	}
-	tb.Append(arrow.Timestamp(t.UnixNano()))
+	ts, err := arrow.TimestampFromTime(t, unit)
+	if err != nil {
+		return err
+	}
+	tb.Append(ts)
 	return nil
 }
 
@@ -822,7 +934,11 @@ func appendListElement(b array.Builder, elem reflect.Value) error {
 		if !ok {
 			return fmt.Errorf("timestamp element got %T", elem.Interface())
 		}
-		b.Append(arrow.Timestamp(t.UnixNano()))
+		ts, err := arrow.TimestampFromTime(t, b.Type().(*arrow.TimestampType).Unit)
+		if err != nil {
+			return err
+		}
+		b.Append(ts)
 	default:
 		return fmt.Errorf("%w: unsupported list element builder %T", ErrUnsupportedStructField, b)
 	}

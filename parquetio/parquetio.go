@@ -237,6 +237,47 @@ type WriteOptions struct {
 	// declared as "primary" in the geo metadata. Ignored on frames
 	// that don't have a geometry column.
 	HilbertSort bool
+
+	// CoerceTimestamps converts every timestamp column to this unit
+	// on write. Empty (the default) writes each column at its own
+	// unit — gobi's native Timestamp[ns] becomes parquet
+	// TIMESTAMP(NANOS), which older Spark / Hive / Athena engine v2
+	// readers reject. Set TimestampMicros for broad engine
+	// compatibility. Each column's time zone is kept: a zoned column
+	// writes isAdjustedToUTC=true, a zone-less one false.
+	//
+	// Coarsening that drops precision (ns → us with a nonzero
+	// sub-microsecond part) is an error unless
+	// AllowTruncatedTimestamps is set. The file reads back at the
+	// coerced unit.
+	CoerceTimestamps TimestampUnit
+
+	// AllowTruncatedTimestamps lets CoerceTimestamps drop sub-unit
+	// precision instead of failing the write. Ignored when
+	// CoerceTimestamps is empty.
+	AllowTruncatedTimestamps bool
+}
+
+// TimestampUnit names a parquet timestamp precision for
+// WriteOptions.CoerceTimestamps.
+type TimestampUnit string
+
+const (
+	TimestampMillis TimestampUnit = "ms"
+	TimestampMicros TimestampUnit = "us"
+	TimestampNanos  TimestampUnit = "ns"
+)
+
+func (u TimestampUnit) toArrow() (arrow.TimeUnit, error) {
+	switch u {
+	case TimestampMillis:
+		return arrow.Millisecond, nil
+	case TimestampMicros:
+		return arrow.Microsecond, nil
+	case TimestampNanos:
+		return arrow.Nanosecond, nil
+	}
+	return 0, fmt.Errorf("parquetio: CoerceTimestamps %q (want ms, us, or ns)", string(u))
 }
 
 // ParseCodec resolves a codec by name (case-insensitive). Empty and "none"
@@ -815,11 +856,22 @@ func Write(f *gobi.Frame, w io.Writer, opts *WriteOptions) error {
 		}
 	}
 
+	arrowProps := []pqarrow.WriterOption{pqarrow.WithStoreSchema()}
+	if opts.CoerceTimestamps != "" {
+		unit, err := opts.CoerceTimestamps.toArrow()
+		if err != nil {
+			return err
+		}
+		arrowProps = append(arrowProps,
+			pqarrow.WithCoerceTimestamps(unit),
+			pqarrow.WithTruncatedTimestamps(opts.AllowTruncatedTimestamps))
+	}
+
 	writer, err := pqarrow.NewFileWriter(
 		augmented.Schema(),
 		writeOnly{w: w},
 		parquet.NewWriterProperties(writerProps...),
-		pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema()),
+		pqarrow.NewArrowWriterProperties(arrowProps...),
 	)
 	if err != nil {
 		return err
