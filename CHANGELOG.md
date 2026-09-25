@@ -5,6 +5,21 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.12]
+
+### Added
+
+- **`Expr.Round()`, `Floor()`, `Ceil()`, `Trunc()`.** `Round` rounds
+  halves away from zero (`math.Round`: 2.5 → 3, −2.5 → −3). Float32 /
+  Float64 keep their type, integer columns pass through unchanged,
+  nulls stay null, and NaN / ±Inf are preserved.
+  - **Lossy float → int reads:** combine `Round` with
+    `StructCoerceNumbers()`. The rounded values are whole, so they
+    convert exactly, and out-of-range values still fail with
+    `ErrStructFieldOverflow`.
+  - **Don't use `Cast` for this:** float → int `Cast` truncates toward
+    zero and doesn't range-check.
+
 ## [v0.4.11]
 
 ### Added

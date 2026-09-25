@@ -220,7 +220,8 @@ built around a strongly-typed schema.
   .Mode()/.BitOrAgg()/.BitAndAgg()/.BitXorAgg().Over(cols...)` for
   scalar-agg-and-broadcast; shape-preserving
   inners like `Shift(1).Over(K)` for prev-row-within-partition
-  patterns), `UnixNano()` (Timestamp → Int64 ns),
+  patterns), `Round()` / `Floor()` / `Ceil()` / `Trunc()`,
+  `UnixNano()` (Timestamp → Int64 ns),
   `IcebergBucket(n)` (Iceberg's `bucket(n)` partition transform), and
   `HaversineExpr(lat1, lon1, lat2, lon2, unit)` for great-circle
   distance between two point columns. A `Custom(node ExprNode)`
