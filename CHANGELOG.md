@@ -5,6 +5,70 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.10]
+
+### Fixed
+
+- **Bloom filters are sized to the data instead of always 1 MiB.**
+  `WriteOptions.BloomFilterColumns` switched filters on without an
+  expected distinct count or adaptive sizing. arrow-go then allocates
+  every filter at its maximum, 1 MiB, however few distinct values the
+  row group holds, so five filtered columns cost 5 MiB per row group.
+  gobi now turns on arrow-go's adaptive filter for each filtered
+  column, with one candidate size per power of two from the max down
+  to the smallest size arrow-go will offer at the target
+  false-positive rate. Each row group keeps the smallest candidate
+  that meets that rate. Measured on a 10-row-group file at the
+  default 1% rate:
+
+  | Column distinct values / row group | Before | After |
+  |---|---|---|
+  | 100    | 1 MiB | 2 KiB  |
+  | 20,000 | 1 MiB | 64 KiB |
+
+  The whole file went from 24.4 MB to 2.3 MB (1.6 MB without any
+  filters).
+  - **Floor:** it depends on the false-positive rate, because
+    arrow-go drops any candidate it rates below 500 distinct values:
+    2 KiB at 1%, 1 KiB at 10%. Candidates are rated conservatively,
+    so a filter can be up to 2× the theoretical optimum.
+  - **Write time:** every value is inserted into every candidate
+    still in play, which took 33 ms → 52 ms in the same measurement.
+  - **Write memory:** every candidate stays resident until the row
+    group's distinct count rules it out. A low-cardinality column
+    therefore holds about 2× the max filter size (~2 MiB at the
+    default 1 MiB cap) per column chunk while writing, where it used
+    to hold 1 MiB. Five such columns hold ~10 MiB instead of 5 MiB.
+  - **Avoiding both costs:** `BloomFilterNDV` sizes a column's filter
+    from a known distinct count, as one filter with no candidates.
+- **`BloomFilterFPP` doc said the default was 0.05.** arrow-go's
+  default is 0.01, and the comment now says so. Behavior is
+  unchanged.
+- **`RowGroupRows` doc said the default was about 1M rows.**
+  arrow-go's default cap is 64Mi rows, which usually means one row
+  group per write. Behavior is unchanged.
+
+### Added
+
+- **`WriteOptions.BloomFilterNDV`** (`map[string]int64`) sets a known
+  per-row-group distinct count for a column. That column's filter is
+  sized from it directly, skipping the adaptive candidates and their
+  write cost. An underestimate raises the real false-positive rate.
+- **`WriteOptions.BloomFilterMaxBytes`** caps each filter's size.
+  The default is still 1 MiB. The value is rounded down to a power of
+  two so that no path writes a filter over the cap. A cap such as
+  24000 would otherwise give a filter that isn't a whole number of
+  32-byte blocks. With adaptive sizing it is the largest candidate.
+- **Bloom option validation.** `Write` now returns an error, instead
+  of silently writing no filter or a wrapped size, when:
+  - a `BloomFilterNDV` key isn't in `BloomFilterColumns` (an NDV
+    doesn't enable a filter by itself);
+  - an NDV is negative or ≥ 2^32 (arrow-go stores it as a uint32);
+  - `BloomFilterMaxBytes` is outside 0 or [32 B, 128 MiB];
+  - `BloomFilterFPP` is outside [0, 1).
+
+  All of these are checked before any write work starts.
+
 ## [v0.4.9]
 
 ### Added

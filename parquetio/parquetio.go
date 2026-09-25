@@ -33,6 +33,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 	"os"
 	"strconv"
 	"strings"
@@ -169,7 +171,8 @@ type WriteOptions struct {
 	Codec Codec
 
 	// RowGroupRows caps the maximum number of rows per row group. 0
-	// uses parquet-arrow's default (~1M rows).
+	// uses arrow-go's default cap of 64Mi rows — in practice one row
+	// group per write for most frames.
 	//
 	// Smaller row groups → more granular predicate pushdown (readers
 	// can skip whole groups via rowgroup statistics) and lower peak
@@ -191,13 +194,55 @@ type WriteOptions struct {
 	// produced here are still consumed correctly by DuckDB, Spark,
 	// Polars, and pyarrow, which do use bloom filters for predicate
 	// pushdown on equality filters.
+	//
+	// Sizing. Each filter is sized to the distinct values its row
+	// group actually holds: the writer tracks power-of-two candidate
+	// filters from BloomFilterMaxBytes down to the smallest size
+	// arrow-go rates for at least 500 distinct values at
+	// BloomFilterFPP, and keeps the smallest candidate that fits
+	// (arrow-go's adaptive bloom filter). At the default 1% FPP the
+	// floor is 2 KiB: a row group with up to ~500 distinct values
+	// gets 2 KiB, ~20k distinct gets 64 KiB. Looser FPPs have a lower
+	// floor. arrow-go rates candidates conservatively, so a filter
+	// can be up to 2× the theoretical optimum.
+	//
+	// Memory: every candidate stays resident until the row group's
+	// distinct count rules it out, so a low-cardinality column holds
+	// about 2 × BloomFilterMaxBytes (1 + 1/2 + 1/4 + …) per column
+	// chunk while writing — ~2 MiB at the default cap. Set
+	// BloomFilterNDV for a column to size it from a known distinct
+	// count instead (one filter, no candidates).
 	BloomFilterColumns []string
 
 	// BloomFilterFPP is the target false-positive probability for
 	// the bloom filters written above. 0 uses arrow-go's default
-	// (0.05). Lower FPP → larger filter on disk; reasonable range
-	// 0.01–0.1. Ignored when BloomFilterColumns is empty.
+	// (0.01). Lower FPP → larger filter on disk; reasonable range
+	// 0.01–0.1. Must be in [0, 1); Write rejects anything else.
 	BloomFilterFPP float64
+
+	// BloomFilterNDV optionally gives the expected number of distinct
+	// values per row group for a bloom-filtered column. A column with
+	// an entry gets a filter sized for exactly that NDV at
+	// BloomFilterFPP (capped at BloomFilterMaxBytes), skipping the
+	// adaptive candidates. Use it when the cardinality is known and
+	// stable; an underestimate raises the real false-positive rate.
+	// Columns not listed here, or listed with 0, use adaptive sizing.
+	//
+	// Every key must also appear in BloomFilterColumns — an NDV does
+	// not enable a filter by itself — and values must be in
+	// [0, 2^32). Write returns an error otherwise.
+	BloomFilterNDV map[string]int64
+
+	// BloomFilterMaxBytes caps each bloom filter's size. 0 uses
+	// arrow-go's default, 1 MiB. Rounded DOWN to a power of two so
+	// the cap holds on every path (arrow-go's split-block filters
+	// are power-of-two sized on the adaptive path, and a clamp to an
+	// arbitrary byte count would not be a whole number of 32-byte
+	// blocks on the NDV path). With adaptive sizing this is the
+	// largest candidate: a row group whose distinct count needs more
+	// than this at BloomFilterFPP gets a max-size filter with a
+	// higher false-positive rate. Must be 0 or in [32 B, 128 MiB].
+	BloomFilterMaxBytes int64
 
 	// SkipBboxCovering disables the GeoParquet 1.1 covering-bbox
 	// column emission that otherwise runs on every write with a
@@ -278,6 +323,81 @@ func (u TimestampUnit) toArrow() (arrow.TimeUnit, error) {
 		return arrow.Nanosecond, nil
 	}
 	return 0, fmt.Errorf("parquetio: CoerceTimestamps %q (want ms, us, or ns)", string(u))
+}
+
+// Bloom filter size bounds, matching arrow-go's split-block filter:
+// one 32-byte block minimum, 128 MiB maximum.
+const (
+	minBloomFilterBytes = 32
+	maxBloomFilterBytes = 128 << 20
+)
+
+// bloomFilterProps validates the bloom options and builds the writer
+// properties for opts.BloomFilterColumns. Returns nil props when no
+// columns are requested.
+//
+// Without an NDV or adaptive sizing, arrow-go allocates every filter
+// at the max size (1 MiB) regardless of cardinality — five filtered
+// columns cost 5 MiB per row group. Adaptive sizing fixes that, but
+// arrow-go's default of 5 candidates halves from the max only down
+// to max/16 (64 KiB), still ~30× what a few-hundred-NDV row group
+// needs. So gobi asks for one candidate per power of two down to the
+// 32-byte minimum. arrow-go stops generating candidates at the first
+// size it rates below 500 distinct values at the target FPP, so the
+// effective floor follows the FPP (2 KiB at 1%) and the extra count
+// costs nothing.
+func bloomFilterProps(opts *WriteOptions) ([]parquet.WriterProperty, error) {
+	if opts.BloomFilterFPP < 0 || opts.BloomFilterFPP >= 1 {
+		return nil, fmt.Errorf("parquetio: BloomFilterFPP %v must be in [0, 1)", opts.BloomFilterFPP)
+	}
+	if opts.BloomFilterMaxBytes != 0 &&
+		(opts.BloomFilterMaxBytes < minBloomFilterBytes || opts.BloomFilterMaxBytes > maxBloomFilterBytes) {
+		return nil, fmt.Errorf("parquetio: BloomFilterMaxBytes %d must be 0 or in [%d, %d]",
+			opts.BloomFilterMaxBytes, minBloomFilterBytes, maxBloomFilterBytes)
+	}
+	enabled := make(map[string]bool, len(opts.BloomFilterColumns))
+	for _, col := range opts.BloomFilterColumns {
+		enabled[col] = true
+	}
+	for col, ndv := range opts.BloomFilterNDV {
+		if !enabled[col] {
+			return nil, fmt.Errorf("parquetio: BloomFilterNDV[%q] set but %q is not in BloomFilterColumns", col, col)
+		}
+		if ndv < 0 || ndv > math.MaxUint32 {
+			return nil, fmt.Errorf("parquetio: BloomFilterNDV[%q] = %d must be in [0, %d]", col, ndv, uint32(math.MaxUint32))
+		}
+	}
+	if len(opts.BloomFilterColumns) == 0 {
+		return nil, nil
+	}
+
+	var props []parquet.WriterProperty
+	if opts.BloomFilterFPP > 0 {
+		props = append(props, parquet.WithBloomFilterFPP(opts.BloomFilterFPP))
+	}
+	maxBytes := int64(parquet.DefaultMaxBloomFilterBytes)
+	if opts.BloomFilterMaxBytes > 0 {
+		// Round down to a power of two (see BloomFilterMaxBytes).
+		maxBytes = int64(1) << (bits.Len64(uint64(opts.BloomFilterMaxBytes)) - 1)
+		props = append(props, parquet.WithMaxBloomFilterBytes(maxBytes))
+	}
+	// One candidate per power of two from maxBytes down to the
+	// 32-byte minimum: 1 MiB → 16 candidates, of which arrow-go keeps
+	// those it rates for >= 500 NDV.
+	candidates := bits.Len64(uint64(maxBytes / minBloomFilterBytes))
+	for _, col := range opts.BloomFilterColumns {
+		props = append(props, parquet.WithBloomFilterEnabledFor(col, true))
+		if ndv := opts.BloomFilterNDV[col]; ndv > 0 {
+			// arrow-go sizes from NDV + FPP when NDV is set; adaptive
+			// is ignored for this column.
+			props = append(props, parquet.WithBloomFilterNDVFor(col, ndv))
+			continue
+		}
+		props = append(props,
+			parquet.WithAdaptiveBloomFilterEnabledFor(col, true),
+			parquet.WithBloomFilterCandidatesFor(col, candidates))
+	}
+	return props, nil
 }
 
 // ParseCodec resolves a codec by name (case-insensitive). Empty and "none"
@@ -779,6 +899,11 @@ func Write(f *gobi.Frame, w io.Writer, opts *WriteOptions) error {
 	if err != nil {
 		return err
 	}
+	// Validate before the (possibly O(N)) augmentation work below.
+	bloomProps, err := bloomFilterProps(opts)
+	if err != nil {
+		return err
+	}
 	// Route the write through one of three paths depending on
 	// HilbertSort / SkipBboxCovering. The fused path is the sweet
 	// spot for HilbertSort=true: sort + bbox-covering augmentation
@@ -847,14 +972,7 @@ func Write(f *gobi.Frame, w io.Writer, opts *WriteOptions) error {
 	if opts.RowGroupRows > 0 {
 		writerProps = append(writerProps, parquet.WithMaxRowGroupLength(opts.RowGroupRows))
 	}
-	if len(opts.BloomFilterColumns) > 0 {
-		if opts.BloomFilterFPP > 0 {
-			writerProps = append(writerProps, parquet.WithBloomFilterFPP(opts.BloomFilterFPP))
-		}
-		for _, col := range opts.BloomFilterColumns {
-			writerProps = append(writerProps, parquet.WithBloomFilterEnabledFor(col, true))
-		}
-	}
+	writerProps = append(writerProps, bloomProps...)
 
 	arrowProps := []pqarrow.WriterOption{pqarrow.WithStoreSchema()}
 	if opts.CoerceTimestamps != "" {
