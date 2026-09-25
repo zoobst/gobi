@@ -27,6 +27,18 @@ type Stats interface {
 	TotalRows() int64
 }
 
+// CoveringStats is an optional Stats extension for sources that
+// declare where each geometry column's per-row bounding box lives —
+// e.g. a GeoParquet file whose covering.bbox names existing lon / lat
+// columns. Spatial pruning reads the named columns' min / max; without
+// it, the gobi-generated <geom>_bbox_* names are assumed.
+type CoveringStats interface {
+	Stats
+	// CoveringColumns returns the columns holding geomCol's per-row
+	// xmin / ymin / xmax / ymax, or ok=false if none is declared.
+	CoveringColumns(geomCol string) (xmin, ymin, xmax, ymax string, ok bool)
+}
+
 // CanPossiblyMatch reports whether pred could be satisfied by any
 // row in the range described by stats. Returns true when uncertain
 // — false positives are safe (over-read); false negatives break
@@ -305,11 +317,17 @@ func unwrapAlias(n ExprNode) ExprNode {
 }
 
 // coveringBounds reads the covering-column min/max stats for a
-// geometry column named geomName. Returns ok=false if any of the
-// four covering columns lacks stats — the caller falls back to
-// "possibly matches."
+// geometry column named geomName: the columns the source declares
+// (CoveringStats), else gobi's generated <geom>_bbox_* names. Returns
+// ok=false if any of the four covering columns lacks stats — the
+// caller falls back to "possibly matches."
 func coveringBounds(s Stats, geomName string) (geometry.Bounds, bool) {
 	xminCol, yminCol, xmaxCol, ymaxCol := BboxColumnNames(geomName)
+	if cs, ok := s.(CoveringStats); ok {
+		if a, b, c, d, ok := cs.CoveringColumns(geomName); ok {
+			xminCol, yminCol, xmaxCol, ymaxCol = a, b, c, d
+		}
+	}
 	// Row-group xmin/ymin comes from the covering column's MIN;
 	// xmax/ymax from the covering column's MAX. The other stat
 	// (min of xmax, max of xmin) is irrelevant for bbox overlap.

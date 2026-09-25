@@ -782,6 +782,8 @@ func newAccumulator(a Aggregation) (aggAccumulator, error) {
 		return &medianAcc{}, nil
 	case AggMode:
 		return &modeAcc{counts: make(map[string]int64)}, nil
+	case AggBitOr, AggBitAnd, AggBitXor:
+		return newBitAcc(a.Kind), nil
 	}
 	return nil, fmt.Errorf("gobi: streaming aggregate: unknown Kind %d", a.Kind)
 }

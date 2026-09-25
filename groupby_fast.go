@@ -92,7 +92,7 @@ func (g *GroupBy) aggFast(aggs []Aggregation) (*Frame, bool, error) {
 			return nil, false, nil
 		}
 		switch a.Kind {
-		case AggFirst, AggLast, AggMedian, AggMode:
+		case AggFirst, AggLast, AggMedian, AggMode, AggBitOr, AggBitAnd, AggBitXor:
 			return nil, false, nil
 		}
 	}

@@ -245,12 +245,17 @@ func (g *GroupBy) buildAggBuilders(aggs []Aggregation, pool memory.Allocator) ([
 			}
 			continue
 		}
-		if a.Kind == AggFirst || a.Kind == AggLast || a.Kind == AggMode {
+		if a.Kind.preservesSourceType() {
 			src, err := g.frame.Column(a.Column)
 			if err != nil {
 				return nil, nil, err
 			}
 			srcType := src.DataType()
+			if isBitwiseAgg(a.Kind) {
+				if err := checkBitwiseInput(a.Kind, a.Column, srcType); err != nil {
+					return nil, nil, err
+				}
+			}
 			b, err := builderForType(pool, srcType)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gobi: aggregation %d (%s): %w",

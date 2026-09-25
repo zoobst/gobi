@@ -19,6 +19,43 @@ import (
 type rowGroupStats struct {
 	rg        *metadata.RowGroupMetaData
 	colByName map[string]int
+	// covering maps a geometry column to the flat columns its
+	// GeoParquet covering.bbox declares (xmin, ymin, xmax, ymax).
+	covering map[string][4]string
+}
+
+// CoveringColumns implements gobi.CoveringStats: spatial pruning reads
+// whatever columns the file's covering declares — e.g. lon / lat for a
+// point file — rather than assuming gobi's generated names.
+func (s *rowGroupStats) CoveringColumns(geom string) (xmin, ymin, xmax, ymax string, ok bool) {
+	c, ok := s.covering[geom]
+	return c[0], c[1], c[2], c[3], ok
+}
+
+// declaredCoverings extracts flat (single-element-path) bbox coverings
+// from a file's "geo" footer entry. Malformed or absent metadata
+// yields nil, and pruning falls back to the generated names.
+func declaredCoverings(pf *file.Reader) map[string][4]string {
+	raw := pf.MetaData().KeyValueMetadata().FindValue(gobi.GeoParquetMetadataKey)
+	if raw == nil {
+		return nil
+	}
+	meta, err := gobi.ParseGeoParquetMetadata(*raw)
+	if err != nil || meta == nil {
+		return nil
+	}
+	out := map[string][4]string{}
+	for geom, cm := range meta.Columns {
+		if cm.Covering == nil || cm.Covering.Bbox == nil {
+			continue
+		}
+		bb := cm.Covering.Bbox
+		if len(bb.Xmin) != 1 || len(bb.Ymin) != 1 || len(bb.Xmax) != 1 || len(bb.Ymax) != 1 {
+			continue // nested covering: not addressable by flat column stats
+		}
+		out[geom] = [4]string{bb.Xmin[0], bb.Ymin[0], bb.Xmax[0], bb.Ymax[0]}
+	}
+	return out
 }
 
 func (s *rowGroupStats) TotalRows() int64 { return s.rg.NumRows() }
@@ -102,10 +139,11 @@ func filterRowGroupsByPredicate(pf *file.Reader, pred gobi.Expr, candidates []in
 		return candidates
 	}
 	colByName := buildColByName(pf)
+	covering := declaredCoverings(pf)
 	kept := make([]int, 0, len(candidates))
 	for _, rgIdx := range candidates {
 		rg := pf.MetaData().RowGroup(rgIdx)
-		s := &rowGroupStats{rg: rg, colByName: colByName}
+		s := &rowGroupStats{rg: rg, colByName: colByName, covering: covering}
 		if gobi.CanPossiblyMatch(pred, s) {
 			kept = append(kept, rgIdx)
 		}

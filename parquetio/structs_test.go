@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/file"
 
 	"github.com/zoobst/gobi"
@@ -196,4 +197,80 @@ func parquetLogicalTypes(t *testing.T, path string) map[string]string {
 		out[c.Name()] = c.LogicalType().String()
 	}
 	return out
+}
+
+// poisonAllocator wraps the Go allocator and overwrites every buffer
+// on Free, standing in for a pooling allocator that recycles memory.
+// Anything still aliasing a freed buffer reads back as 0xAA bytes.
+type poisonAllocator struct {
+	inner *memory.CheckedAllocator
+}
+
+func (a poisonAllocator) Allocate(n int) []byte { return a.inner.Allocate(n) }
+func (a poisonAllocator) Reallocate(n int, b []byte) []byte {
+	return a.inner.Reallocate(n, b)
+}
+func (a poisonAllocator) Free(b []byte) {
+	for i := range b {
+		b[i] = 0xAA
+	}
+	a.inner.Free(b)
+}
+
+// TestReadStructs_CopiesAndReleases — ReadStructs releases its Frame
+// (every allocation freed) and the rows survive the buffers being
+// overwritten, so nothing aliases read memory.
+func TestReadStructs_CopiesAndReleases(t *testing.T) {
+	type row struct {
+		ID   int64    `parquet:"id"`
+		Name string   `parquet:"name"`
+		Tags []string `parquet:"tags"`
+		Blob []byte   `parquet:"blob"`
+	}
+	want := []row{
+		{1, "alpha", []string{"x", "y"}, []byte("one")},
+		{2, "bravo", []string{"z"}, []byte("two")},
+	}
+	path := filepath.Join(t.TempDir(), "own.parquet")
+	if err := parquetio.WriteStructs(want, path, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	checked := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	got, err := parquetio.ReadStructs[row](path, &parquetio.ReadOptions{
+		Allocator: poisonAllocator{inner: checked},
+	})
+	if err != nil {
+		t.Fatalf("ReadStructs: %v", err)
+	}
+	checked.AssertSize(t, 0) // Frame released: nothing left allocated
+	for i := range want {
+		g, w := got[i], want[i]
+		if g.ID != w.ID || g.Name != w.Name || len(g.Tags) != len(w.Tags) || g.Tags[0] != w.Tags[0] ||
+			string(g.Blob) != string(w.Blob) {
+			t.Errorf("row %d = %+v, want %+v (aliased freed memory?)", i, g, w)
+		}
+	}
+}
+
+// TestReadStructs_InternerOption — the variadic StructOption reaches
+// ToStructs, so a shared interner works through the wrapper.
+func TestReadStructs_InternerOption(t *testing.T) {
+	type row struct {
+		OS string `parquet:"os"`
+	}
+	type interned struct {
+		OS string `parquet:"os,intern"`
+	}
+	path := filepath.Join(t.TempDir(), "intern.parquet")
+	if err := parquetio.WriteStructs([]row{{"ios"}, {"android"}, {"ios"}}, path, nil); err != nil {
+		t.Fatal(err)
+	}
+	in := gobi.NewStringInterner(0)
+	if _, err := parquetio.ReadStructs[interned](path, nil, gobi.StructInterner(in)); err != nil {
+		t.Fatal(err)
+	}
+	if in.Len() != 2 {
+		t.Errorf("interner holds %d values, want 2", in.Len())
+	}
 }

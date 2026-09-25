@@ -3,6 +3,7 @@ package gobi
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"time"
@@ -27,6 +28,54 @@ type structOpts struct {
 	// `parquet:"col,opt"`. Empty string means "no format-specific
 	// tag; use the fallback chain directly."
 	tagFormat string
+	// copyValues: ToStructs deep-copies strings / []byte (see
+	// StructCopyValues).
+	copyValues bool
+	// interner backs `intern`-tagged fields; nil means a per-call
+	// one (see StructInterner).
+	interner *StringInterner
+	// coerceNumbers / requireColumns: see StructCoerceNumbers and
+	// StructRequireColumns.
+	coerceNumbers  bool
+	requireColumns bool
+	// FromStructs: see StructRequiredFields, StructZeroTimeAsValue,
+	// StructAllocator.
+	requiredFields  bool
+	zeroTimeAsValue bool
+	allocator       memory.Allocator
+}
+
+// StructRequiredFields makes FromStructs mark non-pointer fields as
+// non-nullable (parquet REQUIRED), matching parquet-go, which writes
+// non-pointer fields as REQUIRED. Pointer fields stay nullable. Per
+// field, the `optional` tag option keeps a non-pointer field nullable,
+// and `required` marks one REQUIRED without this option (e.g.
+// `parquet:"id,required"`).
+//
+// A REQUIRED field never writes null, so zero values that FromStructs
+// would otherwise turn into nulls are written as values: a zero
+// time.Time is the zero instant (see StructZeroTimeAsValue) and a nil
+// slice is an empty list. Zero values with no non-null form — an
+// empty geometry string or nil geometry []byte, an empty time-layout
+// string — are an error.
+func StructRequiredFields() StructOption {
+	return func(o *structOpts) { o.requiredFields = true }
+}
+
+// StructZeroTimeAsValue makes FromStructs write a zero time.Time as
+// the zero instant (0001-01-01T00:00:00Z) instead of NULL, matching
+// parquet-go. The zero instant doesn't fit a nanosecond timestamp
+// (range 1677–2262), so pair it with a coarser unit, e.g.
+// `parquet:"ts,timestamp(microsecond)"`; on a Timestamp[ns] column it
+// is an ErrStructFieldOverflow error.
+func StructZeroTimeAsValue() StructOption {
+	return func(o *structOpts) { o.zeroTimeAsValue = true }
+}
+
+// StructAllocator sets the Arrow allocator FromStructs builds the
+// Frame's buffers with. nil (or no option) uses memory.DefaultAllocator.
+func StructAllocator(pool memory.Allocator) StructOption {
+	return func(o *structOpts) { o.allocator = pool }
 }
 
 // StructTagFormat sets the primary struct-tag namespace to consult
@@ -105,27 +154,46 @@ func resolveFieldName(sf reflect.StructField, o *structOpts) (name string, skip 
 	return ResolveFieldName(sf, format)
 }
 
-// timestampTypeFromTag reads a parquet-go-style timestamp option off
-// sf's name tag: `timestamp`, `timestamp(unit)`, or
-// `timestamp(unit:utc|local)`. Options come from the first tag in the
+// fieldTagOptions returns the comma-separated options after the name
+// part of sf's name tag. Options come from the first tag in the
 // resolution chain (<format>, gobi, csv) with a non-empty value, so
-// `parquet:",timestamp(microsecond)"` works with an empty name part.
-// Returns nil when the tag carries no timestamp option.
-func timestampTypeFromTag(sf reflect.StructField, o *structOpts) (*arrow.TimestampType, error) {
+// `parquet:",intern"` works with an empty name part.
+func fieldTagOptions(sf reflect.StructField, o *structOpts) []string {
 	tags := make([]string, 0, 3)
 	if o != nil && o.tagFormat != "" {
 		tags = append(tags, o.tagFormat)
 	}
 	tags = append(tags, "gobi", "csv")
-	var v string
 	for _, tag := range tags {
-		if v = sf.Tag.Get(tag); v != "" {
-			break
+		if v := sf.Tag.Get(tag); v != "" {
+			parts := strings.Split(v, ",")[1:]
+			for i := range parts {
+				parts[i] = strings.TrimSpace(parts[i])
+			}
+			return parts
 		}
 	}
-	opts := strings.Split(v, ",")
-	for _, opt := range opts[1:] {
-		opt = strings.TrimSpace(opt)
+	return nil
+}
+
+// hasTagOption reports whether sf's name tag carries option opt.
+func hasTagOption(sf reflect.StructField, o *structOpts, opt string) bool {
+	for _, x := range fieldTagOptions(sf, o) {
+		if x == opt {
+			return true
+		}
+	}
+	return false
+}
+
+// timestampTypeFromTag reads a parquet-go-style timestamp option off
+// sf's name tag: `timestamp`, `timestamp(unit)`, or
+// `timestamp(unit:utc|local)`. Options come from the first tag in the
+// resolution chain (see fieldTagOptions), so
+// `parquet:",timestamp(microsecond)"` works with an empty name part.
+// Returns nil when the tag carries no timestamp option.
+func timestampTypeFromTag(sf reflect.StructField, o *structOpts) (*arrow.TimestampType, error) {
+	for _, opt := range fieldTagOptions(sf, o) {
 		if opt != "timestamp" && !strings.HasPrefix(opt, "timestamp(") {
 			continue
 		}
@@ -170,6 +238,13 @@ func timestampTypeFromTag(sf reflect.StructField, o *structOpts) (*arrow.Timesta
 // The error is wrap-friendly: errors.Is(err, ErrUnsupportedStructField)
 // is true for every type-mapping failure.
 var ErrUnsupportedStructField = errors.New("gobi: unsupported struct field type")
+
+// ErrStructFieldOverflow is returned by ToStructs when a column value
+// doesn't fit the struct field's width — e.g. an Int64 value past
+// math.MaxInt16 read into an int16 field. Narrower fields are
+// accepted (an Int64 column into an int32 field works) as long as
+// every value fits; the check is per value, not per type.
+var ErrStructFieldOverflow = errors.New("gobi: value overflows struct field")
 
 // FromStructs builds a Frame from a slice of Go structs. Column
 // order follows struct-field declaration order; unexported fields
@@ -234,12 +309,17 @@ func FromStructs[T any](rows []T, opts ...StructOption) (*Frame, error) {
 	if tp.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("%w: T must be a struct, got %s", ErrUnsupportedStructField, tp.Kind())
 	}
-	plan, err := planStructFields(tp, resolveStructOpts(opts))
+	so := resolveStructOpts(opts)
+	plan, err := planStructFields(tp, so)
 	if err != nil {
 		return nil, err
 	}
+	sw := &structWriter{zeroTimeAsValue: so.zeroTimeAsValue}
 
-	pool := memory.DefaultAllocator
+	pool := so.allocator
+	if pool == nil {
+		pool = memory.DefaultAllocator
+	}
 	builders := make([]array.Builder, len(plan))
 	for i, p := range plan {
 		b, err := builderForType(pool, p.arrowType)
@@ -260,7 +340,7 @@ func FromStructs[T any](rows []T, opts ...StructOption) (*Frame, error) {
 		row := rowsVal.Index(r)
 		for i, p := range plan {
 			fv := row.Field(p.fieldIndex)
-			if err := appendFieldValue(builders[i], fv, p); err != nil {
+			if err := appendFieldValue(builders[i], fv, p, sw); err != nil {
 				return nil, fmt.Errorf("gobi: FromStructs: row %d %q: %w", r, p.name, err)
 			}
 		}
@@ -297,16 +377,57 @@ func FromStructs[T any](rows []T, opts ...StructOption) (*Frame, error) {
 // written back to a string field tagged `geom:"true"` (emits WKT
 // via geometry.WKT()) or a []byte field tagged `geom:"true"` (raw
 // WKB pass-through).
+//
+// Memory ownership. By default string and []byte fields alias the
+// Frame's Arrow buffers (zero-copy). Any surviving struct then keeps
+// its whole source buffer reachable, so a handful of long-lived rows
+// can pin every batch they were decoded from, and the Frame's memory
+// must stay valid while the structs are in use. Pass
+// StructCopyValues() when the structs outlive the Frame. Tag
+// low-cardinality string fields with the `intern` option
+// (`gobi:"os,intern"`) to share one copy per distinct value, and pass
+// a StructInterner to share it across calls. The io packages'
+// ReadStructs wrappers copy by default.
 func ToStructs[T any](f *Frame, opts ...StructOption) ([]T, error) {
+	return toStructs[T](f, nil, "ToStructs", opts)
+}
+
+// ToStructsInto is ToStructs decoding into dst's backing array when it
+// has room for f's rows, so a batch loop can reuse one slice instead of
+// allocating per batch:
+//
+//	var rows []Row
+//	err := parquetio.ReadFileChunksFunc(path, nil, func(f *gobi.Frame) error {
+//	    var err error
+//	    if rows, err = gobi.ToStructsInto(f, rows, gobi.StructCopyValues()); err != nil {
+//	        return err
+//	    }
+//	    return process(rows)
+//	})
+//
+// It returns dst[:f.NumRows()] (a fresh slice when cap(dst) is too
+// small). Every returned element is reset to its zero value before
+// decoding, so nothing leaks from dst's previous contents, and the
+// rows previously in dst are overwritten: copy out anything that must
+// outlive the next call. Pointer, slice and string fields still
+// allocate as ToStructs would; the saving is the []T itself.
+func ToStructsInto[T any](f *Frame, dst []T, opts ...StructOption) ([]T, error) {
+	return toStructs(f, dst, "ToStructsInto", opts)
+}
+
+// toStructs is the shared body of ToStructs / ToStructsInto. dst, when
+// non-nil with enough capacity, provides the output's backing array.
+func toStructs[T any](f *Frame, dst []T, op string, opts []StructOption) ([]T, error) {
 	if f == nil {
-		return nil, fmt.Errorf("gobi: ToStructs: nil frame")
+		return nil, fmt.Errorf("gobi: %s: nil frame", op)
 	}
 	var zero T
 	tp := reflect.TypeOf(zero)
 	if tp.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("%w: T must be a struct, got %s", ErrUnsupportedStructField, tp.Kind())
 	}
-	plan, err := planStructFields(tp, resolveStructOpts(opts))
+	so := resolveStructOpts(opts)
+	plan, err := planStructFields(tp, so)
 	if err != nil {
 		return nil, err
 	}
@@ -319,14 +440,33 @@ func ToStructs[T any](f *Frame, opts ...StructOption) ([]T, error) {
 	for i, p := range plan {
 		s, err := f.Column(p.name)
 		if err != nil {
+			if so.requireColumns {
+				return nil, fmt.Errorf("gobi: %s: %w: %q (field %s)", op, ErrColumnNotFound, p.name, tp.Field(p.fieldIndex).Name)
+			}
 			// Column absent — that's OK, the field stays at zero.
 			continue
 		}
 		cols[i] = newChunkCursor(s)
 	}
 
+	rd := &structReader{copyValues: so.copyValues, interner: so.interner, coerce: so.coerceNumbers}
+	if rd.interner == nil {
+		for _, p := range plan {
+			if p.intern {
+				rd.interner = NewStringInterner(0)
+				break
+			}
+		}
+	}
+
 	nRows := f.NumRows()
-	out := make([]T, nRows)
+	var out []T
+	if cap(dst) >= nRows {
+		out = dst[:nRows]
+		clear(out)
+	} else {
+		out = make([]T, nRows)
+	}
 	rowsVal := reflect.ValueOf(out)
 	for r := range nRows {
 		row := rowsVal.Index(r)
@@ -335,8 +475,8 @@ func ToStructs[T any](f *Frame, opts ...StructOption) ([]T, error) {
 				continue
 			}
 			fv := row.Field(p.fieldIndex)
-			if err := readFieldValue(fv, cols[i], r, p); err != nil {
-				return nil, fmt.Errorf("gobi: ToStructs: row %d %q: %w", r, p.name, err)
+			if err := readFieldValue(fv, cols[i], r, p, rd); err != nil {
+				return nil, fmt.Errorf("gobi: %s: row %d %q: %w", op, r, p.name, err)
 			}
 		}
 	}
@@ -358,6 +498,12 @@ type structFieldPlan struct {
 	isGeometry bool
 	isTimeTag  bool
 	timeLayout string
+	// intern: the `intern` tag option — ToStructs interns this
+	// string field's values (string, *string, []string, []*string).
+	intern bool
+	// required: FromStructs marks the column non-nullable and never
+	// writes null for it (StructRequiredFields / `required` tag).
+	required bool
 	// Pointer wrapping: when true, the struct field is `*T`. Read
 	// path checks for nil; write path allocates a fresh *T.
 	isPointer bool
@@ -372,9 +518,11 @@ func (p structFieldPlan) arrowField() arrow.Field {
 		// FromStructs doesn't know the caller's SRID — use 0 (unset).
 		// Callers who need a specific EPSG on the column can set it
 		// via GeometryField manually after construction.
-		return GeometryField(p.name, 0)
+		f := GeometryField(p.name, 0)
+		f.Nullable = !p.required
+		return f
 	}
-	return arrow.Field{Name: p.name, Type: p.arrowType, Nullable: true}
+	return arrow.Field{Name: p.name, Type: p.arrowType, Nullable: !p.required}
 }
 
 // planStructFields reflects on tp and builds one structFieldPlan per
@@ -483,7 +631,51 @@ func planStructFields(tp reflect.Type, o *structOpts) ([]structFieldPlan, error)
 			arrowType: dt, isPointer: isPtr, valueType: ft,
 		})
 	}
+	// REQUIRED: StructRequiredFields for non-pointer fields, or the
+	// per-field `required` / `optional` tag options.
+	for i := range out {
+		sf := tp.Field(out[i].fieldIndex)
+		req, opt := hasTagOption(sf, o, "required"), hasTagOption(sf, o, "optional")
+		switch {
+		case req && opt:
+			return nil, fmt.Errorf("%w: field %q: both required and optional", ErrUnsupportedStructField, out[i].name)
+		case req && out[i].isPointer:
+			return nil, fmt.Errorf("%w: field %q: a pointer field is nullable by definition and can't be required", ErrUnsupportedStructField, out[i].name)
+		case req:
+			out[i].required = true
+		case opt:
+		default:
+			out[i].required = o != nil && o.requiredFields && !out[i].isPointer
+		}
+	}
+	// `intern` tag option: string-valued fields only.
+	for i := range out {
+		if !hasTagOption(tp.Field(out[i].fieldIndex), o, "intern") {
+			continue
+		}
+		if !internable(out[i]) {
+			return nil, fmt.Errorf("%w: field %q: intern applies to string, *string, []string and []*string fields",
+				ErrUnsupportedStructField, out[i].name)
+		}
+		out[i].intern = true
+	}
 	return out, nil
+}
+
+// internable reports whether p's field holds plain strings (not WKT
+// geometry or time-layout strings, which ToStructs builds fresh).
+func internable(p structFieldPlan) bool {
+	if p.isGeometry || p.isTimeTag {
+		return false
+	}
+	t := p.valueType
+	if t.Kind() == reflect.Slice {
+		t = t.Elem()
+		if t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+	}
+	return t.Kind() == reflect.String
 }
 
 // arrowTypeForField picks the arrow DataType for a struct field's
@@ -555,7 +747,13 @@ func arrowListType(elem reflect.Type) (arrow.DataType, error) {
 // corresponding arrow builder. Handles the pointer-null,
 // geometry-WKT, and time-parsing branches; scalar path routes
 // through appendCustomValue with a Go-typed scalar.
-func appendFieldValue(b array.Builder, fv reflect.Value, p structFieldPlan) error {
+// structWriter carries FromStructs' per-call value policy into the
+// field writers.
+type structWriter struct {
+	zeroTimeAsValue bool
+}
+
+func appendFieldValue(b array.Builder, fv reflect.Value, p structFieldPlan, sw *structWriter) error {
 	// Pointer field: null when nil, otherwise dereference.
 	if p.isPointer {
 		if fv.IsNil() {
@@ -569,10 +767,10 @@ func appendFieldValue(b array.Builder, fv reflect.Value, p structFieldPlan) erro
 		return appendGeomField(b, fv, p)
 	}
 	if p.isTimeTag {
-		return appendTimeField(b, fv, p)
+		return appendTimeField(b, fv, p, sw)
 	}
 	if p.arrowType.ID() == arrow.LIST {
-		return appendListField(b, fv)
+		return appendListField(b, fv, p.required)
 	}
 
 	// Scalar fields — extract as Go-typed value + append via
@@ -621,6 +819,9 @@ func appendGeomField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 	if p.valueType.Kind() == reflect.String {
 		s := fv.String()
 		if s == "" {
+			if p.required {
+				return fmt.Errorf("%w: empty geometry in a required field", ErrUnsupportedStructField)
+			}
 			bb.AppendNull()
 			return nil
 		}
@@ -634,6 +835,9 @@ func appendGeomField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 	// []byte path.
 	bs := fv.Bytes()
 	if bs == nil {
+		if p.required {
+			return fmt.Errorf("%w: nil geometry in a required field", ErrUnsupportedStructField)
+		}
 		bb.AppendNull()
 		return nil
 	}
@@ -644,7 +848,7 @@ func appendGeomField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 // appendTimeField handles the time tag path. Two sub-cases: a
 // time.Time-typed field (layout ignored, value used directly) and
 // a string field with a layout tag (parse first).
-func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan) error {
+func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan, sw *structWriter) error {
 	tb, ok := b.(*array.TimestampBuilder)
 	if !ok {
 		return fmt.Errorf("time builder isn't Timestamp: %T", b)
@@ -653,11 +857,11 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 	timeType := reflect.TypeFor[time.Time]()
 	if p.valueType == timeType {
 		t := fv.Interface().(time.Time)
-		if t.IsZero() {
+		if t.IsZero() && !p.required && !sw.zeroTimeAsValue {
 			tb.AppendNull()
 			return nil
 		}
-		ts, err := arrow.TimestampFromTime(t, unit)
+		ts, err := timestampOf(t, unit)
 		if err != nil {
 			return err
 		}
@@ -667,6 +871,9 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 	// String field with time:"layout" tag.
 	s := fv.String()
 	if s == "" {
+		if p.required {
+			return fmt.Errorf("%w: empty time string in a required field", ErrUnsupportedStructField)
+		}
 		tb.AppendNull()
 		return nil
 	}
@@ -674,7 +881,7 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 	if err != nil {
 		return fmt.Errorf("parse time: %w", err)
 	}
-	ts, err := arrow.TimestampFromTime(t, unit)
+	ts, err := timestampOf(t, unit)
 	if err != nil {
 		return err
 	}
@@ -682,9 +889,26 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan) error
 	return nil
 }
 
+// Nanosecond timestamps cover 1677-09-21 … 2262-04-11 (int64 ns from
+// the epoch); outside that, time.Time.UnixNano is undefined.
+var (
+	minNanoTime = time.Unix(0, math.MinInt64).UTC()
+	maxNanoTime = time.Unix(0, math.MaxInt64).UTC()
+)
+
+// timestampOf converts t to unit, failing instead of overflowing when
+// t is outside the nanosecond range.
+func timestampOf(t time.Time, unit arrow.TimeUnit) (arrow.Timestamp, error) {
+	if unit == arrow.Nanosecond && (t.Before(minNanoTime) || t.After(maxNanoTime)) {
+		return 0, fmt.Errorf("%w: %s is outside the Timestamp[ns] range (1677–2262); use a microsecond or millisecond unit, e.g. `timestamp(microsecond)`",
+			ErrStructFieldOverflow, t.Format(time.RFC3339))
+	}
+	return arrow.TimestampFromTime(t, unit)
+}
+
 // readFieldValue populates one row's value on the struct side by
 // reading from the arrow column. Inverse of appendFieldValue.
-func readFieldValue(fv reflect.Value, cur *chunkCursor, row int, p structFieldPlan) error {
+func readFieldValue(fv reflect.Value, cur *chunkCursor, row int, p structFieldPlan, rd *structReader) error {
 	null, err := cur.isNull(row)
 	if err != nil {
 		return err
@@ -708,13 +932,13 @@ func readFieldValue(fv reflect.Value, cur *chunkCursor, row int, p structFieldPl
 	}
 
 	if p.isGeometry {
-		return readGeomField(fv, cur, row, p)
+		return readGeomField(fv, cur, row, p, rd)
 	}
 	if p.isTimeTag {
 		return readTimeField(fv, cur, row, p)
 	}
 	if p.arrowType.ID() == arrow.LIST {
-		return readListField(fv, cur, row)
+		return readListField(fv, cur, row, rd, p.intern)
 	}
 
 	v, err := cur.scalarAt(row)
@@ -724,13 +948,13 @@ func readFieldValue(fv reflect.Value, cur *chunkCursor, row int, p structFieldPl
 	if v == nil {
 		return nil
 	}
-	return assignScalar(fv, v)
+	return rd.assignOwned(fv, v, p.intern)
 }
 
 // readGeomField reads a geometry column back into a string field
 // (as WKT) or a []byte field (raw WKB). Uses the plan's valueType
 // to disambiguate.
-func readGeomField(fv reflect.Value, cur *chunkCursor, row int, p structFieldPlan) error {
+func readGeomField(fv reflect.Value, cur *chunkCursor, row int, p structFieldPlan, rd *structReader) error {
 	wkb, err := binaryAt(cur, row)
 	if err != nil {
 		return err
@@ -751,7 +975,7 @@ func readGeomField(fv reflect.Value, cur *chunkCursor, row int, p structFieldPla
 		fv.SetString(wkt)
 		return nil
 	}
-	fv.SetBytes(wkb)
+	fv.SetBytes(rd.ownBytes(wkb))
 	return nil
 }
 
@@ -797,32 +1021,58 @@ func assignScalar(fv reflect.Value, v any) error {
 		}
 		fv.SetBool(b)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		switch x := v.(type) {
+		var x int64
+		switch n := v.(type) {
 		case int64:
-			fv.SetInt(x)
+			x = n
 		case int32:
-			fv.SetInt(int64(x))
+			x = int64(n)
+		case int16:
+			x = int64(n)
+		case int8:
+			x = int64(n)
 		default:
 			return fmt.Errorf("int field got %T", v)
 		}
+		// reflect's SetInt truncates silently on a narrower field.
+		if fv.OverflowInt(x) {
+			return fmt.Errorf("%w: value %d overflows %s field", ErrStructFieldOverflow, x, fv.Type())
+		}
+		fv.SetInt(x)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		switch x := v.(type) {
+		var x uint64
+		switch n := v.(type) {
 		case uint64:
-			fv.SetUint(x)
+			x = n
 		case uint32:
-			fv.SetUint(uint64(x))
+			x = uint64(n)
+		case uint16:
+			x = uint64(n)
+		case uint8:
+			x = uint64(n)
 		default:
 			return fmt.Errorf("uint field got %T", v)
 		}
+		if fv.OverflowUint(x) {
+			return fmt.Errorf("%w: value %d overflows %s field", ErrStructFieldOverflow, x, fv.Type())
+		}
+		fv.SetUint(x)
 	case reflect.Float32, reflect.Float64:
-		switch x := v.(type) {
+		var x float64
+		switch n := v.(type) {
 		case float64:
-			fv.SetFloat(x)
+			x = n
 		case float32:
-			fv.SetFloat(float64(x))
+			x = float64(n)
 		default:
 			return fmt.Errorf("float field got %T", v)
 		}
+		// Range only: float64 → float32 rounding is not an error, but
+		// a magnitude past float32's range would become ±Inf.
+		if fv.OverflowFloat(x) {
+			return fmt.Errorf("%w: value %g overflows %s field", ErrStructFieldOverflow, x, fv.Type())
+		}
+		fv.SetFloat(x)
 	case reflect.Slice:
 		if fv.Type().Elem().Kind() != reflect.Uint8 {
 			return fmt.Errorf("%w: slice of %s", ErrUnsupportedStructField, fv.Type().Elem().Kind())
@@ -866,7 +1116,7 @@ func geometryToWKT(g geometry.Geometry) (string, error) {
 // ListBuilder. A nil slice becomes a null list; an empty non-nil
 // slice becomes a zero-length list. Pointer-typed elements
 // (e.g. []*int64) preserve per-element nullability.
-func appendListField(b array.Builder, fv reflect.Value) error {
+func appendListField(b array.Builder, fv reflect.Value, required bool) error {
 	lb, ok := b.(*array.ListBuilder)
 	if !ok {
 		return fmt.Errorf("list builder isn't ListBuilder: %T", b)
@@ -874,11 +1124,11 @@ func appendListField(b array.Builder, fv reflect.Value) error {
 	if fv.Kind() != reflect.Slice {
 		return fmt.Errorf("list field isn't a slice: %s", fv.Kind())
 	}
-	if fv.IsNil() {
+	if fv.IsNil() && !required {
 		lb.AppendNull()
 		return nil
 	}
-	lb.Append(true)
+	lb.Append(true) // a required nil slice is an empty list
 	inner := lb.ValueBuilder()
 	elemIsPtr := fv.Type().Elem().Kind() == reflect.Pointer
 	n := fv.Len()
@@ -934,7 +1184,7 @@ func appendListElement(b array.Builder, elem reflect.Value) error {
 		if !ok {
 			return fmt.Errorf("timestamp element got %T", elem.Interface())
 		}
-		ts, err := arrow.TimestampFromTime(t, b.Type().(*arrow.TimestampType).Unit)
+		ts, err := timestampOf(t, b.Type().(*arrow.TimestampType).Unit)
 		if err != nil {
 			return err
 		}
@@ -948,7 +1198,7 @@ func appendListElement(b array.Builder, elem reflect.Value) error {
 // readListField reads a List cell into a Go slice field. Nil-list
 // rows already returned via the null-check in readFieldValue, so
 // this only handles non-null rows.
-func readListField(fv reflect.Value, cur *chunkCursor, row int) error {
+func readListField(fv reflect.Value, cur *chunkCursor, row int, rd *structReader, intern bool) error {
 	chunk, local, err := cur.locate(row)
 	if err != nil {
 		return err
@@ -981,13 +1231,13 @@ func readListField(fv reflect.Value, cur *chunkCursor, row int) error {
 		}
 		if elemIsPtr {
 			nv := reflect.New(elemType.Elem())
-			if err := assignListElement(nv.Elem(), values, idx); err != nil {
+			if err := assignListElement(nv.Elem(), values, idx, rd, intern); err != nil {
 				return fmt.Errorf("elem %d: %w", i, err)
 			}
 			target.Set(nv)
 			continue
 		}
-		if err := assignListElement(target, values, idx); err != nil {
+		if err := assignListElement(target, values, idx, rd, intern); err != nil {
 			return fmt.Errorf("elem %d: %w", i, err)
 		}
 	}
@@ -997,49 +1247,25 @@ func readListField(fv reflect.Value, cur *chunkCursor, row int) error {
 
 // assignListElement reads one element from a list's inner Array
 // into fv, dispatching on the array's concrete type.
-func assignListElement(fv reflect.Value, arr arrow.Array, idx int) error {
-	switch a := arr.(type) {
-	case *array.String:
-		fv.SetString(a.Value(idx))
-	case *array.Boolean:
-		fv.SetBool(a.Value(idx))
-	case *array.Int64:
-		fv.SetInt(a.Value(idx))
-	case *array.Int32:
-		fv.SetInt(int64(a.Value(idx)))
-	case *array.Int16:
-		fv.SetInt(int64(a.Value(idx)))
-	case *array.Int8:
-		fv.SetInt(int64(a.Value(idx)))
-	case *array.Uint64:
-		fv.SetUint(a.Value(idx))
-	case *array.Uint32:
-		fv.SetUint(uint64(a.Value(idx)))
-	case *array.Uint16:
-		fv.SetUint(uint64(a.Value(idx)))
-	case *array.Uint8:
-		fv.SetUint(uint64(a.Value(idx)))
-	case *array.Float64:
-		fv.SetFloat(a.Value(idx))
-	case *array.Float32:
-		fv.SetFloat(float64(a.Value(idx)))
-	case *array.Binary:
-		fv.SetBytes(a.Value(idx))
-	case *array.LargeBinary:
-		fv.SetBytes(a.Value(idx))
-	case *array.LargeString:
-		fv.SetString(a.Value(idx))
-	case *array.Timestamp:
-		t := a.Value(idx).ToTime(a.DataType().(*arrow.TimestampType).Unit)
+func assignListElement(fv reflect.Value, arr arrow.Array, idx int, rd *structReader, intern bool) error {
+	// Dictionary-encoded elements resolve to their value array.
+	arr, idx = resolveDictionary(arr, idx)
+	if ta, ok := arr.(*array.Timestamp); ok {
+		if fv.Type() != reflect.TypeFor[time.Time]() {
+			return fmt.Errorf("timestamp element into %s field", fv.Type())
+		}
+		t := ta.Value(idx).ToTime(ta.DataType().(*arrow.TimestampType).Unit)
 		fv.Set(reflect.ValueOf(t))
-	case *array.Dictionary:
-		// Spark / Trino dictionary-encode low-cardinality list
-		// elements too; resolve through the dictionary.
-		return assignListElement(fv, a.Dictionary(), a.GetValueIndex(idx))
-	default:
+		return nil
+	}
+	// Scalars share the top-level field path, so list elements get the
+	// same type checks and overflow errors instead of reflect panics or
+	// silent truncation.
+	v, err := readArrayScalar(arr, idx)
+	if err != nil {
 		return fmt.Errorf("%w: unsupported list element array %T", ErrUnsupportedStructField, arr)
 	}
-	return nil
+	return rd.assignOwned(fv, v, intern)
 }
 
 // binaryAt reads a Binary cell's raw bytes at row from a Series.

@@ -42,6 +42,15 @@ const (
 	// source column's arrow type. Ties broken by first-seen order.
 	// Empty groups (or all-null groups) emit null.
 	AggMode
+	// AggBitOr / AggBitAnd / AggBitXor: bitwise reduction of the
+	// group's non-null values. Integer columns only (Int8 … Uint64);
+	// output type matches the source column. Empty or all-null groups
+	// emit null. OR and AND are idempotent — folding already-merged
+	// rows again gives the same result — so they suit bitmask
+	// rollups that get re-compacted.
+	AggBitOr
+	AggBitAnd
+	AggBitXor
 )
 
 func (k AggKind) String() string {
@@ -70,6 +79,12 @@ func (k AggKind) String() string {
 		return "median"
 	case AggMode:
 		return "mode"
+	case AggBitOr:
+		return "bit_or"
+	case AggBitAnd:
+		return "bit_and"
+	case AggBitXor:
+		return "bit_xor"
 	default:
 		return "unknown"
 	}
@@ -301,12 +316,17 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 		// Min / Max additionally preserve source type when the
 		// source is Timestamp — see the Timestamp branch in
 		// appendAgg for the matching read path.
-		if a.Kind == AggFirst || a.Kind == AggLast || a.Kind == AggMode {
+		if a.Kind.preservesSourceType() {
 			src, err := g.frame.Column(a.Column)
 			if err != nil {
 				return nil, err
 			}
 			srcType := src.DataType()
+			if isBitwiseAgg(a.Kind) {
+				if err := checkBitwiseInput(a.Kind, a.Column, srcType); err != nil {
+					return nil, err
+				}
+			}
 			b, err := builderForType(pool, srcType)
 			if err != nil {
 				return nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
@@ -515,6 +535,30 @@ func appendCustomValue(b array.Builder, v any) error {
 		x, ok := v.(uint32)
 		if !ok {
 			return fmt.Errorf("value %T does not match declared Uint32", v)
+		}
+		tb.Append(x)
+	case *array.Int16Builder:
+		x, ok := v.(int16)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Int16", v)
+		}
+		tb.Append(x)
+	case *array.Int8Builder:
+		x, ok := v.(int8)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Int8", v)
+		}
+		tb.Append(x)
+	case *array.Uint16Builder:
+		x, ok := v.(uint16)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Uint16", v)
+		}
+		tb.Append(x)
+	case *array.Uint8Builder:
+		x, ok := v.(uint8)
+		if !ok {
+			return fmt.Errorf("value %T does not match declared Uint8", v)
 		}
 		tb.Append(x)
 	case *array.BooleanBuilder:
@@ -920,6 +964,17 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 			return fmt.Errorf("gobi: aggregation %s: %w", aggName(agg), err)
 		}
 		return nil
+	}
+	if isBitwiseAgg(agg.Kind) {
+		s, err := g.frame.Column(agg.Column)
+		if err != nil {
+			return err
+		}
+		acc := newBitAcc(agg.Kind)
+		if err := acc.Update(s, rows); err != nil {
+			return err
+		}
+		return appendCustomValue(b, acc.Finalize())
 	}
 	if agg.Kind == AggCount {
 		if agg.Column == "" {

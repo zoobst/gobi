@@ -25,9 +25,9 @@ import (
 //
 // Column values are stringified for use as arrow field names — the
 // header row is always a string. The value column's arrow type
-// follows aggOutputType(Aggregation{Kind: agg, ...}); it's Int64 for
-// Count/NUnique and Float64 for the rest, matching what GroupBy.Agg
-// would produce.
+// is whatever GroupBy.Agg produces for agg: Int64 for Count/NUnique,
+// the source type for First/Last/Mode/bitwise kinds (and Min/Max on
+// Timestamp), Float64 for the rest.
 //
 // Cells with no matching input rows are emitted as null. Output rows
 // are ordered by the sorted index value; output columns are ordered
@@ -138,7 +138,10 @@ func (f *Frame) Pivot(index, columns, values string, agg AggKind) (*Frame, error
 	}
 	defer idxBuilder.Release()
 
-	valOutType := aggOutputType(Aggregation{Kind: agg, Column: values})
+	// Cell type is whatever GroupBy.Agg produced for the long form, so
+	// type-preserving kinds (First / Last / Mode / bitwise, Min / Max on
+	// Timestamp) keep the source type instead of forcing Float64.
+	valOutType := valCol.DataType()
 	valBuilders := make([]array.Builder, len(headers))
 	for i := range headers {
 		b, err := builderForType(pool, valOutType)

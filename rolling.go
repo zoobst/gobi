@@ -296,6 +296,14 @@ func (f *Frame) RollingBy(timeCol string, period time.Duration) (*TimeRolling, e
 // returns a Series of the aggregated values. Rows whose window is empty
 // (e.g. all-null time or empty column) produce nulls.
 func (r *TimeRolling) Agg(column string, kind AggKind) (Series, error) {
+	switch kind {
+	case AggCount, AggSum, AggMean, AggMin, AggMax:
+	default:
+		// Checked up front: the per-row switch below only runs for
+		// non-empty windows, so an unsupported kind on all-empty
+		// input would otherwise return nulls instead of an error.
+		return Series{}, fmt.Errorf("gobi: rolling agg kind %v not supported", kind)
+	}
 	src, err := r.frame.Column(column)
 	if err != nil {
 		return Series{}, err

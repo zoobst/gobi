@@ -19,20 +19,28 @@ import (
 //	rows, err := gpkgio.ReadStructs[Row]("data.gpkg", nil)
 //
 // Wraps ReadFile + gobi.ToStructs.
-func ReadStructs[T any](path string, opts *ReadOptions) ([]T, error) {
+//
+// Strings and []byte fields are copied out of the intermediate Frame,
+// which is released before returning, so the rows own their memory
+// and don't pin read buffers. Pass gobi.StructInterner in structOpts
+// to share one copy of each value of `intern`-tagged fields across
+// calls.
+func ReadStructs[T any](path string, opts *ReadOptions, structOpts ...gobi.StructOption) ([]T, error) {
 	f, err := ReadFile(path, opts)
 	if err != nil {
 		return nil, err
 	}
-	return gobi.ToStructs[T](f, gobi.StructTagFormat("gpkg"))
+	defer f.Release()
+	return gobi.ToStructs[T](f, append([]gobi.StructOption{gobi.StructTagFormat("gpkg"), gobi.StructCopyValues()}, structOpts...)...)
 }
 
 // WriteStructs encodes rows into a GeoPackage file. Column names come
 // from the "gpkg" tag namespace (see ReadStructs).
-func WriteStructs[T any](rows []T, path string, opts *WriteOptions) error {
-	f, err := gobi.FromStructs(rows, gobi.StructTagFormat("gpkg"))
+func WriteStructs[T any](rows []T, path string, opts *WriteOptions, structOpts ...gobi.StructOption) error {
+	f, err := gobi.FromStructs(rows, append([]gobi.StructOption{gobi.StructTagFormat("gpkg")}, structOpts...)...)
 	if err != nil {
 		return err
 	}
+	defer f.Release()
 	return WriteFile(f, path, opts)
 }

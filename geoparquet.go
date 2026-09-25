@@ -119,6 +119,34 @@ func BuildGeoParquetMetadata(f *Frame) (*GeoParquetMetadata, error) {
 // (original + new); callers own the Release, symmetric with
 // NewFrame.
 func WithBboxCoveringColumns(f *Frame) (*Frame, *GeoParquetMetadata, error) {
+	return withBboxCoveringColumns(f, nil, nil)
+}
+
+// WithBboxCoveringColumnsFor is WithBboxCoveringColumns limited to the
+// named geometry columns: only those get generated bbox columns and a
+// Covering entry. Other geometry columns are still described in the
+// returned metadata (bbox, types, CRS) with no covering — the caller
+// can point them at existing columns, e.g. lon / lat for points.
+// Naming a column that isn't a geometry column is an error. pool
+// allocates the generated columns (nil = memory.DefaultAllocator).
+func WithBboxCoveringColumnsFor(f *Frame, pool memory.Allocator, geomCols ...string) (*Frame, *GeoParquetMetadata, error) {
+	want := make(map[string]bool, len(geomCols))
+	for _, c := range geomCols {
+		s, err := f.Column(c)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !s.IsGeometry() {
+			return nil, nil, fmt.Errorf("%w: %s is not a geometry column", ErrNotGeometry, c)
+		}
+		want[c] = true
+	}
+	return withBboxCoveringColumns(f, want, pool)
+}
+
+// withBboxCoveringColumns augments the geometry columns in only (all
+// of them when only is nil), allocating from pool (nil = default).
+func withBboxCoveringColumns(f *Frame, only map[string]bool, pool memory.Allocator) (*Frame, *GeoParquetMetadata, error) {
 	meta, err := BuildGeoParquetMetadata(f)
 	if err != nil {
 		return nil, nil, err
@@ -128,7 +156,9 @@ func WithBboxCoveringColumns(f *Frame) (*Frame, *GeoParquetMetadata, error) {
 		f.Retain()
 		return f, nil, nil
 	}
-	pool := memory.DefaultAllocator
+	if pool == nil {
+		pool = memory.DefaultAllocator
+	}
 
 	origFields := f.Schema().Fields()
 	newFields := make([]arrow.Field, 0, len(origFields)+4*len(meta.Columns))
@@ -147,7 +177,7 @@ func WithBboxCoveringColumns(f *Frame) (*Frame, *GeoParquetMetadata, error) {
 	}
 
 	for _, s := range f.series {
-		if !s.IsGeometry() {
+		if !s.IsGeometry() || (only != nil && !only[s.name]) {
 			continue
 		}
 		xminName, yminName, xmaxName, ymaxName := BboxColumnNames(s.name)

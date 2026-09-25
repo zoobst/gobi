@@ -216,10 +216,12 @@ built around a strongly-typed schema.
   (`And`/`Or`/`Not`), `IsNull`/`IsNotNull`, `Cast(dtype)` (numeric-
   to-numeric + Timestamp source), `If`/`Coalesce`, `LitNull(dtype)`,
   `LitEmptyList(elem)`, `ListLen`, `ListUnion`, `Shift(n)`,
-  window functions (`.Sum()/.Mean()/.Min()/.Max()/.Count()/.Median()/
-  .Mode().Over(cols...)` for scalar-agg-and-broadcast; shape-preserving
+  window functions (`.Sum()/.Mean()/.MinAgg()/.MaxAgg()/.Count()/.Median()/
+  .Mode()/.BitOrAgg()/.BitAndAgg()/.BitXorAgg().Over(cols...)` for
+  scalar-agg-and-broadcast; shape-preserving
   inners like `Shift(1).Over(K)` for prev-row-within-partition
-  patterns), `UnixNano()` (Timestamp → Int64 ns), and
+  patterns), `UnixNano()` (Timestamp → Int64 ns),
+  `IcebergBucket(n)` (Iceberg's `bucket(n)` partition transform), and
   `HaversineExpr(lat1, lon1, lat2, lon2, unit)` for great-circle
   distance between two point columns. A `Custom(node ExprNode)`
   escape hatch lets sibling packages (H3, hashes, ML inference)
@@ -296,7 +298,9 @@ built around a strongly-typed schema.
   `RowGroupRows` (predicate-pushdown-friendly small groups vs.
   compression-friendly large ones), `BloomFilterColumns` +
   `BloomFilterFPP` (equality-filter skipping in DuckDB / Spark /
-  Polars / pyarrow / gobi readers today).
+  Polars / pyarrow; gobi's reader doesn't use them yet). `parquetio.NewWriter`
+  writes a file incrementally with caller-chosen row-group
+  boundaries and returns footer statistics on Close.
 - **Parallelism controls.** Package-level `SetMaxParallelism(n)` or
   per-op `Workers(n)`.
 - **Pure Go, no cgo.** No GDAL, no GEOS, no libproj. Cross-compiles
@@ -409,9 +413,38 @@ sorted, _ := df.SortBy(
 // for predicate pushdown on equality filters.
 err := parquetio.WriteFile(df, "events.parquet", &parquetio.WriteOptions{
     Codec:              parquetio.CodecZstd,
-    RowGroupRows:       128_000,                     // 0 = arrow default (~1M)
-    BloomFilterColumns: []string{"user_id", "session_id"},
-    BloomFilterFPP:     0.01,                        // 0 = arrow default (0.05)
+    RowGroupRows:       128_000,                     // 0 = arrow default cap (64Mi rows)
+    BloomFilterColumns: []string{"user_id", "session_id"}, // sized per row group
+    BloomFilterFPP:     0.01,                        // 0 = arrow default (0.01)
+})
+```
+
+### Incremental write with chosen row groups
+
+```go
+// One row group per key range, written batch by batch; Close returns
+// row count, file size and per-column min/max/null counts from the
+// footer (what a table format needs to register the file).
+w, err := parquetio.NewWriter(out, schema, &parquetio.WriteOptions{Codec: parquetio.CodecZstd})
+for _, batch := range batchesSortedByCell {
+    if err := w.Write(batch.Frame); err != nil { return err }
+    if batch.LastOfCell {
+        w.EndRowGroup() // row groups never straddle a cell
+    }
+}
+stats, err := w.Close()
+```
+
+### Point files without extra bbox columns
+
+```go
+// lon / lat already bound each point, so declare them as the
+// GeoParquet covering instead of generating four float64 bbox
+// columns. Readers (gobi, DuckDB, GDAL) prune row groups from the
+// lon / lat min/max stats; every row is checked against its geometry.
+err := parquetio.WriteFile(df, "points.parquet", &parquetio.WriteOptions{
+    Coverings:        map[string]parquetio.Covering{"geometry": parquetio.PointCovering("lon", "lat")},
+    KeyValueMetadata: map[string]string{"writer": "my-etl/v3"},
 })
 ```
 

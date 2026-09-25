@@ -98,9 +98,17 @@ func readArrayScalar(arr arrow.Array, i int) (any, error) {
 		return a.Value(i), nil
 	case *array.Int32:
 		return a.Value(i), nil
+	case *array.Int16:
+		return a.Value(i), nil
+	case *array.Int8:
+		return a.Value(i), nil
 	case *array.Uint64:
 		return a.Value(i), nil
 	case *array.Uint32:
+		return a.Value(i), nil
+	case *array.Uint16:
+		return a.Value(i), nil
+	case *array.Uint8:
 		return a.Value(i), nil
 	case *array.Float64:
 		return a.Value(i), nil
@@ -113,6 +121,10 @@ func readArrayScalar(arr arrow.Array, i int) (any, error) {
 	case *array.LargeString:
 		return a.Value(i), nil
 	case *array.Timestamp:
+		return a.Value(i), nil
+	case *array.Binary:
+		return a.Value(i), nil
+	case *array.LargeBinary:
 		return a.Value(i), nil
 	}
 	return nil, fmt.Errorf("readScalarAt: unsupported type %T", arr)

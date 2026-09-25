@@ -52,6 +52,18 @@ func (e Expr) Median() Expr { return Expr{node: &scalarAggNode{inner: e.node, ki
 // by first-seen order. Output type matches the source column.
 func (e Expr) Mode() Expr { return Expr{node: &scalarAggNode{inner: e.node, kind: AggMode}} }
 
+// BitOrAgg returns an expression that evaluates to the bitwise OR of
+// e's non-null integer values, broadcast to every input row. Output
+// type matches the source column. Named with the Agg suffix because
+// Expr.BitOr is the element-wise two-operand form.
+func (e Expr) BitOrAgg() Expr { return Expr{node: &scalarAggNode{inner: e.node, kind: AggBitOr}} }
+
+// BitAndAgg is the bitwise-AND counterpart of BitOrAgg.
+func (e Expr) BitAndAgg() Expr { return Expr{node: &scalarAggNode{inner: e.node, kind: AggBitAnd}} }
+
+// BitXorAgg is the bitwise-XOR counterpart of BitOrAgg.
+func (e Expr) BitXorAgg() Expr { return Expr{node: &scalarAggNode{inner: e.node, kind: AggBitXor}} }
+
 // Over wraps an expression with partition keys.
 //
 // Two shapes are supported depending on the inner:
@@ -126,7 +138,7 @@ func (n *scalarAggNode) Eval(input *Frame) (Series, error) {
 	// accumulator's Float64 fallback OutputType. (Same pattern as
 	// First/Last, but those don't have Expr surface today.)
 	outType := acc.OutputType()
-	if n.kind == AggMode {
+	if n.kind.preservesSourceType() {
 		outType = col.DataType()
 	}
 	return broadcastScalar(v, outType, input.NumRows(), n.kind.String())
@@ -148,7 +160,12 @@ func (n *scalarAggNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 	if err != nil {
 		return nil, err
 	}
-	if n.kind == AggMode {
+	if n.kind.preservesSourceType() {
+		if isBitwiseAgg(n.kind) {
+			if err := checkBitwiseInput(n.kind, n.inner.String(), innerType); err != nil {
+				return nil, err
+			}
+		}
 		return innerType, nil
 	}
 	if n.kind == AggMin || n.kind == AggMax {
@@ -276,7 +293,7 @@ func (n *overNode) evalScalarAgg(input *Frame, agg *scalarAggNode) (Series, erro
 		groupVals[gid] = acc.Finalize()
 		if outType == nil {
 			outType = acc.OutputType()
-			if agg.kind == AggMode {
+			if agg.kind.preservesSourceType() {
 				outType = col.DataType()
 			}
 		}
@@ -288,7 +305,7 @@ func (n *overNode) evalScalarAgg(input *Frame, agg *scalarAggNode) (Series, erro
 			return Series{}, err
 		}
 		outType = acc.OutputType()
-		if agg.kind == AggMode {
+		if agg.kind.preservesSourceType() {
 			outType = col.DataType()
 		}
 	}

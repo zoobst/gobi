@@ -5,6 +5,344 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.11]
+
+### Added
+
+- **`WriteOptions.Coverings`: GeoParquet coverings on existing
+  columns.** A geometry column can declare existing numeric columns as
+  its per-row bbox covering; `PointCovering("lon", "lat")` does this
+  for point data.
+  - **What it writes:** no `<geom>_bbox_*` columns for that geometry
+    column; the `geo` entry's `covering.bbox` names the declared
+    columns. Readers prune row groups from those columns' min/max.
+  - **Size:** on 200k random points (zstd) the file went from 64 to
+    32 B/row. The saving is the four generated float64 columns, so
+    sorted, compressible data saves less.
+  - **Safety:** every row is checked, and a geometry outside its
+    declared covering fails the write. `Writer.Write` rejects that
+    batch without poisoning the writer. A bad covering would let
+    readers skip row groups that hold matching rows.
+  - **Other geometry columns:** those not listed still follow
+    `SkipBboxCovering`, so one file can mix declared and generated
+    coverings.
+  - **HilbertSort:** works together with declared coverings (sort
+    first, then augment).
+
+- **`WriteOptions.KeyValueMetadata`** adds custom footer entries, in
+  key order, from both `Write` and `Writer`.
+  - **Collisions:** a key that is also in the frame's schema metadata
+    replaces it rather than being duplicated.
+  - **Reserved keys:** `ARROW:schema` is always an error. So is `geo`
+    for frames with a geometry column; use `Coverings` to shape gobi's
+    entry. Frames without geometry may set their own `geo`.
+
+- **`gobi.CoveringStats`**, an optional `Stats` extension that lets a
+  source name each geometry column's covering columns.
+  `gobi.WithBboxCoveringColumnsFor(f, pool, cols...)` generates
+  covering columns for only the named geometry columns, from the given
+  allocator.
+
+- **`parquetio.NewWriter`: incremental parquet writing with
+  caller-chosen row groups.** `Write(frame)` appends rows to the
+  current row group, `EndRowGroup()` closes it, and `Close()` writes
+  the footer. Row groups can now follow the data, for example one
+  group per spatial cell or per day, so readers skip whole groups on
+  a predicate. Before this, `Write` took one whole Frame and could
+  only cut every `RowGroupRows` rows.
+  - **`EndRowGroup` is lazy:** calling it with nothing buffered (at
+    the start, twice in a row, or right before `Close`) writes no
+    empty row group.
+  - **`RowGroupRows`** still caps each group, and a Write that goes
+    over is split automatically.
+  - **Same output as `Write`:** codec, adaptive bloom filters,
+    timestamp coercion, stored Arrow schema, and the bbox covering
+    columns unless `SkipBboxCovering`. The GeoParquet `geo` footer
+    merges bbox and geometry types across every Write. Tests check
+    that several batches produce the same `geo` entry and on-disk
+    schema as `Write` on the concatenated frame.
+  - **Validation up front:** options are checked at `NewWriter`, and
+    `HilbertSort` is rejected there, since it needs the whole file;
+    sort before writing.
+  - **Errors:** a frame whose schema doesn't match is rejected
+    without harming the writer. A failed flush is sticky: later calls
+    return the same error.
+  - **Memory:** a row group is held in memory, encoded and
+    compressed, until it closes.
+
+- **`parquetio.FileStats` from `Writer.Close()`**, and
+  **`StatsFromMetadata(footer, size)`** for any existing file. These
+  give row count, file size, row-group count, and per-column value
+  counts, null counts and min/max merged across row groups.
+  - **Bounds** merge with the column's own parquet sort order, so a
+    `uint32` column's max is right even above MaxInt32. They're
+    reported only when they cover every non-null value; an all-null
+    column has none.
+  - **Encodings:** bounds come both as Go values and as PLAIN-encoded
+    bytes. For int, long, float, double, date, timestamp, string,
+    binary and boolean columns, those bytes are Iceberg's
+    single-value binary serialization.
+  - **Raw footer:** the `*metadata.FileMetaData` is included for
+    anything else.
+
+- **`StructCopyValues()`: `ToStructs` can copy strings and `[]byte`
+  out of Arrow buffers.** By default `ToStructs` is zero-copy: string
+  and `[]byte` fields point into the Frame's column buffers. That's
+  the fastest option for short-lived rows. But any surviving row keeps
+  its whole source buffer reachable, so a few long-lived rows can pin
+  every batch they came from, and nothing in a heap profile says why.
+  With `StructCopyValues()`, each value owns its memory and the Frame
+  can be released as soon as `ToStructs` returns. The option covers
+  scalar, pointer and list fields, and `[]byte` geometry.
+
+- **String interning for low-cardinality fields.** Tag a `string`,
+  `*string`, `[]string` or `[]*string` field with the `intern`
+  option, e.g. `gobi:"os,intern"` or `parquet:"model,intern"`.
+  Every row with the same value then shares one owned copy.
+  - **Sharing across calls:** pass `StructInterner(in)` with a
+    `NewStringInterner(maxEntries)` to share across batches.
+    Without it, each call uses its own interner.
+  - **`StringInterner`:** safe for concurrent use. Its cap bounds
+    memory on a column that turns out to be high-cardinality: past
+    the cap, values are still copied but not remembered.
+  - **Invalid fields:** `intern` on a non-string, geometry or
+    time-layout field is an `ErrUnsupportedStructField` error.
+
+  Measured on 200k rows with three string fields, two of them low
+  cardinality:
+
+  | Mode | Time | Allocations |
+  |---|---|---|
+  | Zero-copy (default) | 27.6 ms | 0.80 M |
+  | `StructCopyValues()` | 30.8 ms (+12%) | 1.40 M |
+  | Copy + intern the two low-cardinality fields | 34.0 ms (+23%) | 1.00 M |
+
+  Interning trades a map lookup per cell for allocations, and for the
+  memory long-lived rows hold.
+
+- **io `ReadStructs` wrappers accept `...gobi.StructOption`**, e.g.
+  to pass a shared `StructInterner`. This covers `parquetio`, `csvio`
+  (both variants), `geojsonio`, `gpkgio`, `kmlio`, `shpio` and
+  `pgio.ReadStructsTable`. It's a trailing variadic, so existing calls
+  compile unchanged. `pgio.ReadStructsQuery` already ends in query
+  args, so it has no slot for struct options.
+
+- **Bitwise group aggregations: `AggBitOr`, `AggBitAnd`, `AggBitXor`.**
+  Each reduces a group's non-null values bitwise.
+  - **Input:** integer columns only (Int8 … Uint64). Float, string and
+    other columns fail up front with `ErrNotNumeric`.
+  - **Output:** the source column's type, so an Int32 bitmask stays
+    Int32. An empty or all-null group gives null, the same as
+    Min / Max.
+  - **Paths:** eager `GroupBy.Agg`, the pre-partitioned group-by
+    path, the streaming lazy executor, filtered aggregations, and
+    `Pivot`.
+  - **Window form:** `Expr.BitOrAgg()` / `BitAndAgg()` /
+    `BitXorAgg()` with `.Over(cols...)`. They carry the `Agg` suffix
+    because `Expr.BitOr` is the element-wise two-operand form.
+  - **Idempotence:** OR and AND give the same result when folded
+    again, so a bitmask rollup can be re-merged with its own output
+    safely. XOR is not idempotent.
+
+  ```go
+  gb, _ := f.GroupBy("user_id")
+  out, _ := gb.Agg(
+      gobi.Aggregation{Column: "flags", Kind: gobi.AggBitOr},
+      gobi.Aggregation{Column: "events", Kind: gobi.AggSum},
+  )
+  ```
+
+  Rolling windows (`TimeRolling.Agg`) don't support them.
+
+- **`ReadOptions.SerialColumnDecode`** decodes each row group's
+  columns on the calling goroutine instead of one goroutine per
+  column. Use it when the caller already reads many files at once.
+  In one test, 32 concurrent reads of a 48-column file peaked at 60
+  goroutines instead of 661, in the same wall time (best of 5,
+  warm cache). The default is unchanged.
+- **`ReadOptions.BufferedStreamBytes`** streams each column chunk
+  through a buffer of that size. The default reads the chunk's whole
+  compressed bytes into memory first. The buffer lowers peak memory
+  for wide or large row groups, and it's worth it on local disk.
+  Usually it isn't on high-latency object storage, which it hits with
+  many more reads. Negative values are an error.
+- **`StructCoerceNumbers()`: lossless numeric coercion in
+  `ToStructs`.** It converts across numeric kinds (signed, unsigned,
+  float) when each value survives exactly. This is for sources whose
+  column types drift between files.
+  - **float → int:** integral values only; `3.5` is the new
+    `ErrStructFieldInexact`.
+  - **int ↔ uint:** in-range values only; `-1` into a uint is
+    `ErrStructFieldOverflow`.
+  - **int → float:** exactly representable values only (2^53 for
+    float64, 2^24 for float32).
+  - **Scope:** list elements are covered. Without the option,
+    cross-kind reads stay an error, as before.
+- **`StructRequireColumns()`** makes `ToStructs` return
+  `ErrColumnNotFound` when a struct field has no matching column. The
+  default still leaves the field at its zero value.
+
+- **`StructRequiredFields()`: parquet-go-style REQUIRED columns.**
+  `FromStructs` marks non-pointer fields non-nullable, which parquet
+  writes as REQUIRED, the way parquet-go does. Pointer fields stay
+  nullable.
+  - **Per-field tags:** `optional` keeps one non-pointer field
+    nullable; `required` marks one REQUIRED without the option.
+    `required` on a pointer field is an error, as are both tags
+    together.
+  - **Zero values** are written as values, never null: a zero
+    `time.Time` becomes the zero instant and a nil slice an empty
+    list. An empty geometry or time-layout string in a required field
+    is an error, since it has no non-null form.
+- **`StructZeroTimeAsValue()`** writes a zero `time.Time` as the zero
+  instant instead of NULL, matching parquet-go. The zero instant
+  doesn't fit Timestamp[ns], so pair it with a coarser unit such as
+  `timestamp(microsecond)`; on an ns column it's an error.
+- **`StructAllocator(pool)`** sets the allocator `FromStructs` builds
+  with.
+- **io `WriteStructs` wrappers accept `...gobi.StructOption`**, as
+  `ReadStructs` does, e.g.
+  `parquetio.WriteStructs(rows, path, nil, gobi.StructRequiredFields())`.
+  This covers `parquetio`, `geojsonio`, `gpkgio`, `kmlio`, `shpio`
+  and `pgio.WriteStructsTable`.
+- **`WriteOptions.CompressionLevel`:** zstd 1–22, gzip 1–9, brotli
+  1–11, checked per codec. 0 keeps the codec default, and setting a
+  level for snappy, lz4 or uncompressed is an error.
+  - **zstd size isn't monotonic in the level.** The pure-Go encoder
+    has four tiers. On 200k text-like rows, level 1 beat the default
+    (1.47 vs 1.90 MB), and the best tier was smallest (1.27 MB) but
+    about 7× slower. Measure before raising it.
+- **`WriteOptions.Allocator`** allocates the writer's buffers
+  (pages, dictionaries, bloom filters) and the generated bbox covering
+  columns. Tests check with a checked allocator that everything is
+  freed by the time `Write` / `Writer.Close` returns.
+
+- **`ToStructsInto(f, dst, opts...)`** decodes into `dst`'s backing
+  array when it has room, so a batch loop reuses one slice. Returned
+  elements are zeroed first, so fields that a batch leaves null or
+  that have no column never carry stale values. On 4,096 rows it cut
+  the per-call allocation from 99 KB to 1.3 KB (the `[]T` itself).
+- **`Expr.IcebergBucket(n)` / `Series.IcebergBucket(n)`: Iceberg's
+  `bucket(n)` partition transform.** It computes
+  `(murmur3_x86_32(v) & MaxInt32) % n`, with values serialized as the
+  Iceberg spec requires.
+  - **Types:** Int8–Int64 and Date32 are hashed as an 8-byte
+    little-endian long. s / ms / µs timestamps are converted exactly
+    to microseconds first. Strings, binary and fixed-size binary are
+    hashed as raw bytes.
+  - **Output:** Int32; a null input gives a null bucket.
+  - **Rejected:** nanosecond timestamps (iceberg-go has no
+    timestamp_ns bucket to match), unsigned, float and decimal
+    columns.
+  - **Verification:** the test checks 156 values generated by
+    iceberg-go v0.6.0's `BucketTransform`, not hand-computed ones, and
+    the murmur3 hash is checked against the Iceberg spec's hash
+    vectors. The implementation is pure Go and adds no dependency.
+
+### Changed
+
+- **Spatial pushdown reads the covering the file declares.** Pruning
+  used to look only for gobi's `<geom>_bbox_*` column names, so a file
+  whose covering named other columns got no spatial pruning. This
+  covers files gobi now writes with `Coverings`, and third-party
+  GeoParquet 1.1 files that declare a flat covering. Files without a
+  declared covering behave as before.
+
+- **Only gobi-generated covering columns are hidden on read.**
+  `ReadFile` hid every column a flat covering named, so a covering
+  that pointed at real data columns (lon / lat) made them vanish from
+  results by default. Now a column is hidden only if it has the
+  generated `<geom>_bbox_*` name for its geometry column.
+  Third-party files with differently named flat covering columns
+  now show them.
+
+- **Every io `ReadStructs` wrapper now copies values and releases its
+  intermediate Frame.** Before, they returned zero-copy rows and never
+  released the Frame. So the rows pinned every read buffer, and a
+  pooling `ReadOptions.Allocator` would have handed callers recycled
+  memory once the Frame was released. The rows now own their memory,
+  at the cost of one allocation per string / `[]byte` cell (+12% in
+  the table above). For zero-copy decoding of short-lived rows, call
+  `ReadFile` + `gobi.ToStructs` yourself and keep the Frame alive
+  while the rows are in use.
+
+### Fixed
+
+- **Timestamps outside 1677–2262 no longer overflow silently.**
+  `FromStructs` converted `time.Time` to Timestamp[ns] with `UnixNano`,
+  which is undefined outside that range. A year-2500 date, or a zero
+  time in a `[]time.Time`, wrote a garbage value. It's now an
+  `ErrStructFieldOverflow` error that suggests a coarser unit;
+  microsecond and millisecond columns hold these dates fine.
+- **io `WriteStructs` wrappers released nothing.** The `geojsonio`,
+  `gpkgio`, `kmlio`, `shpio` and `pgio` wrappers never released the
+  Frame they built. They now release it after writing, as
+  `parquetio.WriteStructs` has since v0.4.9.
+
+- **`Pivot` keeps the source type for type-preserving aggregations.**
+  Pivot cells were always typed from the generic output rule
+  (Float64), so `Pivot(..., AggFirst)` on a string or bool column, or
+  `AggMin`/`AggMax` on a timestamp, failed when writing the cells. The
+  cell type is now whatever `GroupBy.Agg` produced for the
+  aggregation.
+
+- **`TimeRolling.Agg` rejects unsupported kinds up front.** The check
+  used to run only for non-empty windows, so an unsupported kind on
+  input where every window was empty returned all nulls instead of an
+  error.
+
+- **README listed window aggregates as `.Min()` / `.Max()`.** The
+  methods are `MinAgg()` / `MaxAgg()`, and the README now says so.
+
+- **`ScanFile`'s doc said it reads the whole file.** It already
+  pushes projection and predicates into the reader, skipping row
+  groups by min/max and covering statistics. The comment now says
+  what it does, including that bloom filters aren't used yet.
+- **README write-tuning example had stale defaults.** It gave the
+  default row-group cap as "~1M" and the default false-positive rate
+  as 0.05; they are 64Mi rows and 0.01. The README also said gobi's
+  reader uses bloom filters, which it doesn't yet.
+
+- **Rewriting a GeoParquet file no longer leaves a stale `geo`
+  entry.** A frame read by `parquetio` carries the source file's `geo`
+  metadata in its schema. Writing that frame copied the old entry into
+  the new footer, and gobi then appended a fresh one after it. The
+  result was two `geo` keys, and readers take the first, which is the
+  stale one. So a read → sort → write pass republished the old bbox
+  and geometry types. With `SkipBboxCovering` it also published a
+  covering that pointed at columns the new file doesn't have. When
+  gobi writes its own `geo` entry, it now replaces any `geo` key in
+  the schema metadata, so the footer has exactly one entry and it
+  describes the file being written. Other schema-level metadata keys
+  are unaffected.
+
+  If you put a hand-built `geo` value into the schema metadata of a
+  frame that has a geometry column, gobi's generated entry now
+  replaces it, where before yours came first and won by accident.
+  Frames with no geometry column still pass a schema `geo` key
+  through unchanged.
+
+- **`ToStructs` reads every integer width `FromStructs` writes.**
+  `int8`, `int16`, `uint8` and `uint16` fields, and plain (non-geometry)
+  `[]byte` fields, failed to read back with
+  `readScalarAt: unsupported type`. The shared cell reader now covers
+  Int8/Int16/Uint8/Uint16, Binary and LargeBinary. Grouping and
+  aggregation paths that read cells one at a time pick these up too.
+  First/Last/Mode on 8- and 16-bit columns now build their output.
+
+- **`ToStructs` no longer truncates values that don't fit the field.**
+  An Int64 value read into an `int16` field wrapped silently: `1<<30`
+  came back as `0`. Reads into narrower fields still work when every
+  value fits. A value that overflows now fails with the new
+  `ErrStructFieldOverflow`. This applies to signed and unsigned
+  integers, to float64 → float32 (range only; rounding is not an
+  error), and to list elements.
+
+- **`ToStructs` list elements whose type doesn't match the slice**
+  (for example a `list<uint8>` column read into `[]string`) now return
+  an error instead of panicking inside `reflect`. List elements go
+  through the same type-checked path as scalar fields.
+
 ## [v0.4.10]
 
 ### Fixed

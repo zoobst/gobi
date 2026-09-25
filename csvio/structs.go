@@ -19,19 +19,33 @@ import (
 //
 // Wraps ReadFile[T] + gobi.ToStructs. No writing counterpart because
 // csvio itself is read-only; write via parquetio or another sink.
-func ReadStructs[T any](path string, opts *ReadOptions) ([]T, error) {
+//
+// Strings and []byte fields are copied out of the intermediate Frame,
+// which is released before returning, so the rows own their memory
+// and don't pin read buffers. Pass gobi.StructInterner in structOpts
+// to share one copy of each value of `intern`-tagged fields across
+// calls.
+func ReadStructs[T any](path string, opts *ReadOptions, structOpts ...gobi.StructOption) ([]T, error) {
 	f, err := ReadFile[T](path, opts)
 	if err != nil {
 		return nil, err
 	}
-	return gobi.ToStructs[T](f, gobi.StructTagFormat("csv"))
+	defer f.Release()
+	return gobi.ToStructs[T](f, append([]gobi.StructOption{gobi.StructTagFormat("csv"), gobi.StructCopyValues()}, structOpts...)...)
 }
 
 // ReadStructsReader is the io.Reader-backed variant of ReadStructs.
-func ReadStructsReader[T any](r io.Reader, opts *ReadOptions) ([]T, error) {
+//
+// Strings and []byte fields are copied out of the intermediate Frame,
+// which is released before returning, so the rows own their memory
+// and don't pin read buffers. Pass gobi.StructInterner in structOpts
+// to share one copy of each value of `intern`-tagged fields across
+// calls.
+func ReadStructsReader[T any](r io.Reader, opts *ReadOptions, structOpts ...gobi.StructOption) ([]T, error) {
 	f, err := Read[T](r, opts)
 	if err != nil {
 		return nil, err
 	}
-	return gobi.ToStructs[T](f, gobi.StructTagFormat("csv"))
+	defer f.Release()
+	return gobi.ToStructs[T](f, append([]gobi.StructOption{gobi.StructTagFormat("csv"), gobi.StructCopyValues()}, structOpts...)...)
 }

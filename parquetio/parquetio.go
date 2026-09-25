@@ -36,6 +36,7 @@ import (
 	"math"
 	"math/bits"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -144,9 +145,14 @@ type ReadOptions struct {
 	// LazyFrame.Collect.
 	ScanWorkers int
 
-	// IncludeCoveringColumns, when true, returns the GeoParquet 1.1
-	// bounding-box covering columns (typically named
-	// <geom>_bbox_xmin/_ymin/_xmax/_ymax) in the output frame.
+	// IncludeCoveringColumns, when true, returns the generated
+	// GeoParquet 1.1 bounding-box covering columns
+	// (<geom>_bbox_xmin/_ymin/_xmax/_ymax) in the output frame.
+	//
+	// Only columns with those generated names are ever hidden. A
+	// covering that points at ordinary data columns — e.g. lon / lat
+	// via WriteOptions.Coverings — leaves them visible, since they're
+	// real data.
 	//
 	// Default false — the covering columns exist for row-group
 	// pruning at read time and aren't meaningful to callers doing
@@ -158,6 +164,25 @@ type ReadOptions struct {
 	// this flag; setting it only controls whether they're visible
 	// in the output frame.
 	IncludeCoveringColumns bool
+
+	// SerialColumnDecode decodes each row group's columns on the
+	// calling goroutine instead of one goroutine per column.
+	//
+	// Default false: per-column parallelism speeds up a single wide
+	// read. Set it when the caller already reads many files
+	// concurrently. There the extra goroutines (projected columns ×
+	// concurrent files) add scheduling and memory overhead without
+	// adding throughput. Doesn't change ScanWorkers, which splits
+	// row groups across workers at the LazyFrame layer.
+	SerialColumnDecode bool
+
+	// BufferedStreamBytes, when > 0, reads each column chunk through
+	// a buffer of this many bytes instead of loading the chunk's
+	// whole compressed bytes into memory before decoding. That lowers
+	// peak memory for wide or large row groups, at the cost of more,
+	// smaller reads — worth it on local disk, usually not on
+	// high-latency object storage. 0 (default) reads whole chunks.
+	BufferedStreamBytes int64
 }
 
 // WriteOptions controls parquet write behavior. A nil pointer is
@@ -283,6 +308,42 @@ type WriteOptions struct {
 	// that don't have a geometry column.
 	HilbertSort bool
 
+	// Coverings declares, per geometry column, existing numeric columns
+	// that already hold each row's bounding box — for point data,
+	// PointCovering("lon", "lat"). Such a column gets no generated
+	// <geom>_bbox_* columns; the GeoParquet covering.bbox names the
+	// declared columns instead, and readers prune row groups from their
+	// min / max statistics. Every row is checked: a geometry outside its
+	// declared covering fails the write, since it would let readers skip
+	// row groups that hold matching rows. Geometry columns not listed
+	// here follow SkipBboxCovering as before.
+	Coverings map[string]Covering
+
+	// CompressionLevel sets the codec's compression level. 0 (default)
+	// uses the codec's own default. Valid ranges: zstd 1–22, gzip 1–9,
+	// brotli 1–11. Setting a level for a codec without levels (snappy,
+	// lz4, uncompressed) is an error.
+	//
+	// The pure-Go zstd encoder maps levels onto four tiers (roughly 1
+	// fastest, 2–3 default, 4–8 better, 9+ best), and size isn't
+	// monotonic in the tier: on 200k rows of text-like strings, level 1
+	// wrote a smaller file than the default, and the best tier was
+	// smallest but ~7× slower. Measure on your data before raising it.
+	CompressionLevel int
+
+	// Allocator allocates the writer's buffers: encoded pages,
+	// dictionaries, bloom filters, and the generated bbox covering
+	// columns. nil uses memory.DefaultAllocator.
+	Allocator memory.Allocator
+
+	// KeyValueMetadata adds entries to the parquet footer's key-value
+	// metadata, written in key order after gobi's own. A key that is
+	// also in the frame's schema-level metadata replaces it rather than
+	// being duplicated. "ARROW:schema" is reserved, and so is "geo" for
+	// frames with a geometry column (use Coverings to shape gobi's
+	// GeoParquet entry); setting either is an error.
+	KeyValueMetadata map[string]string
+
 	// CoerceTimestamps converts every timestamp column to this unit
 	// on write. Empty (the default) writes each column at its own
 	// unit — gobi's native Timestamp[ns] becomes parquet
@@ -323,6 +384,81 @@ func (u TimestampUnit) toArrow() (arrow.TimeUnit, error) {
 		return arrow.Nanosecond, nil
 	}
 	return 0, fmt.Errorf("parquetio: CoerceTimestamps %q (want ms, us, or ns)", string(u))
+}
+
+// writerSchema returns the schema handed to pqarrow's FileWriter,
+// with the schema-level metadata keys that gobi writes to the footer
+// itself removed.
+//
+// pqarrow copies schema-level metadata into the parquet footer, and
+// gobi appends its own entries after that: the GeoParquet "geo" entry
+// and WriteOptions.KeyValueMetadata. A frame read from a GeoParquet
+// file carries the source file's "geo" in its schema metadata (see
+// attachGeoKey), so writing it back used to produce two "geo" footer
+// keys — the stale one first, which is the one readers take. Dropping
+// the schema's copy of every key gobi writes keeps exactly one entry
+// per key.
+//
+// Only schema-level metadata changes; fields (and their geometry
+// tags) are untouched, and arrow's Schema.Equal ignores schema
+// metadata, so WriteTable still accepts the frame's own table.
+func writerSchema(s *arrow.Schema, drop map[string]bool) *arrow.Schema {
+	if len(drop) == 0 || !s.HasMetadata() {
+		return s
+	}
+	md := s.Metadata()
+	keys := make([]string, 0, md.Len())
+	values := make([]string, 0, md.Len())
+	for i, k := range md.Keys() {
+		if drop[k] {
+			continue
+		}
+		keys = append(keys, k)
+		values = append(values, md.Values()[i])
+	}
+	if len(keys) == md.Len() {
+		return s
+	}
+	stripped := arrow.NewMetadata(keys, values)
+	return arrow.NewSchemaWithEndian(s.Fields(), &stripped, s.Endianness())
+}
+
+// footerKeys is the set of footer keys gobi writes itself for a file:
+// "geo" when it has geometry, plus every KeyValueMetadata key.
+func footerKeys(hasGeo bool, opts *WriteOptions) map[string]bool {
+	keys := make(map[string]bool, len(opts.KeyValueMetadata)+1)
+	if hasGeo {
+		keys[gobi.GeoParquetMetadataKey] = true
+	}
+	for k := range opts.KeyValueMetadata {
+		keys[k] = true
+	}
+	return keys
+}
+
+// appendFooter writes gobi's footer entries — the GeoParquet "geo"
+// entry (when meta is non-nil), then KeyValueMetadata in key order.
+func appendFooter(fw *pqarrow.FileWriter, meta *gobi.GeoParquetMetadata, opts *WriteOptions) error {
+	if meta != nil {
+		blob, err := marshalGeoMeta(meta)
+		if err != nil {
+			return err
+		}
+		if err := fw.AppendKeyValueMetadata(gobi.GeoParquetMetadataKey, blob); err != nil {
+			return err
+		}
+	}
+	keys := make([]string, 0, len(opts.KeyValueMetadata))
+	for k := range opts.KeyValueMetadata {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, k := range keys {
+		if err := fw.AppendKeyValueMetadata(k, opts.KeyValueMetadata[k]); err != nil {
+			return fmt.Errorf("parquetio: KeyValueMetadata[%q]: %w", k, err)
+		}
+	}
+	return nil
 }
 
 // Bloom filter size bounds, matching arrow-go's split-block filter:
@@ -545,11 +681,16 @@ func exprContainsString(e gobi.Expr, target string) bool {
 // Composes with the LazyFrame chain: Filter, Select, WithColumn,
 // SortBy, GroupBy.Agg, Join, Limit, Head, Tail, DropColumn.
 //
-// A future optimizer will push Filter and Select nodes above the
-// scan back INTO the parquet reader (predicate + projection
-// pushdown, bloom-filter-driven rowgroup skipping). Today ScanFile is
-// pure API shape — it reads the whole file at Collect regardless of
-// what's above it.
+// The optimizer pushes work above the scan into the parquet reader:
+//   - Select → projection pushdown: only the referenced columns are
+//     read (ReadOptions.Columns).
+//   - Filter → predicate pushdown: row groups whose min/max statistics
+//     (and GeoParquet covering, for spatial predicates) prove the
+//     predicate false are skipped (ReadOptions.Predicate). Rows in the
+//     surviving row groups are still filtered above the scan.
+//
+// Row groups stream in batches, split across ScanWorkers workers.
+// Bloom filters are not consulted yet.
 func ScanFile(path string, opts *ReadOptions) *gobi.LazyFrame {
 	// Try to read the schema eagerly. If that fails, the read
 	// closure below will surface the same error at Collect time.
@@ -880,6 +1021,73 @@ func WriteFile(f *gobi.Frame, path string, opts *WriteOptions) error {
 // caller-owns-w contract (e.g. a *gzip.Writer wrapping a *os.File,
 // or a caller who intends to append more data after the parquet
 // payload).
+// checkCompressionLevel validates level for codec (see
+// WriteOptions.CompressionLevel).
+func checkCompressionLevel(codec Codec, level int) error {
+	var lo, hi int
+	switch codec {
+	case CodecZstd:
+		lo, hi = 1, 22
+	case CodecGzip:
+		lo, hi = 1, 9
+	case CodecBrotli:
+		lo, hi = 1, 11
+	default:
+		return fmt.Errorf("parquetio: CompressionLevel %d: codec %q has no compression levels", level, codec)
+	}
+	if level < lo || level > hi {
+		return fmt.Errorf("parquetio: CompressionLevel %d out of range [%d, %d] for %s", level, lo, hi, codec)
+	}
+	return nil
+}
+
+// writerProperties validates opts and builds the parquet and pqarrow
+// writer properties shared by Write and Writer: codec, row-group cap,
+// bloom filters, stored Arrow schema, timestamp coercion.
+func writerProperties(opts *WriteOptions) ([]parquet.WriterProperty, []pqarrow.WriterOption, error) {
+	codec := opts.Codec
+	if codec == "" {
+		codec = CodecSnappy
+	}
+	compression, err := codec.toArrow()
+	if err != nil {
+		return nil, nil, err
+	}
+	bloomProps, err := bloomFilterProps(opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	writerProps := []parquet.WriterProperty{parquet.WithCompression(compression)}
+	if opts.CompressionLevel != 0 {
+		if err := checkCompressionLevel(codec, opts.CompressionLevel); err != nil {
+			return nil, nil, err
+		}
+		writerProps = append(writerProps, parquet.WithCompressionLevel(opts.CompressionLevel))
+	}
+	if opts.Allocator != nil {
+		writerProps = append(writerProps, parquet.WithAllocator(opts.Allocator))
+	}
+	if opts.RowGroupRows > 0 {
+		writerProps = append(writerProps, parquet.WithMaxRowGroupLength(opts.RowGroupRows))
+	}
+	writerProps = append(writerProps, bloomProps...)
+
+	arrowProps := []pqarrow.WriterOption{pqarrow.WithStoreSchema()}
+	if opts.Allocator != nil {
+		arrowProps = append(arrowProps, pqarrow.WithAllocator(opts.Allocator))
+	}
+	if opts.CoerceTimestamps != "" {
+		unit, err := opts.CoerceTimestamps.toArrow()
+		if err != nil {
+			return nil, nil, err
+		}
+		arrowProps = append(arrowProps,
+			pqarrow.WithCoerceTimestamps(unit),
+			pqarrow.WithTruncatedTimestamps(opts.AllowTruncatedTimestamps))
+	}
+	return writerProps, arrowProps, nil
+}
+
 type writeOnly struct{ w io.Writer }
 
 func (wo writeOnly) Write(p []byte) (int, error) { return wo.w.Write(p) }
@@ -891,102 +1099,42 @@ func Write(f *gobi.Frame, w io.Writer, opts *WriteOptions) error {
 	if opts == nil {
 		opts = &WriteOptions{}
 	}
-	codec := opts.Codec
-	if codec == "" {
-		codec = CodecSnappy
-	}
-	compression, err := codec.toArrow()
-	if err != nil {
-		return err
-	}
 	// Validate before the (possibly O(N)) augmentation work below.
-	bloomProps, err := bloomFilterProps(opts)
+	writerProps, arrowProps, err := writerProperties(opts)
 	if err != nil {
 		return err
 	}
-	// Route the write through one of three paths depending on
-	// HilbertSort / SkipBboxCovering. The fused path is the sweet
-	// spot for HilbertSort=true: sort + bbox-covering augmentation
-	// share a single WKB parse pass instead of walking every row
-	// twice.
+	if err := validateGeoOptions(f.Schema(), opts); err != nil {
+		return err
+	}
+	// HilbertSort with generated covering columns takes the fused path:
+	// sort + bbox augmentation share one WKB parse. Declared Coverings
+	// (or SkipBboxCovering) sort first, then augment what's left to
+	// generate. Everything else goes straight to prepareGeo.
 	var (
 		augmented *gobi.Frame
 		meta      *gobi.GeoParquetMetadata
 	)
+	primary := primaryGeometryColumn(f)
 	switch {
-	case opts.HilbertSort && !opts.SkipBboxCovering:
-		// Fused single-pass: sort + augment share one WKB scan for
-		// the primary geometry column.
-		if primary := primaryGeometryColumn(f); primary != "" {
-			augmented, meta, err = gobi.HilbertSortWithCovering(f, primary)
-		} else {
-			// No geometry column → HilbertSort is a no-op; fall
-			// through to the normal augment path.
-			augmented, meta, err = gobi.WithBboxCoveringColumns(f)
-		}
-	case opts.HilbertSort && opts.SkipBboxCovering:
-		// Sort but skip augmentation. Two-step form is unavoidable
-		// (there's no augmentation to fuse with).
-		//
-		// Refcount discipline: Retain() runs only AFTER
-		// BuildGeoParquetMetadata succeeds. A metadata error before
-		// the Retain leaves nothing to leak; after would leak the
-		// extra ref (the defer at the bottom only fires when we
-		// reach the code after the error check).
-		if primary := primaryGeometryColumn(f); primary != "" {
-			var sorted *gobi.Frame
-			sorted, err = f.SortByHilbert(primary)
-			if err == nil {
-				meta, err = gobi.BuildGeoParquetMetadata(sorted)
-				if err == nil {
-					augmented = sorted
-					augmented.Retain()
-				}
-				sorted.Release()
-			}
-		} else {
-			meta, err = gobi.BuildGeoParquetMetadata(f)
-			if err == nil {
-				augmented = f
-				augmented.Retain()
-			}
-		}
-	case opts.SkipBboxCovering:
-		// No sort, no bbox augmentation. Same Retain-after-metadata
-		// discipline as above.
-		meta, err = gobi.BuildGeoParquetMetadata(f)
-		if err == nil {
-			augmented = f
-			augmented.Retain()
+	case opts.HilbertSort && primary != "" && !opts.SkipBboxCovering && len(opts.Coverings) == 0:
+		augmented, meta, err = gobi.HilbertSortWithCovering(f, primary)
+	case opts.HilbertSort && primary != "":
+		var sorted *gobi.Frame
+		if sorted, err = f.SortByHilbert(primary); err == nil {
+			augmented, meta, err = prepareGeo(sorted, opts)
+			sorted.Release()
 		}
 	default:
-		// No sort, standard augmentation.
-		augmented, meta, err = gobi.WithBboxCoveringColumns(f)
+		augmented, meta, err = prepareGeo(f, opts)
 	}
 	if err != nil {
 		return err
 	}
 	defer augmented.Release()
 
-	writerProps := []parquet.WriterProperty{parquet.WithCompression(compression)}
-	if opts.RowGroupRows > 0 {
-		writerProps = append(writerProps, parquet.WithMaxRowGroupLength(opts.RowGroupRows))
-	}
-	writerProps = append(writerProps, bloomProps...)
-
-	arrowProps := []pqarrow.WriterOption{pqarrow.WithStoreSchema()}
-	if opts.CoerceTimestamps != "" {
-		unit, err := opts.CoerceTimestamps.toArrow()
-		if err != nil {
-			return err
-		}
-		arrowProps = append(arrowProps,
-			pqarrow.WithCoerceTimestamps(unit),
-			pqarrow.WithTruncatedTimestamps(opts.AllowTruncatedTimestamps))
-	}
-
 	writer, err := pqarrow.NewFileWriter(
-		augmented.Schema(),
+		writerSchema(augmented.Schema(), footerKeys(meta != nil, opts)),
 		writeOnly{w: w},
 		parquet.NewWriterProperties(writerProps...),
 		pqarrow.NewArrowWriterProperties(arrowProps...),
@@ -1009,14 +1157,8 @@ func Write(f *gobi.Frame, w io.Writer, opts *WriteOptions) error {
 		return errors.Join(err, writer.Close())
 	}
 	tbl.Release()
-	if meta != nil {
-		blob, err := marshalGeoMeta(meta)
-		if err != nil {
-			return errors.Join(err, writer.Close())
-		}
-		if err := writer.AppendKeyValueMetadata(gobi.GeoParquetMetadataKey, blob); err != nil {
-			return errors.Join(err, writer.Close())
-		}
+	if err := appendFooter(writer, meta, opts); err != nil {
+		return errors.Join(err, writer.Close())
 	}
 	return writer.Close()
 }
@@ -1085,8 +1227,16 @@ func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOpt
 		pool = memory.DefaultAllocator
 	}
 
+	if opts.BufferedStreamBytes < 0 {
+		_ = closer.Close()
+		return nil, fmt.Errorf("parquetio: BufferedStreamBytes %d must be >= 0", opts.BufferedStreamBytes)
+	}
 	rp := parquet.NewReaderProperties(pool)
 	rp.PageStreamingEnabled = true
+	if opts.BufferedStreamBytes > 0 {
+		rp.BufferedStreamEnabled = true
+		rp.BufferSize = opts.BufferedStreamBytes
+	}
 	pf, err := file.NewParquetReader(rs, file.WithReadProps(rp))
 	if err != nil {
 		_ = closer.Close()
@@ -1101,7 +1251,7 @@ func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOpt
 	}
 
 	fr, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{
-		Parallel:           true,
+		Parallel:           !opts.SerialColumnDecode,
 		BatchSize:          chunkRows(opts),
 		PreAllocBinaryData: true,
 	}, pool)
@@ -1353,17 +1503,22 @@ func coveringColumnNames(geoRaw string, hideCovering bool) map[string]struct{} {
 		return nil
 	}
 	out := map[string]struct{}{}
-	for _, cm := range meta.Columns {
+	for geom, cm := range meta.Columns {
 		if cm.Covering == nil || cm.Covering.Bbox == nil {
 			continue
 		}
 		bb := cm.Covering.Bbox
-		for _, path := range [][]string{bb.Xmin, bb.Ymin, bb.Xmax, bb.Ymax} {
-			// Flat covering: single-element path is the top-level
-			// column name. Nested (struct-field) paths aren't
-			// hideable at the Frame level today — leave them visible.
-			if len(path) == 1 {
-				out[path[0]] = struct{}{}
+		xmin, ymin, xmax, ymax := gobi.BboxColumnNames(geom)
+		for _, c := range []struct {
+			path []string
+			gen  string
+		}{{bb.Xmin, xmin}, {bb.Ymin, ymin}, {bb.Xmax, xmax}, {bb.Ymax, ymax}} {
+			// Hide only gobi's generated covering columns. A covering
+			// that names ordinary columns (lon / lat for points) must
+			// not make real data disappear. Nested (struct-field)
+			// paths aren't hideable at the Frame level either.
+			if len(c.path) == 1 && c.path[0] == c.gen {
+				out[c.gen] = struct{}{}
 			}
 		}
 	}
