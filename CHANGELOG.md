@@ -5,6 +5,35 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.14]
+
+### Changed (breaking)
+
+- **`geometry.CRS` is now a 4-byte handle, and `geometry.Point`
+  shrinks from 64 to 32 bytes.** Every vertex in every `LineString` and
+  `Polygon` is a `Point`, and each carried a full copy of its CRS: the
+  EPSG code, a name string and a projected flag, 32 bytes on its own.
+  `CRS` now holds only `EPSG`. The name and the projected/geographic
+  flag live in a process-wide registry.
+  - **Measured:** parsing 100k 101-vertex polygons went from 129 ms to
+    72 ms, from 663 MB to 353 MB allocated, and from 459 MB to 151 MB
+    live. Every path that builds geometry objects gets the same halving
+    per vertex.
+  - **Migrating:**
+    - `crs.Name` → `crs.Name()` and `crs.Projected` →
+      `crs.Projected()`.
+    - `CRS{EPSG: n}` literals and `.EPSG` reads are unchanged.
+    - `CRS{EPSG: n, Name: …, Projected: …}` becomes
+      `geometry.RegisterCRS(n, name, projected)`, which returns the
+      handle.
+    - `RegisterCRS(c CRS)` is now `RegisterCRS(epsg, name, projected)`.
+  - **Register custom systems.** A CRS value no longer carries its own
+    projected flag, so an unregistered code has no name and reports
+    `Projected() == false`. WGS 84, Web Mercator and every UTM zone
+    are built in.
+  - **The registry is now safe for concurrent use.** Lookups are a
+    single atomic load, and `RegisterCRS` swaps in a copy.
+
 ## [v0.4.13]
 
 ### Changed

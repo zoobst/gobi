@@ -103,7 +103,7 @@ func (l LineString) Length(u Unit) (float64, error) {
 		a, b := l.Points[i], l.Points[i+1]
 		var d float64
 		var err error
-		if l.CRSValue.Projected {
+		if l.CRSValue.Projected() {
 			d, err = Euclidean(a, b, u)
 		} else {
 			d, err = Haversine(a, b, u)

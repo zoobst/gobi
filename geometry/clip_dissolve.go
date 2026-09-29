@@ -167,7 +167,7 @@ func dissolveValidate(geoms []Geometry) (CRS, error) {
 			return CRS{}, ErrCRSMismatch
 		}
 	}
-	if !crs.Zero() && !crs.Projected {
+	if !crs.Zero() && !crs.Projected() {
 		return CRS{}, ErrGeographicCRS
 	}
 	return crs, nil

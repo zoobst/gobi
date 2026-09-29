@@ -13,7 +13,7 @@ var wkbLengthBenchSizes = []int{5, 64, 1_024, 65_536, 1_000_000}
 // []Point pairs and computes Euclidean segment sums). The
 // alloc profile shows the full geometry allocation.
 func BenchmarkPlanarLength_ParseWKB_AoS(b *testing.B) {
-	projected := CRS{EPSG: 3857, Projected: true}
+	projected := CRS{EPSG: 3857}
 	for _, n := range wkbLengthBenchSizes {
 		data := makeLineStringWKB(n)
 		b.Run(sizeLabel(n), func(b *testing.B) {

@@ -87,7 +87,7 @@ func TestSeries_GeomEstimateUTMCRS_WGS84(t *testing.T) {
 	if crs.EPSG != 32611 {
 		t.Errorf("EPSG = %d, want 32611 (WGS 84 / UTM zone 11N)", crs.EPSG)
 	}
-	if !crs.Projected {
+	if !crs.Projected() {
 		t.Errorf("returned CRS should be projected")
 	}
 }

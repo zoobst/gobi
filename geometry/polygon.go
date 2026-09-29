@@ -85,7 +85,7 @@ func (p Polygon) Area(u Unit) (float64, error) {
 	if len(p.Rings) == 0 || len(p.Rings[0]) < 3 {
 		return 0, nil
 	}
-	if p.CRSValue.Projected {
+	if p.CRSValue.Projected() {
 		a := planarRingArea(p.Rings[0])
 		for _, hole := range p.Rings[1:] {
 			a -= planarRingArea(hole)

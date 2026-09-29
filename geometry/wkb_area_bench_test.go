@@ -10,7 +10,7 @@ var wkbAreaBenchSizes = []int{5, 64, 1_024, 65_536, 1_000_000}
 // does ParseWKB (allocates full geometry) → .Area(UnitMeters) on a
 // projected CRS (planar shoelace).
 func BenchmarkPlanarArea_ParseWKB_AoS(b *testing.B) {
-	projected := CRS{EPSG: 3857, Projected: true}
+	projected := CRS{EPSG: 3857}
 	for _, n := range wkbAreaBenchSizes {
 		data := makePolygonWKB(n)
 		b.Run(sizeLabel(n), func(b *testing.B) {

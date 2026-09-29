@@ -25,7 +25,7 @@ import "fmt"
 // Sphere is a 3D ball: every point within R of (X, Y, Z). Used as
 // the buffered shape around a Point.
 //
-// CRSValue.Projected → (X, Y, Z) are Cartesian in the CRS's linear
+// CRSValue.Projected() → (X, Y, Z) are Cartesian in the CRS's linear
 // unit; R is in the same unit. Point-in-sphere is one squared-
 // distance compare per query point.
 //
@@ -168,7 +168,7 @@ func PointsInSphereFromXYZ(xs, ys, zs []float64, s Sphere, out []bool, scratch *
 		return
 	}
 	r2 := s.R * s.R
-	if s.CRSValue.Projected || s.CRSValue.Zero() {
+	if s.CRSValue.Projected() || s.CRSValue.Zero() {
 		for i := 0; i < n; i++ {
 			dx := xs[i] - s.X
 			dy := ys[i] - s.Y
@@ -216,7 +216,7 @@ func PointsInCapsuleFromXYZ(xs, ys, zs []float64, c Capsule, out []bool) {
 	if n == 0 {
 		return
 	}
-	if !c.CRSValue.Projected && !c.CRSValue.Zero() {
+	if !c.CRSValue.Projected() && !c.CRSValue.Zero() {
 		// Zero out for now; docstring flags this as follow-up.
 		// Alternative: panic. Silent-false is safer for the
 		// day-one "wire everything up" path — geographic callers

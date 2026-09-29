@@ -32,7 +32,7 @@ func TestLineString_ToCRS(t *testing.T) {
 		Points:   []Point{{X: -73.99, Y: 40.75}, {X: -73.98, Y: 40.76}},
 		CRSValue: WGS84,
 	}
-	proj, err := l.ToCRS(CRS{EPSG: 3857, Projected: true})
+	proj, err := l.ToCRS(CRS{EPSG: 3857})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestPolygon_ToCRS_AreaAgreesInBothCRSes(t *testing.T) {
 		{X: -74.01, Y: 40.71}, {X: -74.00, Y: 40.71},
 		{X: -74.00, Y: 40.72}, {X: -74.01, Y: 40.72}, {X: -74.01, Y: 40.71},
 	}, WGS84)
-	utm, err := orig.ToCRS(CRS{EPSG: 32618, Projected: true})
+	utm, err := orig.ToCRS(CRS{EPSG: 32618})
 	if err != nil {
 		t.Fatal(err)
 	}

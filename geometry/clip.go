@@ -294,7 +294,7 @@ func validateClipInputs(a, b Geometry) error {
 	if crs.Zero() {
 		crs = bc
 	}
-	if !crs.Zero() && !crs.Projected {
+	if !crs.Zero() && !crs.Projected() {
 		return fmt.Errorf("%w: got %s", ErrGeographicCRS, crs)
 	}
 	return nil

@@ -47,7 +47,7 @@ func (s Series) GeomDistance(other geometry.Geometry, u geometry.Unit) (Series, 
 	// SoA fast path for projected CRSes: read row's bbox via
 	// BoundsFromWKB (zero-alloc), bbox-disjoint rows skip the
 	// AoS ParseWKB and go straight to WKB-direct min-distance.
-	if crs.Projected {
+	if crs.Projected() {
 		perM, err := geometry.MetersPerUnit(u)
 		if err != nil {
 			return Series{}, err
@@ -152,7 +152,7 @@ func (s Series) GeomDistance3D(other geometry.Geometry, u geometry.Unit) (Series
 		otherPt = p
 	}
 
-	geographic := !crs.Projected && !crs.Zero()
+	geographic := !crs.Projected() && !crs.Zero()
 	perM, err := geometry.MetersPerUnit(u)
 	if err != nil {
 		return Series{}, err
@@ -230,7 +230,7 @@ func (s Series) GeomLength3D(u geometry.Unit) (Series, error) {
 	}
 	epsg := geometryCRSFromField(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
-	geographic := !crs.Projected && !crs.Zero()
+	geographic := !crs.Projected() && !crs.Zero()
 	perM, err := geometry.MetersPerUnit(u)
 	if err != nil {
 		return Series{}, err

@@ -25,7 +25,7 @@ func (s Series) GeomArea(u geometry.Unit) (Series, error) {
 	}
 	epsg := geometryCRSFromField(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
-	if crs.Projected {
+	if crs.Projected() {
 		perM, err := geometry.MetersPerUnit(u)
 		if err != nil {
 			return Series{}, err
@@ -62,7 +62,7 @@ func (s Series) GeomLength(u geometry.Unit) (Series, error) {
 	}
 	epsg := geometryCRSFromField(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
-	if crs.Projected {
+	if crs.Projected() {
 		perM, err := geometry.MetersPerUnit(u)
 		if err != nil {
 			return Series{}, err

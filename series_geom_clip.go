@@ -77,13 +77,13 @@ func (s Series) GeomEstimateUTMCRS() (geometry.CRS, error) {
 	}
 	// Geographic-CRS input that spans the antimeridian → bounds center
 	// picks the wrong zone silently. Refuse and let the caller pre-split.
-	if crossesAM && !sourceCRS.Projected {
+	if crossesAM && !sourceCRS.Projected() {
 		return geometry.CRS{}, geometry.ErrAntimeridianCrossing
 	}
 	// Also refuse when the aggregated bounds itself spans >180° (which
 	// can happen with disjoint rows on either side of the antimeridian
 	// even if no single row crosses).
-	if !sourceCRS.Projected && (bounds.MaxX-bounds.MinX) > 180 {
+	if !sourceCRS.Projected() && (bounds.MaxX-bounds.MinX) > 180 {
 		return geometry.CRS{}, geometry.ErrAntimeridianCrossing
 	}
 	if !seen {
@@ -92,7 +92,7 @@ func (s Series) GeomEstimateUTMCRS() (geometry.CRS, error) {
 	cx := (bounds.MinX + bounds.MaxX) / 2
 	cy := (bounds.MinY + bounds.MaxY) / 2
 	lon, lat := cx, cy
-	if sourceCRS.Projected {
+	if sourceCRS.Projected() {
 		g := geometry.Point{X: cx, Y: cy, CRSValue: sourceCRS}
 		reprojected, err := geometry.Project(g, geometry.WGS84)
 		if err != nil {

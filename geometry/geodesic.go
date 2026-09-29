@@ -105,7 +105,7 @@ func DensifyGeodesic(l LineString, stepMeters float64) (LineString, error) {
 	// Check the whole line's CRS once (each segment gets validated
 	// by SampleGeodesic anyway, but doing it up front lets us bail
 	// with one clean error instead of a garbled multi-segment failure).
-	if l.CRSValue.Projected {
+	if l.CRSValue.Projected() {
 		return LineString{}, fmt.Errorf("%w: got %s", ErrGeodesicRequiresGeographic, l.CRSValue)
 	}
 	crs := l.CRSValue
@@ -151,7 +151,7 @@ func DensifyGeodesic(l LineString, stepMeters float64) (LineString, error) {
 // broader package convention).
 func requireGeographic(p1, p2 Point) error {
 	for _, p := range []Point{p1, p2} {
-		if !p.CRSValue.Zero() && p.CRSValue.Projected {
+		if !p.CRSValue.Zero() && p.CRSValue.Projected() {
 			return fmt.Errorf("%w: got %s", ErrGeodesicRequiresGeographic, p.CRSValue)
 		}
 	}

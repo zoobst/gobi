@@ -231,8 +231,8 @@ func TestClip_LShape(t *testing.T) {
 }
 
 func TestBoolean_CRSMismatch(t *testing.T) {
-	crsA := CRS{EPSG: 3857, Projected: true}
-	crsB := CRS{EPSG: 32610, Projected: true}
+	crsA := CRS{EPSG: 3857}
+	crsB := CRS{EPSG: 32610}
 	a := unitSquare(0, 0, 10)
 	a.CRSValue = crsA
 	b := unitSquare(5, 5, 10)

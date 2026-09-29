@@ -97,7 +97,7 @@ func (p Point) Distance(o Point, u Unit) (float64, error) {
 	if !p.CRSValue.Equal(o.CRSValue) {
 		return 0, ErrCRSMismatch
 	}
-	if p.CRSValue.Projected {
+	if p.CRSValue.Projected() {
 		return Euclidean(p, o, u)
 	}
 	return Haversine(p, o, u)
@@ -131,7 +131,7 @@ func (p Point) Distance3D(o Point, u Unit) (float64, error) {
 	if !p.HasZ || !o.HasZ {
 		return 0, fmt.Errorf("%w: Distance3D requires 3D points on both sides", ErrTypeMismatch)
 	}
-	if p.CRSValue.Projected || p.CRSValue.Zero() {
+	if p.CRSValue.Projected() || p.CRSValue.Zero() {
 		// Cartesian path — the pre-existing behavior. Z is
 		// coplanar with X/Y (same linear unit).
 		dx := o.X - p.X

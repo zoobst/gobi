@@ -23,7 +23,7 @@ func CrossesAntimeridian(g Geometry) bool {
 	if g == nil {
 		return false
 	}
-	if c := g.CRS(); !c.Zero() && c.Projected {
+	if c := g.CRS(); !c.Zero() && c.Projected() {
 		return false
 	}
 	crossed := false
@@ -47,7 +47,7 @@ func AntimeridianCrossings(g Geometry) []Point {
 	if g == nil {
 		return nil
 	}
-	if c := g.CRS(); !c.Zero() && c.Projected {
+	if c := g.CRS(); !c.Zero() && c.Projected() {
 		return nil
 	}
 	var out []Point

@@ -20,7 +20,7 @@ func (s Series) GeomDensifyGeodesic(stepMeters float64) (Series, error) {
 	}
 	epsg := geometryCRSFromField(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
-	if !crs.Zero() && crs.Projected {
+	if !crs.Zero() && crs.Projected() {
 		return Series{}, fmt.Errorf("%w: got %s",
 			geometry.ErrGeodesicRequiresGeographic, crs)
 	}

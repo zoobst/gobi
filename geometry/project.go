@@ -258,7 +258,7 @@ func estimateUTMFromXY(x, y float64, crs CRS) (CRS, error) {
 		crs = WGS84
 	}
 	lon, lat := x, y
-	if crs.Projected {
+	if crs.Projected() {
 		var err error
 		lon, lat, err = projectPoint(x, y, crs, WGS84)
 		if err != nil {
@@ -349,8 +349,8 @@ func utmToLL(x, y float64, zone int, north bool) (float64, float64) {
 // so LookupCRS can find them. Called from init.
 func registerUTMZones() {
 	for zone := 1; zone <= 60; zone++ {
-		RegisterCRS(CRS{EPSG: int32(32600 + zone), Name: fmt.Sprintf("WGS 84 / UTM zone %dN", zone), Projected: true})
-		RegisterCRS(CRS{EPSG: int32(32700 + zone), Name: fmt.Sprintf("WGS 84 / UTM zone %dS", zone), Projected: true})
+		RegisterCRS(int32(32600+zone), fmt.Sprintf("WGS 84 / UTM zone %dN", zone), true)
+		RegisterCRS(int32(32700+zone), fmt.Sprintf("WGS 84 / UTM zone %dS", zone), true)
 	}
 }
 

@@ -106,7 +106,7 @@ func TestProject_Polygon_ChainThroughUTMBackToWGS84(t *testing.T) {
 		{X: -74.01, Y: 40.71}, {X: -74.00, Y: 40.71},
 		{X: -74.00, Y: 40.72}, {X: -74.01, Y: 40.72},
 	}, WGS84)
-	utm := CRS{EPSG: 32618, Projected: true}
+	utm := CRS{EPSG: 32618}
 	projected, err := Project(orig, utm)
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +130,7 @@ func TestProject_Polygon_ChainThroughUTMBackToWGS84(t *testing.T) {
 
 func TestProject_MercatorToUTM_RoutedThroughWGS84(t *testing.T) {
 	p := Point{X: -8235000, Y: 4970000, CRSValue: PseudoMercator}
-	out, err := Project(p, CRS{EPSG: 32618, Projected: true})
+	out, err := Project(p, CRS{EPSG: 32618})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestProject_MercatorToUTM_RoutedThroughWGS84(t *testing.T) {
 
 func TestProject_UnknownCRSReturnsError(t *testing.T) {
 	p := Point{X: 0, Y: 0, CRSValue: WGS84}
-	_, err := Project(p, CRS{EPSG: 99999, Projected: true})
+	_, err := Project(p, CRS{EPSG: 99999})
 	if !errors.Is(err, ErrProjectionMissing) {
 		t.Fatalf("want ErrProjectionMissing, got %v", err)
 	}
@@ -165,7 +165,7 @@ func TestLookupCRS_UTMZones(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.Projected || c.EPSG != 32618 {
+	if !c.Projected() || c.EPSG != 32618 {
 		t.Fatalf("UTM 18N: %+v", c)
 	}
 }

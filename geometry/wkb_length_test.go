@@ -13,7 +13,7 @@ import (
 // (planar) across the full geometry-type matrix. Non-linear types
 // return 0 matching geometry.Length's dispatch.
 func TestPlanarLengthFromWKB_MatchesAoS(t *testing.T) {
-	projected := CRS{EPSG: 3857, Projected: true}
+	projected := CRS{EPSG: 3857}
 	cases := []struct {
 		name string
 		g    Geometry
@@ -74,7 +74,7 @@ func TestPlanarLengthFromWKB_MatchesAoS(t *testing.T) {
 // LineString.Length on projected CRS across many random shapes.
 func TestPlanarLengthFromWKB_RandomLineStrings(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
-	projected := CRS{EPSG: 3857, Projected: true}
+	projected := CRS{EPSG: 3857}
 	for iter := range 100 {
 		n := 2 + rng.Intn(20)
 		pts := make([]Point, n)

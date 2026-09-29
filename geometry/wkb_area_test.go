@@ -12,7 +12,7 @@ import (
 // Polygon.Area / MultiPolygon.Area on a projected CRS (planar).
 // Non-areal types return 0 matching geometry.Area's dispatch.
 func TestPlanarAreaFromWKB_MatchesAoS(t *testing.T) {
-	projected := CRS{EPSG: 3857, Projected: true}
+	projected := CRS{EPSG: 3857}
 	cases := []struct {
 		name string
 		g    Geometry
@@ -81,7 +81,7 @@ func TestPlanarAreaFromWKB_MatchesAoS(t *testing.T) {
 // self-intersection edge cases.
 func TestPlanarAreaFromWKB_RandomPolygons(t *testing.T) {
 	rng := rand.New(rand.NewSource(2))
-	projected := CRS{EPSG: 3857, Projected: true}
+	projected := CRS{EPSG: 3857}
 	for iter := range 50 {
 		// n points on a circle, guaranteed convex + non-self-intersecting.
 		n := 3 + rng.Intn(12)

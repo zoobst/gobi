@@ -269,7 +269,7 @@ func TestPoint_Distance3D_GeographicDispatchesToECEF(t *testing.T) {
 func TestProjectCarriesZ(t *testing.T) {
 	p := ptZ(-73.9857, 40.7484, 100)
 	p.CRSValue = WGS84
-	out, err := Project(p, CRS{EPSG: 32618, Projected: true})
+	out, err := Project(p, CRS{EPSG: 32618})
 	if err != nil {
 		t.Fatal(err)
 	}
