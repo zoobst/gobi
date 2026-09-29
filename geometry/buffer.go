@@ -634,3 +634,51 @@ func ringIsCW(ring []Point) bool {
 	}
 	return a < 0
 }
+
+// PointBufferEncoder writes round point buffers straight to WKB — the
+// same bytes as WKB(Point.Buffer(distance, segments)) — without
+// building a Polygon. The circle's unit cos / sin table is computed
+// once, so each point costs segments+1 multiply-adds and one exactly
+// sized append. Used by Series.GeomBuffer's point fast path.
+type PointBufferEncoder struct {
+	distance float64
+	cos, sin []float64
+}
+
+// NewPointBufferEncoder returns an encoder for round buffers of the
+// given distance, or nil when opts asks for a style it doesn't cover
+// (BufferSquare) — callers then take the general Buffer path.
+func NewPointBufferEncoder(distance float64, opts BufferOptions) *PointBufferEncoder {
+	if opts.Style == BufferSquare || !(distance > 0) {
+		return nil
+	}
+	segments := opts.segments()
+	e := &PointBufferEncoder{distance: distance, cos: make([]float64, segments), sin: make([]float64, segments)}
+	for i := range segments {
+		// Same expression as Point.Buffer, so vertices are bit-identical.
+		theta := 2 * math.Pi * float64(i) / float64(segments)
+		e.cos[i] = math.Cos(theta)
+		e.sin[i] = math.Sin(theta)
+	}
+	return e
+}
+
+// WKBSize is the byte length of one encoded buffer.
+func (e *PointBufferEncoder) WKBSize() int { return 1 + 4 + 4 + 4 + 16*(len(e.cos)+1) }
+
+// AppendWKB appends the WKB polygon approximating the disc of radius
+// distance around (x, y) and returns the extended buffer.
+func (e *PointBufferEncoder) AppendWKB(buf []byte, x, y float64) []byte {
+	buf = slices.Grow(buf, e.WKBSize())
+	buf = appendWKBHeader(buf, wkbPolygon)
+	buf = appendUint32LE(buf, 1) // one ring
+	buf = appendUint32LE(buf, uint32(len(e.cos)+1))
+	for i := range e.cos {
+		buf = appendFloat64LE(buf, x+e.distance*e.cos[i])
+		buf = appendFloat64LE(buf, y+e.distance*e.sin[i])
+	}
+	// Closing vertex repeats the first, as Point.Buffer's ring does.
+	buf = appendFloat64LE(buf, x+e.distance*e.cos[0])
+	buf = appendFloat64LE(buf, y+e.distance*e.sin[0])
+	return buf
+}

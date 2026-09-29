@@ -5,6 +5,33 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.13]
+
+### Changed
+
+- **`Series.GeomBuffer` on points is much cheaper.** Round buffers of
+  point rows are now written straight to WKB from a precomputed
+  cos/sin table, skipping the `Point` → `Polygon` → WKB round trip. The
+  output bytes are identical to before; a test checks this row by row
+  on 2D, 3D, big-endian and empty points, nulls, mixed geometry types,
+  several segment counts, and the square style.
+  - **Measured on 1M points:** allocations fell from 6.5 GB to
+    0.58 GB, the peak from 1.87 GB to 0.63 GB, and the time from
+    1.2 s to 0.23 s.
+  - **In wasm,** a 1M-point read → buffer run's memory high-water mark
+    dropped from 2.8 GB to 1.2 GB. Wasm memory never shrinks, so this
+    peak is what a browser worker keeps.
+- **Per-row geometry transforms allocate far less.** This covers
+  `GeomBuffer`, `GeomSimplify` and the other `geomTransformOp`-based
+  ops.
+  - **Reused scratch buffer:** each row is encoded into one reused
+    buffer instead of a fresh WKB slice.
+  - **Pre-sized output:** the output buffer is reserved once, sized
+    from the first 256 rows plus 1/16 headroom. Before, it grew by
+    doubling, which re-copied the whole buffer at each step and could
+    leave up to 2× slack in the final array. A 541 MB result had been
+    held in a 1.07 GB buffer.
+
 ## [v0.4.12]
 
 ### Added
