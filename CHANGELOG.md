@@ -5,6 +5,175 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.16]
+
+### Added
+
+- **Typed Series and Frame constructors from Go slices:**
+  - `NewStringSeries`, `NewFloat64Series`, `NewInt64Series` and
+    `NewBoolSeries`. Each takes a value slice plus an optional
+    validity mask: nil means every row is valid, and `validity[i] ==
+    false` marks row i null. A mask whose length doesn't match the
+    values panics.
+  - `NewTimestampSeriesUnit(name, ts, validity, unit)` stores
+    timestamps in seconds, milliseconds, microseconds or nanoseconds.
+    - **Wider range:** `NewTimestampSeries` is nanosecond-only, which
+      limits it to 1677–2262; microseconds cover ±292,000 years.
+    - **Zone-aware:** the column's zone is `"UTC"`, since a
+      `time.Time` is an absolute instant. Parquet writes it with
+      `isAdjustedToUTC=true`, and pyarrow reads it as
+      `datetime64[unit, UTC]`.
+    - **Precision and range:** precision finer than the unit is
+      floored. A valid time that doesn't fit the unit returns an error
+      instead of a wrapped value.
+  - `NewFrameFromSeries(series...)` builds a Frame from Series in
+    order, keeping each Series' field (type, nullability, geometry
+    tags). The Frame takes its own reference on each column, so your
+    Series stay usable. Series lengths must match
+    (`ErrColumnLenMismatch`), and names must be unique (the new
+    `ErrDuplicateColumn`).
+- **Lenient Series extractors: `AsStrings`, `AsFloat64s` and
+  `AsTimes(layouts...)`.** Unlike `Strings`, `Float64s` and
+  `Timestamps`, they convert across types instead of erroring when the
+  type doesn't match.
+  - **Return values:** each returns `(values, nulls, err)`, where
+    `nulls[i]` means the same as in `Nulls()`. A value that can't be
+    converted is null, such as `"n/a"` in `AsFloat64s` or a string no
+    layout matches in `AsTimes`. To find those values, compare with
+    `Nulls()`. An error means the column's type has no conversion at
+    all. Dictionary-encoded columns are read through their dictionary,
+    and that includes a dictionary timestamp column's time zone.
+  - **`AsStrings`** converts every type:
+    - **floats:** in the shortest form that round-trips, using
+      JavaScript's `Number.prototype.toString` rule:
+      - fixed notation for 1e-7 ≤ |x| < 1e21, exponent form outside
+        that range;
+      - an integral float prints as an integer, so `366999001.0` is
+        `"366999001"`;
+      - IDs stored as float64 therefore match the same IDs read from an
+        int64 column. pandas stores an int column as float64 when it
+        has nulls.
+    - **integers:** in base 10;
+    - **timestamps:** RFC 3339 in the column's zone;
+    - **dates:** `2006-01-02`;
+    - **geometry:** WKT;
+    - **anything else:** Arrow's own text form, such as `[1,2]` for a
+      list.
+  - **`AsFloat64s`** reads every integer, float and decimal type, plus
+    booleans (1 and 0). It also reads strings after trimming spaces.
+  - **`AsTimes`** reads timestamps of any unit in their zone, dates as
+    midnight UTC, and strings by layout.
+    - **Default layouts:** RFC 3339, the same with a space instead of
+      `T`, both without an offset (read as UTC), and `2006-01-02`.
+    - **Passing layouts replaces the defaults** instead of adding to
+      them. For example, `AsTimes("01/02/2006")` turns RFC 3339 strings
+      into nulls.
+    - **Numbers are an error,** because the epoch unit would be a
+      guess.
+  - **Fast path:** arrow-go's `compute.CastArray` does the work when it
+    gives the same result. On 1M rows, int64 → float64 takes 1.1 ms.
+    If its strict cast fails, for example on one bad string, the column
+    is converted row by row.
+- **New `jsonio` package reads JSON records.** `jsonio.Read` and
+  `jsonio.ReadFile` accept a JSON array of objects or newline-delimited
+  JSON (NDJSON). The format is detected from the first byte, or you can
+  set it with `ReadOptions.Format`.
+  - **Rows and columns:** each object is a row, and columns appear in
+    the order their keys are first seen. A missing key or `null` gives
+    a null cell. A Frame's row count comes from its columns, so input
+    made only of empty objects reads as an empty Frame.
+  - **Strict parsing:** it uses `encoding/json/jsontext` (json v2) with
+    its default strictness, so a key repeated within one object, or
+    invalid UTF-8, is an error.
+  - **No float64 rounding on the way in:** numbers are kept as their
+    literal text until the column's type is decided.
+  - **Column types:**
+    - all `true`/`false` → Boolean;
+    - all integers that fit int64 → Int64, so an ID above 2^53 keeps
+      its exact value;
+    - other numbers → Float64, but only if every integer in the column
+      converts to float64 exactly;
+    - all strings → String.
+  - **String fallback:** these columns become String:
+    - mixed kinds;
+    - an integer float64 can't hold exactly in a column that would
+      otherwise be Float64;
+    - integers too large for int64;
+    - numbers outside float64's range;
+    - nested objects or arrays.
+
+    In a String column, strings keep their value with no quotes.
+    Numbers, booleans and nested values become their JSON text: numbers
+    as written, nested values compacted. So `[7, "a"]` reads as `"7"`
+    and `"a"`.
+  - **`ReadOptions.AllStrings`** reads every column as String.
+  - **Errors:** a record that isn't an object returns `ErrNotObject`.
+  - **Throughput:** values are stored in one text buffer per column,
+    and each number is parsed once. 100k NDJSON rows read at about
+    200 MB/s.
+- **`csvio.ReadStrings` reads a CSV without a struct.** Its variants
+  are `ReadFileStrings`, `ReadStringsChunksFunc` and
+  `ReadFileStringsChunksFunc`.
+  - **Columns and values:** columns come from the header, and every
+    column is String. No type inference runs, so `00123` stays
+    `00123`.
+  - **Header handling:**
+    - A blank header cell is named `f<i>`, and without a header the
+      columns are `f0`, `f1`, ….
+    - Duplicate names return the new `ErrDuplicateHeader`.
+  - **Rows:** a row with a different field count from the first returns
+    `ErrRowFieldCountMismatch`.
+  - **Same as `Read`:** empty cells and `NullTokens` read as null, and
+    compression, `SkipRows`, `Delimiter`, `Comment` and `LazyQuotes`
+    behave the same way.
+- **`parquetio.ReadSchemaReader(r io.ReaderAt, size, opts)`**, the
+  `io.ReaderAt` counterpart to `ReadSchema`. It reads only the footer,
+  so you can get a schema from an object already in memory, such as an
+  S3 object.
+
+### Changed
+
+- **Parquet writes no longer copy footer keys that describe the source
+  file's columns** from a Frame's schema metadata. These are `pandas`,
+  `org.apache.spark.sql.parquet.row.metadata`, `iceberg.schema`,
+  `parquet.avro.schema` and `avro.schema`.
+  - **Why:** reads now carry these keys onto the Frame. After a
+    Select, Drop, Rename or WithColumn they would describe columns that
+    no longer match, and pandas and Spark trust them.
+  - **Still possible:** to write one on purpose, pass it in
+    `WriteOptions.KeyValueMetadata`.
+- **`NewTimestampSeries` panics with a clear message** when its
+  validity mask has the wrong length; before, it was an index panic.
+  - Its doc now notes that its column has no zone, so Parquet writes it
+    with `isAdjustedToUTC=false`. Call `.WithTimezone("UTC")` on the
+    result, or use `NewTimestampSeriesUnit`, for a zone-aware column.
+  - Existing output is unchanged.
+
+### Fixed
+
+- **Parquet reads keep the footer's key/value metadata.** `ReadFile`,
+  `ReadReader`, `ReadFileChunksFunc`, `ReadReaderChunksFunc`,
+  `ScanFile` and `ReadSchema` now put every footer entry into the
+  returned schema's metadata, except `ARROW:schema`.
+  - **What's included:** entries written with
+    `WriteOptions.KeyValueMetadata` and by other writers. Before, only
+    `geo` came through, because pqarrow doesn't copy footer metadata
+    onto the Arrow schema.
+  - **Which value wins:**
+    - The footer is authoritative, so its entry replaces the same key
+      from the embedded Arrow schema.
+    - A key that appears more than once keeps its first value, the same
+      value `KeyValueMetadata.FindValue` returns.
+  - **Streaming cost:** streaming reads build this schema once per
+    file, not once per batch.
+  - **Writing it back:** writing a frame you read keeps one footer
+    entry per key, and `WriteOptions.KeyValueMetadata` still replaces a
+    key carried over from the read.
+- **CSV reads handle a UTF-8 byte-order mark before a quoted header,**
+  which is how Excel's "CSV UTF-8" format starts. The mark is now
+  removed from the byte stream before parsing. Before, both `Read[T]`
+  and `ReadStrings` failed with `bare " in non-quoted-field`.
+
 ## [v0.4.15]
 
 ### Changed

@@ -45,6 +45,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/apache/arrow-go/v18/parquet/metadata"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 
 	"github.com/zoobst/gobi"
@@ -423,10 +424,29 @@ func writerSchema(s *arrow.Schema, drop map[string]bool) *arrow.Schema {
 	return arrow.NewSchemaWithEndian(s.Fields(), &stripped, s.Endianness())
 }
 
-// footerKeys is the set of footer keys gobi writes itself for a file:
-// "geo" when it has geometry, plus every KeyValueMetadata key.
+// columnDescribingKeys are footer keys other writers use to describe
+// the file's columns. A Frame read from such a file carries them in
+// its schema metadata, but after a Select / Drop / Rename / WithColumn
+// they no longer match, and their readers trust them: pandas rebuilds
+// the index and dtypes from "pandas", Spark its read schema from the
+// row metadata. So writes never copy them from schema metadata; set
+// one through WriteOptions.KeyValueMetadata to write it deliberately.
+var columnDescribingKeys = []string{
+	"pandas",
+	"org.apache.spark.sql.parquet.row.metadata",
+	"iceberg.schema",
+	"parquet.avro.schema",
+	"avro.schema",
+}
+
+// footerKeys is the set of schema-metadata keys a write must not copy
+// into the footer: the ones gobi writes itself ("geo" when the file
+// has geometry, every KeyValueMetadata key) and columnDescribingKeys.
 func footerKeys(hasGeo bool, opts *WriteOptions) map[string]bool {
-	keys := make(map[string]bool, len(opts.KeyValueMetadata)+1)
+	keys := make(map[string]bool, len(opts.KeyValueMetadata)+1+len(columnDescribingKeys))
+	for _, k := range columnDescribingKeys {
+		keys[k] = true
+	}
 	if hasGeo {
 		keys[gobi.GeoParquetMetadataKey] = true
 	}
@@ -577,8 +597,9 @@ func (c Codec) toArrow() (compress.Compression, error) {
 }
 
 // ReadSchema opens path, reads just the parquet footer, and returns
-// the arrow schema of the file — projected through opts.Columns and
-// stamped with the GeoParquet "geo" metadata if present.
+// the arrow schema of the file — projected through opts.Columns, with
+// the footer's key/value metadata (minus ARROW:schema) as schema
+// metadata, and stamped with the GeoParquet "geo" metadata if present.
 //
 // Reads no column data. Used by ScanFile to populate a lazy plan
 // node's output schema without materializing any rows.
@@ -588,7 +609,23 @@ func ReadSchema(path string, opts *ReadOptions) (*arrow.Schema, error) {
 		return nil, err
 	}
 	defer rc.close()
+	return readSchema(rc, opts)
+}
 
+// ReadSchemaReader is the io.ReaderAt-backed counterpart to
+// ReadSchema: it reads only the footer of a Parquet payload whose size
+// is known upfront (an in-memory object, a ranged S3 reader). The
+// caller retains ownership of r.
+func ReadSchemaReader(r io.ReaderAt, size int64, opts *ReadOptions) (*arrow.Schema, error) {
+	rc, err := openReaderFromRS(newReaderAtSeeker(r, size), noopCloser{}, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.close()
+	return readSchema(rc, opts)
+}
+
+func readSchema(rc *readerContext, opts *ReadOptions) (*arrow.Schema, error) {
 	arrowSchema, err := rc.reader.Schema()
 	if err != nil {
 		return nil, err
@@ -628,11 +665,7 @@ func ReadSchema(path string, opts *ReadOptions) (*arrow.Schema, error) {
 		}
 	}
 
-	// Attach the "geo" key if the file carried one.
-	if rc.geoRaw != "" {
-		return attachGeoKey(arrowSchema, rc.geoRaw)
-	}
-	return arrowSchema, nil
+	return rc.outputSchema(arrowSchema)
 }
 
 // exprAlreadyApplied reports whether pred appears anywhere in the
@@ -819,7 +852,7 @@ func ReadFile(path string, opts *ReadOptions) (*gobi.Frame, error) {
 		return nil, err
 	}
 	defer table.Release() // frameFromTable Retains what the Frame keeps
-	return frameFromTable(table, rc.geoRaw, rc.hideCovering)
+	return frameFromTable(table, rc)
 }
 
 // ReadFileChunksFunc streams path as record-batch-sized Frames. fn is
@@ -849,7 +882,7 @@ func ReadFileChunksFunc(path string, opts *ReadOptions, fn func(*gobi.Frame) err
 
 	for rr.Next() {
 		rec := rr.RecordBatch()
-		frame, err := frameFromRecord(rec, rc.geoRaw, rc.hideCovering)
+		frame, err := frameFromRecord(rec, rc)
 		if err != nil {
 			return err
 		}
@@ -897,7 +930,7 @@ func ReadReader(r io.ReaderAt, size int64, opts *ReadOptions) (*gobi.Frame, erro
 		return nil, err
 	}
 	defer table.Release() // frameFromTable Retains what the Frame keeps
-	return frameFromTable(table, rc.geoRaw, rc.hideCovering)
+	return frameFromTable(table, rc)
 }
 
 // ReadReaderChunksFunc is the io.ReaderAt-backed counterpart to
@@ -922,7 +955,7 @@ func ReadReaderChunksFunc(r io.ReaderAt, size int64, opts *ReadOptions, fn func(
 
 	for rr.Next() {
 		rec := rr.RecordBatch()
-		frame, err := frameFromRecord(rec, rc.geoRaw, rc.hideCovering)
+		frame, err := frameFromRecord(rec, rc)
 		if err != nil {
 			return err
 		}
@@ -1185,6 +1218,15 @@ type readerContext struct {
 	colIndices  []int
 	rowGroups   []int
 	geoRaw      string
+	// footerMeta is the file's footer key/value metadata minus
+	// ARROW:schema (see footerMetadata). outputSchema puts it on every
+	// schema and Frame the read paths return.
+	footerMeta arrow.Metadata
+	// hidden is coveringColumnNames(geoRaw, hideCovering), parsed once
+	// at open rather than per batch.
+	hidden map[string]struct{}
+	// outIn / out cache outputSchema's last input and result.
+	outIn, out *arrow.Schema
 	// hideCovering: opts.IncludeCoveringColumns was false → the
 	// output Frame should drop bbox covering columns declared in
 	// geoRaw. The columns are still read from parquet (needed for
@@ -1243,11 +1285,10 @@ func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOpt
 		return nil, err
 	}
 
+	kv := pf.MetaData().KeyValueMetadata()
 	geoRaw := ""
-	if kv := pf.MetaData().KeyValueMetadata(); kv != nil {
-		if v := kv.FindValue(gobi.GeoParquetMetadataKey); v != nil {
-			geoRaw = *v
-		}
+	if v := kv.FindValue(gobi.GeoParquetMetadataKey); v != nil {
+		geoRaw = *v
 	}
 
 	fr, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{
@@ -1301,6 +1342,8 @@ func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOpt
 		colIndices:   colIndices,
 		rowGroups:    rowGroups,
 		geoRaw:       geoRaw,
+		footerMeta:   footerMetadata(kv),
+		hidden:       coveringColumnNames(geoRaw, !opts.IncludeCoveringColumns),
 		hideCovering: !opts.IncludeCoveringColumns,
 	}, nil
 }
@@ -1365,10 +1408,10 @@ func chunkRows(opts *ReadOptions) int64 {
 // Frame construction
 // -----------------------------------------------------------------------------
 
-// frameFromTable wraps table's columns in a Frame, attaching the geo
-// metadata blob to the schema if present. When hideCovering is true,
-// the GeoParquet 1.1 covering-bbox columns declared in geoRaw are
-// dropped from the returned frame — preserving the WriteFile ↔
+// frameFromTable wraps table's columns in a Frame whose schema carries
+// the file's footer key/value metadata (see outputSchema). When
+// rc.hideCovering is true, the GeoParquet 1.1 covering-bbox columns
+// declared in rc.geoRaw are dropped from the returned frame — preserving the WriteFile ↔
 // ReadFile round-trip contract (the bbox columns still exist in the
 // file and are used by predicate pushdown before this call runs).
 //
@@ -1380,16 +1423,12 @@ func chunkRows(opts *ReadOptions) int64 {
 // Release isn't called, or (b) double-decrement when both
 // Table.Release and Frame.Release run against the same underlying
 // Chunked.
-func frameFromTable(table arrow.Table, geoRaw string, hideCovering bool) (*gobi.Frame, error) {
-	schema := table.Schema()
-	if geoRaw != "" {
-		var err error
-		schema, err = attachGeoKey(schema, geoRaw)
-		if err != nil {
-			return nil, err
-		}
+func frameFromTable(table arrow.Table, rc *readerContext) (*gobi.Frame, error) {
+	schema, err := rc.outputSchema(table.Schema())
+	if err != nil {
+		return nil, err
 	}
-	hidden := coveringColumnNames(geoRaw, hideCovering)
+	hidden := rc.hidden
 	keptFields := make([]arrow.Field, 0, table.NumCols())
 	keptCols := make([]arrow.Column, 0, table.NumCols())
 	for i := int64(0); i < table.NumCols(); i++ {
@@ -1415,16 +1454,12 @@ func frameFromTable(table arrow.Table, geoRaw string, hideCovering bool) (*gobi.
 // arrow.NewColumnFromArr, which Retains each array once — so the Frame
 // owns its refs and the source record can be Released independently.
 // Honors hideCovering the same way as frameFromTable.
-func frameFromRecord(rec arrow.RecordBatch, geoRaw string, hideCovering bool) (*gobi.Frame, error) {
-	schema := rec.Schema()
-	if geoRaw != "" {
-		var err error
-		schema, err = attachGeoKey(schema, geoRaw)
-		if err != nil {
-			return nil, err
-		}
+func frameFromRecord(rec arrow.RecordBatch, rc *readerContext) (*gobi.Frame, error) {
+	schema, err := rc.outputSchema(rec.Schema())
+	if err != nil {
+		return nil, err
 	}
-	hidden := coveringColumnNames(geoRaw, hideCovering)
+	hidden := rc.hidden
 	n := int(rec.NumCols())
 	keptFields := make([]arrow.Field, 0, n)
 	keptCols := make([]arrow.Column, 0, n)
@@ -1530,6 +1565,74 @@ func coveringColumnNames(geoRaw string, hideCovering bool) map[string]struct{} {
 // detail.
 func marshalGeoMeta(meta *gobi.GeoParquetMetadata) (string, error) {
 	return gobi.MarshalGeoParquetMetadata(meta)
+}
+
+// footerMetadata copies a parquet footer's key/value metadata into
+// Arrow schema metadata, minus ARROW:schema (pqarrow's serialized
+// schema, which the writer regenerates). A key repeated in the footer
+// keeps its first value — the one KeyValueMetadata.FindValue returns.
+func footerMetadata(kv metadata.KeyValueMetadata) arrow.Metadata {
+	keys := make([]string, 0, len(kv))
+	values := make([]string, 0, len(kv))
+	seen := make(map[string]bool, len(kv))
+	for _, e := range kv {
+		if e.Key == arrowSchemaKey || seen[e.Key] {
+			continue
+		}
+		seen[e.Key] = true
+		v := ""
+		if e.Value != nil {
+			v = *e.Value
+		}
+		keys = append(keys, e.Key)
+		values = append(values, v)
+	}
+	return arrow.NewMetadata(keys, values)
+}
+
+// outputSchema is the schema every read path hands back for the file:
+// s plus the footer key/value metadata, then attachGeoKey when the
+// file has a "geo" entry. pqarrow doesn't carry footer metadata onto
+// the Arrow schema, so without this a key written via
+// WriteOptions.KeyValueMetadata (or by another writer) would be
+// invisible to readers. The footer is authoritative: a footer entry
+// replaces the same key already on s.
+//
+// Writing the Frame back keeps one entry per key: pqarrow copies
+// schema metadata to the footer, and writerSchema drops the keys
+// gobi writes itself plus the ones that describe the old columns.
+//
+// Every batch of a streaming read shares one input schema, so the
+// result is cached per input schema; a readerContext is used from one
+// goroutine.
+func (rc *readerContext) outputSchema(s *arrow.Schema) (*arrow.Schema, error) {
+	if rc.outIn != nil && rc.outIn == s {
+		return rc.out, nil
+	}
+	in := s
+	if rc.footerMeta.Len() > 0 {
+		keys := append([]string(nil), rc.footerMeta.Keys()...)
+		values := append([]string(nil), rc.footerMeta.Values()...)
+		if s.HasMetadata() {
+			md := s.Metadata()
+			for i, k := range md.Keys() {
+				if rc.footerMeta.FindKey(k) < 0 {
+					keys = append(keys, k)
+					values = append(values, md.Values()[i])
+				}
+			}
+		}
+		md := arrow.NewMetadata(keys, values)
+		s = arrow.NewSchemaWithEndian(s.Fields(), &md, s.Endianness())
+	}
+	if rc.geoRaw != "" {
+		var err error
+		if s, err = attachGeoKey(s, rc.geoRaw); err != nil {
+			return nil, err
+		}
+	}
+	rc.outIn, rc.out = in, s
+	return s, nil
 }
 
 // attachGeoKey returns schema with the "geo" file-level metadata key set

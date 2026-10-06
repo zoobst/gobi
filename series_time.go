@@ -752,7 +752,18 @@ func roundedDivTimestamp(v, div arrow.Timestamp) arrow.Timestamp {
 // NewTimestampSeries builds a Timestamp[ns] Series from the given
 // time.Time values. Passing a nil validity slice means every row is valid;
 // otherwise validity[i]==false marks row i as null (its value is ignored).
+//
+// Nanoseconds only reach 1677-09-21 to 2262-04-11; a time outside
+// that range doesn't fit (time.Time.UnixNano is undefined there). Use
+// NewTimestampSeriesUnit with a coarser unit for dates beyond it.
+//
+// The column has no time zone, so Parquet writes it
+// isAdjustedToUTC=false and pyarrow / pandas read it as zone-naive
+// datetime64[ns], although the values are UTC instants. For a
+// zone-aware column call .WithTimezone("UTC") on the result, or use
+// NewTimestampSeriesUnit, which sets UTC.
 func NewTimestampSeries(name string, ts []time.Time, validity []bool) Series {
+	checkValidityLen("NewTimestampSeries", len(ts), validity)
 	vals := make([]arrow.Timestamp, len(ts))
 	for i, t := range ts {
 		if validity == nil || validity[i] {

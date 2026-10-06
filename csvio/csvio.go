@@ -8,6 +8,10 @@
 // geometry or time.Time are read as strings and post-transformed into
 // their target types (WKB Binary / Timestamp[ns]) in a single bulk pass
 // per column.
+//
+// For CSVs whose columns aren't known at compile time, ReadStrings and
+// its file / streaming variants take columns from the header and read
+// every cell as a String, with no type inference.
 package csvio
 
 import (
@@ -154,6 +158,7 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 	// SkipRows is applied to the raw stream before Arrow's reader sees
 	// it, so the header row (if any) still counts against Arrow's own
 	// parser rather than being consumed here.
+	r = skipBOM(r)
 	if opts.SkipRows > 0 {
 		br := bufio.NewReader(r)
 		for range opts.SkipRows {
@@ -282,6 +287,18 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 		chunked.Release()
 	}
 	return gobi.NewFrame(outSchema, cols)
+}
+
+// skipBOM drops a UTF-8 byte-order mark (as Excel writes) from the
+// start of r. It has to go before the CSV parser runs: left in, it
+// makes a quoted first header cell parse as an unquoted field holding
+// a stray quote, which is a parse error.
+func skipBOM(r io.Reader) io.Reader {
+	br := bufio.NewReader(r)
+	if b, err := br.Peek(3); err == nil && string(b) == "\xef\xbb\xbf" {
+		_, _ = br.Discard(3)
+	}
+	return br
 }
 
 // chunkRows resolves the effective row batch size.
@@ -421,6 +438,7 @@ func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 	}
 	sc.plan = plan
 
+	r = skipBOM(r)
 	if opts.SkipRows > 0 {
 		br := bufio.NewReader(r)
 		for range opts.SkipRows {

@@ -13,8 +13,9 @@ import (
 //
 // Every method:
 //   - Returns an error if the Series' arrow type doesn't match the
-//     method's declared T. No implicit widening; cast explicitly if
-//     you need it (a future gobi.Cast expression will help here).
+//     method's declared T. No implicit widening: for that, use the
+//     lenient AsStrings / AsFloat64s / AsTimes (series_as.go), or
+//     Expr.Cast for numeric-to-numeric inside a plan.
 //   - Returns a NEW slice that owns its memory — safe to mutate,
 //     safe to hold past the source Frame's Release.
 //   - Represents nulls as the type's zero value. Pair with Nulls()
