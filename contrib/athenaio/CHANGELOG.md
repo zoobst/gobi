@@ -9,6 +9,41 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.19]
+
+### Fixed
+
+- **Cancelling a request now stops the Athena query.** Before, if the
+  caller's context was cancelled or hit its deadline while athenaio was
+  waiting on a query, athenaio returned the context error but left the
+  query running in Athena, still scanning and billing, until it
+  finished on its own. The same happened when `MaxPollDuration` ran
+  out.
+  - **What athenaio does now:** it calls `StopQueryExecution` for the
+    abandoned query. This covers every query path, since they share
+    one poll loop: `RawQuery`, the partition-column prepass, and all
+    the CTAS, bucketed and manifest variants.
+  - **Errors still match as before:** `errors.Is(err,
+    context.Canceled)`, `context.DeadlineExceeded` or
+    `ErrQueryTimeout`, and the message now names the query ID.
+  - **Stopping is best effort:** it runs on a fresh context with a
+    10-second limit, since the caller's is already cancelled. If the
+    stop call fails, athenaio reports it through `WarnLog` and joins it
+    into the returned error, since the query may still be running.
+  - **Not covered:** a context cancelled while `StartQueryExecution`
+    is still in flight. If Athena accepted the query but the response
+    never arrived, athenaio has no query ID to stop.
+
+### Changed (breaking)
+
+- **`AthenaAPI` gains `StopQueryExecution`.** The real `*athena.Client`
+  already implements it, so code passing the SDK client is unaffected.
+  Custom implementations (test mocks, instrumentation wrappers) must
+  add the method, and wrappers must forward it to the real client. It's
+  a compile-time requirement rather than an optional runtime check on
+  purpose: a wrapper that silently dropped the call would leave
+  cancelled queries running, which is the bug this release fixes.
+
 ## [v0.1.18]
 
 ### Added

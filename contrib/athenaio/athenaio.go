@@ -122,6 +122,12 @@ type AthenaAPI interface {
 	StartQueryExecution(ctx context.Context, in *athena.StartQueryExecutionInput, opts ...func(*athena.Options)) (*athena.StartQueryExecutionOutput, error)
 	GetQueryExecution(ctx context.Context, in *athena.GetQueryExecutionInput, opts ...func(*athena.Options)) (*athena.GetQueryExecutionOutput, error)
 	GetQueryResults(ctx context.Context, in *athena.GetQueryResultsInput, opts ...func(*athena.Options)) (*athena.GetQueryResultsOutput, error)
+	// StopQueryExecution cancels a running query. athenaio calls it
+	// when the caller's context is cancelled, or MaxPollDuration
+	// elapses, while a query is still running, so abandoned queries
+	// stop scanning (and billing) instead of running to completion.
+	// Wrappers must forward it to the real client.
+	StopQueryExecution(ctx context.Context, in *athena.StopQueryExecutionInput, opts ...func(*athena.Options)) (*athena.StopQueryExecutionOutput, error)
 }
 
 // S3API is the subset of the aws-sdk-go-v2 S3 client that athenaio

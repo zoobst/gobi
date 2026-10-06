@@ -2,6 +2,7 @@ package athenaio
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -121,6 +122,12 @@ func (c *Client) submitTo(ctx context.Context, sql, outputLocation string) (stri
 // pollUntilDone loops GetQueryExecution until the state is terminal,
 // ctx cancels, or MaxPollDuration elapses. Uses exponential backoff
 // starting at PollInterval, capped at defaultPollMax.
+//
+// When it gives up on a query that is still running — ctx cancelled
+// or deadline exceeded, MaxPollDuration elapsed — it asks Athena to
+// stop the query (see abandonQuery). The returned error still matches
+// errors.Is(err, context.Canceled / context.DeadlineExceeded /
+// ErrQueryTimeout) as before.
 func (c *Client) pollUntilDone(ctx context.Context, queryID string) (*athenatypes.QueryExecution, error) {
 	interval := c.cfg.PollInterval
 	if interval <= 0 {
@@ -136,6 +143,11 @@ func (c *Client) pollUntilDone(ctx context.Context, queryID string) (*athenatype
 			QueryExecutionId: aws.String(queryID),
 		})
 		if err != nil {
+			if ctx.Err() != nil {
+				// The poll failed because the caller gave up, not
+				// because Athena did: the query is still running.
+				return nil, c.abandonQuery(ctx, queryID, ctx.Err())
+			}
 			return nil, fmt.Errorf("athenaio: GetQueryExecution %s: %w", queryID, err)
 		}
 		if out.QueryExecution == nil {
@@ -159,13 +171,15 @@ func (c *Client) pollUntilDone(ctx context.Context, queryID string) (*athenatype
 		}
 		// Not terminal — sleep + backoff.
 		if !deadline.IsZero() && time.Now().After(deadline) {
-			return nil, fmt.Errorf("%w: %s after %s (last state=%s)",
-				ErrQueryTimeout, queryID, c.cfg.MaxPollDuration, state)
+			return nil, c.abandonQuery(ctx, queryID, fmt.Errorf("%w: %s after %s (last state=%s)",
+				ErrQueryTimeout, queryID, c.cfg.MaxPollDuration, state))
 		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(interval):
+			timer.Stop()
+			return nil, c.abandonQuery(ctx, queryID, ctx.Err())
+		case <-timer.C:
 		}
 		if interval < defaultPollMax {
 			interval *= 2
@@ -174,6 +188,32 @@ func (c *Client) pollUntilDone(ctx context.Context, queryID string) (*athenatype
 			}
 		}
 	}
+}
+
+// stopQueryTimeout bounds the StopQueryExecution call abandonQuery
+// makes. It runs on a fresh context (the caller's is usually already
+// cancelled), so it needs its own limit.
+const stopQueryTimeout = 10 * time.Second
+
+// abandonQuery stops a query the caller is no longer waiting for and
+// returns cause, annotated with the query ID. Stopping is best
+// effort: Athena may finish the query first, and a failed stop is
+// logged through WarnLog and joined into the error rather than
+// replacing cause, so errors.Is checks on cause keep working.
+func (c *Client) abandonQuery(ctx context.Context, queryID string, cause error) error {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopQueryTimeout)
+	defer cancel()
+	_, err := c.athena.StopQueryExecution(sctx, &athena.StopQueryExecutionInput{
+		QueryExecutionId: aws.String(queryID),
+	})
+	abandoned := fmt.Errorf("athenaio: query %s stopped: %w", queryID, cause)
+	if err != nil {
+		if c.warnLog != nil {
+			c.warnLog("athenaio: StopQueryExecution %s failed; the query may still be running: %v", queryID, err)
+		}
+		return errors.Join(abandoned, fmt.Errorf("athenaio: StopQueryExecution %s: %w", queryID, err))
+	}
+	return abandoned
 }
 
 // scannedBytes pulls DataScannedInBytes off a completed query. Zero

@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -48,6 +49,32 @@ type mockAthena struct {
 	// the query returns that terminal state instead of Succeeded.
 	forceFailState  athenatypes.QueryExecutionState
 	forceFailReason string
+
+	stopRecorder
+}
+
+// stopRecorder implements StopQueryExecution for the mocks: it records
+// every stopped query ID and returns stopErr if set.
+type stopRecorder struct {
+	stopMu  sync.Mutex
+	stopped []string
+	stopErr error
+}
+
+func (r *stopRecorder) StopQueryExecution(ctx context.Context, in *athena.StopQueryExecutionInput, opts ...func(*athena.Options)) (*athena.StopQueryExecutionOutput, error) {
+	r.stopMu.Lock()
+	defer r.stopMu.Unlock()
+	r.stopped = append(r.stopped, aws.ToString(in.QueryExecutionId))
+	if r.stopErr != nil {
+		return nil, r.stopErr
+	}
+	return &athena.StopQueryExecutionOutput{}, nil
+}
+
+func (r *stopRecorder) stoppedIDs() []string {
+	r.stopMu.Lock()
+	defer r.stopMu.Unlock()
+	return append([]string(nil), r.stopped...)
 }
 
 func (m *mockAthena) StartQueryExecution(ctx context.Context, in *athena.StartQueryExecutionInput, opts ...func(*athena.Options)) (*athena.StartQueryExecutionOutput, error) {
@@ -371,6 +398,9 @@ func TestRawQuery_HappyPath(t *testing.T) {
 	if mockA.lastSQL != "SELECT id, v FROM t" {
 		t.Errorf("lastSQL = %q, want the user SQL untouched", mockA.lastSQL)
 	}
+	if got := mockA.stoppedIDs(); len(got) != 0 {
+		t.Errorf("successful query was stopped: %v", got)
+	}
 
 	// Collect the LazyFrame and confirm we round-tripped the mock data.
 	f, err := lf.Collect()
@@ -449,6 +479,8 @@ type mockCTASAthena struct {
 	// Iceberg-fallback path.
 	forceFailState  athenatypes.QueryExecutionState
 	forceFailReason string
+
+	stopRecorder
 }
 
 func (m *mockCTASAthena) StartQueryExecution(ctx context.Context, in *athena.StartQueryExecutionInput, opts ...func(*athena.Options)) (*athena.StartQueryExecutionOutput, error) {
@@ -701,6 +733,10 @@ func (w *mockCTASAthenaWithSideEffect) StartQueryExecution(ctx context.Context, 
 
 func (w *mockCTASAthenaWithSideEffect) GetQueryExecution(ctx context.Context, in *athena.GetQueryExecutionInput, opts ...func(*athena.Options)) (*athena.GetQueryExecutionOutput, error) {
 	return w.inner.GetQueryExecution(ctx, in, opts...)
+}
+
+func (w *mockCTASAthenaWithSideEffect) StopQueryExecution(ctx context.Context, in *athena.StopQueryExecutionInput, opts ...func(*athena.Options)) (*athena.StopQueryExecutionOutput, error) {
+	return w.inner.StopQueryExecution(ctx, in, opts...)
 }
 
 // GetQueryResults delegates to a per-instance columns list when set
