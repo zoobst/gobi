@@ -34,7 +34,10 @@
 
 package compute
 
-import "simd"
+import (
+	"math"
+	"simd"
+)
 
 // BoundsF64 — lane-parallel min/max reduce on parallel Xs/Ys.
 // Matches the scalar signature; scalar tail handles the last
@@ -53,13 +56,34 @@ func BoundsF64(xs, ys []float64) (minX, minY, maxX, maxY float64, ok bool) {
 		return 0, 0, 0, 0, false
 	}
 	n := min(len(ys), len(xs))
+	if n < boundsSIMDMinSize {
+		// Checked before the lane query so small inputs pay nothing
+		// for the SIMD build.
+		minX, minY, maxX, maxY = boundsF64Scalar(xs, ys, n)
+		return minX, minY, maxX, maxY, true
+	}
 	lane := simd.BroadcastFloat64s(0).Len()
-	if lane < 4 || n < lane {
+	if lane < 4 || lane > maxSIMDLanes {
 		minX, minY, maxX, maxY = boundsF64Scalar(xs, ys, n)
 		return minX, minY, maxX, maxY, true
 	}
 	return boundsF64SIMDBody(xs, ys, n, lane)
 }
+
+// centroidSIMDMinSize is the ring size below which
+// PolygonCentroidShoelace stays scalar (AVX2 crossover is between 1K
+// and 64K points; see the note in PolygonCentroidShoelace).
+const centroidSIMDMinSize = 8192
+
+// boundsSIMDMinSize is the input size below which BoundsF64 stays
+// scalar. The vector body has a fixed cost (spilling and reducing six
+// accumulators); on AVX2 (Ryzen 7 5800X) the scalar loop won outright
+// at 64 points and SIMD won 2.8× at 1K and 4.6× from 64K up.
+const boundsSIMDMinSize = 256
+
+// maxSIMDLanes bounds the stack scratch used by the horizontal
+// reduces: 8 float64 lanes is the widest current target (AVX-512).
+const maxSIMDLanes = 8
 
 // boundsF64Scalar is the 2-lane fallback: scalar min/max reduce
 // over parallel xs/ys. Preserves the original one-else-if shape
@@ -67,23 +91,7 @@ func BoundsF64(xs, ys []float64) (minX, minY, maxX, maxY float64, ok bool) {
 // matching or beating explicit SIMD).
 // Caller must ensure n > 0.
 func boundsF64Scalar(xs, ys []float64, n int) (minX, minY, maxX, maxY float64) {
-	minX, maxX = xs[0], xs[0]
-	minY, maxY = ys[0], ys[0]
-	for i := 1; i < n; i++ {
-		x := xs[i]
-		if x < minX {
-			minX = x
-		} else if x > maxX {
-			maxX = x
-		}
-		y := ys[i]
-		if y < minY {
-			minY = y
-		} else if y > maxY {
-			maxY = y
-		}
-	}
-	return
+	return boundsF64ScalarNaN(xs, ys, n)
 }
 
 // boundsF64SIMDBody is the lane-parallel min/max reduce. Callable
@@ -97,6 +105,12 @@ func boundsF64SIMDBody(xs, ys []float64, n, lane int) (minX, minY, maxX, maxY fl
 	yAcc := simd.LoadFloat64s(ys)
 	minXV, maxXV := xAcc, xAcc
 	minYV, maxYV := yAcc, yAcc
+	// NaN tracking: a lane is NaN iff v != v. Hardware min/max can't
+	// be trusted with NaN — arm64 FMAX/FMIN propagate it, x86
+	// MAXPD/MINPD return the other operand — so record it separately
+	// and apply the "any NaN → NaN" rule at the end.
+	nanXV := xAcc.NotEqual(xAcc)
+	nanYV := yAcc.NotEqual(yAcc)
 	i := lane
 	for ; i+lane <= n; i += lane {
 		xv := simd.LoadFloat64s(xs[i:])
@@ -105,36 +119,42 @@ func boundsF64SIMDBody(xs, ys []float64, n, lane int) (minX, minY, maxX, maxY fl
 		maxXV = maxXV.Max(xv)
 		minYV = minYV.Min(yv)
 		maxYV = maxYV.Max(yv)
+		nanXV = nanXV.Or(xv.NotEqual(xv))
+		nanYV = nanYV.Or(yv.NotEqual(yv))
 	}
-	// Horizontal-reduce each accumulator vector.
-	scratch := make([]float64, lane)
-	minXV.Store(scratch)
-	minX = scratch[0]
-	for _, v := range scratch[1:] {
-		if v < minX {
-			minX = v
+	// Spill all six accumulators before reading any lane back. A
+	// scalar read right after the vector store that wrote it can't be
+	// forwarded from the store buffer (wide store, narrower load at a
+	// different offset), so it stalls until the store commits — on
+	// AVX2 that cost ~300 ns per call when each reduce did its own
+	// store-then-read. Issuing every store first overlaps them, so
+	// only the first read waits. Stack arrays sized for the widest
+	// target avoid a heap scratch slice.
+	var sMinX, sMaxX, sMinY, sMaxY [maxSIMDLanes]float64
+	var mNanX, mNanY [maxSIMDLanes]int64
+	minXV.Store(sMinX[:lane])
+	maxXV.Store(sMaxX[:lane])
+	minYV.Store(sMinY[:lane])
+	maxYV.Store(sMaxY[:lane])
+	nanXV.ToInt64s().Store(mNanX[:lane])
+	nanYV.ToInt64s().Store(mNanY[:lane])
+	minX, maxX, minY, maxY = sMinX[0], sMaxX[0], sMinY[0], sMaxY[0]
+	nanX, nanY := mNanX[0] != 0, mNanY[0] != 0
+	for j := 1; j < lane; j++ {
+		if sMinX[j] < minX {
+			minX = sMinX[j]
 		}
-	}
-	maxXV.Store(scratch)
-	maxX = scratch[0]
-	for _, v := range scratch[1:] {
-		if v > maxX {
-			maxX = v
+		if sMaxX[j] > maxX {
+			maxX = sMaxX[j]
 		}
-	}
-	minYV.Store(scratch)
-	minY = scratch[0]
-	for _, v := range scratch[1:] {
-		if v < minY {
-			minY = v
+		if sMinY[j] < minY {
+			minY = sMinY[j]
 		}
-	}
-	maxYV.Store(scratch)
-	maxY = scratch[0]
-	for _, v := range scratch[1:] {
-		if v > maxY {
-			maxY = v
+		if sMaxY[j] > maxY {
+			maxY = sMaxY[j]
 		}
+		nanX = nanX || mNanX[j] != 0
+		nanY = nanY || mNanY[j] != 0
 	}
 	// Scalar tail for the leftover (n mod lane) coordinates.
 	for ; i < n; i++ {
@@ -143,13 +163,23 @@ func boundsF64SIMDBody(xs, ys []float64, n, lane int) (minX, minY, maxX, maxY fl
 			minX = x
 		} else if x > maxX {
 			maxX = x
+		} else if x != x {
+			nanX = true
 		}
 		y := ys[i]
 		if y < minY {
 			minY = y
 		} else if y > maxY {
 			maxY = y
+		} else if y != y {
+			nanY = true
 		}
+	}
+	if nanX {
+		minX, maxX = math.NaN(), math.NaN()
+	}
+	if nanY {
+		minY, maxY = math.NaN(), math.NaN()
 	}
 	return minX, minY, maxX, maxY, true
 }
@@ -167,13 +197,11 @@ func boundsF64SIMDBody(xs, ys []float64, n, lane int) (minX, minY, maxX, maxY fl
 // scalar path is already competitive because the M-series
 // out-of-order engine ILP-saturates the 5-accumulator loop.
 // Explicit SIMD is roughly flat at large sizes and pays setup
-// overhead at small sizes. `simdMinSize` (below) gates the SIMD
-// body at n≥64 so small-polygon workloads don't regress.
+// overhead at small sizes; gated off by the lane < 4 check.
 //
-// amd64 AVX2 (4-lane) / AVX-512 (8-lane): higher lane count
-// gives explicit SIMD the lane budget to beat the compiler's
-// auto-vectorization. Not measurable locally on the Apple M3
-// dev machine, but the kernel is written to scale.
+// amd64 AVX2 (4-lane, Ryzen 7 5800X): ~5.6% faster than scalar from
+// 64K points up, slower below ~1K, so the body only engages from
+// centroidSIMDMinSize points. AVX-512 (8-lane) is unmeasured.
 //
 // Semantics + numeric behavior match the scalar path.
 // Accumulator ordering differs (lane-parallel reduce vs.
@@ -185,22 +213,18 @@ func PolygonCentroidShoelace(xs, ys []float64) (cx, cy float64, ok bool) {
 	if n < 3 {
 		return 0, 0, false
 	}
+	// Size gate first, so small rings never pay for the lane query.
+	// The vector body has a fixed cost (spilling and reducing five
+	// accumulators). On AVX2 (Ryzen 7 5800X) it lost 5.6× at 64
+	// points and 27% at 1K, and won ~5.6% from 64K up; the crossover
+	// is between 1K and 64K.
+	if n < centroidSIMDMinSize {
+		return polygonCentroidShoelaceScalar(xs, ys, n)
+	}
+	// Arch gate (lane < 4): 2-lane NEON regresses per-segment work vs
+	// setup even at large n; the scalar path is competitive there.
 	lane := simd.BroadcastFloat64s(0).Len()
-	// Small-size gate: SIMD setup + horizontal reduce dominate
-	// below simdMinSize on 2-lane NEON. Threshold empirically
-	// picked from the geom_bench_test.go measurements — n<64
-	// consistently regresses on M3, n≥64 is a wash or a small
-	// win. On amd64's wider lanes the crossover is lower;
-	// keeping a single threshold trades some potential amd64
-	// benefit for portable predictability.
-	//
-	// Arch gate (lane < 4): matches the PIP kernel's Slice-8
-	// gate. 2-lane NEON regresses per-segment-work-vs-setup
-	// even at large n; the scalar path is competitive there.
-	// amd64 AVX2 (4-lane) / AVX-512 (8-lane) go through the
-	// SIMD body.
-	const simdMinSize = 64
-	if lane < 4 || n < simdMinSize || n < lane+1 {
+	if lane < 4 || lane > maxSIMDLanes || n < lane+1 {
 		return polygonCentroidShoelaceScalar(xs, ys, n)
 	}
 	return polygonCentroidShoelaceSIMDBody(xs, ys, n, lane)
@@ -209,7 +233,7 @@ func PolygonCentroidShoelace(xs, ys []float64) (cx, cy float64, ok bool) {
 // polygonCentroidShoelaceSIMDBody is the ungated shoelace kernel.
 // Callable from tests so the vector body is exercised on 2-lane
 // hardware where PolygonCentroidShoelace would otherwise take the
-// scalar path. Caller must ensure n ≥ max(simdMinSize, lane+1).
+// scalar path. Caller must ensure n ≥ lane+1 and lane ≤ maxSIMDLanes.
 func polygonCentroidShoelaceSIMDBody(xs, ys []float64, n, lane int) (cx, cy float64, ok bool) {
 	zero := simd.BroadcastFloat64s(0)
 	areaAcc, cxAcc, cyAcc, sxAcc, syAcc := zero, zero, zero, zero, zero
@@ -235,28 +259,31 @@ func polygonCentroidShoelaceSIMDBody(xs, ys []float64, n, lane int) (cx, cy floa
 		syAcc = syAcc.Add(yLo)
 	}
 
-	// Horizontal reduce each accumulator to scalar.
-	scratch := make([]float64, lane)
+	// Horizontal reduce. Spill all five accumulators before reading
+	// any lane back, for the same store-forwarding reason as
+	// boundsF64SIMDBody; each accumulator is still summed in lane
+	// order, so results are bit-identical to reducing one at a time.
+	var sArea, sCx, sCy, sSx, sSy [maxSIMDLanes]float64
+	areaAcc.Store(sArea[:lane])
+	cxAcc.Store(sCx[:lane])
+	cyAcc.Store(sCy[:lane])
+	sxAcc.Store(sSx[:lane])
+	syAcc.Store(sSy[:lane])
 	var areaTwo, cxSum, cySum, sxSum, sySum float64
-	areaAcc.Store(scratch)
-	for _, v := range scratch {
-		areaTwo += v
+	for k := range lane {
+		areaTwo += sArea[k]
 	}
-	cxAcc.Store(scratch)
-	for _, v := range scratch {
-		cxSum += v
+	for k := range lane {
+		cxSum += sCx[k]
 	}
-	cyAcc.Store(scratch)
-	for _, v := range scratch {
-		cySum += v
+	for k := range lane {
+		cySum += sCy[k]
 	}
-	sxAcc.Store(scratch)
-	for _, v := range scratch {
-		sxSum += v
+	for k := range lane {
+		sxSum += sSx[k]
 	}
-	syAcc.Store(scratch)
-	for _, v := range scratch {
-		sySum += v
+	for k := range lane {
+		sySum += sSy[k]
 	}
 
 	// Scalar tail: any segments the SIMD body didn't fit.
@@ -294,85 +321,6 @@ func polygonCentroidShoelaceSIMDBody(xs, ys []float64, n, lane int) (cx, cy floa
 	return cxSum / (3 * areaTwo), cySum / (3 * areaTwo), true
 }
 
-// PIPCrossingCount — lane-parallel even-odd crossing kernel.
-// The reformulated running-count form (Slice 6c) lets each lane
-// track its own segment's contribution independently; a
-// horizontal reduce at the tail sums the per-lane counts and
-// parity-checks the total.
-//
-// # Vector body shape
-//
-// For each lane group of `lane` interior segments, load staggered
-// coordinate windows (xs[j:] as segment starts j, xs[j+1:] as
-// ends i). The crossing test per lane uses a **divless
-// reformulation** — the scalar path evaluates
-// `tx < (xj-xi)*(ty-yi)/(yj-yi) + xi` which pays a per-lane
-// float64 divide even when the straddle mask is false. Vectorized
-// as-is this loses badly to the scalar branch (Apple M3: 2.4×
-// slower; the scalar body only computes xInter on the ~2 segments
-// that actually cross, while the SIMD body computes it on all n).
-//
-// Divless equivalent: let dy = yj-yi, then multiply both sides by
-// `dy`. The inequality direction depends on sign(dy):
-//
-//	tx < xj*t + xi*(1-t)   where t = (ty-yi)/(yj-yi)
-//	⇔ (tx-xi) < (xj-xi)*(ty-yi)/(yj-yi)
-//	⇔ pred := (tx-xi)*(yj-yi) - (xj-xi)*(ty-yi) < 0 when dy > 0
-//	⇔ pred > 0 when dy < 0
-//	⇔ sign(pred) != sign(dy)
-//	⇔ (pred<0) XOR (dy<0)
-//
-// Straddle is guaranteed to imply `dy != 0` (if yj == yi then the
-// two endpoints are on the same side of ty and straddle is false),
-// so the sign test is well-defined in every counted lane.
-//
-// Neither Mask64s XOR nor Not is in the current simd surface
-// (only And/Or), so both XORs are expressed via `Int64s.Xor` after
-// promoting each mask to 1/0 via `vOnes.Masked(m)`.
-//
-// The closing segment (n-1, 0) and any leftover tail past the
-// last aligned lane group are handled by a compact scalar loop.
-// Semantics match the scalar path exactly (accumulator ordering
-// is commutative — crossings are unordered additions).
-//
-// # Arch expectations
-//
-// arm64 NEON (2-lane, Apple M3): **regresses ~2.4×** across every
-// bench size. Root cause: on typical convex ring + interior-point
-// queries the straddle rate is O(1/n) — the scalar branch skips
-// almost every segment's compute, while the SIMD body pays full
-// mul-sub-mul-sub-mask work in every lane. Even the divless form
-// (this kernel) doesn't recover the branch-elimination advantage
-// on 2-lane hardware. Ampere / Graviton Neoverse-N-class cores
-// have similar 2-lane NEON and are expected to behave the same;
-// no measurement yet.
-//
-// amd64 AVX2 (4-lane) / AVX-512 (8-lane): larger lane budget
-// tips the balance — 4-8× parallel work per iter outweighs the
-// wasted per-lane compute. Not measurable on the M3 dev machine;
-// gated behind a `lane >= 4` check so 2-lane hardware falls back
-// to scalar until Ampere / Graviton measurement lands.
-//
-// simdMinSize gates the SIMD body at n≥64 so per-refine-call
-// small polygons (5-vertex bboxes) don't pay the setup +
-// horizontal reduce overhead.
-func PIPCrossingCount(xs, ys []float64, tx, ty float64) bool {
-	n := min(len(ys), len(xs))
-	if n < 3 {
-		return false
-	}
-	lane := simd.BroadcastFloat64s(0).Len()
-	const simdMinSize = 64
-	// 2-lane NEON regresses on measured Apple hardware — see the
-	// Slice 8 comment block above. Fall back to scalar until a
-	// server-class ARM64 measurement (Ampere / Graviton) shows a
-	// win or a divless form that recovers Apple parity lands.
-	if lane < 4 || n < simdMinSize || n < lane+1 {
-		return pipCrossingCountScalar(xs, ys, tx, ty, n)
-	}
-	return pipCrossingCountSIMDBody(xs, ys, tx, ty, n, lane)
-}
-
 // runtimeLane returns the Float64s SIMD lane count on the current
 // build target. Exposed so tests can query it without importing
 // the `simd` package themselves — importing `simd` from a
@@ -385,84 +333,3 @@ func PIPCrossingCount(xs, ys []float64, tx, ty float64) bool {
 // `simd` freely, tests go through runtimeLane and the exported
 // SIMDBody helpers.
 func runtimeLane() int { return simd.BroadcastFloat64s(0).Len() }
-
-// pipCrossingCountSIMDBody is the divless SIMD kernel body. Kept
-// as a separate function so parity tests can exercise it on 2-lane
-// hardware where the public PIPCrossingCount would otherwise take
-// the scalar path (see the `lane < 4` gate above). Caller must
-// ensure n ≥ max(simdMinSize, lane+1); no re-check inside.
-func pipCrossingCountSIMDBody(xs, ys []float64, tx, ty float64, n, lane int) bool {
-	vTy := simd.BroadcastFloat64s(ty)
-	vTx := simd.BroadcastFloat64s(tx)
-	vZero := simd.BroadcastFloat64s(0)
-	vOnes := simd.BroadcastInt64s(1)
-	crossingsAcc := simd.BroadcastInt64s(0)
-
-	// Vector body: interior segments (j, j+1) for j in [0, n-1-lane].
-	// The closing segment (n-1, 0) is handled after the tail.
-	var j int
-	for j = 0; j+lane+1 <= n; j += lane {
-		xj := simd.LoadFloat64s(xs[j:])
-		yj := simd.LoadFloat64s(ys[j:])
-		xi := simd.LoadFloat64s(xs[j+1:])
-		yi := simd.LoadFloat64s(ys[j+1:])
-
-		aboveJ := yj.Greater(vTy)
-		aboveI := yi.Greater(vTy)
-		aboveJI := vOnes.Masked(aboveJ)
-		aboveII := vOnes.Masked(aboveI)
-		straddle := aboveJI.Xor(aboveII).ToMask()
-
-		// pred = (tx-xi)*(yj-yi) - (xj-xi)*(ty-yi)
-		// crossing = straddle AND ((pred<0) XOR (dy<0))
-		dtxi := vTx.Sub(xi)
-		dtyi := vTy.Sub(yi)
-		dx := xj.Sub(xi)
-		dy := yj.Sub(yi)
-		pred := dtxi.Mul(dy).Sub(dx.Mul(dtyi))
-
-		predNeg := pred.Less(vZero)
-		dyNeg := dy.Less(vZero)
-		predNegI := vOnes.Masked(predNeg)
-		dyNegI := vOnes.Masked(dyNeg)
-		crossHere := predNegI.Xor(dyNegI).ToMask()
-
-		crossAdd := straddle.And(crossHere)
-		crossingsAcc = crossingsAcc.Add(vOnes.Masked(crossAdd))
-	}
-
-	// Horizontal reduce the per-lane crossing counts.
-	scratch := make([]int64, lane)
-	crossingsAcc.Store(scratch)
-	var crossings int64
-	for _, v := range scratch {
-		crossings += v
-	}
-
-	// Scalar tail: any interior segments the SIMD body didn't fit.
-	for ; j < n-1; j++ {
-		yStart := ys[j]
-		yEnd := ys[j+1]
-		if (yStart > ty) != (yEnd > ty) {
-			xStart := xs[j]
-			xEnd := xs[j+1]
-			xInter := (xStart-xEnd)*(ty-yEnd)/(yStart-yEnd) + xEnd
-			if tx < xInter {
-				crossings++
-			}
-		}
-	}
-
-	// Closing segment (n-1, 0). Matches the scalar j=n-1, i=0 case.
-	yStart := ys[n-1]
-	yEnd := ys[0]
-	if (yStart > ty) != (yEnd > ty) {
-		xStart := xs[n-1]
-		xEnd := xs[0]
-		xInter := (xStart-xEnd)*(ty-yEnd)/(yStart-yEnd) + xEnd
-		if tx < xInter {
-			crossings++
-		}
-	}
-	return crossings&1 == 1
-}

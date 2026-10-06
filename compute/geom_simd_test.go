@@ -61,7 +61,8 @@ func TestBoundsF64SIMDBody_MatchesScalar(t *testing.T) {
 func TestPolygonCentroidShoelaceSIMDBody_MatchesScalar(t *testing.T) {
 	rng := rand.New(rand.NewPCG(311, 322))
 	lane := runtimeLane()
-	// Body precondition: n ≥ max(simdMinSize=64, lane+1).
+	// Body precondition: n ≥ lane+1 (the public wrapper's size
+	// threshold doesn't apply when the body is called directly).
 	sizes := []int{64, 65, 100, 127, 128, 129, 256, 1024, 4097}
 	for _, n := range sizes {
 		if n < lane+1 {
@@ -88,51 +89,37 @@ func TestPolygonCentroidShoelaceSIMDBody_MatchesScalar(t *testing.T) {
 	}
 }
 
-// TestPIPCrossingCountSIMDBody_MatchesScalar — the public
-// PIPCrossingCount skips the SIMD body on 2-lane NEON (see the
-// `lane < 4` gate in geom_simd.go), so the parity test in
-// geom_test.go never touches it on Apple. This variant calls the
-// SIMD body directly with an explicit lane count so regressions
-// in the vector kernel surface even without amd64 hardware.
-//
-// Tests the kernel at every lane count the compile target might
-// see at runtime (2 = NEON, 4 = AVX2, 8 = AVX-512). The kernel
-// is agnostic to the caller's `lane` argument as long as it
-// matches what `simd.BroadcastFloat64s(0).Len()` returns at
-// runtime — but for correctness testing we can walk the lane
-// counts explicitly.
-func TestPIPCrossingCountSIMDBody_MatchesScalar(t *testing.T) {
-	rng := rand.New(rand.NewPCG(123, 456))
-	// Query the runtime lane count once. On this hardware only
-	// lane==actual will produce a meaningful bench, but the
-	// correctness test uses whatever the runtime reports.
+// TestBoundsF64SIMDBody_NaNAnywhere — a NaN anywhere on an axis makes
+// that axis's min and max NaN, wherever it falls: the first vector,
+// the vectorized middle (any lane), or the scalar tail. Hardware
+// min/max disagree on NaN (arm64 FMAX/FMIN propagate it; x86
+// MAXPD/MINPD return the other operand), so the body must not rely
+// on either. Calls the body directly so this runs at the runtime
+// lane width on every arch, including 2-lane SSE / NEON.
+func TestBoundsF64SIMDBody_NaNAnywhere(t *testing.T) {
 	lane := runtimeLane()
-	// Sizes past simdMinSize=64 so the body actually walks the
-	// vector loop, with non-lane-aligned tails on every arch.
-	sizes := []int{64, 65, 100, 127, 128, 129, 256, 1024, 4097}
-	for _, n := range sizes {
-		if n < lane+1 {
-			continue
-		}
-		xs := make([]float64, n+1)
-		ys := make([]float64, n+1)
+	n := 4*lane + lane/2 + 1 // several vectors plus a scalar tail
+	for _, pos := range []int{0, 1, lane, 2*lane + lane - 1, n - 1} {
+		xs := make([]float64, n)
+		ys := make([]float64, n)
 		for i := range n {
-			theta := 2.0 * math.Pi * float64(i) / float64(n)
-			xs[i] = 500 + 400*math.Cos(theta)
-			ys[i] = 500 + 400*math.Sin(theta)
+			xs[i], ys[i] = float64(i), float64(-i)
 		}
-		xs[n] = xs[0]
-		ys[n] = ys[0]
-
-		for range 50 {
-			tx := 100 + rng.Float64()*800
-			ty := 100 + rng.Float64()*800
-			got := pipCrossingCountSIMDBody(xs, ys, tx, ty, len(xs), lane)
-			want := oracleToggle(xs, ys, tx, ty)
-			if got != want {
-				t.Errorf("n=%d @ (%v,%v): SIMD-body got %v, want %v",
-					n, tx, ty, got, want)
-			}
+		xs[pos] = math.NaN()
+		mnX, mnY, mxX, mxY, ok := boundsF64SIMDBody(xs, ys, n, lane)
+		if !ok {
+			t.Fatalf("pos %d: ok=false", pos)
+		}
+		if !math.IsNaN(mnX) || !math.IsNaN(mxX) {
+			t.Errorf("lane %d, NaN at %d: x bounds = [%v, %v], want NaN", lane, pos, mnX, mxX)
+		}
+		if mnY != float64(-(n-1)) || mxY != 0 {
+			t.Errorf("lane %d, NaN at %d: y bounds = [%v, %v], want [%d, 0] (NaN-free axis)", lane, pos, mnY, mxY, -(n - 1))
+		}
+		// The public entry point (SIMD or scalar path) agrees.
+		pmnX, _, pmxX, _, _ := BoundsF64(xs, ys)
+		if !math.IsNaN(pmnX) || !math.IsNaN(pmxX) {
+			t.Errorf("BoundsF64, NaN at %d: x bounds = [%v, %v], want NaN", pos, pmnX, pmxX)
 		}
 	}
 }

@@ -5,6 +5,70 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.15]
+
+### Changed
+
+- **SIMD build (`GOEXPERIMENT=simd`) retuned against amd64
+  measurements** (Ryzen 7 5800X, AVX2, 4 lanes). The first run showed
+  the SIMD build about 1.6× *slower* than scalar overall; after these
+  changes it measured about 6% faster. Profiling traced the losses to
+  moving vector results through memory: reading lanes back right after
+  storing the vector hits a store-to-load forwarding stall. Default
+  builds are unaffected; only `GOEXPERIMENT=simd` builds change.
+  - **Now scalar in every build:**
+    - the single compares (`CmpF64*`, `CmpI64*`): their vector bodies
+      were 1.77× slower at 1M rows;
+    - `AndChainF64Range` and `WithinSqDistF64`: 29% and 14% slower
+      than the new branchless scalar loops;
+    - `PIPCrossingCount`: it lost at every size on both architectures
+      measured (2.4× on 2-lane NEON, 22–70% on 4-lane AVX2).
+  - **`BoundsF64`** uses its vector body only from 256 points, and its
+    horizontal reduce now stores all accumulators before reading any
+    back. It's 3.9× faster than scalar at 1K points and 4.3× from 64K
+    up; at 1K the SIMD time dropped from 689 ns to 499 ns.
+  - **`PolygonCentroidShoelace`** gets the same reduce fix, and its
+    vector body now starts at 8,192 points instead of 64. It was 5.6×
+    slower at 64 points and 27% slower at 1K, and is ~5.6% faster from
+    64K up.
+  - **`AndChainF64BBox`** keeps its vector body, which is 13% faster
+    than the branchless scalar loop. New benchmarks cover all the fused
+    kernels.
+  - **Small inputs** skip the lane-width query entirely, removing about
+    1.3 ns per call from the SIMD build's small-input paths.
+
+- **Range and bounding-box filters on Float64 columns are 4–5×
+  faster.** These are expressions like
+  `Col("x").Ge(Lit(lo)).And(Col("x").Le(Lit(hi)))`,
+  or the two-column bbox shape, which gobi fuses into a single kernel.
+  - **The fix:** the kernels combined their comparisons with Go's
+    short-circuiting `&&`, which compiled to a branch on every row.
+    With unsorted data the CPU mispredicts it about half the time.
+    They now turn each comparison into a 0/1 byte and combine them
+    with a bitwise AND, with no branches.
+  - **Measured at 1M random rows on arm64:** the range filter went
+    from 2.38 ms to 0.49 ms, and the bbox filter from 4.29 ms to
+    0.77 ms. It's about 3× on amd64, and no slower on sorted input,
+    the best case for branches.
+  - **Scope:** every build. Results are unchanged, including NaN
+    (never matches), ±Inf, values exactly on a bound, and empty
+    ranges; a new test pins them against the old definition.
+
+### Fixed
+
+- **`compute.BoundsF64` handles NaN the same way on every
+  architecture.** A NaN coordinate now always makes that axis's min and
+  max NaN, in both the scalar and the SIMD build. Before, a NaN
+  survived only if it happened to land in the first slot of the final
+  reduce. On amd64 the SIMD path lost it entirely, because x86's vector
+  min/max instructions return the other operand when one is NaN. ARM's
+  propagate it, which is why tests passed on Apple hardware. The vector
+  body now tracks NaN in a separate per-lane mask (one compare and one
+  OR per vector per axis), and the scalar paths record it with a
+  branch that only runs when a value is neither a new min nor a new
+  max. `BoundsF64` isn't called from gobi's own code paths, so query
+  results were unaffected.
+
 ## [v0.4.14]
 
 ### Changed (breaking)

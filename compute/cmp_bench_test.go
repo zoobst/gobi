@@ -5,8 +5,9 @@ import (
 	"testing"
 )
 
-// BenchmarkCmpI64Ge_1M — Slice 23a Int64 SIMD compare on 1M rows.
-// Delta between scalar and SIMD builds is the vectorization win.
+// BenchmarkCmpI64Ge_1M — Int64 compare on 1M rows. Scalar in both
+// builds since the SIMD body was dropped (see cmp_basic.go); kept as
+// the bandwidth reference for the fused kernels below.
 func BenchmarkCmpI64Ge_1M(b *testing.B) {
 	const n = 1_000_000
 	a := make([]int64, n)
@@ -53,4 +54,53 @@ func BenchmarkCountTrue_1M(b *testing.B) {
 		sink += CountTrue(a)
 	}
 	_ = sink
+}
+
+// fusedBenchInput: 1M uniform values in [0, 1000).
+func fusedBenchInput(seed uint64) []float64 {
+	a := make([]float64, 1_000_000)
+	rng := rand.New(rand.NewPCG(seed, seed+1))
+	for i := range a {
+		a[i] = rng.Float64() * 1000
+	}
+	return a
+}
+
+// BenchmarkAndChainF64Range_1M — fused two-sided range compare.
+// Scalar in every build (its SIMD body lost 29% on AVX2 against the
+// branchless loop); kept as a reference for AndChainF64BBox.
+func BenchmarkAndChainF64Range_1M(b *testing.B) {
+	a := fusedBenchInput(55)
+	out := make([]bool, len(a))
+	b.ReportAllocs()
+	for b.Loop() {
+		AndChainF64Range(a, 250, 750, out)
+	}
+}
+
+// BenchmarkAndChainF64BBox_1M — fused four-compare bbox filter. The
+// one fused kernel with a SIMD body; compare the scalar and
+// GOEXPERIMENT=simd builds to keep checking it still wins.
+func BenchmarkAndChainF64BBox_1M(b *testing.B) {
+	xs, ys := fusedBenchInput(66), fusedBenchInput(77)
+	out := make([]bool, len(xs))
+	b.ReportAllocs()
+	for b.Loop() {
+		AndChainF64BBox(xs, 250, 750, ys, 100, 900, out)
+	}
+}
+
+// BenchmarkWithinSqDistF64_1M — fused equirectangular radius test.
+// Scalar in every build (its SIMD body lost 14% on AVX2).
+func BenchmarkWithinSqDistF64_1M(b *testing.B) {
+	lats, lons := fusedBenchInput(88), fusedBenchInput(99)
+	for i := range lats {
+		lats[i] = lats[i]/1000*180 - 90
+		lons[i] = lons[i]/1000*360 - 180
+	}
+	out := make([]bool, len(lats))
+	b.ReportAllocs()
+	for b.Loop() {
+		WithinSqDistF64(lats, lons, 40, -75, 0.766, 25, out)
+	}
 }

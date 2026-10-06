@@ -331,35 +331,23 @@ func TestPolygonCentroidShoelace_NaNInput(t *testing.T) {
 	}
 }
 
-// TestBoundsF64_NaNInput — Min/Max propagate NaN (any comparison
-// against NaN is false, so the scalar and SIMD-body paths both
-// leave NaN in the reduced value if it lands in scratch[0]).
-// This locks in the shared behavior — if a future refactor
-// switches to a NaN-skip reduce, the change should be explicit.
+// TestBoundsF64_NaNInput — a NaN on an axis makes that axis's min
+// and max NaN, on every build and arch. (The rule used to hold only by
+// accident, when the NaN landed in the first reduce slot; x86's
+// MAXPD/MINPD drop NaN, so the SIMD path lost it on amd64.)
+// TestBoundsF64SIMDBody_NaNAnywhere covers every NaN position.
 func TestBoundsF64_NaNInput(t *testing.T) {
-	// First lane holds NaN → scratch[0] after Min/Max reduce
-	// will hold NaN and propagate to minX/maxX.
 	xs := []float64{math.NaN(), 1, 2, 3, 4, 5, 6, 7, 8}
 	ys := []float64{0, 1, 2, 3, 4, 5, 6, 7, 8}
-	_, _, mx, my, ok := BoundsF64(xs, ys)
+	mnX, mnY, mx, my, ok := BoundsF64(xs, ys)
 	if !ok {
 		t.Fatal("ok=false, want true")
 	}
-	// The min-of-xs reduce starts from xs[0]=NaN. Every subsequent
-	// simd.Min(NaN, v) preserves NaN (SIMD hardware) or leaves the
-	// scalar min at NaN because `v < NaN` is false. Either way,
-	// the reduced minX is NaN — that's the shared semantic.
-	// (maxX has the same shape.) We assert the "or NaN" outcome
-	// on X only, since Y is NaN-free and must produce 8.
-	if my != 8 {
-		t.Errorf("maxY: got %v, want 8", my)
+	if mnY != 0 || my != 8 {
+		t.Errorf("y bounds: got [%v, %v], want [0, 8] (NaN-free axis)", mnY, my)
 	}
-	// Just verify the X reduce didn't silently drop NaN and
-	// produce a false "safe" bounds — either NaN propagated
-	// (correct) or the reduce would have returned 8 (bug). Test
-	// only the former.
-	if !math.IsNaN(mx) {
-		t.Errorf("NaN input silently dropped: maxX=%v, want NaN (propagation)", mx)
+	if !math.IsNaN(mnX) || !math.IsNaN(mx) {
+		t.Errorf("NaN input silently dropped: x bounds = [%v, %v], want NaN", mnX, mx)
 	}
 }
 

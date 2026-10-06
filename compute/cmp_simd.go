@@ -1,30 +1,26 @@
 //go:build goexperiment.simd && (arm64 || amd64)
 
-// SIMD-vectorized comparison kernels. Active only when built with
-// `GOEXPERIMENT=simd` on arm64 or amd64. Signatures must match the
-// scalar fallbacks in cmp_scalar.go exactly.
+// SIMD-vectorized fused bbox comparison: AndChainF64BBox. Active
+// only when built with `GOEXPERIMENT=simd` on arm64 or amd64; the
+// signature must match the scalar fallback in cmp_scalar.go. Every
+// other compare kernel is scalar in all builds (cmp_basic.go has the
+// measurements).
 //
 // Per-lane store into out[] goes through a per-lane int64 scratch
-// buffer + a downconvert loop — the stdlib `simd` package does not
-// yet expose a direct mask→[]bool store. That trade costs a small
-// tail loop per SIMD lane group but keeps the compare + AND phases
-// on the vectorized fast path, which is where the real win lives.
+// buffer + a downconvert loop — the portable `simd` package has no
+// direct mask→[]bool store. On amd64 that round trip is a
+// store-to-load forwarding stall per lane group. With four compares
+// per store the bbox kernel still beat the branchless scalar loop
+// (Ryzen 7 5800X, AVX2, 1M rows: 921 vs 1,057 µs); the one- and
+// two-compare kernels didn't, and were routed to scalar.
 //
 // # Testability
 //
-// Each public entry point (CmpF64Ge, AndChainF64BBox, WithinSqDistF64,
-// …) is thin: eligibility gate + dispatch to a scalar fallback or a
-// SIMD-body function. The SIMD bodies are unexported but callable
-// from _test.go — so parity tests can force the vector kernel on
-// 2-lane NEON where the eligibility gate would otherwise reroute to
-// scalar. Matches the pipCrossingCountSIMDBody pattern in geom_simd.go.
-//
-// Benchmark reference (arm64, NEON, 2M rows):
-//
-//	scalar CmpF64Ge:              ~9 ms
-//	SIMD   CmpF64Ge:              ~2 ms   (~4.5×)
-//	scalar AndChainF64Range:      ~12 ms
-//	SIMD   AndChainF64Range:      ~2 ms   (~5.6×)
+// Each public entry point is thin: eligibility gate + dispatch to a
+// scalar fallback or a SIMD-body function. The SIMD bodies are
+// unexported but callable from _test.go, so parity tests can force
+// the vector kernel on 2-lane NEON where the eligibility gate would
+// otherwise reroute to scalar.
 
 package compute
 
@@ -44,174 +40,13 @@ const simdEnabled = true
 // as the Slice-8 PIP SIMD gate.
 //
 // Under this gate, the Slice 22a / 23b wire-ins in gobi/series_ops.go
-// stay correct: on 2-lane hardware they get the scalar loop
-// (fast); on 4/8-lane hardware they get the SIMD kernel (also
-// expected fast, though unmeasured on this Apple M3 dev machine).
+// stay correct: on 2-lane hardware they get the scalar loop. On
+// 4/8-lane hardware the fused kernels take the SIMD body. "Lane ≥ 4
+// wins" turned out false for the single compares on AVX2 (Ryzen 7
+// 5800X: 1.77× slower), so treat it as unproven for these too until
+// the fused benchmarks are measured there.
 func cmpKernelSIMDEligible() bool {
 	return simd.BroadcastFloat64s(0).Len() >= 4
-}
-
-// CmpF64Ge writes out[i] = a[i] >= b.
-func CmpF64Ge(a []float64, b float64, out []bool) {
-	if !cmpKernelSIMDEligible() {
-		for i, v := range a {
-			out[i] = v >= b
-		}
-		return
-	}
-	cmpF64GeSIMDBody(a, b, out)
-}
-
-// cmpF64GeSIMDBody is the ungated SIMD kernel. Callable from tests so
-// the vector body is exercised on 2-lane hardware where CmpF64Ge would
-// otherwise take the scalar path.
-func cmpF64GeSIMDBody(a []float64, b float64, out []bool) {
-	if len(a) == 0 {
-		return
-	}
-	vb := simd.BroadcastFloat64s(b)
-	vOnes := simd.BroadcastInt64s(1)
-	// Query lane count from a broadcast, not from the input slice —
-	// LoadFloat64s panics if len(a) < laneCount (very-short-input
-	// case). Broadcast has no such requirement.
-	laneCount := vb.Len()
-	// Stack-allocated scratch — max SIMD lane count on any
-	// current target is 8 (AVX-512 Int64s), so a [8]int64
-	// bounds the maximum. Slicing to laneCount is safe because
-	// Store only writes the first laneCount entries.
-	var scratchArr [8]int64
-	scratch := scratchArr[:laneCount]
-
-	i := 0
-	for ; i+laneCount <= len(a); i += laneCount {
-		va := simd.LoadFloat64s(a[i:])
-		mask := va.GreaterEqual(vb)
-		vOnes.Masked(mask).Store(scratch)
-		for j := range laneCount {
-			out[i+j] = scratch[j] != 0
-		}
-	}
-	// Tail
-	for ; i < len(a); i++ {
-		out[i] = a[i] >= b
-	}
-}
-
-// CmpF64Le writes out[i] = a[i] <= b.
-func CmpF64Le(a []float64, b float64, out []bool) {
-	if !cmpKernelSIMDEligible() {
-		for i, v := range a {
-			out[i] = v <= b
-		}
-		return
-	}
-	cmpF64LeSIMDBody(a, b, out)
-}
-
-func cmpF64LeSIMDBody(a []float64, b float64, out []bool) {
-	if len(a) == 0 {
-		return
-	}
-	vb := simd.BroadcastFloat64s(b)
-	vOnes := simd.BroadcastInt64s(1)
-	laneCount := vb.Len()
-	// Stack-allocated scratch — max SIMD lane count on any
-	// current target is 8 (AVX-512 Int64s), so a [8]int64
-	// bounds the maximum. Slicing to laneCount is safe because
-	// Store only writes the first laneCount entries.
-	var scratchArr [8]int64
-	scratch := scratchArr[:laneCount]
-
-	i := 0
-	for ; i+laneCount <= len(a); i += laneCount {
-		va := simd.LoadFloat64s(a[i:])
-		mask := va.LessEqual(vb)
-		vOnes.Masked(mask).Store(scratch)
-		for j := range laneCount {
-			out[i+j] = scratch[j] != 0
-		}
-	}
-	for ; i < len(a); i++ {
-		out[i] = a[i] <= b
-	}
-}
-
-// CmpF64Gt writes out[i] = a[i] > b.
-func CmpF64Gt(a []float64, b float64, out []bool) {
-	if !cmpKernelSIMDEligible() {
-		for i, v := range a {
-			out[i] = v > b
-		}
-		return
-	}
-	cmpF64GtSIMDBody(a, b, out)
-}
-
-func cmpF64GtSIMDBody(a []float64, b float64, out []bool) {
-	if len(a) == 0 {
-		return
-	}
-	vb := simd.BroadcastFloat64s(b)
-	vOnes := simd.BroadcastInt64s(1)
-	laneCount := vb.Len()
-	// Stack-allocated scratch — max SIMD lane count on any
-	// current target is 8 (AVX-512 Int64s), so a [8]int64
-	// bounds the maximum. Slicing to laneCount is safe because
-	// Store only writes the first laneCount entries.
-	var scratchArr [8]int64
-	scratch := scratchArr[:laneCount]
-
-	i := 0
-	for ; i+laneCount <= len(a); i += laneCount {
-		va := simd.LoadFloat64s(a[i:])
-		mask := va.Greater(vb)
-		vOnes.Masked(mask).Store(scratch)
-		for j := range laneCount {
-			out[i+j] = scratch[j] != 0
-		}
-	}
-	for ; i < len(a); i++ {
-		out[i] = a[i] > b
-	}
-}
-
-// CmpF64Lt writes out[i] = a[i] < b.
-func CmpF64Lt(a []float64, b float64, out []bool) {
-	if !cmpKernelSIMDEligible() {
-		for i, v := range a {
-			out[i] = v < b
-		}
-		return
-	}
-	cmpF64LtSIMDBody(a, b, out)
-}
-
-func cmpF64LtSIMDBody(a []float64, b float64, out []bool) {
-	if len(a) == 0 {
-		return
-	}
-	vb := simd.BroadcastFloat64s(b)
-	vOnes := simd.BroadcastInt64s(1)
-	laneCount := vb.Len()
-	// Stack-allocated scratch — max SIMD lane count on any
-	// current target is 8 (AVX-512 Int64s), so a [8]int64
-	// bounds the maximum. Slicing to laneCount is safe because
-	// Store only writes the first laneCount entries.
-	var scratchArr [8]int64
-	scratch := scratchArr[:laneCount]
-
-	i := 0
-	for ; i+laneCount <= len(a); i += laneCount {
-		va := simd.LoadFloat64s(a[i:])
-		mask := va.Less(vb)
-		vOnes.Masked(mask).Store(scratch)
-		for j := range laneCount {
-			out[i+j] = scratch[j] != 0
-		}
-	}
-	for ; i < len(a); i++ {
-		out[i] = a[i] < b
-	}
 }
 
 // AndChainF64BBox writes
@@ -227,9 +62,7 @@ func AndChainF64BBox(a []float64, aLo, aHi float64, b []float64, bLo, bHi float6
 		panic("compute: AndChainF64BBox: a and b length mismatch")
 	}
 	if !cmpKernelSIMDEligible() {
-		for i, v := range a {
-			out[i] = aLo <= v && v <= aHi && bLo <= b[i] && b[i] <= bHi
-		}
+		andChainF64BBoxScalar(a, aLo, aHi, b, bLo, bHi, out)
 		return
 	}
 	andChainF64BBoxSIMDBody(a, aLo, aHi, b, bLo, bHi, out)
@@ -269,106 +102,6 @@ func andChainF64BBoxSIMDBody(a []float64, aLo, aHi float64, b []float64, bLo, bH
 	}
 }
 
-// WithinSqDistF64 writes
-//
-//	out[i] = ((lats[i]-refLat)² + ((lons[i]-refLon)·cosRefLat)²) <= sqThreshold
-//
-// Single-pass SIMD kernel: two subtractions, two multiplies (for
-// squarings), one multiply (cosRefLat scaling of the longitude
-// delta), one add, one compare. All Float64s ops execute at the
-// full lane width — this is the workload shape where SIMD's
-// ceiling is the highest for gobi's use cases.
-func WithinSqDistF64(lats, lons []float64, refLat, refLon, cosRefLat, sqThreshold float64, out []bool) {
-	if len(lats) != len(lons) {
-		panic("compute: WithinSqDistF64: lats and lons length mismatch")
-	}
-	if !cmpKernelSIMDEligible() {
-		for i := range lats {
-			dLat := lats[i] - refLat
-			dLon := (lons[i] - refLon) * cosRefLat
-			out[i] = dLat*dLat+dLon*dLon <= sqThreshold
-		}
-		return
-	}
-	withinSqDistF64SIMDBody(lats, lons, refLat, refLon, cosRefLat, sqThreshold, out)
-}
-
-func withinSqDistF64SIMDBody(lats, lons []float64, refLat, refLon, cosRefLat, sqThreshold float64, out []bool) {
-	if len(lats) == 0 {
-		return
-	}
-	vRefLat := simd.BroadcastFloat64s(refLat)
-	vRefLon := simd.BroadcastFloat64s(refLon)
-	vCosRef := simd.BroadcastFloat64s(cosRefLat)
-	vSqThr := simd.BroadcastFloat64s(sqThreshold)
-	vOnes := simd.BroadcastInt64s(1)
-	laneCount := vRefLat.Len()
-	var scratchArr [8]int64
-	scratch := scratchArr[:laneCount]
-
-	i := 0
-	for ; i+laneCount <= len(lats); i += laneCount {
-		vlat := simd.LoadFloat64s(lats[i:])
-		vlon := simd.LoadFloat64s(lons[i:])
-		dLat := vlat.Sub(vRefLat)
-		dLon := vlon.Sub(vRefLon).Mul(vCosRef)
-		sq := dLat.Mul(dLat).Add(dLon.Mul(dLon))
-		mask := sq.LessEqual(vSqThr)
-		vOnes.Masked(mask).Store(scratch)
-		for j := range laneCount {
-			out[i+j] = scratch[j] != 0
-		}
-	}
-	// Tail
-	for ; i < len(lats); i++ {
-		dLat := lats[i] - refLat
-		dLon := (lons[i] - refLon) * cosRefLat
-		out[i] = dLat*dLat+dLon*dLon <= sqThreshold
-	}
-}
-
-// AndChainF64Range writes out[i] = (lo <= a[i]) && (a[i] <= hi).
-// Fused two-sided range check — a single vector load per lane
-// group is compared against BOTH bounds, and the two masks are
-// ANDed in SIMD before the store. Two compares + one AND +
-// one store per lane group.
-func AndChainF64Range(a []float64, lo, hi float64, out []bool) {
-	if !cmpKernelSIMDEligible() {
-		for i, v := range a {
-			out[i] = lo <= v && v <= hi
-		}
-		return
-	}
-	andChainF64RangeSIMDBody(a, lo, hi, out)
-}
-
-func andChainF64RangeSIMDBody(a []float64, lo, hi float64, out []bool) {
-	if len(a) == 0 {
-		return
-	}
-	vLo := simd.BroadcastFloat64s(lo)
-	vHi := simd.BroadcastFloat64s(hi)
-	vOnes := simd.BroadcastInt64s(1)
-	laneCount := vLo.Len()
-	var scratchArr [8]int64
-	scratch := scratchArr[:laneCount]
-
-	i := 0
-	for ; i+laneCount <= len(a); i += laneCount {
-		va := simd.LoadFloat64s(a[i:])
-		var mask simd.Mask64s
-		mask = va.GreaterEqual(vLo)
-		mask = mask.And(va.LessEqual(vHi))
-		vOnes.Masked(mask).Store(scratch)
-		for j := range laneCount {
-			out[i+j] = scratch[j] != 0
-		}
-	}
-	for ; i < len(a); i++ {
-		out[i] = lo <= a[i] && a[i] <= hi
-	}
-}
-
 // CmpI64Ge / Le / Gt / Lt — SIMD variants of the Int64 scalar-vs-
 // column comparisons in cmp_scalar.go. Same lane-parallel compare
 // + mask-store shape as the Float64 variants; simd.Int64s ships
@@ -380,154 +113,6 @@ func andChainF64RangeSIMDBody(a []float64, lo, hi float64, out []bool) {
 // denormals / NaN handling) but the mask-to-bool tail loop is
 // the same, so the observed win vs scalar is comparable
 // (~3-4× on 100k+ rows).
-
-func CmpI64Ge(a []int64, b int64, out []bool) {
-	if !cmpKernelSIMDEligible() {
-		for i, v := range a {
-			out[i] = v >= b
-		}
-		return
-	}
-	cmpI64GeSIMDBody(a, b, out)
-}
-
-func cmpI64GeSIMDBody(a []int64, b int64, out []bool) {
-	if len(a) == 0 {
-		return
-	}
-	vb := simd.BroadcastInt64s(b)
-	vOnes := simd.BroadcastInt64s(1)
-	laneCount := vb.Len()
-	// Stack-allocated scratch — max SIMD lane count on any
-	// current target is 8 (AVX-512 Int64s), so a [8]int64
-	// bounds the maximum. Slicing to laneCount is safe because
-	// Store only writes the first laneCount entries.
-	var scratchArr [8]int64
-	scratch := scratchArr[:laneCount]
-	i := 0
-	for ; i+laneCount <= len(a); i += laneCount {
-		va := simd.LoadInt64s(a[i:])
-		mask := va.GreaterEqual(vb)
-		vOnes.Masked(mask).Store(scratch)
-		for j := range laneCount {
-			out[i+j] = scratch[j] != 0
-		}
-	}
-	for ; i < len(a); i++ {
-		out[i] = a[i] >= b
-	}
-}
-
-func CmpI64Le(a []int64, b int64, out []bool) {
-	if !cmpKernelSIMDEligible() {
-		for i, v := range a {
-			out[i] = v <= b
-		}
-		return
-	}
-	cmpI64LeSIMDBody(a, b, out)
-}
-
-func cmpI64LeSIMDBody(a []int64, b int64, out []bool) {
-	if len(a) == 0 {
-		return
-	}
-	vb := simd.BroadcastInt64s(b)
-	vOnes := simd.BroadcastInt64s(1)
-	laneCount := vb.Len()
-	// Stack-allocated scratch — max SIMD lane count on any
-	// current target is 8 (AVX-512 Int64s), so a [8]int64
-	// bounds the maximum. Slicing to laneCount is safe because
-	// Store only writes the first laneCount entries.
-	var scratchArr [8]int64
-	scratch := scratchArr[:laneCount]
-	i := 0
-	for ; i+laneCount <= len(a); i += laneCount {
-		va := simd.LoadInt64s(a[i:])
-		mask := va.LessEqual(vb)
-		vOnes.Masked(mask).Store(scratch)
-		for j := range laneCount {
-			out[i+j] = scratch[j] != 0
-		}
-	}
-	for ; i < len(a); i++ {
-		out[i] = a[i] <= b
-	}
-}
-
-func CmpI64Gt(a []int64, b int64, out []bool) {
-	if !cmpKernelSIMDEligible() {
-		for i, v := range a {
-			out[i] = v > b
-		}
-		return
-	}
-	cmpI64GtSIMDBody(a, b, out)
-}
-
-func cmpI64GtSIMDBody(a []int64, b int64, out []bool) {
-	if len(a) == 0 {
-		return
-	}
-	vb := simd.BroadcastInt64s(b)
-	vOnes := simd.BroadcastInt64s(1)
-	laneCount := vb.Len()
-	// Stack-allocated scratch — max SIMD lane count on any
-	// current target is 8 (AVX-512 Int64s), so a [8]int64
-	// bounds the maximum. Slicing to laneCount is safe because
-	// Store only writes the first laneCount entries.
-	var scratchArr [8]int64
-	scratch := scratchArr[:laneCount]
-	i := 0
-	for ; i+laneCount <= len(a); i += laneCount {
-		va := simd.LoadInt64s(a[i:])
-		mask := va.Greater(vb)
-		vOnes.Masked(mask).Store(scratch)
-		for j := range laneCount {
-			out[i+j] = scratch[j] != 0
-		}
-	}
-	for ; i < len(a); i++ {
-		out[i] = a[i] > b
-	}
-}
-
-func CmpI64Lt(a []int64, b int64, out []bool) {
-	if !cmpKernelSIMDEligible() {
-		for i, v := range a {
-			out[i] = v < b
-		}
-		return
-	}
-	cmpI64LtSIMDBody(a, b, out)
-}
-
-func cmpI64LtSIMDBody(a []int64, b int64, out []bool) {
-	if len(a) == 0 {
-		return
-	}
-	vb := simd.BroadcastInt64s(b)
-	vOnes := simd.BroadcastInt64s(1)
-	laneCount := vb.Len()
-	// Stack-allocated scratch — max SIMD lane count on any
-	// current target is 8 (AVX-512 Int64s), so a [8]int64
-	// bounds the maximum. Slicing to laneCount is safe because
-	// Store only writes the first laneCount entries.
-	var scratchArr [8]int64
-	scratch := scratchArr[:laneCount]
-	i := 0
-	for ; i+laneCount <= len(a); i += laneCount {
-		va := simd.LoadInt64s(a[i:])
-		mask := va.Less(vb)
-		vOnes.Masked(mask).Store(scratch)
-		for j := range laneCount {
-			out[i+j] = scratch[j] != 0
-		}
-	}
-	for ; i < len(a); i++ {
-		out[i] = a[i] < b
-	}
-}
 
 // CountTrue shares the scalar-body implementation with the
 // !simd build. Go's compiler auto-vectorizes the tight
