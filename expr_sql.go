@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -79,6 +80,57 @@ func appendExprSQL(b *strings.Builder, args *[]any, n ExprNode) bool {
 			return false
 		}
 		b.WriteByte(')')
+		return true
+
+	case *isInNode:
+		if node.err != nil {
+			return false
+		}
+		// SQL has no empty IN list. gobi's empty IsIn is false, but
+		// null for a null input — and stays null under NOT — so a bare
+		// (1 = 0) would diverge once negated.
+		if len(node.norm) == 0 {
+			b.WriteString("(CASE WHEN ")
+			if !appendExprSQL(b, args, node.inner) {
+				return false
+			}
+			b.WriteString(" IS NULL THEN NULL ELSE (1 = 0) END)")
+			return true
+		}
+		// Push down only values a database compares exactly as Eval
+		// matches them: integers that fit int64, strings, booleans.
+		// Floats (a REAL column widens 0.1f, missing 0.1) and times
+		// (Eval matches a date column by calendar day) stay in the
+		// executor; under-filtering in SQL is always safe.
+		vals := make([]any, len(node.norm))
+		for i, v := range node.norm {
+			switch v.kind {
+			case kindInt:
+				if v.unsigned && v.u > math.MaxInt64 {
+					return false // database/sql rejects uint64 with the high bit set
+				}
+				vals[i] = v.i
+			case kindString:
+				vals[i] = v.s
+			case kindBool:
+				vals[i] = v.b
+			default:
+				return false
+			}
+		}
+		b.WriteByte('(')
+		if !appendExprSQL(b, args, node.inner) {
+			return false
+		}
+		b.WriteString(" IN (")
+		for i, v := range vals {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteByte('?')
+			*args = append(*args, v)
+		}
+		b.WriteString("))")
 		return true
 
 	case *aliasNode:

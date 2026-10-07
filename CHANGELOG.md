@@ -5,6 +5,111 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.17]
+
+### Added
+
+- **`Expr.IsIn(values...)`** is true where the value is one of
+  `values`, false where it isn't, and null where the input is null, as
+  in SQL `IN` and Polars `is_in`. A filter drops null rows either way.
+  - **Values:** Go scalars of any int or uint width, float32 / float64,
+    string, bool or `time.Time`. You can also pass a single slice of
+    any of those, as in `Col("id").IsIn(ids)`. The values are copied
+    when the expression is built, so reusing your slice afterwards
+    doesn't change a built plan. A single `[]byte` / `[]uint8` is an
+    error, because Go can't tell a binary value from a list of uint8s;
+    pass uint8 values as a `[]int`.
+  - **Conversion:** each value is converted to the column's type, as a
+    cast would:
+    - **Integer columns:** a value the type can't hold never matches,
+      such as `1.5`, `300` against int8, or `-1` against a uint
+      column.
+    - **Float columns:** values round to the column's precision, so
+      `0.1` matches a float32 `0.1`.
+    - **Timestamp columns:** a time with precision finer than the unit
+      never matches.
+    - **Date columns:** a `time.Time` matches its calendar date in its
+      own location, whatever the time of day.
+  - **Errors:** a value of the wrong kind, such as a string against a
+    numeric column, or a `nil` value is a type error.
+  - **Empty list:** `IsIn()` with no values is not an error. It
+    evaluates to false for every row, or null for null rows.
+  - **Column types:** dictionary-encoded and multi-chunk columns work.
+    Evaluation uses arrow-go's `is_in` kernel.
+  - **Row-group pruning:** `IsIn` skips Parquet row groups whose
+    min/max holds none of the values (`CanPossiblyMatch`). The
+    comparison matches what evaluation does: float32 columns compare
+    the float32-rounded values, and a NaN value keeps float row groups,
+    because Parquet min/max ignore NaN rows. That applies
+    in a lazy plan's `Filter` and also as a read predicate:
+    - `parquetio.ReadOptions.Predicate` on `ReadFile` / `ReadReader`;
+    - athenaio's `Predicate` fields and the `ReadOptions` passed to
+      `BucketResultsFromS3URIs`.
+
+    A read predicate only skips row groups. Rows inside a kept group
+    all come back, so also apply `.Filter(pred)` if you need exact
+    rows.
+  - **SQL pushdown:** `ExprToSQL` renders it as `"col" IN (?, …)`, but
+    only when every value compares in SQL exactly as gobi matches it:
+    integers that fit int64, strings and booleans.
+    - Lists with floats or times stay in the executor, as do uint64
+      values with the high bit set. For example, a SQL `REAL` column
+      widens `0.1f`, and gobi matches a date column by calendar day.
+    - An empty list renders as `CASE WHEN col IS NULL THEN NULL ELSE
+      (1 = 0) END`, so nulls stay null under `NOT`, the same as in
+      memory.
+  - **Result name:** the result column is named `<column>_is_in`, like
+    `IsNull`'s `<column>_is_null`.
+  - **Cost:** values are normalized once when the expression is built,
+    and pruning binary-searches them against each row group's min/max.
+    - **Int64 and string columns** probe a Go hash set built once per
+      expression. Elsewhere, arrow-go's `is_in` rebuilds its hash table
+      from the whole list on every batch. With 100k ids, a 64k-row
+      batch takes 1.2 ms instead of 4.1 ms and allocates 40 KB instead
+      of 11 MB.
+    - **Other columns** use arrow-go's `is_in`; bool columns are
+      evaluated directly.
+
+### Fixed
+
+- **Take now works on every Arrow type and chunk layout.** Before, any
+  of these failed with `take not implemented`:
+  - **Multi-chunk timestamps:** for example the output of `Concat`, or
+    athenaio stitching bucket files together. This hit every unit and
+    zone, including `timestamp[ns, tz=UTC]` (such as Hive INT96 read
+    back), naive `timestamp[ns]` (such as `time.Time` through
+    `FromStructs`) and `timestamp[us, tz=UTC]`. It broke `HilbertSort`
+    / `SortByHilbert`, `SortBy`, `Take`, `Unique` and `Explode` on such
+    frames.
+  - **Joins:** the right side of left and full joins
+    (`takeArrayWithNulls`) failed the same way.
+  - **Other types:** date32/64, durations, int8/16, uint8/16, large
+    strings, decimals, dictionaries and structs failed on every take
+    path.
+
+  gobi's hand-written fast paths stay for the types they cover.
+  Everything else now falls back to arrow-go's `compute.Take`, and a
+  null index produces the null rows that outer joins need. The
+  full-join key coalesce falls back the same way.
+  - **Common types** (ints, floats, bool, strings, binary, timestamps)
+    keep gobi's direct builders, which allocate only the output. For
+    multi-chunk columns each row's chunk is now found by binary search
+    instead of walking the chunk list per row. A full join against
+    2,000 chunks went from 680 ms to 299 ms, with no change in memory.
+  - **Other types** are gathered one chunk at a time by arrow-go's
+    take, never copied into a column-sized array first.
+  - **Errors:** a bad index reports `ErrRowOutOfRange`.
+- **`Join` and the merge join require exactly equal key types.** Before,
+  they compared only the type ID, so `timestamp[us]` and
+  `timestamp[ns]` keys hashed raw values of different scales, and a
+  full or right join's coalesced key mixed them silently. Keys that
+  differ in unit or zone now return `ErrColumnTypeMismatch`.
+- **Parquet row-group pruning on unsigned columns.** uint32 and uint64
+  min/max stats came back as signed bit patterns, so a value at or
+  above 2^31 (uint32) or 2^63 (uint64) read as negative. `Eq`, range
+  comparisons and `IsIn` could then skip row groups that matched. They
+  now decode as unsigned.
+
 ## [v0.4.16]
 
 ### Added

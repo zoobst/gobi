@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"math"
+	"slices"
 
 	"github.com/zoobst/gobi/geometry"
 )
@@ -50,6 +51,7 @@ type CoveringStats interface {
 //   - col == literal, col != literal
 //   - col <, <=, >, >= literal
 //   - literal on either side (auto-normalized)
+//   - col.IsIn(values...): matches if any value lies in [min, max]
 //
 // Anything else (NOT, arithmetic, custom nodes) is treated as
 // "possibly matches." Used by parquetio for row-group skipping;
@@ -86,6 +88,8 @@ func canMatchNode(n ExprNode, s Stats) bool {
 		return canMatchGeomPredicate(n, s)
 	case *geomDWithinNode:
 		return canMatchGeomDWithin(n, s)
+	case *isInNode:
+		return canMatchIsIn(n, s)
 	}
 	// notNode, custom nodes, arithmetic — bail conservatively.
 	return true
@@ -356,6 +360,77 @@ func bboxesOverlap(a, b geometry.Bounds) bool {
 	}
 	if a.MinY > b.MaxY || b.MinY > a.MaxY {
 		return false
+	}
+	return true
+}
+
+// canMatchIsIn handles col.IsIn(values...): the range can match iff
+// some value v has min <= v <= max — a binary search over the node's
+// sorted values. An empty value list matches nothing. Values the stats
+// can't be ordered against (times, or a kind that differs from the
+// column's) make the check "possibly matches."
+func canMatchIsIn(n *isInNode, s Stats) bool {
+	if n.err != nil {
+		return true
+	}
+	col, ok := unwrapAlias(n.inner).(*colRefNode)
+	if !ok {
+		return true
+	}
+	if len(n.norm) == 0 {
+		return false
+	}
+	minV, maxV, ok := s.MinMax(col.name)
+	if !ok || minV == nil || maxV == nil {
+		return true
+	}
+	if nc, ok := s.NullCount(col.name); ok && nc >= s.TotalRows() {
+		return true
+	}
+	p := &n.prune
+	if p.times {
+		return true
+	}
+	if lo, ok := toFloat64(minV); ok {
+		hi, ok := toFloat64(maxV)
+		if !ok || len(p.strs) > 0 || p.bools[0] || p.bools[1] {
+			return true
+		}
+		nums := p.nums
+		switch minV.(type) {
+		case float32:
+			// Eval rounds each value to float32 for a float32 column;
+			// compare the same rounded values (0.1 → 0.100000001…).
+			nums = p.nums32
+			if p.nan {
+				return true
+			}
+		case float64:
+			// Parquet min/max skip NaN, but is_in matches NaN rows.
+			if p.nan {
+				return true
+			}
+		}
+		// float64 conversion is monotonic, so rounding can only keep a
+		// row group, never wrongly skip one.
+		i, _ := slices.BinarySearch(nums, lo)
+		return i < len(nums) && nums[i] <= hi
+	}
+	if lo, ok := minV.(string); ok {
+		hi, ok := maxV.(string)
+		if !ok || len(p.nums) > 0 || p.bools[0] || p.bools[1] {
+			return true
+		}
+		i, _ := slices.BinarySearch(p.strs, lo)
+		return i < len(p.strs) && p.strs[i] <= hi
+	}
+	if lo, ok := minV.(bool); ok {
+		hi, ok := maxV.(bool)
+		if !ok || len(p.nums) > 0 || len(p.strs) > 0 {
+			return true
+		}
+		// false lies in [lo, hi] iff lo is false; true iff hi is true.
+		return (p.bools[0] && !lo) || (p.bools[1] && hi)
 	}
 	return true
 }

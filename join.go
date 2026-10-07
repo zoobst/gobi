@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -64,7 +65,10 @@ func (f *Frame) Join(right *Frame, leftKey, rightKey string, kind JoinType) (*Fr
 	if !isHashable(lKey.DataType()) {
 		return nil, fmt.Errorf("gobi: left key type %s is not hashable", lKey.DataType())
 	}
-	if lKey.DataType().ID() != rKey.DataType().ID() {
+	// Exact type equality, not just the type ID: timestamp keys in
+	// different units would hash raw int64s of different scales, and
+	// the coalesced key of a full / right join would mix them.
+	if !arrow.TypeEqual(lKey.DataType(), rKey.DataType()) {
 		return nil, fmt.Errorf("%w: %s vs %s", ErrColumnTypeMismatch,
 			lKey.DataType(), rKey.DataType())
 	}
@@ -322,28 +326,27 @@ func (f *Frame) buildTwoSidedOutput(right *Frame, leftKey, rightKey string,
 	return NewFrame(schema, outColumns)
 }
 
-// takeCoalescedKey materializes the join key column, pulling from
-// primary at primaryIdxs and falling back to fallback at fallbackIdxs
-// whenever the primary index is -1. Only the join key columns need
-// this: for right / full outer joins, unmatched-right rows have -1
-// on the left side but a valid right index, and the user still wants
-// the key value visible in the output.
-//
-// primary and fallback must share the same arrow type ID (checked
-// higher up in Join). Both index slices must be the same length as
-// each other and describe the output row order.
+// takeCoalescedKey builds a full / right join's key column: row i
+// comes from primary when primaryIdxs[i] >= 0, else from fallback when
+// fallbackIdxs[i] >= 0, else null. The keys must be exactly the same
+// type (Join checks). The common types append into a builder; other
+// types go through takeCoalescedChunks.
 func takeCoalescedKey(pool memory.Allocator, primary, fallback Series,
 	primaryIdxs, fallbackIdxs []int,
 ) (arrow.Array, error) {
+	if !arrow.TypeEqual(primary.DataType(), fallback.DataType()) {
+		return nil, fmt.Errorf("%w: join keys %s and %s", ErrColumnTypeMismatch, primary.DataType(), fallback.DataType())
+	}
 	dt := primary.DataType()
+	ploc, floc := newChunkLocator(primary), newChunkLocator(fallback)
 	appendFrom := func(b array.Builder, i int) error {
 		pi := primaryIdxs[i]
 		if pi >= 0 {
-			return appendPrimitiveAt(primary, pi, b)
+			return ploc.append(pi, b)
 		}
 		fi := fallbackIdxs[i]
 		if fi >= 0 {
-			return appendPrimitiveAt(fallback, fi, b)
+			return floc.append(fi, b)
 		}
 		b.AppendNull()
 		return nil
@@ -422,16 +425,37 @@ func takeCoalescedKey(pool memory.Allocator, primary, fallback Series,
 		}
 		return b.NewArray(), nil
 	default:
-		return nil, fmt.Errorf("%w: coalesced join key not implemented for %s",
-			ErrColumnTypeMismatch, dt)
+		return takeCoalescedChunks(pool, primary, fallback, primaryIdxs, fallbackIdxs)
 	}
 }
 
+// takeCoalescedChunks is takeCoalescedKey as one chunk-aware gather
+// over primary's chunks followed by fallback's.
+func takeCoalescedChunks(pool memory.Allocator, primary, fallback Series,
+	primaryIdxs, fallbackIdxs []int,
+) (arrow.Array, error) {
+	chunks := append(slices.Clone(primary.col.Data().Chunks()), fallback.col.Data().Chunks()...)
+	idx := make([]int, len(primaryIdxs))
+	for i, pi := range primaryIdxs {
+		switch {
+		case pi >= 0:
+			idx[i] = pi
+		case fallbackIdxs[i] >= 0:
+			idx[i] = primary.Len() + fallbackIdxs[i]
+		default:
+			idx[i] = -1
+		}
+	}
+	return takeChunks(pool, primary.DataType(), chunks, idx, true)
+}
+
 // takeArrayWithNulls is like takeArray but permits -1 in indexes to mean
-// "emit null" — used to support left / right / full joins where one
-// side may have no match.
+// "emit null" — used by left / right / full joins where one side may
+// have no match. The common types append into a builder (chunkLocator
+// finds multi-chunk rows); other types go through takeChunks.
 func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.Array, error) {
 	dt := s.DataType()
+	loc := newChunkLocator(s)
 	switch dt.ID() {
 	case arrow.INT64:
 		b := array.NewInt64Builder(pool)
@@ -441,7 +465,7 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 				b.AppendNull()
 				continue
 			}
-			if err := appendPrimitiveAt(s, idx, b); err != nil {
+			if err := loc.append(idx, b); err != nil {
 				return nil, err
 			}
 		}
@@ -454,7 +478,7 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 				b.AppendNull()
 				continue
 			}
-			if err := appendPrimitiveAt(s, idx, b); err != nil {
+			if err := loc.append(idx, b); err != nil {
 				return nil, err
 			}
 		}
@@ -467,7 +491,7 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 				b.AppendNull()
 				continue
 			}
-			if err := appendPrimitiveAt(s, idx, b); err != nil {
+			if err := loc.append(idx, b); err != nil {
 				return nil, err
 			}
 		}
@@ -480,7 +504,7 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 				b.AppendNull()
 				continue
 			}
-			if err := appendPrimitiveAt(s, idx, b); err != nil {
+			if err := loc.append(idx, b); err != nil {
 				return nil, err
 			}
 		}
@@ -493,7 +517,7 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 				b.AppendNull()
 				continue
 			}
-			if err := appendPrimitiveAt(s, idx, b); err != nil {
+			if err := loc.append(idx, b); err != nil {
 				return nil, err
 			}
 		}
@@ -506,7 +530,7 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 				b.AppendNull()
 				continue
 			}
-			if err := appendPrimitiveAt(s, idx, b); err != nil {
+			if err := loc.append(idx, b); err != nil {
 				return nil, err
 			}
 		}
@@ -519,7 +543,7 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 				b.AppendNull()
 				continue
 			}
-			if err := appendPrimitiveAt(s, idx, b); err != nil {
+			if err := loc.append(idx, b); err != nil {
 				return nil, err
 			}
 		}
@@ -550,7 +574,6 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 		}
 		return lb.NewArray(), nil
 	default:
-		return nil, fmt.Errorf("%w: join not implemented for %s",
-			ErrColumnTypeMismatch, dt)
+		return takeComputeSeries(pool, s, indexes, true)
 	}
 }

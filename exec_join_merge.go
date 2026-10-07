@@ -136,7 +136,7 @@ func mergeJoinInner(left, right *Frame, leftKey, rightKey string) (*Frame, error
 	if !isHashable(lKey.DataType()) {
 		return nil, fmt.Errorf("gobi: left key type %s is not hashable", lKey.DataType())
 	}
-	if lKey.DataType().ID() != rKey.DataType().ID() {
+	if !arrow.TypeEqual(lKey.DataType(), rKey.DataType()) {
 		return nil, fmt.Errorf("%w: %s vs %s", ErrColumnTypeMismatch,
 			lKey.DataType(), rKey.DataType())
 	}

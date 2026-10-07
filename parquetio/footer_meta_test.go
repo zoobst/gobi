@@ -2,8 +2,10 @@ package parquetio_test
 
 import (
 	"bytes"
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -280,5 +282,182 @@ func TestWrite_TimestampUnitIsUTC(t *testing.T) {
 	col, _ := back.Column("us")
 	if got, _, _ := col.AsTimes(); !got[0].Equal(ts[0]) {
 		t.Errorf("year 2300 round trip: %v", got[0])
+	}
+}
+
+// TestWrite_HilbertSortZonedTimestamp — Concat of streamed batches
+// keeps one chunk per batch; HilbertSort must be able to permute
+// timestamp[us, tz=UTC], timestamp[ns, tz=UTC] and naive
+// timestamp[ns] columns across those chunks.
+func TestWrite_HilbertSortZonedTimestamp(t *testing.T) {
+	pts := pointFrame(t, []float64{50, 0, 25, 10}, []float64{5, 0, 2, 1}, 0)
+	defer pts.Release()
+	times := []time.Time{time.Unix(50, 0), time.Unix(0, 0), time.Unix(25, 0), time.Unix(10, 0)}
+	ts, err := gobi.NewTimestampSeriesUnit("t", times, nil, arrow.Microsecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The two nanosecond shapes: zoned (e.g. Hive INT96 read back) and
+	// naive (time.Time through FromStructs / NewTimestampSeries).
+	nsUTC, err := gobi.NewTimestampSeriesUnit("t_ns_utc", times, nil, arrow.Nanosecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nsNaive := gobi.NewTimestampSeries("t_ns", times, nil)
+	df := pts
+	for _, s := range []gobi.Series{ts, nsUTC, nsNaive} {
+		next, err := df.WithColumn(s.Name(), s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if df != pts {
+			df.Release()
+		}
+		df = next
+	}
+	defer df.Release()
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.parquet")
+	if err := parquetio.WriteFile(df, in, &parquetio.WriteOptions{RowGroupRows: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var batches []*gobi.Frame
+	if err := parquetio.ReadFileChunksFunc(in, &parquetio.ReadOptions{ChunkRows: 1}, func(f *gobi.Frame) error {
+		f.Retain()
+		batches = append(batches, f)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	back, err := gobi.Concat(batches...)
+	for _, b := range batches {
+		b.Release()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer back.Release()
+	if c, _ := back.Column("t"); len(c.Column().Data().Chunks()) < 2 {
+		t.Fatalf("want a multi-chunk column, got %d chunk(s)", len(c.Column().Data().Chunks()))
+	}
+	out := filepath.Join(dir, "out.parquet")
+	if err := parquetio.WriteFile(back, out, &parquetio.WriteOptions{HilbertSort: true}); err != nil {
+		t.Fatalf("HilbertSort write: %v", err)
+	}
+	sorted, err := parquetio.ReadFile(out, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sorted.Release()
+	lon, _ := sorted.Column("lon")
+	xs, _ := lon.Float64s()
+	for _, name := range []string{"t", "t_ns_utc", "t_ns"} {
+		tc, _ := sorted.Column(name)
+		got, _, err := tc.AsTimes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range xs {
+			if int64(xs[i]) != got[i].Unix() {
+				t.Errorf("%s row %d: lon %v, t %v — rows split apart", name, i, xs[i], got[i].Unix())
+			}
+		}
+	}
+	for name, want := range map[string]string{"t": "timestamp[us, tz=UTC]", "t_ns_utc": "timestamp[ns, tz=UTC]", "t_ns": "timestamp[ns]"} {
+		if c, _ := back.Column(name); c.DataType().String() != want || len(c.Column().Data().Chunks()) < 2 {
+			t.Errorf("%s: %s in %d chunk(s), want multi-chunk %s", name, c.DataType(), len(c.Column().Data().Chunks()), want)
+		}
+	}
+}
+
+// TestIsIn_RowGroupPruning — Predicate IsIn skips row groups whose
+// min/max holds none of the values, and a lazy Filter(IsIn) still
+// returns exactly the matching rows.
+func TestIsIn_RowGroupPruning(t *testing.T) {
+	ids := make([]int64, 10)
+	for i := range ids {
+		ids[i] = int64(i)
+	}
+	df, err := gobi.NewFrameFromSeries(gobi.NewInt64Series("id", ids, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer df.Release()
+	path := filepath.Join(t.TempDir(), "ids.parquet")
+	if err := parquetio.WriteFile(df, path, &parquetio.WriteOptions{RowGroupRows: 2}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Predicate only prunes: rows 2,3 (group of 3) and 8,9 (group of 9).
+	pruned, err := parquetio.ReadFile(path, &parquetio.ReadOptions{Predicate: gobi.Col("id").IsIn(3, 9, 100)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pruned.Release()
+	c, _ := pruned.Column("id")
+	if v, _ := c.Int64s(); !slices.Equal(v, []int64{2, 3, 8, 9}) {
+		t.Errorf("pruned read = %v, want row groups [2 3] and [8 9]", v)
+	}
+
+	got, err := parquetio.ScanFile(path, nil).Filter(gobi.Col("id").IsIn([]int64{3, 9, 100})).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Release()
+	c, _ = got.Column("id")
+	v, _ := c.Int64s()
+	slices.Sort(v) // the parallel scan returns batches in no fixed order
+	if !slices.Equal(v, []int64{3, 9}) {
+		t.Errorf("lazy filter = %v, want [3 9]", v)
+	}
+}
+
+// TestIsIn_PruningUnsignedAndFloat32 — real Parquet stats: uint32
+// above MaxInt32 (stored as a negative int32 bit pattern) and float32
+// 0.1 (widened to 0.100000001…) must not prune matching row groups.
+func TestIsIn_PruningUnsignedAndFloat32(t *testing.T) {
+	pool := memory.DefaultAllocator
+	ub := array.NewUint32Builder(pool)
+	ub.AppendValues([]uint32{5, 3_000_000_000}, nil)
+	fb := array.NewFloat32Builder(pool)
+	fb.AppendValues([]float32{0.1, 0.1}, nil)
+	df, err := gobi.NewFrameFromSeries(
+		gobi.SeriesFromArray(arrow.Field{Name: "u", Type: arrow.PrimitiveTypes.Uint32, Nullable: true}, ub.NewArray()),
+		gobi.SeriesFromArray(arrow.Field{Name: "f", Type: arrow.PrimitiveTypes.Float32, Nullable: true}, fb.NewArray()),
+	)
+	ub.Release()
+	fb.Release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer df.Release()
+	path := filepath.Join(t.TempDir(), "uf.parquet")
+	if err := parquetio.WriteFile(df, path, nil); err != nil {
+		t.Fatal(err)
+	}
+	for name, pred := range map[string]gobi.Expr{
+		"uint32 5":      gobi.Col("u").IsIn(uint32(5)),
+		"uint32 3e9":    gobi.Col("u").IsIn(int64(3_000_000_000)),
+		"uint32 Eq 5":   gobi.Col("u").Eq(gobi.Lit(int64(5))),
+		"float32 0.1":   gobi.Col("f").IsIn(0.1),
+		"float32 NaN+1": gobi.Col("f").IsIn(math.NaN(), 1.0),
+	} {
+		got, err := parquetio.ReadFile(path, &parquetio.ReadOptions{Predicate: pred})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.NumRows() != 2 {
+			t.Errorf("%s: row group pruned (%d rows read)", name, got.NumRows())
+		}
+		got.Release()
+	}
+	// And a value outside the range still prunes.
+	got, err := parquetio.ReadFile(path, &parquetio.ReadOptions{Predicate: gobi.Col("u").IsIn(4)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Release()
+	if got.NumRows() != 0 {
+		t.Errorf("IsIn(4): %d rows read, want the group pruned", got.NumRows())
 	}
 }

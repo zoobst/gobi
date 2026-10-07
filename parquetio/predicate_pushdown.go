@@ -95,11 +95,28 @@ func (s *rowGroupStats) NullCount(col string) (int64, bool) {
 // decodeMinMax pulls Go-typed min/max scalars from a TypedStatistics.
 // Returns ok=false for types gobi.CanPossiblyMatch can't compare
 // (Int96, FixedLenByteArray outside strings, etc.).
+//
+// Unsigned integer columns are stored as INT32 / INT64 with an
+// unsigned logical type: their statistics are ordered unsigned but
+// come back as signed bit patterns (uint32 3e9 reads as a negative
+// int32). Reinterpreting them as uint32 / uint64 restores a range
+// that compares correctly; read as signed, max could sit below min
+// and prune row groups that match.
 func decodeMinMax(stats metadata.TypedStatistics) (any, any, bool) {
+	unsigned := false
+	if it, ok := stats.Descr().LogicalType().(interface{ IsSigned() bool }); ok && !it.IsSigned() {
+		unsigned = true
+	}
 	switch s := stats.(type) {
 	case *metadata.Int32Statistics:
+		if unsigned {
+			return uint32(s.Min()), uint32(s.Max()), true
+		}
 		return s.Min(), s.Max(), true
 	case *metadata.Int64Statistics:
+		if unsigned {
+			return uint64(s.Min()), uint64(s.Max()), true
+		}
 		return s.Min(), s.Max(), true
 	case *metadata.Float32Statistics:
 		return s.Min(), s.Max(), true
