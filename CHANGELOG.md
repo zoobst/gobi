@@ -5,6 +5,20 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.18]
+
+### Fixed
+
+- **A lazy plan naming a missing column no longer panics while it's
+  built.** `LazyFrame.SelectCols`, `Select` and `WithColumn` panicked
+  with `arrow: field with nil DataType` as soon as an expression
+  referenced a column that isn't in the input. Now `Collect()` /
+  `CollectRaw()` return `ErrColumnNotFound`, as documented. The
+  plan's eager schema gives such a column the `null` type as a
+  placeholder. Before, it used a nil type, which arrow-go's
+  `NewSchema` rejects. This affects in-memory frames and `ScanFile`
+  alike.
+
 ## [v0.4.17]
 
 ### Added

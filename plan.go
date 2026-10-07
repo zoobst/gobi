@@ -106,6 +106,22 @@ func (n *filterNode) PartitionMetadata() *PartitionMetadata {
 	return n.input.PartitionMetadata()
 }
 
+// plannedType is e's output type for a plan node's eager schema. When
+// inference fails — a missing column, a type error — or yields no
+// type, it returns the Null type as a placeholder: the plan still
+// builds, and Collect() reports the real error when it evaluates e.
+// (arrow.NewSchema panics on a nil-typed field, so nil can't stand in.)
+func plannedType(e Expr, schema *arrow.Schema) arrow.DataType {
+	if e.node == nil {
+		return arrow.Null
+	}
+	dt, err := e.node.Type(schema)
+	if err != nil || dt == nil {
+		return arrow.Null
+	}
+	return dt
+}
+
 // -----------------------------------------------------------------------------
 // projectNode: reshape output schema to a set of expressions
 // -----------------------------------------------------------------------------
@@ -117,21 +133,17 @@ type projectNode struct {
 }
 
 // newProjectNode computes the output schema eagerly so LazyFrame.Schema()
-// can report it without evaluation. Type-inference failures on an
-// individual Expr produce a nil-typed field in the output schema —
-// Collect() will surface the real error when it evaluates the Expr
-// against a Frame.
+// can report it without evaluation. A type-inference failure on an
+// individual Expr (e.g. a missing column) gives that field the Null
+// placeholder type (see plannedType); Collect() surfaces the real
+// error when it evaluates the Expr against a Frame.
 func newProjectNode(input LogicalPlan, exprs []Expr) *projectNode {
 	inSchema := input.Schema()
 	fields := make([]arrow.Field, len(exprs))
 	for i, e := range exprs {
-		var dt arrow.DataType
-		if e.node != nil {
-			dt, _ = e.node.Type(inSchema)
-		}
 		fields[i] = arrow.Field{
 			Name:     exprOutputName(e, i),
-			Type:     dt,
+			Type:     plannedType(e, inSchema),
 			Nullable: true,
 		}
 	}
@@ -177,11 +189,7 @@ type withColumnNode struct {
 
 func newWithColumnNode(input LogicalPlan, name string, e Expr) *withColumnNode {
 	inSchema := input.Schema()
-	var dt arrow.DataType
-	if e.node != nil {
-		dt, _ = e.node.Type(inSchema)
-	}
-	newField := arrow.Field{Name: name, Type: dt, Nullable: true}
+	newField := arrow.Field{Name: name, Type: plannedType(e, inSchema), Nullable: true}
 
 	replaceIdx := -1
 	for i, f := range inSchema.Fields() {

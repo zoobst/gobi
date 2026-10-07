@@ -2,6 +2,7 @@ package parquetio_test
 
 import (
 	"bytes"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -459,5 +460,28 @@ func TestIsIn_PruningUnsignedAndFloat32(t *testing.T) {
 	defer got.Release()
 	if got.NumRows() != 0 {
 		t.Errorf("IsIn(4): %d rows read, want the group pruned", got.NumRows())
+	}
+}
+
+// TestScanFile_SelectMissingColumn — a scan with projection pushdown
+// reports a missing column from Collect instead of panicking while the
+// plan is built.
+func TestScanFile_SelectMissingColumn(t *testing.T) {
+	df, err := gobi.NewFrameFromSeries(gobi.NewInt64Series("a", []int64{1, 2}, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer df.Release()
+	path := filepath.Join(t.TempDir(), "a.parquet")
+	if err := parquetio.WriteFile(df, path, nil); err != nil {
+		t.Fatal(err)
+	}
+	for name, lf := range map[string]*gobi.LazyFrame{
+		"SelectCols":   parquetio.ScanFile(path, nil).SelectCols("a", "nope"),
+		"after Filter": parquetio.ScanFile(path, nil).Filter(gobi.Col("a").Gt(gobi.Lit(int64(0)))).SelectCols("nope"),
+	} {
+		if _, err := lf.Collect(); !errors.Is(err, gobi.ErrColumnNotFound) {
+			t.Errorf("%s: err = %v, want ErrColumnNotFound", name, err)
+		}
 	}
 }
