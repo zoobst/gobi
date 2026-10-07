@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/assets/gobi-banner.jpg" alt="gobi: geospatial DataFrame library for Go" width="100%">
+</p>
+
 # gobi
 
 `gobi` is a geospatial dataframe library for Go, built on top of
