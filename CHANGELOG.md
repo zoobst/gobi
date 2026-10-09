@@ -1082,7 +1082,7 @@ under scalar wrappers) so Series-level 3D ops never allocate
 - **`PointsInCapsuleFromXYZ` / `PointsInAnyCapsuleFromXYZ`** —
   projected-only day-one.
 
-#### 3D convex hull ([`geometry/convexhull3d.go`](geometry/convexhull3d.go))
+#### 3D convex hull ([`geometry/convexhull3d.go`](geometry/extruded_polygon.go))
 
 - **`ConvexHull3DFromXYZ(xs, ys, zs, crs) Hull3D`** — extruded-
   prism approximation: 2D hull of XY wrapped in `ExtrudedPolygon`
@@ -1197,7 +1197,7 @@ Perf:
   that's the difference between 100M and ~100 float64s of ECEF
   scratch churn.
 - **`readWKBPointXYZ` promoted to `geometry.PointXYZFromWKB`**
-  and moved to a new [`geometry/wkb_point.go`](geometry/wkb_point.go).
+  and moved to a new [`geometry/wkb_point.go`](geometry/wkb.go).
   Uses `encoding/binary`'s `BigEndian` / `LittleEndian` directly
   instead of the ~40 lines of hand-rolled Uint64 conversion the
   gobi-root copy carried. The three Series-level call sites
@@ -1245,7 +1245,7 @@ the single-chunk shape they were built for.
   as designed. Applied inside `writeLayerToDB` so both `WriteFile`
   and `WriteMany` are covered by the single fix. Regression:
   `TestRoundTrip_MultiChunkFrame` in
-  [gpkgio/roundtrip_test.go](gpkgio/roundtrip_test.go) writes a
+  [gpkgio/roundtrip_test.go](gpkgio/write_test.go) writes a
   Concat'd (guaranteed multi-chunk) frame and round-trips it back.
 
 - **`pgio.WriteTable` no longer errors on multi-chunk input.** Same
@@ -1611,7 +1611,7 @@ running accumulators instead of materializing intermediate `[]Point`
 / `Polygon` / etc. structs. Semantics match `ParseWKB(data).<op>()`
 exactly for every supported geometry type.
 
-- **[`geometry.BoundsFromWKB(data) (Bounds, error)`](geometry/wkb_bounds.go)**
+- **[`geometry.BoundsFromWKB(data) (Bounds, error)`](geometry/wkb_scan.go)**
   — Slice 2. Walks the WKB byte stream tracking min/max on X and Y.
   Handles Point / LineString / Polygon / MultiPoint / MultiLineString /
   MultiPolygon / GeometryCollection, both 2D and 3D variants, both
@@ -1622,7 +1622,7 @@ exactly for every supported geometry type.
   (31.7 ms → 21.9 ms), −47% memory (154 MB → 81 MB), −50% allocs
   (600k → 300k). Microbench: 2–3.5× at all sizes.
 
-- **[`geometry.CentroidFromWKB(data) (Point, error)`](geometry/wkb_centroid.go)**
+- **[`geometry.CentroidFromWKB(data) (Point, error)`](geometry/wkb_scan.go)**
   — Slice 3. Walks the WKB byte stream running per-type centroid
   accumulators. Point / LineString / Polygon / MultiPoint /
   MultiLineString centroids match `g.Centroid()` exactly.
@@ -1633,10 +1633,10 @@ exactly for every supported geometry type.
   CRS-independent, correct for the spatial-sort consumers that drove
   the API (Hilbert indexing).
 
-- **[`geometry.CentroidAndBoundsFromWKB(data) (Point, Bounds, error)`](geometry/wkb_centroid.go)**
+- **[`geometry.CentroidAndBoundsFromWKB(data) (Point, Bounds, error)`](geometry/wkb_scan.go)**
   — Slice 3 fused scanner. Computes centroid + 2D bounds in a single
-  byte-stream pass. Wired into [`HilbertSortWithCovering`](sort_hilbert.go)
-  (the fused write-path) and [`SortByHilbertWith`](sort_hilbert.go)
+  byte-stream pass. Wired into [`HilbertSortWithCovering`](sort.go)
+  (the fused write-path) and [`SortByHilbertWith`](sort.go)
   (two-pass form uses `CentroidFromWKB`).
 
   **Measured on 100k-row 9-vertex-polygon workload:**
@@ -1739,13 +1739,13 @@ side of the write path. Same shape as `BoundsFromWKB` / `CentroidFromWKB`:
 walk the WKB blob once with a running accumulator instead of
 materializing `[]Point` / `Polygon` structs the caller throws away.
 
-- **[`geometry.PlanarLengthFromWKB(data) ([]byte) → (float64, error)`](geometry/wkb_length.go)**
+- **[`geometry.PlanarLengthFromWKB(data) ([]byte) → (float64, error)`](geometry/wkb_scan.go)**
   — sums Euclidean segment lengths for LineString / MultiLineString;
   recurses into GeometryCollections. Returns coordinate-unit length;
   callers apply `1 / metersPerUnit(u)` themselves for Unit conversion.
   Geographic CRSes (haversine required) fall back to the AoS path.
 
-- **[`geometry.PlanarAreaFromWKB(data) ([]byte) → (float64, error)`](geometry/wkb_area.go)**
+- **[`geometry.PlanarAreaFromWKB(data) ([]byte) → (float64, error)`](geometry/wkb_scan.go)**
   — planar shoelace on Polygon (exterior − holes), summed across
   MultiPolygon components. Same GeometryCollection recursion.
   Semantics match `PlanarRingArea` composed via `Polygon.Area` on a
@@ -1795,7 +1795,7 @@ materializing `[]Point` / `Polygon` structs the caller throws away.
 
 #### Iterative SoA Douglas-Peucker (Slice 9)
 
-- **[`geometry.SimplifyDPFromXY(xs, ys, tol) ([]float64, []float64)`](geometry/simplify_view.go)**
+- **[`geometry.SimplifyDPFromXY(xs, ys, tol) ([]float64, []float64)`](geometry/simplify.go)**
   — iterative Douglas-Peucker on parallel Xs / Ys slabs, replacing
   the AoS `douglasPeucker`'s recursive `[]Point` splice+append
   pattern. Explicit (lo, hi) stack + retain-bitmap; three total
@@ -1804,7 +1804,7 @@ materializing `[]Point` / `Polygon` structs the caller throws away.
   `sqrt` per split to the outside compare — skipped entirely on
   segments where no interior point exceeds tolerance.
 
-- **[`PointsView.SimplifyDP(tol) PointsView`](geometry/simplify_view.go)**
+- **[`PointsView.SimplifyDP(tol) PointsView`](geometry/simplify.go)**
   — amortized-view entry point. XYZ input retains Z coordinates
   alongside XY at every kept index; the split decision is XY-only,
   matching the AoS shape.
@@ -1887,12 +1887,12 @@ distance with n=1024 vertices each, that's ~1M `Hypot` calls
 outermost call and moves the inner loop onto flat coordinate
 slabs.
 
-- **[`geometry.PointToSegmentDistanceSqXY(px, py, ax, ay, bx, by) float64`](geometry/distance_view.go)**
+- **[`geometry.PointToSegmentDistanceSqXY(px, py, ax, ay, bx, by) float64`](geometry/distance.go)**
   — squared Euclidean distance from a point to a line segment.
   Handles zero-length segments as point-to-point. Zero-alloc,
   branch-free hot path suitable for tight inner loops.
 
-- **[`geometry.PointToPolylineMinDistanceSq(px, py, xs, ys, closed) float64`](geometry/distance_view.go)**
+- **[`geometry.PointToPolylineMinDistanceSq(px, py, xs, ys, closed) float64`](geometry/distance.go)**
   — min squared distance from a point to any segment of a
   polyline (or closed ring when `closed=true`). Runs the segment
   loop directly on parallel Xs / Ys slabs.
@@ -1921,14 +1921,14 @@ slabs.
 
 #### Convex hull on slabs (Slice 12)
 
-- **[`geometry.ConvexHullFromXY(xs, ys) ([]float64, []float64)`](geometry/hull_view.go)**
+- **[`geometry.ConvexHullFromXY(xs, ys) ([]float64, []float64)`](geometry/hull.go)**
   — Andrew's monotone-chain algorithm on parallel Xs / Ys slabs.
   Returns the CCW convex hull with a closing repeat of the first
   vertex. Replaces the AoS Graham scan's polar-angle
   `sort.Slice` on `[]Point` — index-sort on `[]int` (8-byte
   swaps) with coord reads from cache-friendly float64 arrays.
 
-- **[`PointsView.ConvexHull() PointsView`](geometry/hull_view.go)**
+- **[`PointsView.ConvexHull() PointsView`](geometry/hull.go)**
   — amortized-view entry point. XYZ retains Z at every hull
   vertex; XY-only decision.
 
@@ -2064,7 +2064,7 @@ did not benefit from the earlier slices.
 Sweeps the last non-clip AoS Series entry points onto their SoA
 counterparts.
 
-- **[`geometry.BoundsMinDistance(a, b Bounds) float64`](geometry/dwithin.go)**
+- **[`geometry.BoundsMinDistance(a, b Bounds) float64`](geometry/distance.go)**
   — previously unexported `bboxMinDistance`; now public so the
   Slice-15 GeomDWithin fast path can call it after reading row
   bounds via `BoundsFromWKB`.
@@ -2397,7 +2397,7 @@ and the scalar-comparison Series ops weren't wired to the existing
   builds on the `compute/` cmp kernels already shipped in
   [compute/cmp_simd.go](compute/cmp_simd.go).
 
-- **[`tryAndFusionFastPath`](expr_and_fusion.go)** — pattern-
+- **[`tryAndFusionFastPath`](filter_fused.go)** — pattern-
   matches AND-chained scalar comparisons in the LazyFrame
   expression tree and dispatches to fused compute kernels:
 
@@ -2505,7 +2505,7 @@ CountTrue bool-reduce primitive. Also fixes a pre-existing Apple
 
 ### Changed
 
-- **[`hilbert_covering_bench_test.go`](hilbert_covering_bench_test.go)**
+- **[`hilbert_covering_bench_test.go`](sort_bench_test.go)**
   — added `BenchmarkBboxCoveringColumns`, `BenchmarkSortByHilbert`,
   `BenchmarkHilbertSortWithCovering` on 100k-row 9-vertex-polygon
   grids for end-to-end tracking of Slices 2 + 3 wins.
@@ -2752,7 +2752,7 @@ archsimd-only amd64 kernels.
   operators.
 
   Regression test in
-  [parquetio/chunks_test.go](parquetio/chunks_test.go)
+  [parquetio/chunks_test.go](parquetio/parquetio_test.go)
   (`TestReadFile_GeoParquet_RecognizesFileLevelMetadata`) writes a
   fixture directly via `pqarrow.NewFileWriter` +
   `AppendKeyValueMetadata` — file-level "geo" blob only, no per-field
@@ -2808,7 +2808,7 @@ reports true — the two symptoms called out in the report.
   unsupported; only top-level names resolve.
 
   Regression test in
-  [parquetio/chunks_test.go](parquetio/chunks_test.go)
+  [parquetio/chunks_test.go](parquetio/parquetio_test.go)
   (`TestReadFile_ColumnProjection_NestedSchema`) writes a
   struct-containing fixture directly via `pqarrow.NewFileWriter` —
   gobi's own writer is flat, so covering this case required reaching
@@ -5416,7 +5416,7 @@ without a profiler.
   for mean-centering, z-score, and similar per-group transforms.
 - **Struct-typed columns.** `builderForType` handles `arrow.STRUCT`,
   so Custom ExprNodes can construct and return `Struct<...>` columns
-  end-to-end (see [struct_column_test.go](struct_column_test.go) for
+  end-to-end (see [struct_column_test.go](frame_test.go) for
   a `Struct<List<Uint64>, Bool>` UDF pattern matching road-snap-shaped
   outputs). `List<Struct<...>>` also carries through Frame
   construction and `ListLen`/other list ops. FromStructs/ToStructs

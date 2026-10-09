@@ -381,3 +381,708 @@ func TestExpr_Alias(t *testing.T) {
 		t.Fatalf("alias not in string: %s", e.String())
 	}
 }
+
+// bitFlagsFrame builds a one-column Int64 Frame of packed-flag
+// values for exercising BitAnd/BitOr/BitXor with a scalar mask.
+func bitFlagsFrame(t testing.TB) *Frame {
+	t.Helper()
+	pool := memory.DefaultAllocator
+	b := array.NewInt64Builder(pool)
+	defer b.Release()
+	// Bit 0 set: 1, 3, 5. Bit 1 set: 2, 3, 6, 7.
+	b.AppendValues([]int64{0, 1, 2, 3, 4, 5, 6, 7}, nil)
+	arr := b.NewArray()
+	defer arr.Release()
+	field := arrow.Field{Name: "flags", Type: arrow.PrimitiveTypes.Int64, Nullable: false}
+	col := arrow.NewColumn(field, arrow.NewChunked(arr.DataType(), []arrow.Array{arr}))
+	schema := arrow.NewSchema([]arrow.Field{field}, nil)
+	f, err := NewFrame(schema, []arrow.Column{*col})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// TestExpr_BitAnd_Scalar — Col & Lit(bit) unpacks a single flag,
+// output stays Int64.
+func TestExpr_BitAnd_Scalar(t *testing.T) {
+	f := bitFlagsFrame(t)
+	out, err := f.WithColumnExpr("bit0", Col("flags").BitAnd(Lit(int64(1))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	col, _ := out.Column("bit0")
+	if col.DataType().ID() != arrow.INT64 {
+		t.Fatalf("dtype = %s, want INT64", col.DataType())
+	}
+	arr := col.col.Data().Chunks()[0].(*array.Int64)
+	want := []int64{0, 1, 0, 1, 0, 1, 0, 1}
+	for i, w := range want {
+		if arr.Value(i) != w {
+			t.Errorf("row %d = %d, want %d", i, arr.Value(i), w)
+		}
+	}
+}
+
+// TestExpr_BitOr_BitXor_Scalar — sanity for the other two ops on the
+// same fixture.
+func TestExpr_BitOr_BitXor_Scalar(t *testing.T) {
+	f := bitFlagsFrame(t)
+	out, err := f.WithColumnExpr("or8", Col("flags").BitOr(Lit(int64(8))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr := out.mustCol("or8").col.Data().Chunks()[0].(*array.Int64)
+	// Every value gets bit 3 set → 8, 9, 10, 11, 12, 13, 14, 15.
+	want := []int64{8, 9, 10, 11, 12, 13, 14, 15}
+	for i, w := range want {
+		if arr.Value(i) != w {
+			t.Errorf("or8 row %d = %d, want %d", i, arr.Value(i), w)
+		}
+	}
+
+	out, err = f.WithColumnExpr("xor5", Col("flags").BitXor(Lit(int64(5))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr = out.mustCol("xor5").col.Data().Chunks()[0].(*array.Int64)
+	xorWant := []int64{5, 4, 7, 6, 1, 0, 3, 2}
+	for i, w := range xorWant {
+		if arr.Value(i) != w {
+			t.Errorf("xor5 row %d = %d, want %d", i, arr.Value(i), w)
+		}
+	}
+}
+
+// TestExpr_BitAnd_ColCol — col & col path (falls through the scalar
+// fast path when both operands are ExprNodes rather than literals).
+func TestExpr_BitAnd_ColCol(t *testing.T) {
+	pool := memory.DefaultAllocator
+	aB := array.NewInt64Builder(pool)
+	defer aB.Release()
+	aB.AppendValues([]int64{0xF0, 0xF0, 0xFF, 0x0F}, nil)
+	bB := array.NewInt64Builder(pool)
+	defer bB.Release()
+	bB.AppendValues([]int64{0x0F, 0xFF, 0xAA, 0xF0}, nil)
+	arrA := aB.NewArray()
+	defer arrA.Release()
+	arrB := bB.NewArray()
+	defer arrB.Release()
+	fields := []arrow.Field{
+		{Name: "a", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "b", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+	}
+	schema := arrow.NewSchema(fields, nil)
+	cols := []arrow.Column{
+		*arrow.NewColumn(fields[0], arrow.NewChunked(arrA.DataType(), []arrow.Array{arrA})),
+		*arrow.NewColumn(fields[1], arrow.NewChunked(arrB.DataType(), []arrow.Array{arrB})),
+	}
+	f, err := NewFrame(schema, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.WithColumnExpr("and", Col("a").BitAnd(Col("b")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr := out.mustCol("and").col.Data().Chunks()[0].(*array.Int64)
+	want := []int64{0x00, 0xF0, 0xAA, 0x00}
+	for i, w := range want {
+		if arr.Value(i) != w {
+			t.Errorf("row %d = %x, want %x", i, arr.Value(i), w)
+		}
+	}
+}
+
+// TestExpr_Bitwise_RejectsFloat — bitwise on Float column errors
+// at Type() time.
+func TestExpr_Bitwise_RejectsFloat(t *testing.T) {
+	pool := memory.DefaultAllocator
+	fb := array.NewFloat64Builder(pool)
+	defer fb.Release()
+	fb.AppendValues([]float64{1.5, 2.5}, nil)
+	arr := fb.NewArray()
+	defer arr.Release()
+	field := arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Float64, Nullable: false}
+	col := arrow.NewColumn(field, arrow.NewChunked(arr.DataType(), []arrow.Array{arr}))
+	schema := arrow.NewSchema([]arrow.Field{field}, nil)
+	f, _ := NewFrame(schema, []arrow.Column{*col})
+	_, err := f.WithColumnExpr("bad", Col("x").BitAnd(Lit(int64(1))))
+	if err == nil {
+		t.Fatal("expected error for BitAnd on Float64 column")
+	}
+	if !errors.Is(err, ErrExprTypeMismatch) {
+		t.Errorf("error should wrap ErrExprTypeMismatch, got %v", err)
+	}
+}
+
+// mustCol returns the named column or panics — test-only helper for
+// tighter assertions.
+func (f *Frame) mustCol(name string) Series {
+	s, err := f.Column(name)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
+// --- LitNull ------------------------------------------------------------
+
+func TestLitNull_StringBroadcast(t *testing.T) {
+	f := lazyFrame(t)
+	out, err := f.WithColumnExpr("provider", LitNull(arrow.BinaryTypes.String))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := out.Column("provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.DataType().ID() != arrow.STRING {
+		t.Fatalf("provider type = %s, want STRING", provider.DataType())
+	}
+	arr := provider.col.Data().Chunks()[0].(*array.String)
+	for i := range 5 {
+		if !arr.IsNull(i) {
+			t.Fatalf("row %d not null (LitNull should produce all nulls)", i)
+		}
+	}
+}
+
+func TestLitNull_ComposesWithCollectSet(t *testing.T) {
+	f := lazyFrame(t)
+	// Adding a null provider column then aggregating: the null-of-type
+	// String should be skipped by the set aggregator, yielding an
+	// empty list per group.
+	out, err := f.Lazy().
+		WithColumn("provider", LitNull(arrow.BinaryTypes.String)).
+		GroupBy("region").
+		Agg(Aggregation{Column: "provider", Fn: NewStringSetAggregator(), Alias: "providers"}).
+		Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two regions (US, EU), each with empty provider set.
+	if r, _ := out.Shape(); r != 2 {
+		t.Fatalf("row count = %d, want 2", r)
+	}
+	providers, _ := out.Column("providers")
+	la := providers.col.Data().Chunks()[0].(*array.List)
+	for i := 0; i < 2; i++ {
+		start, end := la.ValueOffsets(i)
+		if end != start {
+			t.Fatalf("row %d producer list should be empty; got %d values", i, end-start)
+		}
+	}
+}
+
+func TestLitNull_TypeIsPreserved(t *testing.T) {
+	f := lazyFrame(t)
+	// Verify Type() reports the requested dtype at plan time.
+	lf := f.Lazy().WithColumn("k", LitNull(arrow.PrimitiveTypes.Uint64))
+	fields, ok := lf.Schema().FieldsByName("k")
+	if !ok || len(fields) == 0 {
+		t.Fatalf("k field missing")
+	}
+	if fields[0].Type.ID() != arrow.UINT64 {
+		t.Fatalf("k type = %s, want UINT64", fields[0].Type)
+	}
+}
+
+// --- SelectCols ---------------------------------------------------------
+
+func TestSelectCols_Eager(t *testing.T) {
+	f := lazyFrame(t)
+	// Reorder: region first, then price. Drop id and active.
+	out, err := f.SelectCols("region", "price")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := out.ColumnNames()
+	if len(names) != 2 || names[0] != "region" || names[1] != "price" {
+		t.Fatalf("column names = %v, want [region price]", names)
+	}
+}
+
+func TestSelectCols_MissingColumn(t *testing.T) {
+	f := lazyFrame(t)
+	_, err := f.SelectCols("region", "nope")
+	if !errors.Is(err, ErrColumnNotFound) {
+		t.Fatalf("want ErrColumnNotFound, got %v", err)
+	}
+}
+
+func TestSelectCols_Lazy(t *testing.T) {
+	f := lazyFrame(t)
+	out, err := f.Lazy().SelectCols("region", "id").Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := out.ColumnNames()
+	if len(names) != 2 || names[0] != "region" || names[1] != "id" {
+		t.Fatalf("column names = %v, want [region id]", names)
+	}
+}
+
+func TestSelectCols_Empty(t *testing.T) {
+	f := lazyFrame(t)
+	out, err := f.SelectCols()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.ColumnNames()) != 0 {
+		t.Fatalf("empty SelectCols should produce a 0-column Frame, got %d columns", len(out.ColumnNames()))
+	}
+}
+
+// --- Rename -------------------------------------------------------------
+
+func TestRename_EagerPreservesBuffers(t *testing.T) {
+	f := lazyFrame(t)
+	out, err := f.Rename("price", "cost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The renamed column should be present under the new name...
+	cost, err := out.Column("cost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost.DataType().ID() != arrow.FLOAT64 {
+		t.Fatalf("cost dtype = %s, want FLOAT64", cost.DataType())
+	}
+	// ...and absent under the old name.
+	if _, err := out.Column("price"); !errors.Is(err, ErrColumnNotFound) {
+		t.Fatalf("old name should be gone; got err %v", err)
+	}
+	// Column order preserved.
+	oldNames := f.ColumnNames()
+	newNames := out.ColumnNames()
+	if len(oldNames) != len(newNames) {
+		t.Fatalf("column count changed: %v -> %v", oldNames, newNames)
+	}
+	// Only the renamed position differs.
+	for i := range oldNames {
+		want := oldNames[i]
+		if oldNames[i] == "price" {
+			want = "cost"
+		}
+		if newNames[i] != want {
+			t.Fatalf("column %d: %q, want %q", i, newNames[i], want)
+		}
+	}
+}
+
+func TestRename_MissingErrors(t *testing.T) {
+	f := lazyFrame(t)
+	_, err := f.Rename("nope", "new")
+	if !errors.Is(err, ErrColumnNotFound) {
+		t.Fatalf("want ErrColumnNotFound, got %v", err)
+	}
+}
+
+func TestRename_SameNameIsNoop(t *testing.T) {
+	f := lazyFrame(t)
+	out, err := f.Rename("price", "price")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Frame.Rename with old==new returns the receiver — cheap no-op,
+	// matches LazyFrame.Rename's identity path.
+	if out != f {
+		t.Fatal("Frame.Rename(same, same) should return the receiver unchanged")
+	}
+}
+
+func TestRename_Lazy(t *testing.T) {
+	f := lazyFrame(t)
+	out, err := f.Lazy().Rename("price", "cost").Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.Column("cost"); err != nil {
+		t.Fatalf("cost column missing after lazy rename: %v", err)
+	}
+	if _, err := out.Column("price"); !errors.Is(err, ErrColumnNotFound) {
+		t.Fatalf("price should be gone; got err %v", err)
+	}
+}
+
+func TestRename_LazySameNameNoop(t *testing.T) {
+	f := lazyFrame(t)
+	// LazyFrame.Rename with old==new returns receiver — the plan tree
+	// shouldn't grow a rename node.
+	lf := f.Lazy()
+	lf2 := lf.Rename("price", "price")
+	if lf2 != lf {
+		t.Fatal("LazyFrame.Rename(same, same) should be a no-op returning the receiver")
+	}
+}
+
+// End-to-end: rename + SelectCols + LitNull composing.
+func TestRename_ComposedPipeline(t *testing.T) {
+	f := lazyFrame(t)
+	out, err := f.Lazy().
+		Rename("price", "cost").
+		WithColumn("provider", LitNull(arrow.BinaryTypes.String)).
+		SelectCols("id", "cost", "provider").
+		Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := out.ColumnNames()
+	if len(names) != 3 || names[0] != "id" || names[1] != "cost" || names[2] != "provider" {
+		t.Fatalf("column names = %v, want [id cost provider]", names)
+	}
+}
+
+// TestExprShift_WithColumn — Col("price").Shift(1) as an appended
+// column. Row 0 becomes null; rows 1..N take the prior row's value.
+func TestExprShift_WithColumn(t *testing.T) {
+	f := exprFrame(t)
+	out, err := f.WithColumnExpr("prev_price", Col("price").Shift(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev, err := out.Column("prev_price")
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr := prev.col.Data().Chunks()[0].(*array.Float64)
+	if !arr.IsNull(0) {
+		t.Fatalf("row 0 should be null after Shift(1), got %v", arr.Value(0))
+	}
+	want := []float64{0, 10, 20, 30}
+	for i := 1; i < 4; i++ {
+		if arr.IsNull(i) {
+			t.Fatalf("row %d null after Shift(1); expected %v", i, want[i])
+		}
+		if arr.Value(i) != want[i] {
+			t.Fatalf("row %d = %v, want %v", i, arr.Value(i), want[i])
+		}
+	}
+}
+
+// TestExprShift_NegativeLead — Shift(-1) produces a lead (i+1's value
+// in position i). Last row becomes null.
+func TestExprShift_NegativeLead(t *testing.T) {
+	f := exprFrame(t)
+	out, err := f.WithColumnExpr("next_price", Col("price").Shift(-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _ := out.Column("next_price")
+	arr := next.col.Data().Chunks()[0].(*array.Float64)
+	want := []float64{20, 30, 40}
+	for i := 0; i < 3; i++ {
+		if arr.IsNull(i) {
+			t.Fatalf("row %d null after Shift(-1); expected %v", i, want[i])
+		}
+		if arr.Value(i) != want[i] {
+			t.Fatalf("row %d = %v, want %v", i, arr.Value(i), want[i])
+		}
+	}
+	if !arr.IsNull(3) {
+		t.Fatalf("last row should be null after Shift(-1), got %v", arr.Value(3))
+	}
+}
+
+// TestExprShift_ComposesWithArithmetic — a period-over-period delta
+// via Sub(Shift(1)). Row 0 is null; the rest carry the arithmetic
+// difference.
+func TestExprShift_ComposesWithArithmetic(t *testing.T) {
+	f := exprFrame(t)
+	// delta = price - price.shift(1)
+	out, err := f.WithColumnExpr("delta", Col("price").Sub(Col("price").Shift(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta, _ := out.Column("delta")
+	arr := delta.col.Data().Chunks()[0].(*array.Float64)
+	if !arr.IsNull(0) {
+		t.Fatalf("row 0 should be null (Sub with null RHS); got %v", arr.Value(0))
+	}
+	// prices are 10, 20, 30, 40 → deltas at rows 1..3 are all 10.
+	for i := 1; i < 4; i++ {
+		if arr.IsNull(i) || arr.Value(i) != 10 {
+			t.Fatalf("row %d = %v (null=%v), want 10", i, arr.Value(i), arr.IsNull(i))
+		}
+	}
+}
+
+// TestExprShift_Lazy — same expression through the lazy plan surface,
+// verifying the ExprNode round-trips through Compile/Execute.
+func TestExprShift_Lazy(t *testing.T) {
+	f := exprFrame(t)
+	out, err := f.Lazy().
+		WithColumn("prev_price", Col("price").Shift(1)).
+		Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev, _ := out.Column("prev_price")
+	arr := prev.col.Data().Chunks()[0].(*array.Float64)
+	if !arr.IsNull(0) {
+		t.Fatalf("row 0 should be null via lazy Shift(1)")
+	}
+	if arr.Value(3) != 30 {
+		t.Fatalf("row 3 via lazy = %v, want 30", arr.Value(3))
+	}
+}
+
+// TestExprShift_StringColumn — Shift on a non-numeric column also
+// works (Series.Shift routes through builderForType, which covers
+// strings). Verifies we haven't accidentally locked Shift to numeric-
+// only paths at the Expr layer.
+func TestExprShift_StringColumn(t *testing.T) {
+	f := exprFrame(t)
+	out, err := f.WithColumnExpr("prev_name", Col("name").Shift(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev, _ := out.Column("prev_name")
+	arr := prev.col.Data().Chunks()[0].(*array.String)
+	if !arr.IsNull(0) {
+		t.Fatalf("row 0 should be null after Shift(1); got %q", arr.Value(0))
+	}
+	if arr.Value(1) != "Alpha" || arr.Value(3) != "Charlie" {
+		t.Fatalf("Shift preserves values wrong: got %q, %q", arr.Value(1), arr.Value(3))
+	}
+}
+
+// shiftOverFrame builds a per-partition Shift fixture:
+//
+//	k    t   v
+//	A    3   100
+//	B    1   200
+//	A    1   300
+//	B    3   400
+//	A    2   500
+//
+// Groups A rows in input order: [100, 300, 500]. Sorted by t: [300, 500, 100].
+// Groups B rows in input order: [200, 400]. Sorted by t: [200, 400].
+func shiftOverFrame(t *testing.T) *Frame {
+	t.Helper()
+	pool := memory.DefaultAllocator
+	kb := array.NewStringBuilder(pool)
+	defer kb.Release()
+	kb.AppendValues([]string{"A", "B", "A", "B", "A"}, nil)
+	tb := array.NewInt64Builder(pool)
+	defer tb.Release()
+	tb.AppendValues([]int64{3, 1, 1, 3, 2}, nil)
+	vb := array.NewInt64Builder(pool)
+	defer vb.Release()
+	vb.AppendValues([]int64{100, 200, 300, 400, 500}, nil)
+
+	fields := []arrow.Field{
+		{Name: "k", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "t", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "v", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+	}
+	schema := arrow.NewSchema(fields, nil)
+	arrs := []arrow.Array{kb.NewArray(), tb.NewArray(), vb.NewArray()}
+	defer func() {
+		for _, a := range arrs {
+			a.Release()
+		}
+	}()
+	cols := make([]arrow.Column, len(fields))
+	for i, a := range arrs {
+		cols[i] = *arrow.NewColumn(fields[i], arrow.NewChunked(a.DataType(), []arrow.Array{a}))
+	}
+	f, err := NewFrame(schema, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// TestExprShift_OverUnordered — Shift(1) per partition using input row
+// order within each partition (polars default when no order_by given).
+// Row-order-preserving output: each row gets the prior in-partition v
+// at its own position, or null if it's the first row in that partition.
+func TestExprShift_OverUnordered(t *testing.T) {
+	f := shiftOverFrame(t)
+	out, err := f.WithColumnExpr("prev_v", Col("v").Shift(1).Over("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev, _ := out.Column("prev_v")
+	arr := prev.col.Data().Chunks()[0].(*array.Int64)
+	// A rows in input order: 0, 2, 4 with v = 100, 300, 500
+	//   → shift(1) within A yields: null, 100, 300 at rows 0, 2, 4.
+	// B rows in input order: 1, 3 with v = 200, 400
+	//   → shift(1) within B yields: null, 200 at rows 1, 3.
+	if !arr.IsNull(0) {
+		t.Fatalf("row 0 (first A) should be null, got %d", arr.Value(0))
+	}
+	if !arr.IsNull(1) {
+		t.Fatalf("row 1 (first B) should be null, got %d", arr.Value(1))
+	}
+	if arr.Value(2) != 100 {
+		t.Fatalf("row 2 (2nd A) = %d, want 100", arr.Value(2))
+	}
+	if arr.Value(3) != 200 {
+		t.Fatalf("row 3 (2nd B) = %d, want 200", arr.Value(3))
+	}
+	if arr.Value(4) != 300 {
+		t.Fatalf("row 4 (3rd A) = %d, want 300", arr.Value(4))
+	}
+}
+
+// TestExprShift_OverOrdered — Shift(1) per partition, sorted by t
+// within each partition. Uses polars-shaped `.OverOrdered` API.
+// Row-order in the output still matches input row order — orderBy only
+// affects what "previous row" means inside the partition.
+func TestExprShift_OverOrdered(t *testing.T) {
+	f := shiftOverFrame(t)
+	out, err := f.WithColumnExpr("prev_v",
+		Col("v").Shift(1).OverOrdered([]string{"k"}, SortKey{Column: "t"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev, _ := out.Column("prev_v")
+	arr := prev.col.Data().Chunks()[0].(*array.Int64)
+	// A rows sorted by t: row 2 (t=1, v=300), row 4 (t=2, v=500), row 0 (t=3, v=100).
+	//   Shift(1) within sorted A: row 2 → null, row 4 → 300, row 0 → 500.
+	// B rows sorted by t: row 1 (t=1, v=200), row 3 (t=3, v=400).
+	//   Shift(1) within sorted B: row 1 → null, row 3 → 200.
+	// Scatter back to input row positions:
+	//   row 0: 500 (A, t=3, prior in sorted A is row 4 with v=500)
+	//   row 1: null (B, t=1, first in sorted B)
+	//   row 2: null (A, t=1, first in sorted A)
+	//   row 3: 200 (B, t=3, prior in sorted B is row 1 with v=200)
+	//   row 4: 300 (A, t=2, prior in sorted A is row 2 with v=300)
+	want := []struct {
+		row  int
+		val  int64
+		null bool
+	}{
+		{0, 500, false},
+		{1, 0, true},
+		{2, 0, true},
+		{3, 200, false},
+		{4, 300, false},
+	}
+	for _, tc := range want {
+		if tc.null {
+			if !arr.IsNull(tc.row) {
+				t.Errorf("row %d: expected null, got %d", tc.row, arr.Value(tc.row))
+			}
+			continue
+		}
+		if arr.IsNull(tc.row) {
+			t.Errorf("row %d: expected %d, got null", tc.row, tc.val)
+			continue
+		}
+		if arr.Value(tc.row) != tc.val {
+			t.Errorf("row %d = %d, want %d", tc.row, arr.Value(tc.row), tc.val)
+		}
+	}
+}
+
+// TestExprShift_OverOrderedDescending — orderBy Descending semantics.
+// Same partitions as above but sorted by t descending changes what
+// "previous" means. Sorted A (t desc): row 0 (t=3, v=100), row 4 (t=2, v=500), row 2 (t=1, v=300).
+// Shift(1) yields at input positions: row 0 → null, row 4 → 100, row 2 → 500.
+func TestExprShift_OverOrderedDescending(t *testing.T) {
+	f := shiftOverFrame(t)
+	out, err := f.WithColumnExpr("prev_v",
+		Col("v").Shift(1).OverOrdered([]string{"k"}, SortKey{Column: "t", Descending: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev, _ := out.Column("prev_v")
+	arr := prev.col.Data().Chunks()[0].(*array.Int64)
+	// A sorted t desc: rows [0, 4, 2] with v [100, 500, 300].
+	// Shift(1): row 0 → null, row 4 → 100, row 2 → 500.
+	// B sorted t desc: rows [3, 1] with v [400, 200].
+	// Shift(1): row 3 → null, row 1 → 400.
+	if !arr.IsNull(0) || !arr.IsNull(3) {
+		t.Fatalf("row 0 and row 3 should be null (first in each partition sorted desc)")
+	}
+	if arr.Value(1) != 400 {
+		t.Fatalf("row 1 = %d, want 400", arr.Value(1))
+	}
+	if arr.Value(2) != 500 {
+		t.Fatalf("row 2 = %d, want 500", arr.Value(2))
+	}
+	if arr.Value(4) != 100 {
+		t.Fatalf("row 4 = %d, want 100", arr.Value(4))
+	}
+}
+
+// TestExprShift_OverAlignedFastPath — same result via the aligned
+// fast path: input pre-sorted by [k, t], with a matching
+// PartitionMetadata claim. Verifies the fast path produces the same
+// output as the general path. Uses WithPartitionAssertion at the
+// LazyFrame level (fast path detection reads the plan node's metadata
+// via inputMeta at Compile time).
+func TestExprShift_OverAlignedFastPath(t *testing.T) {
+	pool := memory.DefaultAllocator
+	// Pre-sorted by [k, t]: A rows first (t=1,2,3), then B (t=1,3).
+	kb := array.NewStringBuilder(pool)
+	defer kb.Release()
+	kb.AppendValues([]string{"A", "A", "A", "B", "B"}, nil)
+	tb := array.NewInt64Builder(pool)
+	defer tb.Release()
+	tb.AppendValues([]int64{1, 2, 3, 1, 3}, nil)
+	vb := array.NewInt64Builder(pool)
+	defer vb.Release()
+	// Corresponds to shiftOverFrame's values under the (k,t) sort.
+	vb.AppendValues([]int64{300, 500, 100, 200, 400}, nil)
+
+	fields := []arrow.Field{
+		{Name: "k", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "t", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "v", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+	}
+	schema := arrow.NewSchema(fields, nil)
+	arrs := []arrow.Array{kb.NewArray(), tb.NewArray(), vb.NewArray()}
+	defer func() {
+		for _, a := range arrs {
+			a.Release()
+		}
+	}()
+	cols := make([]arrow.Column, len(fields))
+	for i, a := range arrs {
+		cols[i] = *arrow.NewColumn(fields[i], arrow.NewChunked(a.DataType(), []arrow.Array{a}))
+	}
+	f, err := NewFrame(schema, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Attach the aligned+sorted claim so the fast path fires.
+	lf, err := f.Lazy().WithPartitionAssertion(&PartitionMetadata{
+		Columns:      []string{"k"},
+		HashFn:       "test/v1",
+		SortedBy:     []SortKey{{Column: "k"}, {Column: "t"}},
+		SortEnforced: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := lf.
+		WithColumn("prev_v", Col("v").Shift(1).OverOrdered([]string{"k"}, SortKey{Column: "t"})).
+		Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev, _ := out.Column("prev_v")
+	arr := prev.col.Data().Chunks()[0].(*array.Int64)
+	// A partition [t=1,2,3] with v=[300,500,100]. Shift(1): [null, 300, 500].
+	// B partition [t=1,3] with v=[200,400]. Shift(1): [null, 200].
+	// Rows 0..4 map to (A,t=1), (A,t=2), (A,t=3), (B,t=1), (B,t=3).
+	if !arr.IsNull(0) || !arr.IsNull(3) {
+		t.Fatalf("rows 0 and 3 should be null (first in each partition)")
+	}
+	want := map[int]int64{1: 300, 2: 500, 4: 200}
+	for row, w := range want {
+		if arr.IsNull(row) {
+			t.Fatalf("row %d: expected %d, got null", row, w)
+		}
+		if arr.Value(row) != w {
+			t.Fatalf("row %d = %d, want %d", row, arr.Value(row), w)
+		}
+	}
+}
