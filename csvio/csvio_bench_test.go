@@ -1,6 +1,7 @@
 package csvio_test
 
 import (
+	"io"
 	"strings"
 	"testing"
 
@@ -100,5 +101,22 @@ func BenchmarkRead_1M(b *testing.B) {
 			b.Fatal(err)
 		}
 		sinkFrame = df
+	}
+}
+
+// BenchmarkWrite_1M writes the BenchmarkRead_1M table (name, int,
+// float, string; 1M rows) back out as CSV.
+func BenchmarkWrite_1M(b *testing.B) {
+	df, err := csvio.Read[benchRow](strings.NewReader(makeBenchCSV(1_000_000)), nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer df.Release()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := csvio.Write(df, io.Discard, nil); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

@@ -5,6 +5,88 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.4.19]
+
+### Added
+
+- **`Null[T]`, a value-typed nullable struct field for `ToStructs`
+  and `FromStructs`.** It has the same `{V T; Valid bool}` layout as
+  `database/sql.Null[T]`. `ToStructs` sets `Valid=false` for a null
+  cell and `V` plus `Valid=true` otherwise. `FromStructs` writes null
+  exactly when `Valid` is false.
+  - **Why:** before this, the only way to tell a null from a zero
+    value was a `*T` field, which allocates a `T` for every non-null
+    cell. `Null[T]` holds the value inline and decodes at the same cost
+    as a plain field. On a 10k-row `int64` column that is about 9.7k
+    allocations instead of about 19.7k for `*int64`. The remaining
+    allocation is in `ToStructs`' shared scalar path and is paid by
+    plain fields too.
+  - **Zero values stay values:** `Null[time.Time]{Valid: true}` writes
+    the zero instant, where a bare zero `time.Time` field writes null.
+    The zero instant needs a coarser unit than the default
+    nanoseconds, such as `timestamp(microsecond)`; on `Timestamp[ns]`
+    it is an `ErrStructFieldOverflow` error.
+  - **Shapes:** `T` can be any type a plain field may have. `*Null[T]`,
+    `Null[*T]`, `Null[[]T]` (other than `[]byte`) and a `required` tag
+    on a `Null[T]` field are `ErrUnsupportedStructField`.
+    `StructRequiredFields()` leaves `Null[T]` fields nullable.
+  - **Coverage:** every io package's `ReadStructs` / `WriteStructs`,
+    including the new `csvio.WriteStructs`. csvio's readers are the
+    exception: `csvio.ReadFile[T]` plans its schema separately and
+    rejects `Null[T]`, as it already rejects `*T`.
+
+- **CSV writing in csvio.** `Write(f, w, opts)`, `WriteFile(f, path,
+  opts)`, `WriteStructs` / `WriteStructsWriter`, and a streaming
+  `NewWriter(w, schema, opts)` → `Write(frame)` → `Close()` for
+  writing a table in pieces (from `ReadFileChunksFunc` or a lazy
+  plan's batches) without holding it all in memory.
+  - **Output reads back:** every cell is written in a form `Read` and
+    `ReadStrings` parse back. Nulls are empty fields, floats use the
+    shortest exact form (with `NaN` / `+Inf` / `-Inf`), timestamps are
+    RFC 3339 with nanoseconds in the column's zone, dates are
+    `2006-01-02`, and geometry columns are WKT. Pass the CRS back as
+    `ReadOptions.CRSHint`, since WKT doesn't carry it. Other binary
+    columns are base64; lists, structs and maps are JSON; dictionary
+    columns write their values.
+  - **Quoting** follows `encoding/csv`. Round-trip limits: an empty
+    string reads back as null, and a CR LF inside a value reads back
+    as LF.
+  - **Options:** `HasHeader`, `Delimiter`, `UseCRLF`, `NullValue`,
+    `TimeFormat`, `DateFormat`, `Compression`. `WriteFile` gzip- or
+    zstd-compresses by filename, as `ReadFile` decompresses. A `.bz2`
+    name is an `ErrUnknownCodec` error, because Go's standard library
+    has no bzip2 encoder. A delimiter that can't separate fields is
+    `ErrInvalidDelimiter`.
+  - **Throughput:** 1M rows × 4 columns write in about 120 ms with 16
+    allocations in total, against about 155 ms and 1M allocations to
+    read them.
+
+### Fixed
+
+- **`SortBy` accepts every scalar key type.** Through `Frame.SortBy`,
+  `LazyFrame.SortBy` and `OverOrdered`, a sort key could only be
+  String, Bool, a 32/64-bit int, Float32/64 or Timestamp. Anything
+  else failed with `unsupported sort key type`. Newly supported keys:
+  - **Numbers:** Int8, Int16, Uint8, Uint16, Float16, Decimal128 and
+    Decimal256.
+  - **Text and bytes:** LargeString, StringView, and Binary /
+    LargeBinary / BinaryView / FixedSizeBinary, which compare in byte
+    order.
+  - **Times:** Date32, Date64, Time32, Time64 and Duration.
+  - **Other:** Null columns, and dictionaries of any of these, which
+    sort by the dictionary values rather than the indices. A valid
+    index pointing at a null entry sorts as null.
+- **Multi-chunk sort keys work in `Frame.SortBy`.** A key column with
+  more than one chunk, such as `Concat` output or a multi-row-group
+  parquet read, failed with `call Frame.CompactChunks() first`. The
+  key column alone is now concatenated for the sort; other columns
+  are reordered chunk by chunk as before.
+- **NaN sorts last in descending sorts too.** The docs said NaN sorts
+  last in either direction, but a descending sort put it first.
+- **StringView and BinaryView columns can be reordered.** `Take`,
+  `SortBy` and outer joins failed on them, because arrow-go's
+  `compute.Take` has no kernel for view types.
+
 ## [v0.4.18]
 
 ### Fixed

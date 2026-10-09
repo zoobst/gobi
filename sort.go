@@ -1,10 +1,15 @@
 package gobi
 
 import (
+	"bytes"
+	"cmp"
 	"fmt"
 	"sort"
+	"strings"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // SortKey names a column to sort by and its direction. Compose multiple
@@ -22,8 +27,13 @@ type SortKey struct {
 // sort is stable: rows that compare equal on every key retain their
 // input order.
 //
-// Supported key column types: String, Bool, Int32, Int64, Uint32,
-// Uint64, Float64, Float32, Timestamp. Nulls sort last.
+// Key columns can be any integer, float (Float16/32/64), Decimal128/256,
+// Bool, String / LargeString / StringView, Binary / LargeBinary /
+// BinaryView / FixedSizeBinary (byte order), Timestamp, Date32/64,
+// Time32/64, Duration or Null column, or a dictionary of any of those
+// (sorted by the dictionary values, not the indices). Strings compare
+// by byte order. A multi-chunk key column is concatenated into one
+// array for the sort. Nulls sort last.
 //
 // Example:
 //
@@ -42,10 +52,11 @@ func (f *Frame) SortBy(keys ...SortKey) (*Frame, error) {
 		if err != nil {
 			return nil, err
 		}
-		cmp, err := newRowComparator(s, k.Descending)
+		cmp, release, err := newRowComparator(s, k.Descending)
 		if err != nil {
 			return nil, fmt.Errorf("gobi: SortBy key %q: %w", k.Column, err)
 		}
+		defer release()
 		cmps[i] = cmp
 	}
 
@@ -74,63 +85,175 @@ func (f *Frame) SortBy(keys ...SortKey) (*Frame, error) {
 // branch on either.
 type rowComparator func(i, j int) int
 
-// newRowComparator dispatches on the Series' arrow type and returns a
-// comparator that indexes directly into the underlying typed array.
-func newRowComparator(s Series, descending bool) (rowComparator, error) {
+// newRowComparator returns the comparator for key column s. A
+// multi-chunk key is concatenated into one array first (the key column
+// only, not the frame); release frees that copy and must be called once
+// the comparator is no longer used.
+func newRowComparator(s Series, descending bool) (cmp rowComparator, release func(), err error) {
+	release = func() {}
 	chunks := s.col.Data().Chunks()
-	if len(chunks) != 1 {
-		return nil, fmt.Errorf("sort key column %q is multi-chunk (%d chunks); call Frame.CompactChunks() first "+
-			"— multi-chunk sort keys not yet supported directly",
-			s.name, len(chunks))
+	var arr arrow.Array
+	switch len(chunks) {
+	case 0:
+		arr = array.MakeArrayOfNull(memory.DefaultAllocator, s.DataType(), 0)
+		release = arr.Release
+	case 1:
+		arr = chunks[0]
+	default:
+		cat, err := array.Concatenate(chunks, memory.DefaultAllocator)
+		if err != nil {
+			return nil, release, fmt.Errorf("concatenate %d-chunk sort key: %w", len(chunks), err)
+		}
+		arr, release = cat, cat.Release
 	}
-	switch a := chunks[0].(type) {
+	cmp, err = arrayComparator(arr, descending)
+	if err != nil {
+		release()
+		return nil, func() {}, err
+	}
+	return cmp, release, nil
+}
+
+// arrayComparator dispatches on arr's concrete type. Fixed-width
+// numeric types compare their raw value slices; the rest go through
+// the type's Value accessor.
+func arrayComparator(arr arrow.Array, descending bool) (rowComparator, error) {
+	switch a := arr.(type) {
 	case *array.Int64:
-		return func(i, j int) int {
-			return nullAwareCompare(a.IsNull(i), a.IsNull(j),
-				cmpOrd(a.Value(i), a.Value(j)), descending)
-		}, nil
+		return ordered(a, a.Int64Values(), descending), nil
 	case *array.Int32:
-		return func(i, j int) int {
-			return nullAwareCompare(a.IsNull(i), a.IsNull(j),
-				cmpOrd(a.Value(i), a.Value(j)), descending)
-		}, nil
+		return ordered(a, a.Int32Values(), descending), nil
+	case *array.Int16:
+		return ordered(a, a.Int16Values(), descending), nil
+	case *array.Int8:
+		return ordered(a, a.Int8Values(), descending), nil
 	case *array.Uint64:
-		return func(i, j int) int {
-			return nullAwareCompare(a.IsNull(i), a.IsNull(j),
-				cmpOrd(a.Value(i), a.Value(j)), descending)
-		}, nil
+		return ordered(a, a.Uint64Values(), descending), nil
 	case *array.Uint32:
-		return func(i, j int) int {
-			return nullAwareCompare(a.IsNull(i), a.IsNull(j),
-				cmpOrd(a.Value(i), a.Value(j)), descending)
-		}, nil
-	case *array.Float64:
-		return func(i, j int) int {
-			return nullAwareCompare(a.IsNull(i), a.IsNull(j),
-				cmpFloat(a.Value(i), a.Value(j)), descending)
-		}, nil
-	case *array.Float32:
-		return func(i, j int) int {
-			return nullAwareCompare(a.IsNull(i), a.IsNull(j),
-				cmpFloat(float64(a.Value(i)), float64(a.Value(j))), descending)
-		}, nil
-	case *array.Boolean:
-		return func(i, j int) int {
-			return nullAwareCompare(a.IsNull(i), a.IsNull(j),
-				cmpBool(a.Value(i), a.Value(j)), descending)
-		}, nil
-	case *array.String:
-		return func(i, j int) int {
-			return nullAwareCompare(a.IsNull(i), a.IsNull(j),
-				cmpString(a.Value(i), a.Value(j)), descending)
-		}, nil
+		return ordered(a, a.Uint32Values(), descending), nil
+	case *array.Uint16:
+		return ordered(a, a.Uint16Values(), descending), nil
+	case *array.Uint8:
+		return ordered(a, a.Uint8Values(), descending), nil
 	case *array.Timestamp:
+		return ordered(a, a.TimestampValues(), descending), nil
+	case *array.Date32:
+		return ordered(a, a.Date32Values(), descending), nil
+	case *array.Date64:
+		return ordered(a, a.Date64Values(), descending), nil
+	case *array.Time32:
+		return ordered(a, a.Time32Values(), descending), nil
+	case *array.Time64:
+		return ordered(a, a.Time64Values(), descending), nil
+	case *array.Duration:
+		return ordered(a, a.DurationValues(), descending), nil
+	case *array.Float64:
+		return floats(a, a.Float64Values(), descending), nil
+	case *array.Float32:
+		return floats(a, a.Float32Values(), descending), nil
+	case *array.Float16:
+		vals := a.Values()
+		return floatsBy(a, func(i int) float64 { return float64(vals[i].Float32()) }, descending), nil
+	case *array.String:
+		return byIndex(a, func(i, j int) int { return strings.Compare(a.Value(i), a.Value(j)) }, descending), nil
+	case *array.LargeString:
+		return byIndex(a, func(i, j int) int { return strings.Compare(a.Value(i), a.Value(j)) }, descending), nil
+	case *array.StringView:
+		return byIndex(a, func(i, j int) int { return strings.Compare(a.Value(i), a.Value(j)) }, descending), nil
+	case *array.Binary:
+		return byIndex(a, func(i, j int) int { return bytes.Compare(a.Value(i), a.Value(j)) }, descending), nil
+	case *array.LargeBinary:
+		return byIndex(a, func(i, j int) int { return bytes.Compare(a.Value(i), a.Value(j)) }, descending), nil
+	case *array.BinaryView:
+		return byIndex(a, func(i, j int) int { return bytes.Compare(a.Value(i), a.Value(j)) }, descending), nil
+	case *array.FixedSizeBinary:
+		return byIndex(a, func(i, j int) int { return bytes.Compare(a.Value(i), a.Value(j)) }, descending), nil
+	case *array.Boolean:
+		return byIndex(a, func(i, j int) int { return cmpBool(a.Value(i), a.Value(j)) }, descending), nil
+	case *array.Decimal128:
+		return byIndex(a, func(i, j int) int { return a.Value(i).Cmp(a.Value(j)) }, descending), nil
+	case *array.Decimal256:
+		return byIndex(a, func(i, j int) int { return a.Value(i).Cmp(a.Value(j)) }, descending), nil
+	case *array.Dictionary:
+		// Compare the dictionary entries the indices point at. The inner
+		// comparator applies direction and puts null entries last.
+		inner, err := arrayComparator(a.Dictionary(), descending)
+		if err != nil {
+			return nil, err
+		}
 		return func(i, j int) int {
-			return nullAwareCompare(a.IsNull(i), a.IsNull(j),
-				cmpOrd(int64(a.Value(i)), int64(a.Value(j))), descending)
+			ni, nj := a.IsNull(i), a.IsNull(j)
+			if ni || nj {
+				return nullAwareCompare(ni, nj, 0, descending)
+			}
+			return inner(a.GetValueIndex(i), a.GetValueIndex(j))
 		}, nil
+	case *array.Null:
+		return func(i, j int) int { return 0 }, nil
 	}
-	return nil, fmt.Errorf("unsupported sort key type %s", s.DataType())
+	return nil, fmt.Errorf("unsupported sort key type %s", arr.DataType())
+}
+
+// ordered compares a fixed-width column through its value slice. Kept
+// generic over the element type rather than going through byIndex so
+// the hot numeric case is one closure call per comparison.
+func ordered[T cmp.Ordered](a arrow.Array, vals []T, descending bool) rowComparator {
+	sign := direction(descending)
+	if a.NullN() == 0 {
+		return func(i, j int) int { return sign * cmp.Compare(vals[i], vals[j]) }
+	}
+	return func(i, j int) int {
+		ni, nj := a.IsNull(i), a.IsNull(j)
+		if ni || nj {
+			return nullAwareCompare(ni, nj, 0, descending)
+		}
+		return sign * cmp.Compare(vals[i], vals[j])
+	}
+}
+
+// floats compares a float column with NaN treated like null: last in
+// either direction.
+func floats[T float32 | float64](a arrow.Array, vals []T, descending bool) rowComparator {
+	return floatsBy(a, func(i int) float64 { return float64(vals[i]) }, descending)
+}
+
+func floatsBy(a arrow.Array, at func(int) float64, descending bool) rowComparator {
+	sign := direction(descending)
+	return func(i, j int) int {
+		ni, nj := a.IsNull(i), a.IsNull(j)
+		if ni || nj {
+			return nullAwareCompare(ni, nj, 0, descending)
+		}
+		x, y := at(i), at(j)
+		xNaN, yNaN := isNaN(x), isNaN(y)
+		if xNaN || yNaN {
+			return nullAwareCompare(xNaN, yNaN, 0, descending)
+		}
+		return sign * cmp.Compare(x, y)
+	}
+}
+
+// byIndex wraps a value comparator over non-null rows with the null-last
+// policy and direction.
+func byIndex(a arrow.Array, cmp func(i, j int) int, descending bool) rowComparator {
+	sign := direction(descending)
+	if a.NullN() == 0 {
+		return func(i, j int) int { return sign * cmp(i, j) }
+	}
+	return func(i, j int) int {
+		ni, nj := a.IsNull(i), a.IsNull(j)
+		if ni || nj {
+			return nullAwareCompare(ni, nj, 0, descending)
+		}
+		return sign * cmp(i, j)
+	}
+}
+
+func direction(descending bool) int {
+	if descending {
+		return -1
+	}
+	return 1
 }
 
 // nullAwareCompare composes a null-last policy with a value comparator
@@ -158,37 +281,6 @@ func nullAwareCompare(ni, nj bool, cmpVal int, descending bool) int {
 	return cmpVal
 }
 
-// cmpOrd is the generic three-way comparator for any ordered numeric
-// type. Signed and unsigned integers cover the group-by key set.
-func cmpOrd[T int64 | int32 | uint64 | uint32](a, b T) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return +1
-	}
-	return 0
-}
-
-// cmpFloat treats NaN as null-equivalent — NaN sorts after every
-// non-NaN value, matching numpy / pandas behavior.
-func cmpFloat(a, b float64) int {
-	aNaN, bNaN := isNaN(a), isNaN(b)
-	switch {
-	case aNaN && bNaN:
-		return 0
-	case aNaN:
-		return +1
-	case bNaN:
-		return -1
-	case a < b:
-		return -1
-	case a > b:
-		return +1
-	}
-	return 0
-}
-
 func isNaN(f float64) bool { return f != f }
 
 func cmpBool(a, b bool) int {
@@ -196,16 +288,6 @@ func cmpBool(a, b bool) int {
 	case !a && b:
 		return -1
 	case a && !b:
-		return +1
-	}
-	return 0
-}
-
-func cmpString(a, b string) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
 		return +1
 	}
 	return 0

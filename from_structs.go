@@ -291,8 +291,8 @@ var ErrStructFieldOverflow = errors.New("gobi: value overflows struct field")
 //   - other field types: error.
 //
 // Nulls. Pointer-typed fields (*string, *int64, ...) emit null when
-// the pointer is nil. Non-pointer fields never emit null — their
-// zero value goes in.
+// the pointer is nil, and Null[T] fields when Valid is false. Other
+// fields never emit null — their zero value goes in.
 //
 // Supported non-tagged field types:
 //
@@ -303,6 +303,7 @@ var ErrStructFieldOverflow = errors.New("gobi: value overflows struct field")
 //	[]byte           (arrow Binary)
 //	time.Time        (arrow Timestamp[ns]; see "Timestamp precision")
 //	*T of any above  (nullable)
+//	Null[T] of any above (nullable, held inline; see Null)
 func FromStructs[T any](rows []T, opts ...StructOption) (*Frame, error) {
 	var zero T
 	tp := reflect.TypeOf(zero)
@@ -369,9 +370,11 @@ func FromStructs[T any](rows []T, opts ...StructOption) (*Frame, error) {
 // at its zero value. A frame column with no matching struct field
 // is ignored.
 //
-// Null cells populate the zero value for non-pointer fields, or nil
-// for pointer fields. Type mismatches between column and field
-// return an error.
+// Null cells populate the zero value for plain fields, nil for pointer
+// fields, and Valid=false for Null[T] fields. Use Null[T] or a pointer
+// when a null has to be told apart from a zero value; Null[T] does it
+// without the per-cell allocation a pointer needs. Type mismatches
+// between column and field return an error.
 //
 // Geometry columns (Binary with the geometry metadata) can be
 // written back to a string field tagged `geom:"true"` (emits WKT
@@ -507,6 +510,9 @@ type structFieldPlan struct {
 	// Pointer wrapping: when true, the struct field is `*T`. Read
 	// path checks for nil; write path allocates a fresh *T.
 	isPointer bool
+	// nullWrap: the struct field is Null[T]; the plan describes T. The
+	// read path sets Valid, the write path checks it.
+	nullWrap bool
 	// Actual reflect type of the (unwrapped) field. Used by the
 	// time.Time detection since the direct field type may be
 	// *time.Time under a nullable-time convention.
@@ -530,6 +536,7 @@ func (p structFieldPlan) arrowField() arrow.Field {
 // for column names — see resolveFieldName for the resolution order.
 func planStructFields(tp reflect.Type, o *structOpts) ([]structFieldPlan, error) {
 	timeType := reflect.TypeFor[time.Time]()
+	nullType := reflect.TypeFor[nullMarker]()
 	out := make([]structFieldPlan, 0, tp.NumField())
 	for i := 0; i < tp.NumField(); i++ {
 		sf := tp.Field(i)
@@ -553,6 +560,22 @@ func planStructFields(tp reflect.Type, o *structOpts) ([]structFieldPlan, error)
 		if isPtr && ft.Kind() == reflect.Slice && ft.Elem().Kind() != reflect.Uint8 {
 			return nil, fmt.Errorf("%w: field %q is *[]T; use []T (slices already convey nullability via nil)",
 				ErrUnsupportedStructField, name)
+		}
+
+		// Null[T]: plan the field as T, with nullWrap carrying Valid.
+		nullWrap := ft.Implements(nullType)
+		if nullWrap {
+			if isPtr {
+				return nil, fmt.Errorf("%w: field %q is *Null[T]; use Null[T]", ErrUnsupportedStructField, name)
+			}
+			ft = ft.Field(0).Type
+			switch {
+			case ft.Kind() == reflect.Pointer:
+				return nil, fmt.Errorf("%w: field %q is Null[*T]; use Null[T]", ErrUnsupportedStructField, name)
+			case ft.Kind() == reflect.Slice && ft.Elem().Kind() != reflect.Uint8:
+				return nil, fmt.Errorf("%w: field %q is Null[[]T]; use []T (slices already convey nullability via nil)",
+					ErrUnsupportedStructField, name)
+			}
 		}
 
 		tsType, err := timestampTypeFromTag(sf, o)
@@ -631,21 +654,24 @@ func planStructFields(tp reflect.Type, o *structOpts) ([]structFieldPlan, error)
 			arrowType: dt, isPointer: isPtr, valueType: ft,
 		})
 	}
-	// REQUIRED: StructRequiredFields for non-pointer fields, or the
-	// per-field `required` / `optional` tag options.
+	// REQUIRED: StructRequiredFields for non-pointer, non-Null fields,
+	// or the per-field `required` / `optional` tag options.
 	for i := range out {
 		sf := tp.Field(out[i].fieldIndex)
+		out[i].nullWrap = sf.Type.Implements(nullType)
 		req, opt := hasTagOption(sf, o, "required"), hasTagOption(sf, o, "optional")
 		switch {
 		case req && opt:
 			return nil, fmt.Errorf("%w: field %q: both required and optional", ErrUnsupportedStructField, out[i].name)
 		case req && out[i].isPointer:
 			return nil, fmt.Errorf("%w: field %q: a pointer field is nullable by definition and can't be required", ErrUnsupportedStructField, out[i].name)
+		case req && out[i].nullWrap:
+			return nil, fmt.Errorf("%w: field %q: a Null[T] field is nullable by definition and can't be required", ErrUnsupportedStructField, out[i].name)
 		case req:
 			out[i].required = true
 		case opt:
 		default:
-			out[i].required = o != nil && o.requiredFields && !out[i].isPointer
+			out[i].required = o != nil && o.requiredFields && !out[i].isPointer && !out[i].nullWrap
 		}
 	}
 	// `intern` tag option: string-valued fields only.
@@ -754,13 +780,21 @@ type structWriter struct {
 }
 
 func appendFieldValue(b array.Builder, fv reflect.Value, p structFieldPlan, sw *structWriter) error {
-	// Pointer field: null when nil, otherwise dereference.
-	if p.isPointer {
+	// Pointer field: null when nil, otherwise dereference. Null[T]:
+	// null when !Valid, otherwise V.
+	switch {
+	case p.isPointer:
 		if fv.IsNil() {
 			b.AppendNull()
 			return nil
 		}
 		fv = fv.Elem()
+	case p.nullWrap:
+		if !fv.Field(1).Bool() {
+			b.AppendNull()
+			return nil
+		}
+		fv = fv.Field(0)
 	}
 
 	if p.isGeometry {
@@ -857,7 +891,8 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan, sw *s
 	timeType := reflect.TypeFor[time.Time]()
 	if p.valueType == timeType {
 		t := fv.Interface().(time.Time)
-		if t.IsZero() && !p.required && !sw.zeroTimeAsValue {
+		// A Valid Null[time.Time] is a value even when zero.
+		if t.IsZero() && !p.required && !sw.zeroTimeAsValue && !p.nullWrap {
 			tb.AppendNull()
 			return nil
 		}
@@ -914,41 +949,48 @@ func readFieldValue(fv reflect.Value, cur *chunkCursor, row int, p structFieldPl
 		return err
 	}
 
-	if p.isPointer {
-		if null {
-			// nil already; leave alone.
-			return nil
-		}
-		// Allocate a fresh *T; then fv becomes the pointee for the
-		// scalar-write path below.
+	// A null cell leaves every field shape at its zero value — nil
+	// pointer, Null[T]{Valid: false}, or zero T — which is what fv
+	// already holds (toStructs zeroes the output), so no write.
+	if null {
+		return nil
+	}
+	switch {
+	case p.isPointer:
+		// Allocate a fresh *T and decode into the pointee.
 		nv := reflect.New(fv.Type().Elem())
 		fv.Set(nv)
-		fv = nv.Elem()
-	} else if null {
-		// Non-pointer field, null cell → zero value. That's what
-		// fv already is by default (struct-zero-value); no write
-		// needed.
-		return nil
-	}
-
-	if p.isGeometry {
-		return readGeomField(fv, cur, row, p, rd)
-	}
-	if p.isTimeTag {
-		return readTimeField(fv, cur, row, p)
-	}
-	if p.arrowType.ID() == arrow.LIST {
-		return readListField(fv, cur, row, rd, p.intern)
-	}
-
-	v, err := cur.scalarAt(row)
-	if err != nil {
+		_, err := readNonNull(nv.Elem(), cur, row, p, rd)
 		return err
-	}
-	if v == nil {
+	case p.nullWrap:
+		ok, err := readNonNull(fv.Field(0), cur, row, p, rd)
+		if err != nil {
+			return err
+		}
+		fv.Field(1).SetBool(ok)
 		return nil
 	}
-	return rd.assignOwned(fv, v, p.intern)
+	_, err = readNonNull(fv, cur, row, p, rd)
+	return err
+}
+
+// readNonNull decodes a non-null cell into fv, which is the field's
+// value type (the pointee for *T, V for Null[T]). ok is false when the
+// cell's scalar came back nil after all, leaving fv at zero.
+func readNonNull(fv reflect.Value, cur *chunkCursor, row int, p structFieldPlan, rd *structReader) (ok bool, err error) {
+	switch {
+	case p.isGeometry:
+		return true, readGeomField(fv, cur, row, p, rd)
+	case p.isTimeTag:
+		return true, readTimeField(fv, cur, row, p)
+	case p.arrowType.ID() == arrow.LIST:
+		return true, readListField(fv, cur, row, rd, p.intern)
+	}
+	v, err := cur.scalarAt(row)
+	if err != nil || v == nil {
+		return false, err
+	}
+	return true, rd.assignOwned(fv, v, p.intern)
 }
 
 // readGeomField reads a geometry column back into a string field

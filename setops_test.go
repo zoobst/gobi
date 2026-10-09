@@ -343,9 +343,9 @@ func TestFrame_NumChunks_SingleAndMulti(t *testing.T) {
 	}
 }
 
-// TestFrame_CompactChunks_ConcatRoundTrip — the motivating shape:
-// Concat produces multi-chunk output; CompactChunks flattens it so
-// SortBy can consume the result.
+// TestFrame_CompactChunks_ConcatRoundTrip — Concat produces
+// multi-chunk output; CompactChunks flattens it, and SortBy sorts
+// either form to the same result.
 func TestFrame_CompactChunks_ConcatRoundTrip(t *testing.T) {
 	l, r := buildSetOpFixture(t)
 	stacked, err := l.Concat(r)
@@ -353,13 +353,10 @@ func TestFrame_CompactChunks_ConcatRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pre-fix confirmation: SortBy on Concat output should error and
-	// the error should point at CompactChunks — the whole reason this
-	// feature exists.
-	if _, err := stacked.SortBy(SortKey{Column: "id"}); err == nil {
-		t.Fatal("SortBy on multi-chunk frame should error, got nil")
-	} else if !stringContains(err.Error(), "CompactChunks") {
-		t.Errorf("SortBy multi-chunk error should mention CompactChunks, got: %v", err)
+	// SortBy takes the multi-chunk Concat output directly.
+	direct, err := stacked.SortBy(SortKey{Column: "id"})
+	if err != nil {
+		t.Fatalf("SortBy on multi-chunk frame: %v", err)
 	}
 
 	compact, err := stacked.CompactChunks()
@@ -378,20 +375,23 @@ func TestFrame_CompactChunks_ConcatRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SortBy on compacted frame: %v", err)
 	}
-	// Read back the id column in sorted order and verify it's
-	// non-decreasing. Fixture has ids {1,2,3,2} + {2,3,4} = {1,2,2,2,3,3,4}.
-	idCol, err := sorted.Column("id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	arr := idCol.col.Data().Chunks()[0].(*array.Int64)
+	// Read back the id column in sorted order, for both the compacted
+	// and the direct sort. Fixture has ids {1,2,3,2} + {2,3,4} =
+	// {1,2,2,2,3,3,4}.
 	want := []int64{1, 2, 2, 2, 3, 3, 4}
-	if arr.Len() != len(want) {
-		t.Fatalf("sorted len=%d, want %d", arr.Len(), len(want))
-	}
-	for i, w := range want {
-		if arr.Value(i) != w {
-			t.Errorf("sorted[%d]=%d, want %d", i, arr.Value(i), w)
+	for name, f := range map[string]*Frame{"compacted": sorted, "direct": direct} {
+		idCol, err := f.Column("id")
+		if err != nil {
+			t.Fatal(err)
+		}
+		arr := idCol.col.Data().Chunks()[0].(*array.Int64)
+		if arr.Len() != len(want) {
+			t.Fatalf("%s: sorted len=%d, want %d", name, arr.Len(), len(want))
+		}
+		for i, w := range want {
+			if arr.Value(i) != w {
+				t.Errorf("%s: sorted[%d]=%d, want %d", name, i, arr.Value(i), w)
+			}
 		}
 	}
 }

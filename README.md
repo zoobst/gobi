@@ -281,7 +281,8 @@ built around a strongly-typed schema.
   `geojson:` / `gpkg:` / `shp:` / `kml:` / `pgio:` — so the same
   Go type can carry different column names per format (shp's
   10-char DBF alias, `parquet:"-"` to omit from parquet only,
-  etc.). Formats: CSV (with `.gz` / `.zst` / `.bz2` auto-detect),
+  etc.). Formats: CSV read/write (`.gz` / `.zst` detected from the
+  filename both ways, `.bz2` read-only),
   Parquet with proper GeoParquet 1.1 metadata (snappy / gzip /
   brotli / zstd / lz4, canonical PROJJSON for EPSG:3857 + all 120
   UTM zones), full RFC 7946 GeoJSON (every geometry type + XYZ,
@@ -739,7 +740,7 @@ rows, err := parquetio.ReadStructs[Feature]("in.parquet", nil)
 err = shpio.WriteStructs(rows, "out", nil)
 ```
 
-The same shape works for `csvio.ReadStructs`,
+The same shape works for `csvio.ReadStructs` / `WriteStructs`,
 `geojsonio.ReadStructs` / `WriteStructs`, `gpkgio.ReadStructs` /
 `WriteStructs`, `kmlio.ReadStructs` / `WriteStructs`, and
 `pgio.ReadStructsQuery` / `ReadStructsTable` / `WriteStructsTable`.
@@ -820,7 +821,7 @@ _ = shpio.WriteFile(counties, "counties_out", nil)  // writes all four files
 |---------------------------|-------------------------------------------------------------------------------------------------|
 | `github.com/zoobst/gobi`  | `Frame`, `Series`, `GroupBy`, `Join`, `SJoin`, `Explode`, datetime + rolling + resample, options |
 | `.../gobi/geometry`       | 2D + 3D primitives (Point/LineString/Polygon + `ExtrudedPolygon`/`Sphere`/`Capsule`), WKB / WKT, CRS + reprojection (incl. WGS84 ECEF), predicates, R-tree, Buffer / Simplify / Centroid, geodesic 3D distance |
-| `.../gobi/csvio`          | Typed CSV read + streaming (`ReadFileChunksFunc`), gzip / zstd / bzip2 auto-detect; `ReadStrings` for CSVs with no struct (every column String) |
+| `.../gobi/csvio`          | Typed CSV read + streaming (`ReadFileChunksFunc`), gzip / zstd / bzip2 auto-detect; `ReadStrings` for CSVs with no struct (every column String); `WriteFile` / streaming `NewWriter` (gzip / zstd) |
 | `.../gobi/jsonio`         | JSON array or NDJSON records → Frame with lossless type inference (int64 IDs above 2^53 survive), or `AllStrings` |
 | `.../gobi/parquetio`      | Parquet read/write + streaming + column projection + row-group + bloom-filter tuning; snappy/gzip/brotli/zstd/lz4 + GeoParquet 1.1 |
 | `.../gobi/geojsonio`      | Full RFC 7946 GeoJSON (all geometry types + XYZ) — Frame-level `ReadFile`/`WriteFile`/`ScanFile`, `.geojsonl` streaming |

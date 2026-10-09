@@ -12,6 +12,10 @@
 // For CSVs whose columns aren't known at compile time, ReadStrings and
 // its file / streaming variants take columns from the header and read
 // every cell as a String, with no type inference.
+//
+// Write, WriteFile and WriteStructs write a Frame (or structs) as CSV
+// in formats the readers parse back; NewWriter streams frames to one
+// file in pieces.
 package csvio
 
 import (

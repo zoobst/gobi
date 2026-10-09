@@ -3,6 +3,7 @@ package gobi
 import (
 	"errors"
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -332,5 +333,68 @@ func TestSortBy_MissingColumnErrors(t *testing.T) {
 	_, err := df.SortBy(SortKey{Column: "nope"})
 	if !errors.Is(err, ErrColumnNotFound) {
 		t.Fatalf("want ErrColumnNotFound, got %v", err)
+	}
+}
+
+// smallIntSortRow carries one key column per small integer width. The
+// pointer fields give each column a null in row "c".
+type smallIntSortRow struct {
+	Name string
+	I8   *int8
+	I16  *int16
+	U8   *uint8
+	U16  *uint16
+}
+
+// TestSortBy_SmallIntKeys — Int8 / Int16 / Uint8 / Uint16 work as sort
+// keys in both directions, with nulls last, through Frame.SortBy and
+// LazyFrame.SortBy.
+func TestSortBy_SmallIntKeys(t *testing.T) {
+	i8 := func(v int8) *int8 { return &v }
+	i16 := func(v int16) *int16 { return &v }
+	u8 := func(v uint8) *uint8 { return &v }
+	u16 := func(v uint16) *uint16 { return &v }
+	// Values chosen so each column ranks the rows b < a < d; c is null.
+	// Negative Int8/Int16 values check signed comparison.
+	rows := []smallIntSortRow{
+		{Name: "a", I8: i8(-1), I16: i16(-100), U8: u8(20), U16: u16(2000)},
+		{Name: "b", I8: i8(-128), I16: i16(-32768), U8: u8(0), U16: u16(0)},
+		{Name: "c"},
+		{Name: "d", I8: i8(127), I16: i16(32767), U8: u8(255), U16: u16(65535)},
+	}
+	df, err := FromStructs(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := func(f *Frame) []string {
+		t.Helper()
+		got, err := ToStructs[smallIntSortRow](f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]string, len(got))
+		for i, r := range got {
+			out[i] = r.Name
+		}
+		return out
+	}
+	want := map[bool][]string{false: {"b", "a", "d", "c"}, true: {"d", "a", "b", "c"}}
+	for _, col := range []string{"I8", "I16", "U8", "U16"} {
+		for _, desc := range []bool{false, true} {
+			out, err := df.SortBy(SortKey{Column: col, Descending: desc})
+			if err != nil {
+				t.Fatalf("%s desc=%v: %v", col, desc, err)
+			}
+			if got := names(out); !slices.Equal(got, want[desc]) {
+				t.Errorf("%s desc=%v: got %v, want %v", col, desc, got, want[desc])
+			}
+		}
+		lazy, err := df.Lazy().SortBy(SortKey{Column: col}).Collect()
+		if err != nil {
+			t.Fatalf("%s lazy: %v", col, err)
+		}
+		if got := names(lazy); !slices.Equal(got, want[false]) {
+			t.Errorf("%s lazy: got %v, want %v", col, got, want[false])
+		}
 	}
 }

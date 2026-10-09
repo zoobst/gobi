@@ -17,8 +17,8 @@ import (
 //	}
 //	rows, err := csvio.ReadStructs[Row]("data.csv", nil)
 //
-// Wraps ReadFile[T] + gobi.ToStructs. No writing counterpart because
-// csvio itself is read-only; write via parquetio or another sink.
+// Wraps ReadFile[T] + gobi.ToStructs. WriteStructs is the writing
+// counterpart.
 //
 // Strings and []byte fields are copied out of the intermediate Frame,
 // which is released before returning, so the rows own their memory

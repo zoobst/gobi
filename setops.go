@@ -36,7 +36,7 @@ func Concat(frames ...*Frame) (*Frame, error) {
 // Each frame's Arrow buffers are kept alive as separate chunks of
 // the output — no memcpy of the underlying data. The resulting
 // Frame's columns are multi-chunk; downstream ops that assume
-// single-chunk (SortBy, Timestamp col-vs-col comparisons, ListUnion,
+// single-chunk (Timestamp col-vs-col comparisons, ListUnion,
 // RecordBatch views) will error until compacted. Call
 // `.CompactChunks()` to materialize a single-chunk copy — cheap no-op
 // when the frame is already single-chunk, so callers can compact
@@ -92,8 +92,8 @@ func (f *Frame) Concat(others ...*Frame) (*Frame, error) {
 // contiguous Arrow array. Concatenates each column's chunk list via
 // `array.Concatenate` and rebuilds the Frame with the same schema.
 //
-// Required before SortBy, Timestamp column-vs-column comparisons,
-// and ListUnion on Concat output — those code paths currently error
+// Required before Timestamp column-vs-column comparisons and
+// ListUnion on Concat output — those code paths currently error
 // on multi-chunk input pending a chunk-walking rework. Also useful
 // before handing a Frame to code that expects the RecordBatch shape
 // (which is single-array-per-column by construction).

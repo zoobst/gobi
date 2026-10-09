@@ -427,13 +427,14 @@ func (n *overNode) evalShapePreserving(input *Frame) (Series, error) {
 func (n *overNode) evalShapePreservingGeneral(input, projected *Frame, nRows int, partCols []Series, outValues []any) error {
 	partitions := collectHashedPartitions(nRows, partCols)
 	if len(n.orderBy) > 0 {
-		cmps, err := buildOrderComparators(input, n.orderBy)
+		cmps, release, err := buildOrderComparators(input, n.orderBy)
 		if err != nil {
 			return fmt.Errorf("Over.OrderBy: %w", err)
 		}
 		for _, rows := range partitions {
 			sortRowIndicesBy(rows, cmps)
 		}
+		release()
 	}
 	for _, rows := range partitions {
 		if len(rows) == 0 {
@@ -581,21 +582,31 @@ func collectHashedPartitions(nRows int, partCols []Series) [][]int {
 }
 
 // buildOrderComparators returns a rowComparator per orderBy key,
-// suitable for stable multi-key sort of row indices into input.
-func buildOrderComparators(input *Frame, orderBy []SortKey) ([]rowComparator, error) {
-	cmps := make([]rowComparator, len(orderBy))
+// suitable for stable multi-key sort of row indices into input. Call
+// release once the comparators are no longer used.
+func buildOrderComparators(input *Frame, orderBy []SortKey) (cmps []rowComparator, release func(), err error) {
+	var releases []func()
+	release = func() {
+		for _, r := range releases {
+			r()
+		}
+	}
+	cmps = make([]rowComparator, len(orderBy))
 	for i, k := range orderBy {
 		s, err := input.Column(k.Column)
 		if err != nil {
-			return nil, err
+			release()
+			return nil, func() {}, err
 		}
-		cmp, err := newRowComparator(s, k.Descending)
+		cmp, rel, err := newRowComparator(s, k.Descending)
 		if err != nil {
-			return nil, fmt.Errorf("order key %q: %w", k.Column, err)
+			release()
+			return nil, func() {}, fmt.Errorf("order key %q: %w", k.Column, err)
 		}
+		releases = append(releases, rel)
 		cmps[i] = cmp
 	}
-	return cmps, nil
+	return cmps, release, nil
 }
 
 // sortRowIndicesBy sorts rows in place by cmps (lex, stable,

@@ -10,19 +10,20 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Codec selects the stream-compression codec used when reading a CSV.
+// Codec selects the stream-compression codec used when reading or
+// writing a CSV.
 type Codec string
 
 const (
 	// CodecAuto is the zero value: infer the codec from the filename in
-	// ReadFile, or treat as uncompressed when the source is a plain
-	// io.Reader (Read).
+	// ReadFile / WriteFile, or treat the stream as uncompressed when it is
+	// a plain io.Reader / io.Writer (Read, Write, NewWriter).
 	CodecAuto Codec = ""
-	// CodecNone forces no decompression, regardless of filename.
+	// CodecNone forces no compression either way, regardless of filename.
 	CodecNone Codec = "none"
-	// CodecGzip decompresses via compress/gzip (RFC 1952, ".gz" files).
+	// CodecGzip reads and writes via compress/gzip (RFC 1952, ".gz" files).
 	CodecGzip Codec = "gzip"
-	// CodecZstd decompresses via klauspost/compress/zstd (".zst" files).
+	// CodecZstd reads and writes via klauspost/compress/zstd (".zst" files).
 	CodecZstd Codec = "zstd"
 	// CodecBzip2 decompresses via compress/bzip2 (".bz2" files). Read-only;
 	// the Go stdlib doesn't ship a bzip2 writer.

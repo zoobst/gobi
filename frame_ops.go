@@ -302,6 +302,10 @@ func takeArrayFast(pool memory.Allocator, chunk arrow.Array, indexes []int) (arr
 // index emits a null row (the outer-join convention). Any other index
 // outside vals is ErrRowOutOfRange.
 func takeCompute(pool memory.Allocator, vals arrow.Array, indexes []int, negIsNull bool) (arrow.Array, error) {
+	switch vals.(type) {
+	case *array.StringView, *array.BinaryView:
+		return takeView(pool, vals, indexes, negIsNull)
+	}
 	ib := array.NewInt64Builder(pool)
 	defer ib.Release()
 	ib.Reserve(len(indexes))
@@ -322,6 +326,35 @@ func takeCompute(pool memory.Allocator, vals arrow.Array, indexes []int, negIsNu
 		return nil, fmt.Errorf("%w: take %s: %v", ErrColumnTypeMismatch, vals.DataType(), err)
 	}
 	return out, nil
+}
+
+// takeView is takeCompute for the string and binary view types, which
+// arrow-go's compute.Take has no kernel for: a builder loop with the
+// same index rules.
+func takeView(pool memory.Allocator, vals arrow.Array, indexes []int, negIsNull bool) (arrow.Array, error) {
+	b := array.NewBuilder(pool, vals.DataType())
+	defer b.Release()
+	b.Reserve(len(indexes))
+	for _, idx := range indexes {
+		if idx < 0 && negIsNull {
+			b.AppendNull()
+			continue
+		}
+		if idx < 0 || idx >= vals.Len() {
+			return nil, fmt.Errorf("%w: %d not in [0,%d)", ErrRowOutOfRange, idx, vals.Len())
+		}
+		if vals.IsNull(idx) {
+			b.AppendNull()
+			continue
+		}
+		switch a := vals.(type) {
+		case *array.StringView:
+			b.(*array.StringViewBuilder).Append(a.Value(idx))
+		case *array.BinaryView:
+			b.(*array.BinaryViewBuilder).Append(a.Value(idx))
+		}
+	}
+	return b.NewArray(), nil
 }
 
 // takeComputeSeries is takeCompute over every chunk of s.
