@@ -115,34 +115,99 @@ func TestRawQuery_CancelDuringPollCallStopsQuery(t *testing.T) {
 	assertStopped(t, m.stoppedIDs(), "test-query-id-abc123")
 }
 
-// TestRawQuery_StopFailureReported — a failed StopQueryExecution is
-// logged and joined into the error, without hiding the cancellation.
+// TestRawQuery_StopFailureReported — when StopQueryExecution fails on
+// an abandoned query, the failure goes to WarnLog and the error's
+// StopErr, but not into the message: callers see the timeout or
+// cancellation alone, which errors.Is still matches.
 func TestRawQuery_StopFailureReported(t *testing.T) {
-	m := &mockAthena{pollsBeforeDone: 1 << 30}
-	m.stopErr = errors.New("AccessDenied")
-	var mu sync.Mutex
-	var warnings []string
-	c := newCancelClient(t, m, func(cc *ClientConfig) {
-		cc.WarnLog = func(format string, args ...any) {
-			mu.Lock()
-			warnings = append(warnings, fmt.Sprintf(format, args...))
-			mu.Unlock()
-		}
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
+	stopFailure := errors.New("AccessDeniedException: not authorized to perform athena:StopQueryExecution")
+	cases := []struct {
+		name  string
+		cfg   func(*ClientConfig)
+		ctx   func() (context.Context, context.CancelFunc)
+		cause error
+	}{
+		{
+			name:  "timeout",
+			cfg:   func(cc *ClientConfig) { cc.MaxPollDuration = 20 * time.Millisecond },
+			ctx:   func() (context.Context, context.CancelFunc) { return context.Background(), func() {} },
+			cause: ErrQueryTimeout,
+		},
+		{
+			name: "deadline",
+			ctx: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 20*time.Millisecond)
+			},
+			cause: context.DeadlineExceeded,
+		},
+		{
+			name: "cancel",
+			ctx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				time.AfterFunc(20*time.Millisecond, cancel)
+				return ctx, cancel
+			},
+			cause: context.Canceled,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &mockAthena{pollsBeforeDone: 1 << 30}
+			m.stopErr = stopFailure
+			var mu sync.Mutex
+			var warnings []string
+			c := newCancelClient(t, m, func(cc *ClientConfig) {
+				cc.WarnLog = func(format string, args ...any) {
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf(format, args...))
+					mu.Unlock()
+				}
+				if tc.cfg != nil {
+					tc.cfg(cc)
+				}
+			})
+			ctx, cancel := tc.ctx()
+			defer cancel()
 
-	_, err := c.RawQuery(ctx, "SELECT 1")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+			_, err := c.RawQuery(ctx, "SELECT 1")
+			if !errors.Is(err, tc.cause) {
+				t.Fatalf("err = %v, want errors.Is %v", err, tc.cause)
+			}
+			if strings.Contains(err.Error(), "AccessDenied") || strings.Contains(err.Error(), "StopQueryExecution") {
+				t.Errorf("message should not include the stop failure: %v", err)
+			}
+			if !strings.Contains(err.Error(), "abandoned") {
+				t.Errorf("message should say the query was abandoned, not stopped: %v", err)
+			}
+			var ab *AbandonedQueryError
+			if !errors.As(err, &ab) {
+				t.Fatalf("err = %T, want *AbandonedQueryError", err)
+			}
+			if ab.QueryID != "test-query-id-abc123" || !errors.Is(ab.StopErr, stopFailure) {
+				t.Errorf("AbandonedQueryError = %+v", ab)
+			}
+			assertStopped(t, m.stoppedIDs(), "test-query-id-abc123")
+			mu.Lock()
+			defer mu.Unlock()
+			if len(warnings) != 1 || !strings.Contains(warnings[0], "may still be running") || !strings.Contains(warnings[0], "AccessDenied") {
+				t.Errorf("warnings = %v, want one stop-failure warning", warnings)
+			}
+		})
 	}
-	if !strings.Contains(err.Error(), "AccessDenied") {
-		t.Errorf("error should include the stop failure: %v", err)
+}
+
+// TestRawQuery_StoppedErrorHasNoStopErr — a successful stop yields an
+// *AbandonedQueryError with StopErr nil and a "stopped" message.
+func TestRawQuery_StoppedErrorHasNoStopErr(t *testing.T) {
+	m := &mockAthena{pollsBeforeDone: 1 << 30}
+	c := newCancelClient(t, m, func(cc *ClientConfig) { cc.MaxPollDuration = 20 * time.Millisecond })
+	_, err := c.RawQuery(context.Background(), "SELECT 1")
+	var ab *AbandonedQueryError
+	if !errors.As(err, &ab) || ab.StopErr != nil {
+		t.Fatalf("err = %v, want *AbandonedQueryError with nil StopErr", err)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "may still be running") {
-		t.Errorf("warnings = %v, want one stop-failure warning", warnings)
+	if want := "athenaio: query test-query-id-abc123 stopped: "; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("message = %q, want prefix %q", err.Error(), want)
 	}
 }
 

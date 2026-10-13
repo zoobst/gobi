@@ -2,7 +2,6 @@ package athenaio
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -125,9 +124,9 @@ func (c *Client) submitTo(ctx context.Context, sql, outputLocation string) (stri
 //
 // When it gives up on a query that is still running — ctx cancelled
 // or deadline exceeded, MaxPollDuration elapsed — it asks Athena to
-// stop the query (see abandonQuery). The returned error still matches
-// errors.Is(err, context.Canceled / context.DeadlineExceeded /
-// ErrQueryTimeout) as before.
+// stop the query (see abandonQuery) and returns an
+// *AbandonedQueryError, which still matches errors.Is(err,
+// context.Canceled / context.DeadlineExceeded / ErrQueryTimeout).
 func (c *Client) pollUntilDone(ctx context.Context, queryID string) (*athenatypes.QueryExecution, error) {
 	interval := c.cfg.PollInterval
 	if interval <= 0 {
@@ -195,25 +194,53 @@ func (c *Client) pollUntilDone(ctx context.Context, queryID string) (*athenatype
 // cancelled), so it needs its own limit.
 const stopQueryTimeout = 10 * time.Second
 
+// AbandonedQueryError is the error for a query athenaio stopped
+// waiting on: the caller's context was cancelled or hit its deadline,
+// or ClientConfig.MaxPollDuration ran out. Cause is that reason, and
+// errors.Is sees through to it (context.Canceled,
+// context.DeadlineExceeded, ErrQueryTimeout).
+//
+// athenaio tries to stop the query in Athena. StopErr is non-nil when
+// that failed, in which case the query may still be running and
+// billing. The failure is reported through ClientConfig.WarnLog and
+// kept here, but it is not part of the message: Error names only the
+// query and the cause, so a cleanup error (an IAM denial naming a
+// role, say) doesn't replace "the query timed out" for whoever reads
+// it. Read it with errors.As:
+//
+//	var ab *athenaio.AbandonedQueryError
+//	if errors.As(err, &ab) && ab.StopErr != nil {
+//	    // the query may still be running
+//	}
+type AbandonedQueryError struct {
+	QueryID string
+	Cause   error
+	StopErr error
+}
+
+func (e *AbandonedQueryError) Error() string {
+	if e.StopErr != nil {
+		return fmt.Sprintf("athenaio: query %s abandoned: %v", e.QueryID, e.Cause)
+	}
+	return fmt.Sprintf("athenaio: query %s stopped: %v", e.QueryID, e.Cause)
+}
+
+func (e *AbandonedQueryError) Unwrap() error { return e.Cause }
+
 // abandonQuery stops a query the caller is no longer waiting for and
-// returns cause, annotated with the query ID. Stopping is best
+// returns an *AbandonedQueryError wrapping cause. Stopping is best
 // effort: Athena may finish the query first, and a failed stop is
-// logged through WarnLog and joined into the error rather than
-// replacing cause, so errors.Is checks on cause keep working.
+// logged through WarnLog and kept on the error's StopErr.
 func (c *Client) abandonQuery(ctx context.Context, queryID string, cause error) error {
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopQueryTimeout)
 	defer cancel()
 	_, err := c.athena.StopQueryExecution(sctx, &athena.StopQueryExecutionInput{
 		QueryExecutionId: aws.String(queryID),
 	})
-	abandoned := fmt.Errorf("athenaio: query %s stopped: %w", queryID, cause)
-	if err != nil {
-		if c.warnLog != nil {
-			c.warnLog("athenaio: StopQueryExecution %s failed; the query may still be running: %v", queryID, err)
-		}
-		return errors.Join(abandoned, fmt.Errorf("athenaio: StopQueryExecution %s: %w", queryID, err))
+	if err != nil && c.warnLog != nil {
+		c.warnLog("athenaio: StopQueryExecution %s failed; the query may still be running: %v", queryID, err)
 	}
-	return abandoned
+	return &AbandonedQueryError{QueryID: queryID, Cause: cause, StopErr: err}
 }
 
 // scannedBytes pulls DataScannedInBytes off a completed query. Zero

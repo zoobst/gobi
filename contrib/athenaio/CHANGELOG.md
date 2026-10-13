@@ -9,6 +9,39 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.20]
+
+### Fixed
+
+- **A failed stop no longer replaces the timeout in the error
+  message.** When athenaio gave up on a query (`MaxPollDuration`, or
+  a cancelled or expired context) and the cleanup `StopQueryExecution`
+  call then failed, v0.1.19 joined that failure into the returned
+  error. Callers who showed `err.Error()` to users showed an AWS
+  cleanup error instead of "the query timed out". For an IAM denial
+  that message names the role and account.
+  - **Now:** the message names only the query and the cause:
+    `athenaio: query <id> abandoned: <timeout or cancellation>`.
+    "abandoned" replaces "stopped" when the stop failed, since the
+    query may still be running. `errors.Is(err, ErrQueryTimeout)`,
+    `context.Canceled` and `context.DeadlineExceeded` match as before.
+    The failure is still reported through `WarnLog`.
+
+### Added
+
+- **`AbandonedQueryError{QueryID, Cause, StopErr}`.** Every abandoned
+  query now returns one. `Cause` is the timeout or cancellation, and
+  `Unwrap` returns it. `StopErr` is non-nil when the stop failed, so
+  the query may still be running and billing. Read it with
+  `errors.As`:
+
+  ```go
+  var ab *athenaio.AbandonedQueryError
+  if errors.As(err, &ab) && ab.StopErr != nil {
+      // the query may still be running
+  }
+  ```
+
 ## [v0.1.19]
 
 ### Fixed
