@@ -15,17 +15,24 @@ see [Versioning](#versioning) below.
 
 - **A failed stop no longer replaces the timeout in the error
   message.** When athenaio gave up on a query (`MaxPollDuration`, or
-  a cancelled or expired context) and the cleanup `StopQueryExecution`
+  a canceled or expired context) and the cleanup `StopQueryExecution`
   call then failed, v0.1.19 joined that failure into the returned
   error. Callers who showed `err.Error()` to users showed an AWS
   cleanup error instead of "the query timed out". For an IAM denial
   that message names the role and account.
-  - **Now:** the message names only the query and the cause:
-    `athenaio: query <id> abandoned: <timeout or cancellation>`.
-    "abandoned" replaces "stopped" when the stop failed, since the
-    query may still be running. `errors.Is(err, ErrQueryTimeout)`,
-    `context.Canceled` and `context.DeadlineExceeded` match as before.
-    The failure is still reported through `WarnLog`.
+  - **Now:** the message names only the query and the cause, in one
+    of two forms:
+    - stop succeeded: `athenaio: query <id> stopped: <timeout or cancellation>`
+    - stop failed: `athenaio: query <id> abandoned: <timeout or cancellation>`,
+      since the query may still be running.
+  - **Unchanged:** `errors.Is(err, ErrQueryTimeout)`,
+    `context.Canceled` and `context.DeadlineExceeded` match as before,
+    and the stop failure is still reported through
+    `ClientConfig.WarnLog`.
+  - **Breaking for stop-failure checks:** the stop failure is no
+    longer in the error chain. `Unwrap` returns only the cause, so
+    `errors.Is(err, <stop error>)` no longer matches. Read `StopErr`
+    through `errors.As` instead (below).
 
 ### Added
 

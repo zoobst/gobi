@@ -122,7 +122,7 @@ func (c *Client) submitTo(ctx context.Context, sql, outputLocation string) (stri
 // ctx cancels, or MaxPollDuration elapses. Uses exponential backoff
 // starting at PollInterval, capped at defaultPollMax.
 //
-// When it gives up on a query that is still running — ctx cancelled
+// When it gives up on a query that is still running — ctx canceled
 // or deadline exceeded, MaxPollDuration elapsed — it asks Athena to
 // stop the query (see abandonQuery) and returns an
 // *AbandonedQueryError, which still matches errors.Is(err,
@@ -191,11 +191,11 @@ func (c *Client) pollUntilDone(ctx context.Context, queryID string) (*athenatype
 
 // stopQueryTimeout bounds the StopQueryExecution call abandonQuery
 // makes. It runs on a fresh context (the caller's is usually already
-// cancelled), so it needs its own limit.
+// canceled), so it needs its own limit.
 const stopQueryTimeout = 10 * time.Second
 
 // AbandonedQueryError is the error for a query athenaio stopped
-// waiting on: the caller's context was cancelled or hit its deadline,
+// waiting on: the caller's context was canceled or hit its deadline,
 // or ClientConfig.MaxPollDuration ran out. Cause is that reason, and
 // errors.Is sees through to it (context.Canceled,
 // context.DeadlineExceeded, ErrQueryTimeout).
