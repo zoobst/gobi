@@ -5,6 +5,16 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.5.1]
+
+### Fixed
+
+- **`csvio.ReadChunksFunc` keeps the callback's error in the chain.**
+  When the callback returned an error, it came back wrapped in
+  `ErrChunksAborted` as text only, so `errors.Is` / `errors.As`
+  couldn't find the original, though the docs said they could. Both
+  now match. `ReadStringChunksFunc` and `parquetio` already did this.
+
 ## [v0.5.0]
 
 ### Changed (breaking)

@@ -129,8 +129,8 @@ func TestReadChunksFunc_CallbackErrorAborts(t *testing.T) {
 	if !errors.Is(err, csvio.ErrChunksAborted) {
 		t.Fatalf("want ErrChunksAborted in the chain, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "boom") {
-		t.Fatalf("original callback error should be wrapped: %v", err)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("original callback error should be in the chain: %v", err)
 	}
 	if invocations != 2 {
 		t.Fatalf("callback invocations = %d, want 2 (stopped after error)", invocations)

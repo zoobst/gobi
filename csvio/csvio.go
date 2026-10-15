@@ -363,7 +363,7 @@ func ReadFileChunksFunc[T any](path string, opts *ReadOptions, fn func(*gobi.Fra
 // caller is then responsible for the matching Release().
 //
 // If fn returns an error, iteration stops and the error is wrapped in
-// ErrChunksAborted. If reading fails, the underlying Arrow error is
+// ErrChunksAborted; errors.Is / errors.As match both. If reading fails, the underlying Arrow error is
 // returned directly.
 func ReadChunksFunc[T any](r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) error) error {
 	sc, err := setupReader[T](r, opts)
@@ -381,7 +381,7 @@ func ReadChunksFunc[T any](r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) 
 		cbErr := fn(frame)
 		frame.Release()
 		if cbErr != nil {
-			return fmt.Errorf("%w: %v", ErrChunksAborted, cbErr)
+			return fmt.Errorf("%w: %w", ErrChunksAborted, cbErr)
 		}
 	}
 	if err := sc.rdr.Err(); err != nil {
