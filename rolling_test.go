@@ -352,3 +352,42 @@ func TestResampleEvery_TimezoneMetadataPreserved(t *testing.T) {
 		t.Fatalf("output timestamp tz = %q, want America/New_York", outT.Timezone())
 	}
 }
+
+// TestResampleEvery_AggKinds — Int64 Sum resamples to Int64, and kinds
+// the bucket path can't compute are an error, not a column of nulls
+// (First on an Int64 column used to panic, and before that, null).
+func TestResampleEvery_AggKinds(t *testing.T) {
+	ts := &arrow.TimestampType{Unit: arrow.Nanosecond}
+	fields := []arrow.Field{{Name: "t", Type: ts}, {Name: "v", Type: arrow.PrimitiveTypes.Int64}}
+	df := chunkedFrame(t, fields, 4, 4, func(c int, b array.Builder, lo, hi int) {
+		for r := lo; r < hi; r++ {
+			if c == 0 {
+				b.(*array.TimestampBuilder).Append(arrow.Timestamp(int64(r) * int64(30*time.Second)))
+			} else {
+				b.(*array.Int64Builder).Append(int64(r + 1))
+			}
+		}
+	})
+	defer df.Release()
+	r, err := df.ResampleEvery("t", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.Agg(Aggregation{Column: "v", Kind: AggSum, Alias: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := out.Column("s")
+	if got := s.col.Data().Chunks()[0].(*array.Int64).Int64Values(); got[0] != 3 || got[1] != 7 {
+		t.Errorf("sums = %v, want [3 7]", got)
+	}
+	out.Release()
+	for _, k := range []AggKind{AggFirst, AggLast, AggMedian, AggMode, AggBitOr, AggNUnique} {
+		if _, err := r.Agg(Aggregation{Column: "v", Kind: k}); err == nil {
+			t.Errorf("%s: expected an error", k)
+		}
+	}
+	if _, err := r.Agg(Aggregation{Column: "v", Fn: &countDistinctAggregator{}}); err == nil {
+		t.Error("custom aggregator: expected an error")
+	}
+}

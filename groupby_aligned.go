@@ -213,88 +213,6 @@ func (g *GroupBy) rowKeyInto(dst []byte, row int) ([]byte, error) {
 	return dst, nil
 }
 
-// buildAggBuilders is the shared aggregation-builder setup extracted
-// from GroupBy.Agg's slow path. Sits here so the fast path doesn't
-// duplicate the type-selection logic (Count/NUnique → Int64;
-// First/Last preserve source type; custom Fn uses declared Type;
-// default Float64).
-func (g *GroupBy) buildAggBuilders(aggs []Aggregation, pool memory.Allocator) ([]array.Builder, []arrow.Field, error) {
-	aggBuilders := make([]array.Builder, len(aggs))
-	aggFields := make([]arrow.Field, len(aggs))
-	for i, a := range aggs {
-		if a.Fn != nil {
-			if _, err := g.frame.Column(a.Column); err != nil {
-				return nil, nil, err
-			}
-			b, err := builderForType(pool, a.Fn.Type())
-			if err != nil {
-				return nil, nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
-					i, aggName(a), err)
-			}
-			aggBuilders[i] = b
-			aggFields[i] = arrow.Field{
-				Name: aggName(a), Type: a.Fn.Type(), Nullable: true,
-			}
-			continue
-		}
-		if a.Kind == AggCount || a.Kind == AggNUnique {
-			aggBuilders[i] = array.NewInt64Builder(pool)
-			aggFields[i] = arrow.Field{
-				Name: aggName(a), Type: arrow.PrimitiveTypes.Int64,
-				Nullable: a.Kind != AggCount && a.Kind != AggNUnique,
-			}
-			continue
-		}
-		if a.Kind.preservesSourceType() {
-			src, err := g.frame.Column(a.Column)
-			if err != nil {
-				return nil, nil, err
-			}
-			srcType := src.DataType()
-			if isBitwiseAgg(a.Kind) {
-				if err := checkBitwiseInput(a.Kind, a.Column, srcType); err != nil {
-					return nil, nil, err
-				}
-			}
-			b, err := builderForType(pool, srcType)
-			if err != nil {
-				return nil, nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
-					i, aggName(a), err)
-			}
-			aggBuilders[i] = b
-			aggFields[i] = arrow.Field{Name: aggName(a), Type: srcType, Nullable: true}
-			continue
-		}
-		if a.Kind == AggMin || a.Kind == AggMax {
-			src, err := g.frame.Column(a.Column)
-			if err != nil {
-				return nil, nil, err
-			}
-			if _, isTS := src.DataType().(*arrow.TimestampType); isTS {
-				srcType := src.DataType()
-				b, err := builderForType(pool, srcType)
-				if err != nil {
-					return nil, nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
-						i, aggName(a), err)
-				}
-				aggBuilders[i] = b
-				aggFields[i] = arrow.Field{Name: aggName(a), Type: srcType, Nullable: true}
-				continue
-			}
-		}
-		src, err := g.frame.Column(a.Column)
-		if err != nil {
-			return nil, nil, err
-		}
-		t := aggResultType(a, src.DataType())
-		if aggBuilders[i], err = builderForType(pool, t); err != nil {
-			return nil, nil, fmt.Errorf("gobi: aggregation %d (%s): %w", i, aggName(a), err)
-		}
-		aggFields[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: true}
-	}
-	return aggBuilders, aggFields, nil
-}
-
 // assembleOutput builds the final Frame from populated key + agg
 // builders. Extracted from Agg's tail so both paths share the same
 // schema + Frame construction. Reads-out arrays and constructs a
@@ -343,12 +261,13 @@ func (g *GroupBy) assembleOutput(keyBuilders, aggBuilders []array.Builder, aggFi
 //   - Source column resolves cleanly.
 //   - Source column is single-chunk (RecordBatch columns always
 //     are, but the eager path may see multi-chunk).
-//   - Source column is null-free (any nulls fall through — the
-//     general path handles null propagation).
-//   - Source column is Float64 or Int64 (both have SIMD Sum;
-//     Float64 additionally has SIMD Min/Max).
-//   - Output builder is *array.Float64Builder (buildAggBuilders
-//     picks Float64 for all four reduction kinds on numeric input).
+//   - Source column is Float64 or Int64.
+//   - For an Int64 Sum the output builder is *array.Int64Builder and
+//     the sum is overflow-checked (intSum.addRows), not SIMD:
+//     compute.SumI64 would wrap silently. Nulls are skipped.
+//   - Otherwise the output builder is *array.Float64Builder, the
+//     column is null-free (nulls fall through to the general path),
+//     and the reduction uses the SIMD kernels.
 func (g *GroupBy) tryEmitContiguousSIMD(b array.Builder, a Aggregation, start, end int) (bool, error) {
 	// Kind gate: only reducible numeric aggs are candidates.
 	// Custom Fn aggs, First/Last/Median/Mode/Count/NUnique all
@@ -370,15 +289,15 @@ func (g *GroupBy) tryEmitContiguousSIMD(b array.Builder, a Aggregation, start, e
 		return false, nil
 	}
 	if ib, ok := b.(*array.Int64Builder); ok && a.Kind == AggSum {
+		// Integer sums are overflow-checked, so they don't use the SIMD
+		// reduce (compute.SumI64 wraps silently).
 		arr, ok := chunks[0].(*array.Int64)
-		if !ok || arr.NullN() != 0 {
+		if !ok {
 			return false, nil
 		}
 		var sum intSum
-		for _, v := range arr.Int64Values()[start:end] {
-			if err := sum.addI(v); err != nil {
-				return false, fmt.Errorf("gobi: aggregation %s: %w", aggName(a), err)
-			}
+		if err := sum.addRows(arr, nil, start, end); err != nil {
+			return false, fmt.Errorf("gobi: aggregation %s: %w", aggName(a), err)
 		}
 		return true, appendIntSum(ib, sum)
 	}
@@ -432,23 +351,15 @@ func emitReducedFloat64(b *array.Float64Builder, kind AggKind, vals []float64) b
 	return true
 }
 
-// emitReducedInt64 is the Int64-input counterpart. Aligned
-// GroupBy's output builder for numeric reductions is Float64
-// (matches the general path), so integer results widen on emit —
-// same convention as gobi's other integer aggregations.
+// emitReducedInt64 is the Int64-input counterpart for the Float64
+// outputs — Mean / Min / Max widen on emit. Int64 Sum never gets here:
+// its output is Int64 (see tryEmitContiguousSIMD).
 func emitReducedInt64(b *array.Float64Builder, kind AggKind, vals []int64) bool {
 	if len(vals) == 0 {
-		switch kind {
-		case AggSum:
-			b.Append(0)
-		default:
-			b.AppendNull()
-		}
+		b.AppendNull()
 		return true
 	}
 	switch kind {
-	case AggSum:
-		b.Append(float64(compute.SumI64(vals)))
 	case AggMean:
 		b.Append(float64(compute.SumI64(vals)) / float64(len(vals)))
 	case AggMin:

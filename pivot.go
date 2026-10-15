@@ -27,7 +27,8 @@ import (
 // header row is always a string. The value column's arrow type
 // is whatever GroupBy.Agg produces for agg: Int64 for Count/NUnique,
 // the source type for First/Last/Mode/bitwise kinds (and Min/Max on
-// Timestamp), Float64 for the rest.
+// Timestamp), Int64 for Sum on a signed integer column (Uint64 on an
+// unsigned one), Float64 for the rest.
 //
 // Cells with no matching input rows are emitted as null. Output rows
 // are ordered by the sorted index value; output columns are ordered

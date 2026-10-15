@@ -291,88 +291,9 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 	}
 	defer releaseBuilders(keyBuilders)
 
-	// Aggregation output builders.
-	aggBuilders := make([]array.Builder, len(aggs))
-	aggFields := make([]arrow.Field, len(aggs))
-	for i, a := range aggs {
-		if a.Fn != nil {
-			if _, err := g.frame.Column(a.Column); err != nil {
-				return nil, err
-			}
-			b, err := builderForType(pool, a.Fn.Type())
-			if err != nil {
-				return nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
-					i, aggName(a), err)
-			}
-			aggBuilders[i] = b
-			aggFields[i] = arrow.Field{
-				Name: aggName(a), Type: a.Fn.Type(), Nullable: true,
-			}
-			continue
-		}
-		if a.Kind == AggCount || a.Kind == AggNUnique {
-			aggBuilders[i] = array.NewInt64Builder(pool)
-			aggFields[i] = arrow.Field{
-				Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: a.Kind != AggCount && a.Kind != AggNUnique,
-			}
-			continue
-		}
-		// First / Last / Mode preserve the source column's arrow
-		// type. We stand up a builder matching that type and let
-		// appendAgg route through the type-generic value writer.
-		// Min / Max additionally preserve source type when the
-		// source is Timestamp — see the Timestamp branch in
-		// appendAgg for the matching read path.
-		if a.Kind.preservesSourceType() {
-			src, err := g.frame.Column(a.Column)
-			if err != nil {
-				return nil, err
-			}
-			srcType := src.DataType()
-			if isBitwiseAgg(a.Kind) {
-				if err := checkBitwiseInput(a.Kind, a.Column, srcType); err != nil {
-					return nil, err
-				}
-			}
-			b, err := builderForType(pool, srcType)
-			if err != nil {
-				return nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
-					i, aggName(a), err)
-			}
-			aggBuilders[i] = b
-			aggFields[i] = arrow.Field{
-				Name: aggName(a), Type: srcType, Nullable: true,
-			}
-			continue
-		}
-		if a.Kind == AggMin || a.Kind == AggMax {
-			src, err := g.frame.Column(a.Column)
-			if err != nil {
-				return nil, err
-			}
-			if _, isTS := src.DataType().(*arrow.TimestampType); isTS {
-				srcType := src.DataType()
-				b, err := builderForType(pool, srcType)
-				if err != nil {
-					return nil, fmt.Errorf("gobi: aggregation %d (%s): %w",
-						i, aggName(a), err)
-				}
-				aggBuilders[i] = b
-				aggFields[i] = arrow.Field{
-					Name: aggName(a), Type: srcType, Nullable: true,
-				}
-				continue
-			}
-		}
-		src, err := g.frame.Column(a.Column)
-		if err != nil {
-			return nil, err
-		}
-		t := aggResultType(a, src.DataType())
-		if aggBuilders[i], err = builderForType(pool, t); err != nil {
-			return nil, fmt.Errorf("gobi: aggregation %d (%s): %w", i, aggName(a), err)
-		}
-		aggFields[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: true}
+	aggBuilders, aggFields, err := g.buildAggBuilders(aggs, pool)
+	if err != nil {
+		return nil, err
 	}
 	defer releaseBuilders(aggBuilders)
 
@@ -1327,6 +1248,43 @@ func timestampAt(s Series, i int) (arrow.Timestamp, bool, error) {
 	return 0, false, fmt.Errorf("%w: index %d unreachable", ErrRowOutOfRange, i)
 }
 
+// buildAggBuilders sets up one output builder + field per aggregation
+// for the eager and aligned GroupBy paths. Types come from
+// aggResultType, the rule every engine follows; bitwise kinds also
+// check their input here.
+func (g *GroupBy) buildAggBuilders(aggs []Aggregation, pool memory.Allocator) (bs []array.Builder, fs []arrow.Field, err error) {
+	bs = make([]array.Builder, 0, len(aggs))
+	defer func() {
+		if err != nil {
+			releaseBuilders(bs)
+		}
+	}()
+	fs = make([]arrow.Field, len(aggs))
+	for i, a := range aggs {
+		var src arrow.DataType
+		if a.Column != "" {
+			s, err := g.frame.Column(a.Column)
+			if err != nil {
+				return nil, nil, err
+			}
+			src = s.DataType()
+		}
+		if a.Fn == nil && isBitwiseAgg(a.Kind) {
+			if err := checkBitwiseInput(a.Kind, a.Column, src); err != nil {
+				return nil, nil, err
+			}
+		}
+		t := aggResultType(a, src)
+		b, err := builderForType(pool, t)
+		if err != nil {
+			return nil, nil, fmt.Errorf("gobi: aggregation %d (%s): %w", i, aggName(a), err)
+		}
+		bs = append(bs, b)
+		fs[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: aggOutputNullable(a)}
+	}
+	return bs, fs, nil
+}
+
 // ErrSumOverflow is returned when a grouped integer sum doesn't fit
 // its Int64 (or Uint64) output column.
 var ErrSumOverflow = errors.New("gobi: integer sum overflows")
@@ -1387,27 +1345,100 @@ func (s *intSum) addU(v uint64) error {
 	return nil
 }
 
-// add adds the integer cell arr[i] (non-null).
-func (s *intSum) add(arr arrow.Array, i int) error {
+// intCell reads integer cell arr[i] as its uint64 bits plus its sign:
+// a signed value is returned as uint64(int64(x)) with neg = x < 0.
+func intCell(arr arrow.Array, i int) (v uint64, neg bool, err error) {
 	switch a := arr.(type) {
 	case *array.Int64:
-		return s.addI(a.Value(i))
+		x := a.Value(i)
+		return uint64(x), x < 0, nil
 	case *array.Int32:
-		return s.addI(int64(a.Value(i)))
+		x := int64(a.Value(i))
+		return uint64(x), x < 0, nil
 	case *array.Int16:
-		return s.addI(int64(a.Value(i)))
+		x := int64(a.Value(i))
+		return uint64(x), x < 0, nil
 	case *array.Int8:
-		return s.addI(int64(a.Value(i)))
+		x := int64(a.Value(i))
+		return uint64(x), x < 0, nil
 	case *array.Uint64:
-		return s.addU(a.Value(i))
+		return a.Value(i), false, nil
 	case *array.Uint32:
-		return s.addU(uint64(a.Value(i)))
+		return uint64(a.Value(i)), false, nil
 	case *array.Uint16:
-		return s.addU(uint64(a.Value(i)))
+		return uint64(a.Value(i)), false, nil
 	case *array.Uint8:
-		return s.addU(uint64(a.Value(i)))
+		return uint64(a.Value(i)), false, nil
 	}
-	return fmt.Errorf("%w: integer sum over %s", ErrColumnTypeMismatch, arr.DataType())
+	return 0, false, fmt.Errorf("%w: integer sum over %s", ErrColumnTypeMismatch, arr.DataType())
+}
+
+// add adds the integer cell arr[i] (non-null) to the sum of its own
+// signedness: signed sources into i, unsigned into u.
+func (s *intSum) add(arr arrow.Array, i int) error {
+	v, _, err := intCell(arr, i)
+	if err != nil {
+		return err
+	}
+	if isSignedInt(arr.DataType()) {
+		return s.addI(int64(v)) // v holds the int64's bits
+	}
+	return s.addU(v)
+}
+
+func isSignedInt(dt arrow.DataType) bool {
+	t := intSumType(dt)
+	return t != nil && t.ID() == arrow.INT64
+}
+
+// addRows adds the non-null cells of the single array arr at rows —
+// the one integer-sum loop the eager, fast and aligned GroupBy paths
+// share. rows nil means rows lo..hi-1.
+func (s *intSum) addRows(arr arrow.Array, rows []int, lo, hi int) error {
+	if a, ok := arr.(*array.Int64); ok {
+		vals := a.Int64Values()
+		nulls := a.NullN() > 0
+		add := func(i int) error {
+			if nulls && a.IsNull(i) {
+				return nil
+			}
+			return s.addI(vals[i])
+		}
+		if rows == nil {
+			for i := lo; i < hi; i++ {
+				if err := add(i); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for _, i := range rows {
+			if err := add(i); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if rows == nil {
+		for i := lo; i < hi; i++ {
+			if arr.IsNull(i) {
+				continue
+			}
+			if err := s.add(arr, i); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, i := range rows {
+		if arr.IsNull(i) {
+			continue
+		}
+		if err := s.add(arr, i); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // sumIntRows sums the non-null integer cells of s at rows.

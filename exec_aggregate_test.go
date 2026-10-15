@@ -858,7 +858,8 @@ func TestGroupTable_PlannedTypeMismatch(t *testing.T) {
 		{Aggregation{Column: "v", Kind: AggMax}, &arrow.TimestampType{Unit: arrow.Second}},
 		{Aggregation{Column: "v", Kind: AggFirst}, arrow.BinaryTypes.String},
 	} {
-		tbl, err := newGroupTable(keyModeString1, []string{"k"}, []Aggregation{tc.agg}, []arrow.DataType{tc.dt})
+		out := arrow.NewSchema([]arrow.Field{{Name: "k", Type: arrow.BinaryTypes.String}, {Name: "x", Type: tc.dt}}, nil)
+		tbl, err := newGroupTable(keyModeString1, []string{"k"}, []Aggregation{tc.agg}, out)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -926,7 +927,8 @@ func TestValueCapture_PiecesStayFew(t *testing.T) {
 		b.(*array.Int64Builder).Append(int64(lo))
 	})
 	defer df.Release()
-	tbl, err := newGroupTable(keyModeInt641, []string{"k"}, []Aggregation{{Kind: AggCount, Alias: "n"}}, []arrow.DataType{arrow.PrimitiveTypes.Int64})
+	out := arrow.NewSchema([]arrow.Field{{Name: "k", Type: arrow.PrimitiveTypes.Int64}, {Name: "n", Type: arrow.PrimitiveTypes.Int64}}, nil)
+	tbl, err := newGroupTable(keyModeInt641, []string{"k"}, []Aggregation{{Kind: AggCount, Alias: "n"}}, out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -943,7 +945,7 @@ func TestValueCapture_PiecesStayFew(t *testing.T) {
 	if got := len(tbl.keyCaps[0].pieces); got > 12 {
 		t.Errorf("%d pieces after %d batches, want O(log n)", got, batches)
 	}
-	tbl.finish(false)
+	tbl.finish(false, false)
 	keys, err := takeCaptures(memory.DefaultAllocator, arrow.PrimitiveTypes.Int64,
 		[]*valueCapture{&tbl.keyCaps[0]}, outputOrder([]*groupTable{tbl}, keyModeInt641, false),
 		func(r rowRef) int32 { return r.g })

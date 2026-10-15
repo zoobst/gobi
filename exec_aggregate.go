@@ -16,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/bitutil"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
@@ -105,8 +106,8 @@ type streamingAggregateExec struct {
 //     back to the original arrow type at buildResultBatch time)
 //
 // More can be added (single float64) once the payoff is measured;
-// each adds a specialized branch to consumeBatch / workerConsume
-// and dispatchBatch.
+// each adds a specialized branch to groupTable.consume and
+// dispatchBatch.
 func pickKeyMode(n *aggregateNode) keyMode {
 	if len(n.keys) != 1 {
 		return keyModeComposite
@@ -146,16 +147,16 @@ const (
 	keyModeComposite keyMode = iota
 	// keyModeString1 is the specialized single-column string path.
 	// Handles a single String or LargeString key. The arrow value
-	// is used directly as the map key (probe zero-copy via the
-	// compiler's map[stringVar] optimization; insert clones for
-	// durability past the batch's lifetime).
+	// is used directly as the groupTable.strIdx key (probed with a
+	// string aliasing the batch, no copy; insert copies it into the
+	// table's arena).
 	keyModeString1
 	// keyModeInt641 is the specialized single-column integer-ish
 	// path. Handles a single Int64, Int32, Uint64, Uint32,
 	// Timestamp, or Bool key — every one fits losslessly in an
 	// int64 for hash-table purposes. Skips the composite byte
 	// encoding entirely: the arrow value is read once per row and
-	// used directly as a `map[int64]*aggGroup` key. Faster hash
+	// used directly as the groupTable.intIdx key. Faster hash
 	// (word-at-a-time vs byte-loop) and no scratch allocation.
 	keyModeInt641
 )
@@ -170,7 +171,7 @@ type aggAccumulator interface {
 	//
 	// Contract: implementations MUST NOT retain the `rows` slice
 	// past the Update call. The caller reuses the underlying
-	// backing array (aggGroup.batchRows) across batches — a
+	// backing array (the table's aggBatch) across batches — a
 	// retained alias would see it overwritten with the next
 	// batch's row indices, silently corrupting downstream reads.
 	// Copy any subset you need to hold onto (rare — the built-in
@@ -238,20 +239,11 @@ func (e *streamingAggregateExec) buildIfNeeded(ctx context.Context) error {
 	return nil
 }
 
-// aggTypes returns the aggregations' planned output types.
-func (e *streamingAggregateExec) aggTypes() []arrow.DataType {
-	ts := make([]arrow.DataType, len(e.aggs))
-	for i := range ts {
-		ts[i] = e.outSchema.Field(len(e.keys) + i).Type
-	}
-	return ts
-}
-
 // buildSerial folds every batch into one groupTable. Used for
 // workers <= 1 — the partitioned path pays for goroutine + channel +
 // hash overhead that isn't worth it without CPU parallelism to unlock.
 func (e *streamingAggregateExec) buildSerial(ctx context.Context) error {
-	t, err := newGroupTable(e.keyMode, e.keys, e.aggs, e.aggTypes())
+	t, err := newGroupTable(e.keyMode, e.keys, e.aggs, e.outSchema)
 	if err != nil {
 		return err
 	}
@@ -262,7 +254,7 @@ func (e *streamingAggregateExec) buildSerial(ctx context.Context) error {
 		}
 		batch, err := e.input.Next(ctx)
 		if err == io.EOF {
-			t.finish(e.unordered)
+			t.finish(e.unordered, false)
 			return nil
 		}
 		if err != nil {
@@ -584,7 +576,7 @@ type groupTable struct {
 	n       int32   // groups so far
 	order   []int32 // gids in output order, set by finish
 	// The keys of order, laid out in that order, for merging the
-	// tables' sorted runs (set by finish unless unordered).
+	// tables' sorted runs (set by finish when the table is merged).
 	runStr []string
 	runInt []int64
 
@@ -595,9 +587,9 @@ type groupTable struct {
 	allRows []int // 0..n-1, for the serial build
 }
 
-// newGroupTable builds an empty table; aggTypes are the aggregations'
-// planned output types (the output schema after the key columns).
-func newGroupTable(mode keyMode, keys []string, aggs []Aggregation, aggTypes []arrow.DataType) (*groupTable, error) {
+// newGroupTable builds an empty table for output schema out: the key
+// columns, then one column per aggregation, with their planned types.
+func newGroupTable(mode keyMode, keys []string, aggs []Aggregation, out *arrow.Schema) (*groupTable, error) {
 	t := &groupTable{mode: mode, keys: keys, aggs: aggs}
 	if mode == keyModeInt641 {
 		t.intIdx = make(map[int64]int32)
@@ -606,10 +598,13 @@ func newGroupTable(mode keyMode, keys []string, aggs []Aggregation, aggTypes []a
 	}
 	if mode != keyModeString1 {
 		t.keyCaps = make([]valueCapture, len(keys))
+		for i := range t.keyCaps {
+			t.keyCaps[i].dt = out.Field(i).Type
+		}
 	}
 	t.states = make([]aggState, len(aggs))
 	for i, a := range aggs {
-		st, err := newAggState(a, aggTypes[i])
+		st, err := newAggState(a, out.Field(len(keys)+i).Type)
 		if err != nil {
 			t.release()
 			return nil, err
@@ -745,7 +740,7 @@ func (t *groupTable) consume(batch arrow.RecordBatch, rows []int) error {
 			return err
 		}
 		if err := st.update(aggCols[i], b); err != nil {
-			return fmt.Errorf("agg %s: %w", aggName(t.aggs[i]), err)
+			return fmt.Errorf("gobi: aggregation %s: %w", aggName(t.aggs[i]), err)
 		}
 	}
 	return nil
@@ -754,8 +749,10 @@ func (t *groupTable) consume(batch arrow.RecordBatch, rows []int) error {
 // finish sorts the table's groups into output order: by key — the
 // String1 string, the composite encoding, or the widened int64 — or
 // first-seen order when unordered. The parallel build calls it on
-// each worker, so the tables sort concurrently.
-func (t *groupTable) finish(unordered bool) {
+// each worker, so the tables sort concurrently. merged says outputOrder
+// will merge this table with others, which needs the keys copied out
+// in sorted order (runInt / runStr); a lone table skips that copy.
+func (t *groupTable) finish(unordered, merged bool) {
 	t.order = make([]int32, t.n)
 	for i := range t.order {
 		t.order[i] = int32(i)
@@ -766,6 +763,9 @@ func (t *groupTable) finish(unordered bool) {
 	if t.mode == keyModeInt641 {
 		k := t.sortInt
 		slices.SortFunc(t.order, func(a, b int32) int { return cmp.Compare(k[a], k[b]) })
+		if !merged {
+			return
+		}
 		t.runInt = make([]int64, len(t.order))
 		for i, g := range t.order {
 			t.runInt[i] = k[g]
@@ -773,6 +773,9 @@ func (t *groupTable) finish(unordered bool) {
 	} else {
 		k := t.sortStr
 		slices.SortFunc(t.order, func(a, b int32) int { return strings.Compare(k[a], k[b]) })
+		if !merged {
+			return
+		}
 		t.runStr = make([]string, len(t.order))
 		for i, g := range t.order {
 			t.runStr[i] = k[g]
@@ -921,7 +924,13 @@ func (e *streamingAggregateExec) buildResultBatch() (arrow.RecordBatch, error) {
 // emitStringKeys writes the String1 key column from the tables' key
 // strings.
 func emitStringKeys(pool memory.Allocator, dt arrow.DataType, tables []*groupTable, order []rowRef) (arrow.Array, error) {
-	return buildBytesArray(pool, dt, len(order), func(i int) (string, bool) {
+	total := 0
+	for _, t := range tables {
+		for _, k := range t.sortStr[:t.n] {
+			total += len(k)
+		}
+	}
+	return buildBytesArray(pool, dt, len(order), total, func(i int) (string, bool) {
 		r := order[i]
 		return tables[r.t].sortStr[r.g], true
 	})
@@ -930,7 +939,9 @@ func emitStringKeys(pool memory.Allocator, dt arrow.DataType, tables []*groupTab
 // buildBytesArray builds a String / LargeString / Binary / LargeBinary
 // array of n values straight into its buffers — get(i) returns value
 // i, ok=false for null — skipping the builder's per-value bookkeeping.
-func buildBytesArray(pool memory.Allocator, dt arrow.DataType, n int, get func(int) (string, bool)) (arrow.Array, error) {
+// total is the byte length of all non-null values; get is called once
+// per row, in order.
+func buildBytesArray(pool memory.Allocator, dt arrow.DataType, n, total int, get func(int) (string, bool)) (arrow.Array, error) {
 	large := false
 	switch dt.ID() {
 	case arrow.STRING, arrow.BINARY:
@@ -938,14 +949,6 @@ func buildBytesArray(pool memory.Allocator, dt arrow.DataType, n int, get func(i
 		large = true
 	default:
 		return nil, fmt.Errorf("byte values into %s", dt)
-	}
-	total, nulls := 0, 0
-	for i := range n {
-		v, ok := get(i)
-		if !ok {
-			nulls++
-		}
-		total += len(v)
 	}
 	if !large && total > math.MaxInt32 {
 		return nil, fmt.Errorf("%d bytes overflow %s offsets", total, dt)
@@ -966,41 +969,54 @@ func buildBytesArray(pool memory.Allocator, dt arrow.DataType, n int, get func(i
 	}
 	offBuf.Resize((n + 1) * width)
 	dataBuf.Resize(total)
-	data := dataBuf.Bytes()
-	var bits []byte
-	if nulls > 0 {
-		bitmap = memory.NewResizableBuffer(pool)
-		bitmap.Resize(int(bitutil.BytesForBits(int64(n))))
-		bits = bitmap.Bytes()
-		clear(bits)
-	}
-	pos := 0
+	var nulls int
+	var err error
 	if large {
-		offs := arrow.Int64Traits.CastFromBytes(offBuf.Bytes())
-		for i := range n {
-			offs[i] = int64(pos)
-			v, ok := get(i)
-			if ok && bits != nil {
-				bitutil.SetBit(bits, i)
-			}
-			pos += copy(data[pos:], v)
-		}
-		offs[n] = int64(pos)
+		bitmap, nulls, err = fillBytes(pool, arrow.Int64Traits.CastFromBytes(offBuf.Bytes()), dataBuf.Bytes(), n, get)
 	} else {
-		offs := arrow.Int32Traits.CastFromBytes(offBuf.Bytes())
-		for i := range n {
-			offs[i] = int32(pos)
-			v, ok := get(i)
-			if ok && bits != nil {
-				bitutil.SetBit(bits, i)
-			}
-			pos += copy(data[pos:], v)
-		}
-		offs[n] = int32(pos)
+		bitmap, nulls, err = fillBytes(pool, arrow.Int32Traits.CastFromBytes(offBuf.Bytes()), dataBuf.Bytes(), n, get)
+	}
+	if err != nil {
+		return nil, err
 	}
 	d := array.NewData(dt, n, []*memory.Buffer{bitmap, offBuf, dataBuf}, nil, nulls, 0)
 	defer d.Release()
 	return array.MakeFromData(d), nil
+}
+
+// fillBytes writes buildBytesArray's offsets and data. The validity
+// bitmap is allocated at the first null, with every earlier row marked
+// valid; it stays nil when there are none.
+func fillBytes[O int32 | int64](pool memory.Allocator, offs []O, data []byte, n int, get func(int) (string, bool)) (bitmap *memory.Buffer, nulls int, err error) {
+	var bits []byte
+	pos := 0
+	for i := range n {
+		offs[i] = O(pos)
+		v, ok := get(i)
+		if !ok {
+			if bits == nil {
+				bitmap = memory.NewResizableBuffer(pool)
+				bitmap.Resize(int(bitutil.BytesForBits(int64(n))))
+				bits = bitmap.Bytes()
+				clear(bits)
+				bitutil.SetBitsTo(bits, 0, int64(i), true)
+			}
+			nulls++
+			continue
+		}
+		if bits != nil {
+			bitutil.SetBit(bits, i)
+		}
+		if len(v) > len(data)-pos {
+			if bitmap != nil {
+				bitmap.Release()
+			}
+			return nil, 0, fmt.Errorf("byte values exceed the %d-byte total", len(data))
+		}
+		pos += copy(data[pos:], v)
+	}
+	offs[n] = O(pos)
+	return bitmap, nulls, nil
 }
 
 // takeCaptures gathers captured values in order: slot(r) is the
@@ -1074,6 +1090,7 @@ func (a *strArena) string(s string) string {
 // addressed by slot: their position across the captures laid end to
 // end.
 type valueCapture struct {
+	dt     arrow.DataType // planned type: captures of another type are cast to it
 	pieces []arrow.Array
 	n      int
 }
@@ -1090,6 +1107,17 @@ func (c *valueCapture) capture(col Series, rows []int) (int, error) {
 	arr, err := takeArray(memory.DefaultAllocator, col, rows)
 	if err != nil {
 		return 0, err
+	}
+	if c.dt != nil && !arrow.TypeEqual(arr.DataType(), c.dt) {
+		// The batch drifted from the planned schema (String vs
+		// LargeString, a time zone label, …): cast so every piece has
+		// the output type.
+		cast, err := compute.CastArray(context.Background(), arr, compute.SafeCastOptions(c.dt))
+		arr.Release()
+		if err != nil {
+			return 0, fmt.Errorf("%w: %s planned, column is %s: %v", ErrColumnTypeMismatch, c.dt, col.DataType(), err)
+		}
+		arr = cast
 	}
 	c.pieces = append(c.pieces, arr)
 	c.n += len(rows)
@@ -1252,6 +1280,7 @@ func newAggState(a Aggregation, dt arrow.DataType) (aggState, error) {
 			s := &firstLastState{first: a.Kind == AggFirst, dt: dt, vals: newFLValues(dt)}
 			if s.vals == nil {
 				s.capt = &flCapture{last: !s.first}
+				s.capt.cap.dt = dt
 			}
 			return s, nil
 		}
@@ -1371,28 +1400,28 @@ func (s *sumState) update(col Series, b *aggBatch) error {
 			s.n[g]++
 		})
 	}
-	if t := intSumType(col.DataType()); t == nil || (t.ID() == arrow.INT64) != s.signed {
+	if intSumType(col.DataType()) == nil {
 		return fmt.Errorf("%w: integer sum planned, column is %s", ErrColumnTypeMismatch, col.DataType())
 	}
 	chunks := col.col.Data().Chunks()
 	if len(chunks) == 1 {
 		switch a := chunks[0].(type) {
 		case *array.Int64:
-			return foldSigned(s, a, a.Int64Values(), b)
+			return foldInts(s, a, a.Int64Values(), b)
 		case *array.Int32:
-			return foldSigned(s, a, a.Int32Values(), b)
+			return foldInts(s, a, a.Int32Values(), b)
 		case *array.Int16:
-			return foldSigned(s, a, a.Int16Values(), b)
+			return foldInts(s, a, a.Int16Values(), b)
 		case *array.Int8:
-			return foldSigned(s, a, a.Int8Values(), b)
+			return foldInts(s, a, a.Int8Values(), b)
 		case *array.Uint64:
-			return foldUnsigned(s, a, a.Uint64Values(), b)
+			return foldInts(s, a, a.Uint64Values(), b)
 		case *array.Uint32:
-			return foldUnsigned(s, a, a.Uint32Values(), b)
+			return foldInts(s, a, a.Uint32Values(), b)
 		case *array.Uint16:
-			return foldUnsigned(s, a, a.Uint16Values(), b)
+			return foldInts(s, a, a.Uint16Values(), b)
 		case *array.Uint8:
-			return foldUnsigned(s, a, a.Uint8Values(), b)
+			return foldInts(s, a, a.Uint8Values(), b)
 		}
 	}
 	loc := newChunkLocator(col)
@@ -1404,54 +1433,53 @@ func (s *sumState) update(col Series, b *aggBatch) error {
 		if chunk.IsNull(local) {
 			continue
 		}
-		g := b.gids[i]
-		acc := intSum{i: s.isum[g], n: s.n[g]}
-		if !s.signed {
-			acc = intSum{u: s.usum[g], n: s.n[g]}
-		}
-		if err := acc.add(chunk, local); err != nil {
+		v, neg, err := intCell(chunk, local)
+		if err != nil {
 			return err
 		}
-		if s.signed {
-			s.isum[g] = acc.i
-		} else {
-			s.usum[g] = acc.u
+		if err := s.add(b.gids[i], v, neg); err != nil {
+			return err
 		}
-		s.n[g] = acc.n
 	}
 	return nil
 }
 
-func foldSigned[T int64 | int32 | int16 | int8](s *sumState, a arrow.Array, vals []T, b *aggBatch) error {
+// add folds one integer value into group g's sum: v is its magnitude
+// bits as uint64 and neg its sign (v is then the two's-complement
+// int64). A value outside the output type — negative into Uint64,
+// above MaxInt64 into Int64 — is an overflow.
+func (s *sumState) add(g int32, v uint64, neg bool) error {
+	var ok bool
+	if s.signed {
+		if !neg && v > math.MaxInt64 {
+			return ErrSumOverflow
+		}
+		s.isum[g], ok = addInt64(s.isum[g], int64(v))
+	} else {
+		if neg {
+			return ErrSumOverflow
+		}
+		s.usum[g], ok = addUint64(s.usum[g], v)
+	}
+	if !ok {
+		return ErrSumOverflow
+	}
+	s.n[g]++
+	return nil
+}
+
+// foldInts folds a single-chunk integer column of any width into the
+// sum's Int64 or Uint64 accumulator.
+func foldInts[T int64 | int32 | int16 | int8 | uint64 | uint32 | uint16 | uint8](s *sumState, a arrow.Array, vals []T, b *aggBatch) error {
 	nulls := a.NullN() > 0
 	for i, row := range b.rows {
 		if nulls && a.IsNull(row) {
 			continue
 		}
-		g := b.gids[i]
-		r, ok := addInt64(s.isum[g], int64(vals[row]))
-		if !ok {
-			return ErrSumOverflow
+		v := vals[row]
+		if err := s.add(b.gids[i], uint64(v), v < 0); err != nil {
+			return err
 		}
-		s.isum[g] = r
-		s.n[g]++
-	}
-	return nil
-}
-
-func foldUnsigned[T uint64 | uint32 | uint16 | uint8](s *sumState, a arrow.Array, vals []T, b *aggBatch) error {
-	nulls := a.NullN() > 0
-	for i, row := range b.rows {
-		if nulls && a.IsNull(row) {
-			continue
-		}
-		g := b.gids[i]
-		r, ok := addUint64(s.usum[g], uint64(vals[row]))
-		if !ok {
-			return ErrSumOverflow
-		}
-		s.usum[g] = r
-		s.n[g]++
 	}
 	return nil
 }
@@ -1685,7 +1713,7 @@ func (s *firstLastState) update(col Series, b *aggBatch) error {
 		s.nset += added
 		return err
 	}
-	if !arrow.TypeEqual(col.DataType(), s.dt) {
+	if !s.vals.holds(col.DataType()) {
 		return fmt.Errorf("%w: %s first/last planned, column is %s", ErrColumnTypeMismatch, s.dt, col.DataType())
 	}
 	loc := newChunkLocator(col)
@@ -1728,13 +1756,22 @@ func (s *firstLastState) emit(pool memory.Allocator, dt arrow.DataType, peers []
 		return takeCaptures(pool, dt, caps, order, func(r rowRef) int32 { return ps[r.t].capt.slot[r.g] })
 	}
 	if _, ok := s.vals.(*flBytes); ok {
-		return buildBytesArray(pool, dt, len(order), func(i int) (string, bool) {
+		bs := make([]*flBytes, len(ps))
+		total := 0
+		for i, p := range ps {
+			bs[i] = p.vals.(*flBytes)
+		}
+		for _, r := range order {
+			if ps[r.t].set[r.g] {
+				total += len(bs[r.t].vals[r.g])
+			}
+		}
+		return buildBytesArray(pool, dt, len(order), total, func(i int) (string, bool) {
 			r := order[i]
-			p := ps[r.t]
-			if !p.set[r.g] {
+			if !ps[r.t].set[r.g] {
 				return "", false
 			}
-			return p.vals.(*flBytes).vals[r.g], true
+			return bs[r.t].vals[r.g], true
 		})
 	}
 	// array.NewBuilder covers every fixed-width type flFixed stores
@@ -1753,6 +1790,10 @@ func (s *firstLastState) emit(pool memory.Allocator, dt arrow.DataType, peers []
 
 // flValues is firstLastState's typed per-group storage.
 type flValues interface {
+	// holds reports whether values of a column of type dt can be
+	// stored — e.g. String and LargeString share byte storage, and a
+	// timestamp's zone label doesn't matter.
+	holds(dt arrow.DataType) bool
 	grow(n int)
 	// put stores chunk[i] (non-null) as group g's value.
 	put(g int32, chunk arrow.Array, i int)
@@ -1811,6 +1852,14 @@ type flBytes struct {
 
 func (v *flBytes) grow(n int) { v.vals = growTo(v.vals, n, "") }
 
+func (v *flBytes) holds(dt arrow.DataType) bool {
+	switch dt.ID() {
+	case arrow.STRING, arrow.LARGE_STRING, arrow.BINARY, arrow.LARGE_BINARY:
+		return true
+	}
+	return false
+}
+
 func (v *flBytes) put(g int32, chunk arrow.Array, i int) {
 	var s string
 	switch a := chunk.(type) {
@@ -1850,6 +1899,15 @@ var errBytesEmit = errors.New("gobi: internal: flBytes emits through buildBytesA
 // flFixed stores fixed-width values in a typed slice.
 type flFixed[T any] struct {
 	vals []T
+}
+
+func (v *flFixed[T]) holds(dt arrow.DataType) bool {
+	b := array.NewBuilder(memory.DefaultAllocator, dt)
+	defer b.Release()
+	arr := b.NewArray()
+	defer arr.Release()
+	_, ok := arr.(interface{ Value(int) T })
+	return ok
 }
 
 func (v *flFixed[T]) grow(n int) {

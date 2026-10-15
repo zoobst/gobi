@@ -380,7 +380,7 @@ func makeAggBuilders(pool memory.Allocator, aggs []Aggregation, views []aggView)
 			fs[i] = arrow.Field{Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: false}
 			continue
 		}
-		if views[i].kind == aggViewNumeric && aggResultType(a, views[i].arr.DataType()).ID() == arrow.INT64 {
+		if a.Kind == AggSum && views[i].kind == aggViewNumeric && aggResultType(a, views[i].arr.DataType()).ID() == arrow.INT64 {
 			// Int64 Sum: the fast path's only integer view is Int64.
 			bs[i] = array.NewInt64Builder(pool)
 			fs[i] = arrow.Field{Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: true}
@@ -427,13 +427,8 @@ func appendFastAgg(b array.Builder, a Aggregation, v aggView, rows []int) error 
 	}
 	if ib, ok := b.(*array.Int64Builder); ok && a.Kind == AggSum {
 		var sum intSum
-		for _, row := range rows {
-			if v.arr.IsNull(row) {
-				continue
-			}
-			if err := sum.addI(v.i64[row]); err != nil {
-				return fmt.Errorf("gobi: aggregation %s: %w", aggName(a), err)
-			}
+		if err := sum.addRows(v.arr, rows, 0, 0); err != nil {
+			return fmt.Errorf("gobi: aggregation %s: %w", aggName(a), err)
 		}
 		return appendIntSum(ib, sum)
 	}

@@ -643,20 +643,24 @@ func (l chunkLocator) locate(row int) (chunk arrow.Array, local int, ok bool) {
 }
 
 // reserveValues sizes b for the rows at indexes (negative indexes are
-// nulls) so appending them doesn't regrow the value buffer.
+// nulls) so appending them rarely regrows the value buffer. One chunk
+// is measured exactly; across chunks the data is estimated from the
+// chunks' average value length, saving a chunk lookup per row.
 func (l chunkLocator) reserveValues(b *array.BinaryBuilder, indexes []int) {
 	if len(l.chunks) == 1 {
 		reserveValues(b, l.chunks[0], indexes)
 		return
 	}
-	n := 0
-	for _, idx := range indexes {
-		if chunk, local, ok := l.locate(idx); ok {
-			n += valueLen(chunk, local)
-		}
-	}
 	b.Reserve(len(indexes))
-	b.ReserveData(n)
+	rows := l.total()
+	if rows == 0 {
+		return
+	}
+	data := 0
+	for _, c := range l.chunks {
+		data += dataLen(c)
+	}
+	b.ReserveData(int(int64(data) * int64(len(indexes)) / int64(rows)))
 }
 
 // reserveValues is chunkLocator.reserveValues for one chunk.
@@ -669,6 +673,21 @@ func reserveValues(b *array.BinaryBuilder, chunk arrow.Array, indexes []int) {
 	}
 	b.Reserve(len(indexes))
 	b.ReserveData(n)
+}
+
+// dataLen is the byte length of chunk's values.
+func dataLen(chunk arrow.Array) int {
+	switch a := chunk.(type) {
+	case *array.String:
+		if o := a.ValueOffsets(); len(o) > 0 {
+			return int(o[len(o)-1] - o[0])
+		}
+	case *array.Binary:
+		if o := a.ValueOffsets(); len(o) > 0 {
+			return int(o[len(o)-1] - o[0])
+		}
+	}
+	return 0
 }
 
 func valueLen(chunk arrow.Array, i int) int {

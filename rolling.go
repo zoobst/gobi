@@ -432,7 +432,9 @@ func (f *Frame) ResampleEvery(timeCol string, interval time.Duration) (*Resample
 // output frame has one row per bucket, ordered by bucket start, with the
 // time column named the same as the input's time column followed by one
 // column per aggregation. Empty buckets are omitted (this mirrors
-// GroupBy's behavior).
+// GroupBy's behavior). Supported kinds: Count, Sum, Mean, Min, Max,
+// Std, Var; others return an error. Output types follow GroupBy (an
+// Int64 column's Sum is Int64).
 func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 	timeSer, _ := r.frame.Column(r.timeCol)
 	tsView, ok := viewTimestamp(timeSer)
@@ -470,6 +472,17 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 	// rather than silently mis-dispatch.
 	aggViews := make([]aggView, len(aggs))
 	for i, a := range aggs {
+		// The bucket path computes only these kinds. Others used to come
+		// back as a column of nulls, and a custom Fn (whose Kind is
+		// usually the zero value, AggCount) as a row count.
+		if a.Fn != nil {
+			return nil, fmt.Errorf("gobi: ResampleEvery.Agg does not support custom aggregators (%s)", aggName(a))
+		}
+		switch a.Kind {
+		case AggCount, AggSum, AggMean, AggMin, AggMax, AggStd, AggVar:
+		default:
+			return nil, fmt.Errorf("gobi: ResampleEvery.Agg does not support %s", a.Kind)
+		}
 		v, ok, err := buildAggView(r.frame, a)
 		if err != nil {
 			return nil, err

@@ -77,10 +77,9 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 	}
 
 	// One group table per worker; buildResultBatch combines them.
-	aggTypes := e.aggTypes()
 	tables := make([]*groupTable, workers)
 	for i := range tables {
-		t, err := newGroupTable(e.keyMode, e.keys, e.aggs, aggTypes)
+		t, err := newGroupTable(e.keyMode, e.keys, e.aggs, e.outSchema)
 		if err != nil {
 			for _, t := range tables[:i] {
 				t.release()
@@ -114,7 +113,7 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 				e.rowsPool.Put(msg.rows)
 			}
 			if wctx.Err() == nil {
-				tables[i].finish(e.unordered)
+				tables[i].finish(e.unordered, len(tables) > 1)
 			}
 		}()
 	}
@@ -236,9 +235,9 @@ func (e *streamingAggregateExec) dispatchBatch(ctx context.Context, batch arrow.
 		// Fast path: widen arrow value to int64, splatter through
 		// FNV so ints with a tiny value range still spread across
 		// workers. (A raw `key mod N` would collide all consecutive
-		// int keys onto the same worker on ordered data.) Nulls
-		// aren't routed anywhere — workerConsume drops them for the
-		// same reason the serial path does.
+		// int keys onto the same worker on ordered data.) Null keys
+		// aren't routed anywhere, matching the serial build, which
+		// skips them in groupTable.consume.
 		intArr, err := resolveIntArray(keySeries[0])
 		if err != nil {
 			return err

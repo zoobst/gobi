@@ -30,6 +30,10 @@ introduce breaking changes; check this file when upgrading.
       accepts it.
     - a direct cast: `panic: interface conversion: arrow.Array is
       *array.Int64, not *array.Float64`.
+- **`ResampleEvery(...).Agg` rejects aggregations it can't compute.**
+  It supports Count, Sum, Mean, Min, Max, Std and Var. Other kinds
+  used to come back as a column of nulls, and a custom `Fn` as a row
+  count. Both now return an error.
 
 ### Added
 
@@ -39,6 +43,10 @@ introduce breaking changes; check this file when upgrading.
   the caller sorts or indexes the result itself. Values and schema are
   the same as the sorted form. The order is unspecified, and
   `Explain` shows `unordered` on the node.
+- **Lazy `GroupBy` accepts batches whose column types drift** from the
+  planned schema (an Int32 batch under an Int64 plan, say). Values
+  are cast to the planned type when every value converts without
+  loss. Otherwise the query fails with `ErrColumnTypeMismatch`.
 
 ### Performance
 

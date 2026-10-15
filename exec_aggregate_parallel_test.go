@@ -90,7 +90,7 @@ func TestParallelAggregate_FewerKeysThanWorkers(t *testing.T) {
 // TestParallelAggregate_CancellationStopsWorkers verifies that a
 // cancelled parent context propagates through the parallel build and
 // returns an error without deadlocking. -race enforces the goroutine
-// safety of the drain-on-cancel logic in workerConsume.
+// safety of the drain-on-cancel logic in the worker loop.
 func TestParallelAggregate_CancellationStopsWorkers(t *testing.T) {
 	df := lazyFrame(t)
 	agg := df.Lazy().
