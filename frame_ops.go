@@ -656,11 +656,17 @@ func (l chunkLocator) reserveValues(b *array.BinaryBuilder, indexes []int) {
 	if rows == 0 {
 		return
 	}
+	valid := 0 // negative indexes are nulls and take no bytes
+	for _, idx := range indexes {
+		if idx >= 0 {
+			valid++
+		}
+	}
 	data := 0
 	for _, c := range l.chunks {
 		data += dataLen(c)
 	}
-	b.ReserveData(int(int64(data) * int64(len(indexes)) / int64(rows)))
+	b.ReserveData(int(int64(data) * int64(valid) / int64(rows)))
 }
 
 // reserveValues is chunkLocator.reserveValues for one chunk.

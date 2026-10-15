@@ -19,8 +19,10 @@ introduce breaking changes; check this file when upgrading.
   - **Unchanged:** `Series.Sum` (float64), `Mean`, sums of float
     columns, `Expr.Sum()` / `.Over(...)`, and rolling sums, all
     Float64.
-  - **Overflow:** a sum past the output type's range now fails with the
-    new `ErrSumOverflow` instead of wrapping.
+  - **Overflow:** a group whose total is past the output type's range
+    fails with the new `ErrSumOverflow` instead of wrapping. Only the
+    total counts: the running sum is kept in 128 bits, so values like
+    `MaxInt64, 1, -1` sum to `MaxInt64` in any row order.
   - **Migrating:** code that reads an integer sum column as
     `*array.Float64`, or decodes it into a `float64` struct field, has
     to switch to `*array.Int64` / `int64` (`*array.Uint64` / `uint64`
@@ -35,11 +37,15 @@ introduce breaking changes; check this file when upgrading.
   used to come back as a column of nulls, and a custom `Fn` as a row
   count. Both now return an error.
 
-- **Lazy `GroupBy` keeps a null key as its own group**, first in key
-  order, as eager `GroupBy` and multi-column keys already did. With a
-  single String key, null rows used to be counted under `""`, and the
-  key came back as `""` rather than null. With a single integer,
-  timestamp or boolean key, null rows were dropped.
+- **`GroupBy` keeps a null key as its own group, first in key order**,
+  in both engines.
+  - **Lazy:** with a single String key, null rows used to be counted
+    under `""`, and the key came back as `""` rather than null. With a
+    single integer, timestamp or boolean key, null rows were dropped.
+    Multi-column keys already kept null first.
+  - **Eager:** a single Int64 or Float64 key put the null group last,
+    and a single String key put it after `""`. Other keys already put
+    it first.
 
 ### Added
 

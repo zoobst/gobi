@@ -80,7 +80,7 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 	// One group table per worker; buildResultBatch combines them.
 	tables := make([]*groupTable, workers)
 	for i := range tables {
-		t, err := newGroupTable(e.keyMode, e.keys, e.aggs, e.input.Schema())
+		t, err := newGroupTable(e.keyMode, e.keys, e.aggs, e.inSchema)
 		if err != nil {
 			for _, t := range tables[:i] {
 				t.release()
@@ -144,7 +144,7 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 			}
 			// Conform before hashing: a drifted key type would hash
 			// (and group) apart from the planned one.
-			conformed, err := conformBatch(batch, e.input.Schema(), cols)
+			conformed, err := conformBatch(batch, e.inSchema, cols)
 			batch.Release()
 			if err != nil {
 				return err

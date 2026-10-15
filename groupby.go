@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/bits"
 	"sort"
+	"unsafe"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -20,7 +21,8 @@ const (
 	// AggSum: sum of the group's non-null values, null for an empty
 	// group. A grouped sum of an integer column (GroupBy, LazyFrame
 	// GroupBy, ResampleEvery) is Int64 — Uint64 for unsigned columns —
-	// and fails with ErrSumOverflow past that range. Other columns, and
+	// and fails with ErrSumOverflow when the group's total is past that
+	// range (the running total can't overflow). Other columns, and
 	// Over / rolling sums, are Float64.
 	AggSum
 	AggMean
@@ -938,10 +940,13 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 				return err
 			}
 			sum, err := sumIntRows(s, rows)
+			if err == nil {
+				err = appendIntSum(b, sum)
+			}
 			if err != nil {
 				return fmt.Errorf("gobi: aggregation %s: %w", aggName(agg), err)
 			}
-			return appendIntSum(b, sum)
+			return nil
 		}
 	}
 	// Median: buffer non-null numeric values, sort, emit the middle
@@ -1261,7 +1266,7 @@ func (g *GroupBy) buildAggBuilders(aggs []Aggregation, pool memory.Allocator) ([
 	}
 	for i, a := range aggs {
 		var src arrow.DataType
-		if a.Column != "" {
+		if a.Fn != nil || a.Kind != AggCount || a.Column != "" { // only count(*) has no column
 			s, err := g.frame.Column(a.Column)
 			if err != nil {
 				return fail(err)
@@ -1304,44 +1309,45 @@ func intSumType(src arrow.DataType) arrow.DataType {
 	return nil
 }
 
-// intSum is an overflow-checked integer sum: i for signed sources, u
-// for unsigned; n counts the values added (0 → null output).
+// intSum is an integer sum kept in 128 bits (hi:lo, two's
+// complement), so the running total can't overflow on the way: the
+// result is exact and doesn't depend on row order, and only the final
+// value has to fit its Int64 / Uint64 output (see value). n counts the
+// values added (0 → null output).
 type intSum struct {
-	i int64
-	u uint64
-	n int64
+	lo uint64
+	hi int64
+	n  int64
 }
 
-// addInt64 returns a+b, ok=false on overflow.
-func addInt64(a, b int64) (int64, bool) {
-	r := a + b
-	return r, !((b > 0 && r < a) || (b < 0 && r > a))
-}
-
-// addUint64 returns a+b, ok=false on overflow.
-func addUint64(a, b uint64) (uint64, bool) {
-	r, carry := bits.Add64(a, b, 0)
-	return r, carry == 0
-}
-
-func (s *intSum) addI(v int64) error {
-	r, ok := addInt64(s.i, v)
-	if !ok {
-		return ErrSumOverflow
-	}
-	s.i = r
+func (s *intSum) addI(v int64) {
+	var c uint64
+	s.lo, c = bits.Add64(s.lo, uint64(v), 0)
+	s.hi += int64(c) + v>>63 // carry, plus v's sign extension
 	s.n++
-	return nil
 }
 
-func (s *intSum) addU(v uint64) error {
-	r, ok := addUint64(s.u, v)
-	if !ok {
-		return ErrSumOverflow
-	}
-	s.u = r
+func (s *intSum) addU(v uint64) {
+	var c uint64
+	s.lo, c = bits.Add64(s.lo, v, 0)
+	s.hi += int64(c)
 	s.n++
-	return nil
+}
+
+// int64 is the sum as an Int64, ErrSumOverflow when it doesn't fit.
+func (s intSum) int64() (int64, error) {
+	if s.hi != int64(s.lo)>>63 {
+		return 0, ErrSumOverflow
+	}
+	return int64(s.lo), nil
+}
+
+// uint64 is the sum as a Uint64, ErrSumOverflow when it doesn't fit.
+func (s intSum) uint64() (uint64, error) {
+	if s.hi != 0 {
+		return 0, ErrSumOverflow
+	}
+	return s.lo, nil
 }
 
 // integer is the Arrow integer widths an integer sum reads.
@@ -1349,71 +1355,62 @@ type integer interface {
 	int64 | int32 | int16 | int8 | uint64 | uint32 | uint16 | uint8
 }
 
-// addInt adds v to s: signed widths into i, unsigned into u. It's the
-// one per-value rule every integer-sum path (eager, aligned, fast and
-// streaming) goes through.
-func addInt[T integer](s *intSum, v T) error {
+// addInt adds v to s, sign-extended for signed widths.
+func addInt[T integer](s *intSum, v T) {
 	var zero T
 	if ^zero < 0 { // signed
-		return s.addI(int64(v))
+		s.addI(int64(v))
+		return
 	}
-	return s.addU(uint64(v))
+	s.addU(uint64(v))
 }
 
 // add adds the integer cell arr[i] (non-null) to s.
 func (s *intSum) add(arr arrow.Array, i int) error {
-	switch a := arr.(type) {
-	case *array.Int64:
-		return addInt(s, a.Value(i))
-	case *array.Int32:
-		return addInt(s, a.Value(i))
-	case *array.Int16:
-		return addInt(s, a.Value(i))
-	case *array.Int8:
-		return addInt(s, a.Value(i))
-	case *array.Uint64:
-		return addInt(s, a.Value(i))
-	case *array.Uint32:
-		return addInt(s, a.Value(i))
-	case *array.Uint16:
-		return addInt(s, a.Value(i))
-	case *array.Uint8:
-		return addInt(s, a.Value(i))
-	}
-	return fmt.Errorf("%w: integer sum over %s", ErrColumnTypeMismatch, arr.DataType())
+	return addIntRows(unsafe.Slice(s, 1), nil, arr, []int{i}, 0, 0)
 }
 
-// addRows adds the non-null cells of the single array arr at rows —
-// the integer-sum loop the eager, fast and aligned GroupBy paths
-// share. rows nil means rows lo..hi-1.
+// addRows adds the non-null cells of the single array arr at rows into
+// s; rows nil means rows lo..hi-1.
 func (s *intSum) addRows(arr arrow.Array, rows []int, lo, hi int) error {
-	switch a := arr.(type) {
-	case *array.Int64:
-		return addRowsOf(s, a, a.Int64Values(), rows, lo, hi)
-	case *array.Int32:
-		return addRowsOf(s, a, a.Int32Values(), rows, lo, hi)
-	case *array.Int16:
-		return addRowsOf(s, a, a.Int16Values(), rows, lo, hi)
-	case *array.Int8:
-		return addRowsOf(s, a, a.Int8Values(), rows, lo, hi)
-	case *array.Uint64:
-		return addRowsOf(s, a, a.Uint64Values(), rows, lo, hi)
-	case *array.Uint32:
-		return addRowsOf(s, a, a.Uint32Values(), rows, lo, hi)
-	case *array.Uint16:
-		return addRowsOf(s, a, a.Uint16Values(), rows, lo, hi)
-	case *array.Uint8:
-		return addRowsOf(s, a, a.Uint8Values(), rows, lo, hi)
-	}
-	return fmt.Errorf("%w: integer sum over %s", ErrColumnTypeMismatch, arr.DataType())
+	return addIntRows(unsafe.Slice(s, 1), nil, arr, rows, lo, hi)
 }
 
-func addRowsOf[T integer](s *intSum, arr arrow.Array, vals []T, rows []int, lo, hi int) error {
+// addIntRows is the one integer-sum loop every engine runs (eager,
+// fast, aligned and streaming): it adds the non-null cells of arr at
+// rows (nil: lo..hi-1) into sums — the k-th row into sums[gids[k]], or
+// every row into sums[0] when gids is nil.
+func addIntRows(sums []intSum, gids []int32, arr arrow.Array, rows []int, lo, hi int) error {
+	switch a := arr.(type) {
+	case *array.Int64:
+		addIntRowsOf(sums, gids, a, a.Int64Values(), rows, lo, hi)
+	case *array.Int32:
+		addIntRowsOf(sums, gids, a, a.Int32Values(), rows, lo, hi)
+	case *array.Int16:
+		addIntRowsOf(sums, gids, a, a.Int16Values(), rows, lo, hi)
+	case *array.Int8:
+		addIntRowsOf(sums, gids, a, a.Int8Values(), rows, lo, hi)
+	case *array.Uint64:
+		addIntRowsOf(sums, gids, a, a.Uint64Values(), rows, lo, hi)
+	case *array.Uint32:
+		addIntRowsOf(sums, gids, a, a.Uint32Values(), rows, lo, hi)
+	case *array.Uint16:
+		addIntRowsOf(sums, gids, a, a.Uint16Values(), rows, lo, hi)
+	case *array.Uint8:
+		addIntRowsOf(sums, gids, a, a.Uint8Values(), rows, lo, hi)
+	default:
+		return fmt.Errorf("%w: integer sum over %s", ErrColumnTypeMismatch, arr.DataType())
+	}
+	return nil
+}
+
+func addIntRowsOf[T integer](sums []intSum, gids []int32, arr arrow.Array, vals []T, rows []int, lo, hi int) {
 	nulls := arr.NullN() > 0
 	n := hi - lo
 	if rows != nil {
 		n = len(rows)
 	}
+	sum := &sums[0]
 	for k := range n {
 		i := lo + k
 		if rows != nil {
@@ -1422,11 +1419,11 @@ func addRowsOf[T integer](s *intSum, arr arrow.Array, vals []T, rows []int, lo, 
 		if nulls && arr.IsNull(i) {
 			continue
 		}
-		if err := addInt(s, vals[i]); err != nil {
-			return err
+		if gids != nil {
+			sum = &sums[gids[k]]
 		}
+		addInt(sum, vals[i])
 	}
-	return nil
 }
 
 // sumIntRows sums the non-null integer cells of s at rows.
@@ -1457,9 +1454,17 @@ func appendIntSum(b array.Builder, sum intSum) error {
 	}
 	switch tb := b.(type) {
 	case *array.Int64Builder:
-		tb.Append(sum.i)
+		v, err := sum.int64()
+		if err != nil {
+			return err
+		}
+		tb.Append(v)
 	case *array.Uint64Builder:
-		tb.Append(sum.u)
+		v, err := sum.uint64()
+		if err != nil {
+			return err
+		}
+		tb.Append(v)
 	default:
 		return fmt.Errorf("integer sum into %T", b)
 	}

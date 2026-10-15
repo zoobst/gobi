@@ -319,9 +319,10 @@ func TestExec_StreamingAggregate_MultipleBatches(t *testing.T) {
 	// the scan operator: LazyFrame's Compile uses defaultBatchRows.
 	scan := newScanFrameExec(df, 2) // → 3 batches of 2/2/1
 	agg := &streamingAggregateExec{
-		input: scan,
-		keys:  []string{"region"},
-		aggs:  []Aggregation{{Column: "price", Kind: AggSum}},
+		input:    scan,
+		keys:     []string{"region"},
+		aggs:     []Aggregation{{Column: "price", Kind: AggSum}},
+		inSchema: df.Schema(),
 		outSchema: newAggregateNode(&scanFrameNode{frame: df}, []string{"region"},
 			[]Aggregation{{Column: "price", Kind: AggSum}}).outSchema,
 	}

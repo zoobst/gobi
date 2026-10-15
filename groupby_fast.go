@@ -207,18 +207,13 @@ func (g *GroupBy) aggFastString(keyArr *array.String, aggs []Aggregation, aggVie
 	// Insertion-order tracked keys; sort just before emit.
 	groups := make(map[string][]int, 64)
 	var order []string
-	// Nulls collapse into a sentinel key. Using "\x00" is safe because
-	// Arrow strings can't contain a raw NUL — but even if they can, we
-	// disambiguate below by seeing null=true separately if we cared. Here
-	// we just treat null-keyed rows as their own group.
-	const nullKey = "\x00__gobi_null__"
+	var nullRows []int
 	for i := range n {
-		var k string
 		if keyArr.IsNull(i) {
-			k = nullKey
-		} else {
-			k = keyArr.Value(i)
+			nullRows = append(nullRows, i)
+			continue
 		}
+		k := keyArr.Value(i)
 		if _, ok := groups[k]; !ok {
 			order = append(order, k)
 		}
@@ -230,20 +225,32 @@ func (g *GroupBy) aggFastString(keyArr *array.String, aggs []Aggregation, aggVie
 	keyB := array.NewStringBuilder(pool)
 	defer keyB.Release()
 
-	aggBuilders, aggFields := makeAggBuilders(pool, aggs, aggViews)
+	aggBuilders, aggFields, err := makeAggBuilders(pool, aggs, aggViews)
+	if err != nil {
+		return nil, false, err
+	}
 	defer releaseBuilders(aggBuilders)
 
-	for _, k := range order {
-		if k == nullKey {
-			keyB.AppendNull()
-		} else {
-			keyB.Append(k)
-		}
-		rows := groups[k]
+	emit := func(rows []int) error {
 		for i, a := range aggs {
 			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], rows); err != nil {
-				return nil, false, err
+				return err
 			}
+		}
+		return nil
+	}
+	// The null key's group comes first, as in the general path (whose
+	// key encoding tags null 0x00) and the streaming one.
+	if nullRows != nil {
+		keyB.AppendNull()
+		if err := emit(nullRows); err != nil {
+			return nil, false, err
+		}
+	}
+	for _, k := range order {
+		keyB.Append(k)
+		if err := emit(groups[k]); err != nil {
+			return nil, false, err
 		}
 	}
 
@@ -275,22 +282,27 @@ func (g *GroupBy) aggFastInt64(keyArr *array.Int64, aggs []Aggregation, aggViews
 	keyB := array.NewInt64Builder(pool)
 	defer keyB.Release()
 
-	aggBuilders, aggFields := makeAggBuilders(pool, aggs, aggViews)
+	aggBuilders, aggFields, err := makeAggBuilders(pool, aggs, aggViews)
+	if err != nil {
+		return nil, false, err
+	}
 	defer releaseBuilders(aggBuilders)
 
+	// The null key's group comes first, as in the general path (whose
+	// key encoding tags null 0x00) and the streaming one.
+	if hasNull {
+		keyB.AppendNull()
+		for i, a := range aggs {
+			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], nullRows); err != nil {
+				return nil, false, err
+			}
+		}
+	}
 	for _, k := range keysSorted {
 		keyB.Append(k)
 		rows := groups[k]
 		for i, a := range aggs {
 			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], rows); err != nil {
-				return nil, false, err
-			}
-		}
-	}
-	if hasNull {
-		keyB.AppendNull()
-		for i, a := range aggs {
-			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], nullRows); err != nil {
 				return nil, false, err
 			}
 		}
@@ -326,22 +338,27 @@ func (g *GroupBy) aggFastFloat64(keyArr *array.Float64, aggs []Aggregation, aggV
 	keyB := array.NewFloat64Builder(pool)
 	defer keyB.Release()
 
-	aggBuilders, aggFields := makeAggBuilders(pool, aggs, aggViews)
+	aggBuilders, aggFields, err := makeAggBuilders(pool, aggs, aggViews)
+	if err != nil {
+		return nil, false, err
+	}
 	defer releaseBuilders(aggBuilders)
 
+	// The null key's group comes first, as in the general path (whose
+	// key encoding tags null 0x00) and the streaming one.
+	if hasNull {
+		keyB.AppendNull()
+		for i, a := range aggs {
+			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], nullRows); err != nil {
+				return nil, false, err
+			}
+		}
+	}
 	for _, k := range keysSorted {
 		keyB.Append(k)
 		rows := groups[k]
 		for i, a := range aggs {
 			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], rows); err != nil {
-				return nil, false, err
-			}
-		}
-	}
-	if hasNull {
-		keyB.AppendNull()
-		for i, a := range aggs {
-			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], nullRows); err != nil {
 				return nil, false, err
 			}
 		}
@@ -371,31 +388,24 @@ func (v aggView) numAt(i int) (float64, bool) {
 // an Int64 source → Int64; Min / Max on Timestamp preserve the
 // source's TimestampType via tsType captured in the aggView; everything
 // else → Float64 nullable.
-func makeAggBuilders(pool memory.Allocator, aggs []Aggregation, views []aggView) ([]array.Builder, []arrow.Field) {
-	bs := make([]array.Builder, len(aggs))
+func makeAggBuilders(pool memory.Allocator, aggs []Aggregation, views []aggView) ([]array.Builder, []arrow.Field, error) {
+	bs := make([]array.Builder, 0, len(aggs))
 	fs := make([]arrow.Field, len(aggs))
 	for i, a := range aggs {
-		if a.Kind == AggCount || a.Kind == AggNUnique {
-			bs[i] = array.NewInt64Builder(pool)
-			fs[i] = arrow.Field{Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: false}
-			continue
+		var src arrow.DataType
+		if views[i].arr != nil {
+			src = views[i].arr.DataType()
 		}
-		if a.Kind == AggSum && views[i].kind == aggViewNumeric && aggResultType(a, views[i].arr.DataType()).ID() == arrow.INT64 {
-			// Int64 Sum: the fast path's only integer view is Int64.
-			bs[i] = array.NewInt64Builder(pool)
-			fs[i] = arrow.Field{Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: true}
-			continue
+		t := aggResultType(a, src)
+		b, err := builderForType(pool, t)
+		if err != nil {
+			releaseBuilders(bs)
+			return nil, nil, fmt.Errorf("gobi: aggregation %d (%s): %w", i, aggName(a), err)
 		}
-		if views[i].kind == aggViewTimestamp {
-			tsType := views[i].tsType.(*arrow.TimestampType)
-			bs[i] = array.NewTimestampBuilder(pool, tsType)
-			fs[i] = arrow.Field{Name: aggName(a), Type: views[i].tsType, Nullable: true}
-			continue
-		}
-		bs[i] = array.NewFloat64Builder(pool)
-		fs[i] = arrow.Field{Name: aggName(a), Type: arrow.PrimitiveTypes.Float64, Nullable: true}
+		bs = append(bs, b)
+		fs[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: aggOutputNullable(a)}
 	}
-	return bs, fs
+	return bs, fs, nil
 }
 
 // appendFastAgg computes one aggregation output over rows and appends the
@@ -425,12 +435,15 @@ func appendFastAgg(b array.Builder, a Aggregation, v aggView, rows []int) error 
 		appendFastTimestampMinMax(b.(*array.TimestampBuilder), a.Kind, v, rows)
 		return nil
 	}
-	if ib, ok := b.(*array.Int64Builder); ok && a.Kind == AggSum {
+	if a.Kind == AggSum && intSumType(v.arr.DataType()) != nil {
 		var sum intSum
 		if err := sum.addRows(v.arr, rows, 0, 0); err != nil {
 			return fmt.Errorf("gobi: aggregation %s: %w", aggName(a), err)
 		}
-		return appendIntSum(ib, sum)
+		if err := appendIntSum(b, sum); err != nil {
+			return fmt.Errorf("gobi: aggregation %s: %w", aggName(a), err)
+		}
+		return nil
 	}
 	fb := b.(*array.Float64Builder)
 	// Welford's running mean + M2 alongside the existing sum/min/max

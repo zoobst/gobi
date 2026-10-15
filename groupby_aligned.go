@@ -289,8 +289,9 @@ func (g *GroupBy) tryEmitContiguousSIMD(b array.Builder, a Aggregation, start, e
 		return false, nil
 	}
 	if ib, ok := b.(*array.Int64Builder); ok && a.Kind == AggSum {
-		// Integer sums are overflow-checked, so they don't use the SIMD
-		// reduce (compute.SumI64 wraps silently).
+		// Integer sums carry 128 bits to check the total's range, so
+		// they don't use the SIMD reduce (compute.SumI64 wraps
+		// silently).
 		arr, ok := chunks[0].(*array.Int64)
 		if !ok {
 			return false, nil
@@ -299,7 +300,10 @@ func (g *GroupBy) tryEmitContiguousSIMD(b array.Builder, a Aggregation, start, e
 		if err := sum.addRows(arr, nil, start, end); err != nil {
 			return false, fmt.Errorf("gobi: aggregation %s: %w", aggName(a), err)
 		}
-		return true, appendIntSum(ib, sum)
+		if err := appendIntSum(ib, sum); err != nil {
+			return false, fmt.Errorf("gobi: aggregation %s: %w", aggName(a), err)
+		}
+		return true, nil
 	}
 	fb, ok := b.(*array.Float64Builder)
 	if !ok {

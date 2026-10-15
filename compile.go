@@ -170,6 +170,7 @@ func compileNode(p LogicalPlan) (ExecOperator, error) {
 				keys:      keys,
 				aggs:      aggs,
 				outSchema: n.outSchema,
+				inSchema:  n.input.Schema(),
 				workers:   resolveWorkers(),
 				keyMode:   pickKeyMode(n),
 				unordered: n.unordered,

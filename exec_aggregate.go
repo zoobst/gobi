@@ -40,6 +40,10 @@ type streamingAggregateExec struct {
 	keys      []string
 	aggs      []Aggregation
 	outSchema *arrow.Schema
+	// inSchema is the logical input schema the plan (outSchema,
+	// keyMode) was derived from. Batches are conformed to it, whatever
+	// the child exec reports.
+	inSchema *arrow.Schema
 
 	// workers: number of partitioned aggregate workers. 1 = serial
 	// build (single goroutine, single map — original behavior). >1 =
@@ -243,7 +247,7 @@ func (e *streamingAggregateExec) buildIfNeeded(ctx context.Context) error {
 // workers <= 1 — the partitioned path pays for goroutine + channel +
 // hash overhead that isn't worth it without CPU parallelism to unlock.
 func (e *streamingAggregateExec) buildSerial(ctx context.Context) error {
-	t, err := newGroupTable(e.keyMode, e.keys, e.aggs, e.input.Schema())
+	t, err := newGroupTable(e.keyMode, e.keys, e.aggs, e.inSchema)
 	if err != nil {
 		return err
 	}
@@ -260,8 +264,13 @@ func (e *streamingAggregateExec) buildSerial(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		err = t.consume(batch, nil)
+		conformed, err := conformBatch(batch, e.inSchema, t.cols)
 		batch.Release()
+		if err != nil {
+			return err
+		}
+		err = t.consume(conformed, nil)
+		conformed.Release()
 		if err != nil {
 			return err
 		}
@@ -564,13 +573,27 @@ func (v *chunkedIntView) value(row int) (int64, bool) {
 // Plain Aggregator-only custom Fns are still rejected here; the
 // compiler routes them to the materializing fallback via
 // allBuiltInAggs.
-func newAccumulator(a Aggregation) (aggAccumulator, error) {
+// checkAccumulator reports whether newAccumulator can build a, without
+// building one (a custom Clone or a Mode map isn't free).
+func checkAccumulator(a Aggregation) error {
 	if a.Fn != nil {
-		inc, ok := a.Fn.(IncrementalAggregator)
-		if !ok {
-			return nil, fmt.Errorf("gobi: streaming aggregate does not support custom Aggregator Fn (implement IncrementalAggregator for streaming support)")
+		if _, ok := a.Fn.(IncrementalAggregator); !ok {
+			return fmt.Errorf("gobi: streaming aggregate does not support custom Aggregator Fn (implement IncrementalAggregator for streaming support)")
 		}
-		return &customIncrementalAcc{inner: inc.Clone(), outType: a.Fn.Type()}, nil
+		return nil
+	}
+	if a.Kind > AggBitXor {
+		return fmt.Errorf("gobi: streaming aggregate: unknown Kind %d", a.Kind)
+	}
+	return nil
+}
+
+func newAccumulator(a Aggregation) (aggAccumulator, error) {
+	if err := checkAccumulator(a); err != nil {
+		return nil, err
+	}
+	if a.Fn != nil {
+		return &customIncrementalAcc{inner: a.Fn.(IncrementalAggregator).Clone(), outType: a.Fn.Type()}, nil
 	}
 	switch a.Kind {
 	case AggCount:
@@ -640,8 +663,7 @@ type groupTable struct {
 	mode keyMode
 	keys []string
 	aggs []Aggregation
-	in   *arrow.Schema // planned input
-	cols []string      // the columns consume reads, conformed to in
+	cols []string // the columns consume reads (conformBatch's cols)
 
 	strIdx  map[string]int32 // keyModeString1 + keyModeComposite
 	intIdx  map[int64]int32  // keyModeInt641
@@ -670,11 +692,11 @@ type groupTable struct {
 
 // newGroupTable builds an empty table over input schema in, the
 // planned input: key columns keep their types, and each aggregation's
-// state is set up for aggResultType of its column. consume conforms
-// every batch to in, so the states only ever see the types they were
-// built for.
+// state is set up for aggResultType of its column. The builds conform
+// every batch to in before consume, so the states only ever see the
+// types they were built for.
 func newGroupTable(mode keyMode, keys []string, aggs []Aggregation, in *arrow.Schema) (*groupTable, error) {
-	t := &groupTable{mode: mode, keys: keys, aggs: aggs, in: in, cols: conformCols(keys, aggs), nullG: -1}
+	t := &groupTable{mode: mode, keys: keys, aggs: aggs, cols: conformCols(keys, aggs), nullG: -1}
 	typeOf := func(name string) (arrow.DataType, error) {
 		fs, ok := in.FieldsByName(name)
 		if !ok || len(fs) == 0 {
@@ -730,7 +752,9 @@ func (t *groupTable) release() {
 }
 
 // consume folds batch into the table. rows selects the batch rows to
-// fold (the parallel build's partition); nil means every row.
+// fold (the parallel build's partition); nil means every row. batch
+// must be conformed to the table's input schema (conformBatch): the
+// builds do that once per batch, the parallel one before hashing keys.
 func (t *groupTable) consume(batch arrow.RecordBatch, rows []int) error {
 	nb := int(batch.NumRows())
 	if nb == 0 {
@@ -742,14 +766,6 @@ func (t *groupTable) consume(batch arrow.RecordBatch, rows []int) error {
 		}
 		rows = t.allRows[:nb]
 	}
-	// The builds conform batches before they get here (the parallel
-	// one before hashing keys); this is a no-op then, and a guard
-	// otherwise.
-	batch, err := conformBatch(batch, t.in, t.cols)
-	if err != nil {
-		return err
-	}
-	defer batch.Release()
 	frame, err := batchToFrame(batch)
 	if err != nil {
 		return err
@@ -1423,7 +1439,7 @@ func newAggState(a Aggregation, dt arrow.DataType) (aggState, error) {
 			return s, nil
 		}
 	}
-	if _, err := newAccumulator(a); err != nil {
+	if err := checkAccumulator(a); err != nil {
 		return nil, err
 	}
 	return &accState{agg: a}, nil
@@ -1535,24 +1551,7 @@ func (s *sumState) update(col Series, b *aggBatch) error {
 	}
 	chunks := col.col.Data().Chunks()
 	if len(chunks) == 1 {
-		switch a := chunks[0].(type) {
-		case *array.Int64:
-			return foldInts(s.ints, a, a.Int64Values(), b)
-		case *array.Int32:
-			return foldInts(s.ints, a, a.Int32Values(), b)
-		case *array.Int16:
-			return foldInts(s.ints, a, a.Int16Values(), b)
-		case *array.Int8:
-			return foldInts(s.ints, a, a.Int8Values(), b)
-		case *array.Uint64:
-			return foldInts(s.ints, a, a.Uint64Values(), b)
-		case *array.Uint32:
-			return foldInts(s.ints, a, a.Uint32Values(), b)
-		case *array.Uint16:
-			return foldInts(s.ints, a, a.Uint16Values(), b)
-		case *array.Uint8:
-			return foldInts(s.ints, a, a.Uint8Values(), b)
-		}
+		return addIntRows(s.ints, b.gids, chunks[0], b.rows, 0, 0)
 	}
 	loc := newChunkLocator(col)
 	for i, row := range b.rows {
@@ -1564,20 +1563,6 @@ func (s *sumState) update(col Series, b *aggBatch) error {
 			continue
 		}
 		if err := s.ints[b.gids[i]].add(chunk, local); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// foldInts folds a single-chunk integer column into per-group sums.
-func foldInts[T integer](sums []intSum, a arrow.Array, vals []T, b *aggBatch) error {
-	nulls := a.NullN() > 0
-	for i, row := range b.rows {
-		if nulls && a.IsNull(row) {
-			continue
-		}
-		if err := addInt(&sums[b.gids[i]], vals[row]); err != nil {
 			return err
 		}
 	}
@@ -1769,12 +1754,19 @@ type firstLastState struct {
 	nset  int            // groups with a value
 	vals  flValues       // typed storage; nil when capt is used
 	capt  *flCapture     // take-based storage
+	// Last with vals: seen[g] == epoch marks a group already given
+	// this batch's value, so each group is stored once per batch.
+	seen  []uint32
+	epoch uint32
 }
 
 func (s *firstLastState) grow(n int) error {
 	s.set = growTo(s.set, n, false)
 	if s.vals != nil {
 		s.vals.grow(n)
+		if !s.first {
+			s.seen = growTo(s.seen, n, 0)
+		}
 	} else {
 		s.capt.grow(n)
 	}
@@ -1802,12 +1794,30 @@ func (s *firstLastState) update(col Series, b *aggBatch) error {
 	if !arrow.TypeEqual(col.DataType(), s.dt) { // batches are conformed upstream
 		return fmt.Errorf("%w: %s first/last planned, column is %s", ErrColumnTypeMismatch, s.dt, col.DataType())
 	}
+	if !s.first {
+		if s.epoch++; s.epoch == 0 {
+			clear(s.seen)
+			s.epoch = 1
+		}
+	}
 	loc := newChunkLocator(col)
 	single := len(loc.chunks) == 1
 	noNulls := single && loc.chunks[0].NullN() == 0
-	for i, row := range b.rows {
-		g := b.gids[i]
-		if s.first && s.set[g] {
+	// First walks the rows forward, Last backward, so each group's value
+	// is the first one met and is stored once — Last over strings
+	// doesn't copy every row into the arena only to overwrite it.
+	n := len(b.rows)
+	for k := range n {
+		i := k
+		if !s.first {
+			i = n - 1 - k
+		}
+		row, g := b.rows[i], b.gids[i]
+		if s.first {
+			if s.set[g] {
+				continue
+			}
+		} else if s.seen[g] == s.epoch {
 			continue
 		}
 		chunk, local := loc.chunks[0], row
@@ -1821,6 +1831,9 @@ func (s *firstLastState) update(col Series, b *aggBatch) error {
 			continue
 		}
 		s.vals.put(g, chunk, local)
+		if !s.first {
+			s.seen[g] = s.epoch
+		}
 		if !s.set[g] {
 			s.set[g] = true
 			s.nset++

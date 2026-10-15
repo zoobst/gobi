@@ -723,6 +723,124 @@ func TestGroupBy_IntegerSumOverflow(t *testing.T) {
 	}
 }
 
+// TestGroupBy_IntegerSumTransientOverflow — only the total has to fit:
+// a running sum that leaves the Int64 range and comes back is exact,
+// whatever the row order, in every engine.
+func TestGroupBy_IntegerSumTransientOverflow(t *testing.T) {
+	for _, tc := range []struct {
+		vals string
+		want string
+	}{
+		{`[9223372036854775807, 1, -1]`, `[9223372036854775807]`},
+		{`[1, -1, 9223372036854775807]`, `[9223372036854775807]`},
+		{`[-9223372036854775808, -1, 1]`, `[-9223372036854775808]`},
+	} {
+		fields := []arrow.Field{{Name: "k", Type: arrow.PrimitiveTypes.Int64}, {Name: "v", Type: arrow.PrimitiveTypes.Int64}}
+		rb := batchOf(t, fields, `[1, 1, 1]`, tc.vals)
+		df, err := batchToFrame(rb)
+		rb.Release()
+		if err != nil {
+			t.Fatal(err)
+		}
+		agg := Aggregation{Column: "v", Kind: AggSum, Alias: "s"}
+		gb, err := df.GroupBy("k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := gb.Agg(agg)
+		if err != nil {
+			t.Fatalf("%s eager: %v", tc.vals, err)
+		}
+		if got := colJSON(t, out, "s"); got != tc.want {
+			t.Errorf("%s eager: s = %s, want %s", tc.vals, got, tc.want)
+		}
+		out.Release()
+		plan := arrow.NewSchema(fields, nil)
+		for _, w := range []int{1, 2} {
+			// One row per batch, so the running total crosses batches.
+			var batches []arrow.RecordBatch
+			for _, v := range strings.Split(strings.Trim(tc.vals, "[]"), ",") {
+				batches = append(batches, batchOf(t, fields, `[1]`, "["+v+"]"))
+			}
+			out, err := runAggExec(t, plan, []string{"k"}, []Aggregation{agg}, w, batches...)
+			if err != nil {
+				t.Fatalf("%s streaming workers=%d: %v", tc.vals, w, err)
+			}
+			if got := colJSON(t, out, "s"); got != tc.want {
+				t.Errorf("%s streaming workers=%d: s = %s, want %s", tc.vals, w, got, tc.want)
+			}
+			out.Release()
+		}
+		df.Release()
+	}
+}
+
+// TestGroupBy_NullKeyFirst — eager (its String / Int64 / Float64 fast
+// paths and the general path) and lazy GroupBy all put the null key's
+// group first.
+func TestGroupBy_NullKeyFirst(t *testing.T) {
+	for _, tc := range []struct {
+		dt   arrow.DataType
+		keys string
+		want string
+	}{
+		{arrow.BinaryTypes.String, `["b", null, "", "b"]`, `[null,"","b"]`},
+		{arrow.PrimitiveTypes.Int64, `[2, null, -1, 2]`, `[null,-1,2]`},
+		// Non-negative: the composite key encoding (lazy Float64 keys,
+		// eager's general path) sorts negative numbers after positive.
+		{arrow.PrimitiveTypes.Float64, `[2, null, 0.5, 2]`, `[null,0.5,2]`},
+		{arrow.PrimitiveTypes.Int32, `[2, null, 1, 2]`, `[null,1,2]`},
+	} {
+		fields := []arrow.Field{{Name: "k", Type: tc.dt, Nullable: true}, {Name: "v", Type: arrow.PrimitiveTypes.Int64}}
+		rb := batchOf(t, fields, tc.keys, `[1, 2, 3, 4]`)
+		df, err := batchToFrame(rb)
+		rb.Release()
+		if err != nil {
+			t.Fatal(err)
+		}
+		agg := Aggregation{Column: "v", Kind: AggSum, Alias: "s"}
+		gb, err := df.GroupBy("k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		eager, err := gb.Agg(agg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lazy, err := df.Lazy().GroupBy("k").Agg(agg).Collect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, f := range map[string]*Frame{"eager": eager, "lazy": lazy} {
+			if got := colJSON(t, f, "k"); got != tc.want {
+				t.Errorf("%s %s: k = %s, want %s", tc.dt, name, got, tc.want)
+			}
+			if got := colJSON(t, f, "s"); got != `[2,3,5]` {
+				t.Errorf("%s %s: s = %s, want [2,3,5]", tc.dt, name, got)
+			}
+		}
+		eager.Release()
+		lazy.Release()
+		df.Release()
+	}
+}
+
+// TestGroupBy_ColumnlessAgg — only count(*) may omit Column; anything
+// else is ErrColumnNotFound, not a panic.
+func TestGroupBy_ColumnlessAgg(t *testing.T) {
+	df := parityFrame(t)
+	defer df.Release()
+	gb, err := df.GroupBy("ks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []AggKind{AggBitOr, AggSum, AggFirst} {
+		if _, err := gb.Agg(Aggregation{Kind: k}); !errors.Is(err, ErrColumnNotFound) {
+			t.Errorf("%s with no column: err = %v, want ErrColumnNotFound", k, err)
+		}
+	}
+}
+
 // TestStreamingAggregate_LastAcrossManyBatches — Last over hundreds of
 // batches keeps the last non-null value per group, through the string
 // arena's and the take-based capture's compaction.
@@ -882,6 +1000,7 @@ func runAggExec(t *testing.T, plan *arrow.Schema, keys []string, aggs []Aggregat
 		keys:      n.keys,
 		aggs:      n.aggs,
 		outSchema: n.outSchema,
+		inSchema:  plan,
 		workers:   workers,
 		keyMode:   pickKeyMode(n),
 	}
@@ -1009,6 +1128,7 @@ func TestStreamingAggregate_CancelAfterEOF(t *testing.T) {
 		keys:      n.keys,
 		aggs:      n.aggs,
 		outSchema: n.outSchema,
+		inSchema:  df.Schema(),
 		workers:   4,
 		keyMode:   keyModeString1,
 	}

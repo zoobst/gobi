@@ -500,7 +500,10 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 	tsB := array.NewTimestampBuilder(pool, tsType)
 	defer tsB.Release()
 
-	aggBs, aggFields := makeAggBuilders(pool, aggs, aggViews)
+	aggBs, aggFields, err := makeAggBuilders(pool, aggs, aggViews)
+	if err != nil {
+		return nil, err
+	}
 	defer releaseBuilders(aggBs)
 
 	for _, bucketStart := range order {
