@@ -1,31 +1,35 @@
 package gobi
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/bitutil"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // streamingAggregateExec is a native streaming hash aggregate.
 //
-// Pulls its input one batch at a time, maintaining an in-memory map
-// from composite key bytes → per-group accumulator state. Rows are
+// Pulls its input one batch at a time into groupTables (dense group
+// ids, per-aggregation state slabs — see groupTable). Rows are
 // consumed as batches arrive; no accumulated input is held in memory
-// beyond the (typically small) result hash table. On EOF, iterates
-// groups in deterministic key order and emits one output row per
-// group.
+// beyond the group state. On EOF, emits one output row per group, in
+// key order unless unordered.
 //
-// Only handles Aggregations with built-in Kinds (Count / Sum / Mean /
-// Min / Max). Custom Fn Aggregators require the whole input at once
+// Handles the built-in Kinds and custom IncrementalAggregators.
+// Plain custom Fn Aggregators require the whole input at once
 // (their interface signature is Aggregate(Series, []int)) so the
 // compiler routes those to the materializing fallback instead.
 //
@@ -50,35 +54,19 @@ type streamingAggregateExec struct {
 	// constants for the specific fast paths.
 	keyMode keyMode
 
-	built  bool
-	groups map[string]*aggGroup // final merged groups (keyModeString1 + keyModeComposite)
-	order  []string             // sorted keys for deterministic output
-	// int64-keyed parallel state, used when keyMode == keyModeInt641.
-	// Kept as a separate map (rather than shoehorning ints into
-	// `groups`) so the fast path pays no string-conversion cost and
-	// so Go's runtime picks its native int64-hash intrinsics.
-	groupsInt64 map[int64]*aggGroup
-	orderInt64  []int64
-
-	// keyScratch is a reusable []byte the serial build path grows
-	// once and rewrites per row via composeCompositeKeyInto. Combined
-	// with the map[string(scratch)] compiler idiom, this cuts per-row
-	// key allocations from ~2/row to ~1/new-group.
-	keyScratch []byte
-
-	// touchedScratch is the per-batch touched-groups list used by
-	// consumeBatch. Grown once (up to the batch's group cardinality)
-	// and truncated between batches — steady-state append per new-
-	// group-per-batch, no map lookup. Replaces the pre-v0.3.9
-	// `buckets map[*aggGroup][]int` that added a second map lookup
-	// per row on the hot path.
-	touchedScratch []*aggGroup
+	built bool
+	// unordered skips sorting the output by key (LazyGroupBy.Unordered).
+	unordered bool
+	// tables holds the build's group state: one table for the serial
+	// build, one per worker for the parallel build. buildResultBatch
+	// consumes and releases them.
+	tables []*groupTable
 
 	// dispatchScratch is the parallel reader's per-row composite key
 	// buffer. Only the reader goroutine touches it, so no
-	// synchronization is needed. Workers do not use this — they
-	// recompute keys off the batch with their own local scratch on
-	// the receive side, so nothing key-shaped crosses the channel.
+	// synchronization is needed. Workers recompute keys off the batch
+	// with their own table's scratch, so nothing key-shaped crosses
+	// the channel.
 	dispatchScratch []byte
 
 	// rowsPool recycles the []int payloads that dispatchBatch sends
@@ -173,36 +161,6 @@ const (
 	keyModeInt641
 )
 
-// aggGroup holds one group's key values and one accumulator per
-// aggregation. Key values are the raw Go scalars captured when the
-// group was first seen — appended into the output when the result
-// is emitted.
-//
-// batchRows and touched are per-batch scratch state used by the
-// consume loop to avoid a `map[*aggGroup][]int` bucket structure
-// that previously sat on the hot path. Every batch, the consume
-// loop walks each row's key once, finds/creates the group, and
-// appends the row index to that group's batchRows — no second
-// map lookup. After the row walk, the loop iterates touched
-// groups once, calls Update on each accumulator with the group's
-// batchRows, resets batchRows[:0] and touched=false, and moves on.
-//
-// batchRows is retained across batches (its cap grows to the
-// group's max-per-batch cardinality), so the reset is O(1)
-// and steady-state per-row cost is one append into an already-
-// allocated slice.
-//
-// Concurrency: aggGroup is per-worker in the parallel build
-// (each worker has its own `groups map[string]*aggGroup`) and
-// single-owner in the serial build. No cross-goroutine access
-// to batchRows/touched.
-type aggGroup struct {
-	keyVals   []any            // one per key column
-	accs      []aggAccumulator // one per Aggregation
-	batchRows []int            // per-batch row indices, reused across batches
-	touched   bool             // set when this group has rows in the current batch
-}
-
 // aggAccumulator is the streaming counterpart to the built-in Aggregation
 // Kinds. Update() consumes a batch's rows for one aggregation column;
 // Finalize() produces the group's aggregated value.
@@ -278,213 +236,33 @@ func (e *streamingAggregateExec) buildIfNeeded(ctx context.Context) error {
 	return nil
 }
 
-// buildSerial is the original single-goroutine, single-map build.
-// Kept as the fast path for workers <= 1 — the partitioned path pays
-// for goroutine + channel + hash overhead that isn't worth it when
-// there's no CPU parallelism to unlock.
+// buildSerial folds every batch into one groupTable. Used for
+// workers <= 1 — the partitioned path pays for goroutine + channel +
+// hash overhead that isn't worth it without CPU parallelism to unlock.
 func (e *streamingAggregateExec) buildSerial(ctx context.Context) error {
-	// Initialize the group container that matches the chosen
-	// keyMode. keyModeInt641 uses e.groupsInt64 + e.orderInt64;
-	// every other mode uses e.groups + e.order. consumeBatch
-	// dispatches on the same enum.
-	if e.keyMode == keyModeInt641 {
-		e.groupsInt64 = make(map[int64]*aggGroup)
-	} else {
-		e.groups = make(map[string]*aggGroup)
+	t, err := newGroupTable(e.keyMode, e.keys, e.aggs)
+	if err != nil {
+		return err
 	}
+	e.tables = []*groupTable{t}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		batch, err := e.input.Next(ctx)
 		if err == io.EOF {
-			break
+			t.finish(e.unordered)
+			return nil
 		}
 		if err != nil {
 			return err
 		}
-		if err := e.consumeBatch(batch); err != nil {
-			batch.Release()
-			return err
-		}
+		err = t.consume(batch, nil)
 		batch.Release()
-	}
-	if e.keyMode == keyModeInt641 {
-		slices.Sort(e.orderInt64)
-	} else {
-		sort.Strings(e.order)
-	}
-	return nil
-}
-
-// consumeBatch buckets one batch's rows by composite key, then updates
-// each affected group's accumulators for each aggregation.
-//
-// Hot path: uses e.keyScratch as a reusable []byte for composite key
-// encoding, and the compiler-recognized `map[string(scratch)]` idiom
-// to probe the group map without allocating per row. The only
-// per-new-group allocation is the `string(scratch)` conversion at
-// first-touch, which forces the heap copy that guarantees the map
-// key outlives future scratch overwrites.
-func (e *streamingAggregateExec) consumeBatch(batch arrow.RecordBatch) error {
-	if batch.NumRows() == 0 {
-		return nil
-	}
-	frame, err := batchToFrame(batch)
-	if err != nil {
-		return err
-	}
-
-	// Resolve key columns and per-aggregation source columns once
-	// for this batch.
-	keySeries := make([]Series, len(e.keys))
-	for i, k := range e.keys {
-		s, err := frame.Column(k)
 		if err != nil {
 			return err
 		}
-		keySeries[i] = s
 	}
-	aggCols := make([]Series, len(e.aggs))
-	for i, a := range e.aggs {
-		if a.Column == "" {
-			continue // Count-star: no source column needed
-		}
-		s, err := frame.Column(a.Column)
-		if err != nil {
-			return err
-		}
-		aggCols[i] = s
-	}
-
-	// Route rows to their group's per-batch scratch (g.batchRows) as
-	// we walk the key column. Tracking touched groups in a slice
-	// rather than a `map[*aggGroup][]int` bucket saves one map
-	// lookup per row — which shows up as ~9% of the CPU profile
-	// on 1BRC-shaped workloads (10K groups × 1B rows).
-	//
-	// Three paths depending on keyMode; see keyMode consts for
-	// the specific fast paths.
-	touched := e.touchedScratch[:0]
-	rows := int(batch.NumRows())
-	switch e.keyMode {
-	case keyModeString1:
-		strArr, err := resolveStringArray(keySeries[0])
-		if err != nil {
-			return err
-		}
-		for row := range rows {
-			s := strArr.value(row) // zero-copy alias to arrow buffer
-			g, ok := e.groups[s]
-			if !ok {
-				// strings.Clone forces a durable heap copy that
-				// outlives the batch's release; needed because Go
-				// stores string headers, not underlying bytes.
-				ks := strings.Clone(s)
-				g, err = newAggGroupString1(ks, e.aggs)
-				if err != nil {
-					return err
-				}
-				e.groups[ks] = g
-				e.order = append(e.order, ks)
-			}
-			if !g.touched {
-				g.touched = true
-				g.batchRows = g.batchRows[:0]
-				touched = append(touched, g)
-			}
-			g.batchRows = append(g.batchRows, row)
-		}
-	case keyModeInt641:
-		intArr, err := resolveIntArray(keySeries[0])
-		if err != nil {
-			return err
-		}
-		if e.groupsInt64 == nil {
-			e.groupsInt64 = make(map[int64]*aggGroup)
-		}
-		for row := range rows {
-			k, ok := intArr.value(row)
-			if !ok {
-				// Skip null-keyed rows in the fast path. The int64
-				// map key can't losslessly represent "null" — using
-				// a sentinel would collide with a real value like
-				// math.MinInt64. Composite encoding does support a
-				// null-key group (via the 0x00 tag) but users who
-				// need that should GroupBy(...) on a column that
-				// routes to the composite path (e.g. by adding a
-				// second key column).
-				continue
-			}
-			g, ok := e.groupsInt64[k]
-			if !ok {
-				// Use the generic newAggGroup so the group's
-				// keyVals stores the source column's arrow-typed
-				// scalar (Int32, Timestamp, Bool, etc.), not the
-				// widened int64. That's what appendCustomValue
-				// expects at buildResultBatch time — the output
-				// key column matches the input type.
-				g, err = newAggGroup(keySeries, row, e.aggs)
-				if err != nil {
-					return err
-				}
-				e.groupsInt64[k] = g
-				e.orderInt64 = append(e.orderInt64, k)
-			}
-			if !g.touched {
-				g.touched = true
-				g.batchRows = g.batchRows[:0]
-				touched = append(touched, g)
-			}
-			g.batchRows = append(g.batchRows, row)
-		}
-	default:
-		for row := range rows {
-			scratch, err := composeCompositeKeyInto(e.keyScratch[:0], keySeries, row)
-			if err != nil {
-				return err
-			}
-			e.keyScratch = scratch
-			g, ok := e.groups[string(scratch)]
-			if !ok {
-				g, err = newAggGroup(keySeries, row, e.aggs)
-				if err != nil {
-					return err
-				}
-				ks := string(scratch)
-				e.groups[ks] = g
-				e.order = append(e.order, ks)
-			}
-			if !g.touched {
-				g.touched = true
-				g.batchRows = g.batchRows[:0]
-				touched = append(touched, g)
-			}
-			g.batchRows = append(g.batchRows, row)
-		}
-	}
-
-	// Update each touched group's accumulators, then reset its
-	// per-batch state ready for the next batch. batchRows keeps
-	// its capacity — steady-state cost is one append per row.
-	for _, g := range touched {
-		for i, a := range e.aggs {
-			src := aggCols[i]
-			if a.Column == "" {
-				// Count-star: accumulator ignores col, uses len(rows).
-				if err := g.accs[i].Update(Series{}, g.batchRows); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := g.accs[i].Update(src, g.batchRows); err != nil {
-				return err
-			}
-		}
-		g.touched = false
-	}
-	e.touchedScratch = touched[:0]
-	return nil
 }
 
 // composeCompositeKeyInto appends the byte-encoded composite key
@@ -702,45 +480,6 @@ func (v *chunkedIntView) value(row int) (int64, bool) {
 	return 0, false
 }
 
-// newAggGroupString1 is the specialized first-touch group
-// constructor for keyModeString1. Skips the readScalarAt round-trip
-// through the generic keyVals []any — the caller already has the
-// key string (from strings.Clone) so we just capture it directly.
-func newAggGroupString1(key string, aggs []Aggregation) (*aggGroup, error) {
-	accs := make([]aggAccumulator, len(aggs))
-	for i, a := range aggs {
-		acc, err := newAccumulator(a)
-		if err != nil {
-			return nil, err
-		}
-		accs[i] = acc
-	}
-	return &aggGroup{keyVals: []any{key}, accs: accs}, nil
-}
-
-// newAggGroup allocates a group's state on first-touch: captures the
-// key values from the current row and constructs one accumulator per
-// aggregation.
-func newAggGroup(keys []Series, row int, aggs []Aggregation) (*aggGroup, error) {
-	keyVals := make([]any, len(keys))
-	for i, k := range keys {
-		v, err := readScalarAt(k, row)
-		if err != nil {
-			return nil, err
-		}
-		keyVals[i] = v
-	}
-	accs := make([]aggAccumulator, len(aggs))
-	for i, a := range aggs {
-		acc, err := newAccumulator(a)
-		if err != nil {
-			return nil, err
-		}
-		accs[i] = acc
-	}
-	return &aggGroup{keyVals: keyVals, accs: accs}, nil
-}
-
 // newAccumulator constructs the accumulator for one Aggregation kind.
 // Custom Fn accumulators route through this path when they implement
 // IncrementalAggregator — a fresh clone is instantiated per group.
@@ -803,92 +542,1493 @@ func (a *customIncrementalAcc) Update(col Series, rows []int) error {
 func (a *customIncrementalAcc) Finalize() any              { return a.inner.Finalize() }
 func (a *customIncrementalAcc) OutputType() arrow.DataType { return a.outType }
 
-// buildResultBatch produces the single result RecordBatch by iterating
-// groups in sorted order and appending to per-column builders. Uses
-// the same builder types as the existing eager Agg path so the two
-// engines produce structurally identical output.
+// -----------------------------------------------------------------------------
+// groupTable: columnar hash-aggregation state
+//
+// A group is a dense id (gid), assigned in first-seen order. The key
+// index maps each key to its gid, and every aggregation keeps its
+// state in slices indexed by gid (sums in a []float64, first-value
+// slots in a []int32, …), so a new group costs no allocation beyond
+// amortized slice and map growth. Key bytes are copied into an arena
+// for the same reason. Key columns are captured with one vectorized
+// take per batch over the rows that opened groups, and emitted with
+// one more take in output order.
+//
+// The serial build uses one table; the parallel build one per worker
+// (keys are hash-partitioned, so tables never share a key).
+// -----------------------------------------------------------------------------
+
+type groupTable struct {
+	mode keyMode
+	keys []string
+	aggs []Aggregation
+
+	strIdx  map[string]int32 // keyModeString1 + keyModeComposite
+	intIdx  map[int64]int32  // keyModeInt641
+	sortStr []string         // per gid: the key (String1) or its encoding (Composite)
+	sortInt []int64          // per gid: the widened key (Int641)
+	arena   strArena
+	keyCaps []valueCapture // per key column; unused for keyModeString1
+	states  []aggState
+	n       int32   // groups so far
+	order   []int32 // gids in output order, set by finish
+	// The keys of order, laid out in that order, for merging the
+	// tables' sorted runs (set by finish unless unordered).
+	runStr []string
+	runInt []int64
+
+	// Per-batch scratch, reused across batches.
+	scratch []byte
+	batch   aggBatch
+	newRows []int // rows that opened a group in the current batch
+	allRows []int // 0..n-1, for the serial build
+}
+
+func newGroupTable(mode keyMode, keys []string, aggs []Aggregation) (*groupTable, error) {
+	t := &groupTable{mode: mode, keys: keys, aggs: aggs}
+	if mode == keyModeInt641 {
+		t.intIdx = make(map[int64]int32)
+	} else {
+		t.strIdx = make(map[string]int32)
+	}
+	if mode != keyModeString1 {
+		t.keyCaps = make([]valueCapture, len(keys))
+	}
+	t.states = make([]aggState, len(aggs))
+	for i, a := range aggs {
+		st, err := newAggState(a)
+		if err != nil {
+			t.release()
+			return nil, err
+		}
+		t.states[i] = st
+	}
+	return t, nil
+}
+
+// release frees the Arrow arrays the table captured.
+func (t *groupTable) release() {
+	for i := range t.keyCaps {
+		t.keyCaps[i].release()
+	}
+	for _, st := range t.states {
+		if st != nil {
+			st.release()
+		}
+	}
+}
+
+// consume folds batch into the table. rows selects the batch rows to
+// fold (the parallel build's partition); nil means every row.
+func (t *groupTable) consume(batch arrow.RecordBatch, rows []int) error {
+	nb := int(batch.NumRows())
+	if nb == 0 {
+		return nil
+	}
+	if rows == nil {
+		for len(t.allRows) < nb {
+			t.allRows = append(t.allRows, len(t.allRows))
+		}
+		rows = t.allRows[:nb]
+	}
+	frame, err := batchToFrame(batch)
+	if err != nil {
+		return err
+	}
+	keySeries := make([]Series, len(t.keys))
+	for i, k := range t.keys {
+		if keySeries[i], err = frame.Column(k); err != nil {
+			return err
+		}
+	}
+	aggCols := make([]Series, len(t.aggs))
+	for i, a := range t.aggs {
+		if a.Column == "" {
+			continue // count(*): no source column
+		}
+		if aggCols[i], err = frame.Column(a.Column); err != nil {
+			return err
+		}
+	}
+
+	b := &t.batch
+	b.reset()
+	t.newRows = t.newRows[:0]
+	switch t.mode {
+	case keyModeString1:
+		strArr, err := resolveStringArray(keySeries[0])
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			s := strArr.value(row) // aliases the batch; cloned on insert
+			g, ok := t.strIdx[s]
+			if !ok {
+				g = t.n
+				t.n++
+				ks := t.arena.string(s)
+				t.strIdx[ks] = g
+				t.sortStr = appendDoubling(t.sortStr, ks)
+			}
+			b.rows = append(b.rows, row)
+			b.gids = append(b.gids, g)
+		}
+	case keyModeInt641:
+		intArr, err := resolveIntArray(keySeries[0])
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			k, ok := intArr.value(row)
+			if !ok {
+				// Null keys are dropped in this mode: an int64 map key
+				// can't represent null without colliding with a value.
+				continue
+			}
+			g, ok := t.intIdx[k]
+			if !ok {
+				g = t.n
+				t.n++
+				t.intIdx[k] = g
+				t.sortInt = appendDoubling(t.sortInt, k)
+				t.newRows = append(t.newRows, row)
+			}
+			b.rows = append(b.rows, row)
+			b.gids = append(b.gids, g)
+		}
+	default:
+		for _, row := range rows {
+			buf, err := composeCompositeKeyInto(t.scratch[:0], keySeries, row)
+			if err != nil {
+				return err
+			}
+			t.scratch = buf
+			g, ok := t.strIdx[string(buf)]
+			if !ok {
+				g = t.n
+				t.n++
+				ks := t.arena.bytes(buf)
+				t.strIdx[ks] = g
+				t.sortStr = appendDoubling(t.sortStr, ks)
+				t.newRows = append(t.newRows, row)
+			}
+			b.rows = append(b.rows, row)
+			b.gids = append(b.gids, g)
+		}
+	}
+	b.groups = int(t.n)
+
+	// Capture the key values of the groups this batch opened. Groups
+	// open in gid order, so capture slot == gid.
+	if len(t.newRows) > 0 {
+		for i := range t.keyCaps {
+			if _, err := t.keyCaps[i].capture(keySeries[i], t.newRows); err != nil {
+				return fmt.Errorf("key %s: %w", t.keys[i], err)
+			}
+		}
+	}
+	for i, st := range t.states {
+		if err := st.grow(int(t.n)); err != nil {
+			return err
+		}
+		if err := st.update(aggCols[i], b); err != nil {
+			return fmt.Errorf("agg %s: %w", aggName(t.aggs[i]), err)
+		}
+	}
+	return nil
+}
+
+// finish sorts the table's groups into output order: by key — the
+// String1 string, the composite encoding, or the widened int64 — or
+// first-seen order when unordered. The parallel build calls it on
+// each worker, so the tables sort concurrently.
+func (t *groupTable) finish(unordered bool) {
+	t.order = make([]int32, t.n)
+	for i := range t.order {
+		t.order[i] = int32(i)
+	}
+	if unordered {
+		return
+	}
+	if t.mode == keyModeInt641 {
+		k := t.sortInt
+		slices.SortFunc(t.order, func(a, b int32) int { return cmp.Compare(k[a], k[b]) })
+		t.runInt = make([]int64, len(t.order))
+		for i, g := range t.order {
+			t.runInt[i] = k[g]
+		}
+	} else {
+		k := t.sortStr
+		slices.SortFunc(t.order, func(a, b int32) int { return strings.Compare(k[a], k[b]) })
+		t.runStr = make([]string, len(t.order))
+		for i, g := range t.order {
+			t.runStr[i] = k[g]
+		}
+	}
+}
+
+// rowRef addresses one group: table t, gid g.
+type rowRef struct{ t, g int32 }
+
+// outputOrder lists every group of the finished tables in output
+// order: the tables' sorted runs merged by key (keys are disjoint
+// across tables, so the merge is total), or, when unordered, table by
+// table.
+func outputOrder(tables []*groupTable, mode keyMode, unordered bool) []rowRef {
+	if unordered || len(tables) == 1 {
+		total := 0
+		for _, t := range tables {
+			total += len(t.order)
+		}
+		order := make([]rowRef, 0, total)
+		for ti, t := range tables {
+			for _, g := range t.order {
+				order = append(order, rowRef{int32(ti), g})
+			}
+		}
+		return order
+	}
+	if mode == keyModeInt641 {
+		runs := make([]sortedRun[int64], len(tables))
+		for ti, t := range tables {
+			runs[ti] = newSortedRun(int32(ti), t.order, t.runInt)
+		}
+		return mergeRuns(runs)
+	}
+	runs := make([]sortedRun[string], len(tables))
+	for ti, t := range tables {
+		runs[ti] = newSortedRun(int32(ti), t.order, t.runStr)
+	}
+	return mergeRuns(runs)
+}
+
+// sortedRun is one table's groups in key order, keys alongside.
+type sortedRun[K cmp.Ordered] struct {
+	refs []rowRef
+	keys []K
+}
+
+func newSortedRun[K cmp.Ordered](t int32, order []int32, keys []K) sortedRun[K] {
+	refs := make([]rowRef, len(order))
+	for i, g := range order {
+		refs[i] = rowRef{t, g}
+	}
+	return sortedRun[K]{refs: refs, keys: keys}
+}
+
+// mergeRuns merges sorted runs pairwise, each round's merges running
+// concurrently, until one run is left.
+func mergeRuns[K cmp.Ordered](runs []sortedRun[K]) []rowRef {
+	for len(runs) > 1 {
+		next := make([]sortedRun[K], (len(runs)+1)/2)
+		var wg sync.WaitGroup
+		for i := 0; i+1 < len(runs); i += 2 {
+			wg.Go(func() { next[i/2] = mergeTwo(runs[i], runs[i+1]) })
+		}
+		if len(runs)%2 == 1 {
+			next[len(next)-1] = runs[len(runs)-1]
+		}
+		wg.Wait()
+		runs = next
+	}
+	if len(runs) == 0 {
+		return nil
+	}
+	return runs[0].refs
+}
+
+func mergeTwo[K cmp.Ordered](a, b sortedRun[K]) sortedRun[K] {
+	n := len(a.refs) + len(b.refs)
+	out := sortedRun[K]{refs: make([]rowRef, 0, n), keys: make([]K, 0, n)}
+	i, j := 0, 0
+	for i < len(a.keys) && j < len(b.keys) {
+		if b.keys[j] < a.keys[i] {
+			out.refs = append(out.refs, b.refs[j])
+			out.keys = append(out.keys, b.keys[j])
+			j++
+		} else {
+			out.refs = append(out.refs, a.refs[i])
+			out.keys = append(out.keys, a.keys[i])
+			i++
+		}
+	}
+	out.refs = append(append(out.refs, a.refs[i:]...), b.refs[j:]...)
+	out.keys = append(append(out.keys, a.keys[i:]...), b.keys[j:]...)
+	return out
+}
+
+// buildResultBatch emits one row per group across the build's tables,
+// in outputOrder. Each column is written once, straight in final
+// order: slab states append from their slices, captured values (keys,
+// First / Last) are gathered with one take.
 func (e *streamingAggregateExec) buildResultBatch() (arrow.RecordBatch, error) {
 	pool := memory.DefaultAllocator
-
-	// Key column builders — one per key column, typed by the input
-	// schema's field type.
-	keyBuilders := make([]array.Builder, len(e.keys))
-	for i := range e.keys {
-		field := e.outSchema.Field(i)
-		b, err := builderForType(pool, field.Type)
-		if err != nil {
-			return nil, fmt.Errorf("key col %s: %w", e.keys[i], err)
+	tables := e.tables
+	defer func() {
+		for _, t := range tables {
+			t.release()
 		}
-		keyBuilders[i] = b
-	}
-	defer releaseBuilders(keyBuilders)
+	}()
+	order := outputOrder(tables, e.keyMode, e.unordered)
+	out := make([]arrow.Array, 0, e.outSchema.NumFields())
+	defer func() { releaseArrays(out) }()
 
-	// Agg column builders — one per Aggregation, typed by the
-	// accumulator's OutputType.
-	aggBuilders := make([]array.Builder, len(e.aggs))
+	for i, k := range e.keys {
+		dt := e.outSchema.Field(i).Type
+		var arr arrow.Array
+		var err error
+		if e.keyMode == keyModeString1 {
+			arr, err = emitStringKeys(pool, dt, tables, order)
+		} else {
+			caps := make([]*valueCapture, len(tables))
+			for ti, t := range tables {
+				caps[ti] = &t.keyCaps[i]
+			}
+			arr, err = takeCaptures(pool, dt, caps, order, func(r rowRef) int32 { return r.g })
+		}
+		if err != nil {
+			return nil, fmt.Errorf("key col %s: %w", k, err)
+		}
+		out = append(out, arr)
+	}
 	for i, a := range e.aggs {
-		// Use the schema's field type so builder + emit path agree.
-		field := e.outSchema.Field(len(e.keys) + i)
-		b, err := builderForType(pool, field.Type)
+		peers := make([]aggState, len(tables))
+		for ti, t := range tables {
+			peers[ti] = t.states[i]
+		}
+		arr, err := peers[0].emit(pool, e.outSchema.Field(len(e.keys)+i).Type, peers, order)
 		if err != nil {
 			return nil, fmt.Errorf("agg %s: %w", aggName(a), err)
 		}
-		aggBuilders[i] = b
+		out = append(out, arr)
 	}
-	defer releaseBuilders(aggBuilders)
+	return array.NewRecordBatch(e.outSchema, out, int64(len(order))), nil
+}
 
-	// Emit one row per group. Walks e.orderInt64 in the int64 fast
-	// path, e.order in every other mode — the two containers are
-	// mutually exclusive per keyMode selection.
-	emitGroup := func(g *aggGroup) error {
-		for i, b := range keyBuilders {
-			if err := appendCustomValue(b, g.keyVals[i]); err != nil {
-				return fmt.Errorf("emit key %s: %w", e.keys[i], err)
-			}
+// emitStringKeys writes the String1 key column from the tables' key
+// strings.
+func emitStringKeys(pool memory.Allocator, dt arrow.DataType, tables []*groupTable, order []rowRef) (arrow.Array, error) {
+	return buildBytesArray(pool, dt, len(order), func(i int) (string, bool) {
+		r := order[i]
+		return tables[r.t].sortStr[r.g], true
+	})
+}
+
+// buildBytesArray builds a String / LargeString / Binary / LargeBinary
+// array of n values straight into its buffers — get(i) returns value
+// i, ok=false for null — skipping the builder's per-value bookkeeping.
+func buildBytesArray(pool memory.Allocator, dt arrow.DataType, n int, get func(int) (string, bool)) (arrow.Array, error) {
+	large := false
+	switch dt.ID() {
+	case arrow.STRING, arrow.BINARY:
+	case arrow.LARGE_STRING, arrow.LARGE_BINARY:
+		large = true
+	default:
+		return nil, fmt.Errorf("byte values into %s", dt)
+	}
+	total, nulls := 0, 0
+	for i := range n {
+		v, ok := get(i)
+		if !ok {
+			nulls++
 		}
-		for i, b := range aggBuilders {
-			v := g.accs[i].Finalize()
-			if err := appendCustomValue(b, v); err != nil {
-				return fmt.Errorf("emit agg %s: %w", aggName(e.aggs[i]), err)
+		total += len(v)
+	}
+	if !large && total > math.MaxInt32 {
+		return nil, fmt.Errorf("%d bytes overflow %s offsets", total, dt)
+	}
+	offBuf := memory.NewResizableBuffer(pool)
+	dataBuf := memory.NewResizableBuffer(pool)
+	var bitmap *memory.Buffer
+	defer func() {
+		offBuf.Release()
+		dataBuf.Release()
+		if bitmap != nil {
+			bitmap.Release()
+		}
+	}()
+	width := 4
+	if large {
+		width = 8
+	}
+	offBuf.Resize((n + 1) * width)
+	dataBuf.Resize(total)
+	data := dataBuf.Bytes()
+	var bits []byte
+	if nulls > 0 {
+		bitmap = memory.NewResizableBuffer(pool)
+		bitmap.Resize(int(bitutil.BytesForBits(int64(n))))
+		bits = bitmap.Bytes()
+		clear(bits)
+	}
+	pos := 0
+	if large {
+		offs := arrow.Int64Traits.CastFromBytes(offBuf.Bytes())
+		for i := range n {
+			offs[i] = int64(pos)
+			v, ok := get(i)
+			if ok && bits != nil {
+				bitutil.SetBit(bits, i)
 			}
+			pos += copy(data[pos:], v)
+		}
+		offs[n] = int64(pos)
+	} else {
+		offs := arrow.Int32Traits.CastFromBytes(offBuf.Bytes())
+		for i := range n {
+			offs[i] = int32(pos)
+			v, ok := get(i)
+			if ok && bits != nil {
+				bitutil.SetBit(bits, i)
+			}
+			pos += copy(data[pos:], v)
+		}
+		offs[n] = int32(pos)
+	}
+	d := array.NewData(dt, n, []*memory.Buffer{bitmap, offBuf, dataBuf}, nil, nulls, 0)
+	defer d.Release()
+	return array.MakeFromData(d), nil
+}
+
+// takeCaptures gathers captured values in order: slot(r) is the
+// group's slot in its table's capture, -1 for null. The captures are
+// read in place as one multi-chunk column, without concatenating.
+func takeCaptures(pool memory.Allocator, dt arrow.DataType, caps []*valueCapture, order []rowRef, slot func(rowRef) int32) (arrow.Array, error) {
+	base := make([]int, len(caps))
+	var pieces []arrow.Array
+	n := 0
+	for i, c := range caps {
+		base[i] = n
+		n += c.n
+		pieces = append(pieces, c.pieces...)
+	}
+	if len(pieces) == 0 {
+		return array.MakeArrayOfNull(pool, dt, len(order)), nil
+	}
+	idx := make([]int, len(order))
+	for i, r := range order {
+		if s := slot(r); s >= 0 {
+			idx[i] = base[r.t] + int(s)
+		} else {
+			idx[i] = -1
+		}
+	}
+	chunked := arrow.NewChunked(dt, pieces)
+	defer chunked.Release()
+	col := arrow.NewColumn(arrow.Field{Name: "captured", Type: dt, Nullable: true}, chunked)
+	defer col.Release()
+	return takeArrayWithNulls(pool, NewSeries(col), idx)
+}
+
+func releaseArrays(arrs []arrow.Array) {
+	for _, a := range arrs {
+		a.Release()
+	}
+}
+
+// strArena hands out strings backed by shared byte blocks, so storing
+// a group's key costs no allocation of its own. Blocks start small and
+// double up to strArenaBlock, so a table with few groups stays small.
+// Bytes are never written after a string is cut from them.
+type strArena struct {
+	block []byte
+}
+
+const strArenaBlock = 64 << 10
+
+func (a *strArena) bytes(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if len(b) > strArenaBlock/4 {
+		return string(b) // large keys get their own allocation
+	}
+	if cap(a.block)-len(a.block) < len(b) {
+		size := min(max(2*cap(a.block), 256, len(b)), strArenaBlock)
+		a.block = make([]byte, 0, size)
+	}
+	start := len(a.block)
+	a.block = append(a.block, b...)
+	return unsafe.String(&a.block[start], len(b))
+}
+
+func (a *strArena) string(s string) string {
+	return a.bytes(unsafe.Slice(unsafe.StringData(s), len(s)))
+}
+
+// valueCapture copies selected cells of a column into owned Arrow
+// arrays, one vectorized take per capture call. Captured values are
+// addressed by slot: their position across the captures laid end to
+// end.
+type valueCapture struct {
+	pieces []arrow.Array
+	n      int
+}
+
+// capture appends col's rows and returns the slot of the first one.
+func (c *valueCapture) capture(col Series, rows []int) (int, error) {
+	base := c.n
+	if len(rows) == 0 {
+		return base, nil
+	}
+	// takeArray, not compute.Take: arrow-go's variable-width take sizes
+	// its output from the whole input, which over-allocates badly when
+	// a few rows are taken from each batch.
+	arr, err := takeArray(memory.DefaultAllocator, col, rows)
+	if err != nil {
+		return 0, err
+	}
+	c.pieces = append(c.pieces, arr)
+	c.n += len(rows)
+	return base, nil
+}
+
+// compact keeps only the values slots still refer to, renumbering
+// slots, so a capture rewritten many times (Last) doesn't grow without
+// bound.
+func (c *valueCapture) compact(dt arrow.DataType, slots []int32) error {
+	keep := make([]int, 0, len(slots))
+	for i, s := range slots {
+		if s >= 0 {
+			keep = append(keep, int(s))
+			slots[i] = int32(len(keep) - 1)
+		}
+	}
+	chunked := arrow.NewChunked(dt, c.pieces)
+	col := arrow.NewColumn(arrow.Field{Name: "captured", Type: dt, Nullable: true}, chunked)
+	arr, err := takeArray(memory.DefaultAllocator, NewSeries(col), keep)
+	col.Release()
+	chunked.Release()
+	if err != nil {
+		return err
+	}
+	c.release()
+	c.pieces = []arrow.Array{arr}
+	c.n = len(keep)
+	return nil
+}
+
+func (c *valueCapture) release() {
+	releaseArrays(c.pieces)
+	c.pieces = nil
+	c.n = 0
+}
+
+// aggBatch is one batch's rows routed to a table: rows[i] belongs to
+// group gids[i]. byGroup lazily buckets the rows by group for the
+// per-group accumulators.
+type aggBatch struct {
+	rows   []int
+	gids   []int32
+	groups int
+
+	bucketed bool
+	touched  []int32 // groups with rows in this batch, first-seen order
+	start    []int32 // per gid: offset into sorted (valid for touched)
+	count    []int32 // per gid: rows in this batch, zeroed on reset
+	sorted   []int
+}
+
+func (b *aggBatch) reset() {
+	b.rows = b.rows[:0]
+	b.gids = b.gids[:0]
+	if b.bucketed {
+		for _, g := range b.touched {
+			b.count[g] = 0
+		}
+		b.bucketed = false
+	}
+}
+
+// byGroup buckets the batch's rows by group with a counting sort,
+// keeping each group's rows in batch order.
+func (b *aggBatch) byGroup() {
+	if b.bucketed {
+		return
+	}
+	b.bucketed = true
+	for len(b.count) < b.groups {
+		b.count = append(b.count, 0)
+		b.start = append(b.start, 0)
+	}
+	b.touched = b.touched[:0]
+	for _, g := range b.gids {
+		if b.count[g] == 0 {
+			b.touched = append(b.touched, g)
+		}
+		b.count[g]++
+	}
+	off := int32(0)
+	for _, g := range b.touched {
+		b.start[g] = off
+		off += b.count[g]
+		b.count[g] = 0 // reused below as the fill cursor
+	}
+	b.sorted = slices.Grow(b.sorted[:0], len(b.rows))[:len(b.rows)]
+	for i, g := range b.gids {
+		b.sorted[b.start[g]+b.count[g]] = b.rows[i]
+		b.count[g]++
+	}
+}
+
+// groupRows returns group g's rows in this batch; byGroup must have
+// run.
+func (b *aggBatch) groupRows(g int32) []int {
+	return b.sorted[b.start[g] : b.start[g]+b.count[g]]
+}
+
+// -----------------------------------------------------------------------------
+// Aggregation state
+// -----------------------------------------------------------------------------
+
+// aggState is one aggregation's state across every group of a table.
+type aggState interface {
+	// grow extends the state to n groups.
+	grow(n int) error
+	// update folds a batch's rows; col is zero for count(*).
+	update(col Series, b *aggBatch) error
+	// emit returns the results for the groups in order, as dt.
+	// peers holds this aggregation's state in every table of the
+	// build (including the receiver); order addresses them.
+	emit(pool memory.Allocator, dt arrow.DataType, peers []aggState, order []rowRef) (arrow.Array, error)
+	release()
+}
+
+// newAggState picks the columnar state for the built-in kinds that
+// have one, and the per-group accumulator adapter for the rest.
+func newAggState(a Aggregation) (aggState, error) {
+	if a.Fn == nil {
+		switch a.Kind {
+		case AggCount:
+			return &countState{star: a.Column == ""}, nil
+		case AggSum:
+			return &sumState{}, nil
+		case AggMean:
+			return &sumState{mean: true}, nil
+		case AggMin, AggMax:
+			return &minMaxState{isMin: a.Kind == AggMin}, nil
+		case AggFirst, AggLast:
+			return &firstLastState{first: a.Kind == AggFirst}, nil
+		}
+	}
+	if _, err := newAccumulator(a); err != nil {
+		return nil, err
+	}
+	return &accState{agg: a}, nil
+}
+
+// appendDoubling is append with capacity doubling at every size
+// (append grows large slices by ~1.25×, recopying them more often).
+func appendDoubling[T any](s []T, v T) []T {
+	if len(s) == cap(s) {
+		s = slices.Grow(s, max(cap(s), 8))
+	}
+	return append(s, v)
+}
+
+// growTo extends s to n elements of fill, doubling the capacity when
+// it has to grow (append's 1.25× growth for large slices would recopy
+// a group slab many times over).
+func growTo[T any](s []T, n int, fill T) []T {
+	old := len(s)
+	if old >= n {
+		return s
+	}
+	if cap(s) < n {
+		s = slices.Grow(s, max(n, 2*cap(s))-old)
+	}
+	s = s[:n]
+	for i := old; i < n; i++ {
+		s[i] = fill
+	}
+	return s
+}
+
+// countState: count(*) or count of non-null values.
+type countState struct {
+	star bool
+	n    []int64
+}
+
+func (s *countState) grow(n int) error { s.n = growTo(s.n, n, 0); return nil }
+func (s *countState) release()         {}
+
+func (s *countState) update(col Series, b *aggBatch) error {
+	if s.star {
+		for _, g := range b.gids {
+			s.n[g]++
 		}
 		return nil
 	}
-	if e.keyMode == keyModeInt641 {
-		for _, k := range e.orderInt64 {
-			if err := emitGroup(e.groupsInt64[k]); err != nil {
-				return nil, err
+	if col.col == nil {
+		return nil
+	}
+	cur := newChunkCursor(col)
+	for i, row := range b.rows {
+		null, err := cur.isNull(row)
+		if err != nil {
+			return err
+		}
+		if !null {
+			s.n[b.gids[i]]++
+		}
+	}
+	return nil
+}
+
+func (s *countState) emit(pool memory.Allocator, dt arrow.DataType, peers []aggState, order []rowRef) (arrow.Array, error) {
+	ps := peersOf[*countState](peers)
+	bld := array.NewInt64Builder(pool)
+	defer bld.Release()
+	bld.Reserve(len(order))
+	for _, r := range order {
+		bld.UnsafeAppend(ps[r.t].n[r.g])
+	}
+	return bld.NewArray(), nil
+}
+
+// sumState: Sum and Mean. Mean, and Sum over a non-integer column,
+// are Float64, adding each value as float64 in row order — the same
+// arithmetic the per-group accumulators used, so results match bit for
+// bit. Sum over an integer column is an overflow-checked Int64 (signed
+// sources) or Uint64 (unsigned) sum.
+type sumState struct {
+	mean    bool
+	decided bool
+	signed  bool // integer Sum, signed source
+	integer bool // integer Sum
+	sum     []float64
+	isum    []int64
+	usum    []uint64
+	n       []int64 // non-null values; 0 → null output
+}
+
+func (s *sumState) grow(n int) error {
+	s.n = growTo(s.n, n, 0)
+	switch {
+	case !s.integer:
+		s.sum = growTo(s.sum, n, 0)
+	case s.signed:
+		s.isum = growTo(s.isum, n, 0)
+	default:
+		s.usum = growTo(s.usum, n, 0)
+	}
+	return nil
+}
+func (s *sumState) release() {}
+
+func (s *sumState) update(col Series, b *aggBatch) error {
+	if col.col == nil {
+		return nil
+	}
+	if !s.decided {
+		s.decided = true
+		if t := intSumType(col.DataType()); t != nil && !s.mean {
+			s.integer = true
+			s.signed = t.ID() == arrow.INT64
+			s.sum = nil
+			if err := s.grow(len(s.n)); err != nil {
+				return err
+			}
+		}
+	}
+	if s.integer {
+		return s.updateInt(col, b)
+	}
+	return foldNumeric(col, b, func(g int32, v float64) {
+		s.sum[g] += v
+		s.n[g]++
+	})
+}
+
+func (s *sumState) updateInt(col Series, b *aggBatch) error {
+	chunks := col.col.Data().Chunks()
+	if len(chunks) == 1 {
+		switch a := chunks[0].(type) {
+		case *array.Int64:
+			return foldSigned(s, a, a.Int64Values(), b)
+		case *array.Int32:
+			return foldSigned(s, a, a.Int32Values(), b)
+		case *array.Int16:
+			return foldSigned(s, a, a.Int16Values(), b)
+		case *array.Int8:
+			return foldSigned(s, a, a.Int8Values(), b)
+		case *array.Uint64:
+			return foldUnsigned(s, a, a.Uint64Values(), b)
+		case *array.Uint32:
+			return foldUnsigned(s, a, a.Uint32Values(), b)
+		case *array.Uint16:
+			return foldUnsigned(s, a, a.Uint16Values(), b)
+		case *array.Uint8:
+			return foldUnsigned(s, a, a.Uint8Values(), b)
+		}
+	}
+	cur := newChunkCursor(col)
+	for i, row := range b.rows {
+		chunk, local, err := cur.locate(row)
+		if err != nil {
+			return err
+		}
+		if chunk.IsNull(local) {
+			continue
+		}
+		g := b.gids[i]
+		acc := intSum{n: s.n[g]}
+		if s.signed {
+			acc.i = s.isum[g]
+		} else {
+			acc.u = s.usum[g]
+		}
+		if err := acc.add(chunk, local); err != nil {
+			return err
+		}
+		if s.signed {
+			s.isum[g] = acc.i
+		} else {
+			s.usum[g] = acc.u
+		}
+		s.n[g] = acc.n
+	}
+	return nil
+}
+
+func foldSigned[T int64 | int32 | int16 | int8](s *sumState, a arrow.Array, vals []T, b *aggBatch) error {
+	nulls := a.NullN() > 0
+	for i, row := range b.rows {
+		if nulls && a.IsNull(row) {
+			continue
+		}
+		g := b.gids[i]
+		v := int64(vals[row])
+		r := s.isum[g] + v
+		if (v > 0 && r < s.isum[g]) || (v < 0 && r > s.isum[g]) {
+			return ErrSumOverflow
+		}
+		s.isum[g] = r
+		s.n[g]++
+	}
+	return nil
+}
+
+func foldUnsigned[T uint64 | uint32 | uint16 | uint8](s *sumState, a arrow.Array, vals []T, b *aggBatch) error {
+	nulls := a.NullN() > 0
+	for i, row := range b.rows {
+		if nulls && a.IsNull(row) {
+			continue
+		}
+		g := b.gids[i]
+		r, carry := bits.Add64(s.usum[g], uint64(vals[row]), 0)
+		if carry != 0 {
+			return ErrSumOverflow
+		}
+		s.usum[g] = r
+		s.n[g]++
+	}
+	return nil
+}
+
+func (s *sumState) emit(pool memory.Allocator, dt arrow.DataType, peers []aggState, order []rowRef) (arrow.Array, error) {
+	ps := peersOf[*sumState](peers)
+	switch dt.ID() {
+	case arrow.INT64:
+		bld := array.NewInt64Builder(pool)
+		defer bld.Release()
+		bld.Reserve(len(order))
+		for _, r := range order {
+			p := ps[r.t]
+			if int(r.g) >= len(p.isum) || p.n[r.g] == 0 {
+				bld.UnsafeAppendBoolToBitmap(false)
+				continue
+			}
+			bld.UnsafeAppend(p.isum[r.g])
+		}
+		return bld.NewArray(), nil
+	case arrow.UINT64:
+		bld := array.NewUint64Builder(pool)
+		defer bld.Release()
+		bld.Reserve(len(order))
+		for _, r := range order {
+			p := ps[r.t]
+			if int(r.g) >= len(p.usum) || p.n[r.g] == 0 {
+				bld.UnsafeAppendBoolToBitmap(false)
+				continue
+			}
+			bld.UnsafeAppend(p.usum[r.g])
+		}
+		return bld.NewArray(), nil
+	}
+	bld := array.NewFloat64Builder(pool)
+	defer bld.Release()
+	bld.Reserve(len(order))
+	for _, r := range order {
+		p := ps[r.t]
+		switch {
+		case int(r.g) >= len(p.sum) || p.n[r.g] == 0:
+			bld.UnsafeAppendBoolToBitmap(false)
+		case s.mean:
+			bld.UnsafeAppend(p.sum[r.g] / float64(p.n[r.g]))
+		default:
+			bld.UnsafeAppend(p.sum[r.g])
+		}
+	}
+	return bld.NewArray(), nil
+}
+
+// foldNumeric calls fn(gid, value) for every non-null numeric cell of
+// the batch's rows, in row order. Single-chunk Float64 / Int64 /
+// Float32 / Int32 columns read their value slices directly.
+func foldNumeric(col Series, b *aggBatch, fn func(int32, float64)) error {
+	chunks := col.col.Data().Chunks()
+	if len(chunks) == 1 {
+		switch a := chunks[0].(type) {
+		case *array.Float64:
+			foldTyped(a, a.Float64Values(), b, fn)
+			return nil
+		case *array.Int64:
+			foldTyped(a, a.Int64Values(), b, fn)
+			return nil
+		case *array.Float32:
+			foldTyped(a, a.Float32Values(), b, fn)
+			return nil
+		case *array.Int32:
+			foldTyped(a, a.Int32Values(), b, fn)
+			return nil
+		}
+	}
+	for i, row := range b.rows {
+		v, ok, err := col.numericAt(row)
+		if err != nil {
+			return err
+		}
+		if ok {
+			fn(b.gids[i], v)
+		}
+	}
+	return nil
+}
+
+func foldTyped[T int64 | int32 | float64 | float32](a arrow.Array, vals []T, b *aggBatch, fn func(int32, float64)) {
+	if a.NullN() == 0 {
+		for i, row := range b.rows {
+			fn(b.gids[i], float64(vals[row]))
+		}
+		return
+	}
+	for i, row := range b.rows {
+		if !a.IsNull(row) {
+			fn(b.gids[i], float64(vals[row]))
+		}
+	}
+}
+
+// minMaxState: Min / Max as Float64, or as the source Timestamp type
+// (compared as int64, so nanosecond precision survives).
+type minMaxState struct {
+	isMin   bool
+	decided bool
+	ts      bool
+	ext     []float64
+	tsExt   []int64
+	seen    []bool
+}
+
+func (s *minMaxState) grow(n int) error {
+	s.ext = growTo(s.ext, n, 0)
+	s.tsExt = growTo(s.tsExt, n, 0)
+	s.seen = growTo(s.seen, n, false)
+	return nil
+}
+func (s *minMaxState) release() {}
+
+func (s *minMaxState) update(col Series, b *aggBatch) error {
+	if col.col == nil {
+		return nil
+	}
+	if !s.decided {
+		s.decided = true
+		_, s.ts = col.DataType().(*arrow.TimestampType)
+	}
+	if !s.ts {
+		// Same rule as minMaxAcc: the first value is taken as is, after
+		// that only a strictly smaller (larger) one replaces it, so a
+		// NaN never displaces a number.
+		return foldNumeric(col, b, func(g int32, v float64) {
+			switch {
+			case !s.seen[g]:
+				s.ext[g], s.seen[g] = v, true
+			case s.isMin && v < s.ext[g], !s.isMin && v > s.ext[g]:
+				s.ext[g] = v
+			}
+		})
+	}
+	for i, row := range b.rows {
+		v, null, err := timestampAt(col, row)
+		if err != nil {
+			return err
+		}
+		if null {
+			continue
+		}
+		g := b.gids[i]
+		switch {
+		case !s.seen[g]:
+			s.tsExt[g], s.seen[g] = int64(v), true
+		case s.isMin && int64(v) < s.tsExt[g], !s.isMin && int64(v) > s.tsExt[g]:
+			s.tsExt[g] = int64(v)
+		}
+	}
+	return nil
+}
+
+func (s *minMaxState) emit(pool memory.Allocator, dt arrow.DataType, peers []aggState, order []rowRef) (arrow.Array, error) {
+	ps := peersOf[*minMaxState](peers)
+	if tt, ok := dt.(*arrow.TimestampType); ok {
+		bld := array.NewTimestampBuilder(pool, tt)
+		defer bld.Release()
+		bld.Reserve(len(order))
+		for _, r := range order {
+			p := ps[r.t]
+			if !p.seen[r.g] {
+				bld.UnsafeAppendBoolToBitmap(false)
+				continue
+			}
+			bld.UnsafeAppend(arrow.Timestamp(p.tsExt[r.g]))
+		}
+		return bld.NewArray(), nil
+	}
+	bld := array.NewFloat64Builder(pool)
+	defer bld.Release()
+	bld.Reserve(len(order))
+	for _, r := range order {
+		p := ps[r.t]
+		if !p.seen[r.g] {
+			bld.UnsafeAppendBoolToBitmap(false)
+			continue
+		}
+		bld.UnsafeAppend(p.ext[r.g])
+	}
+	return bld.NewArray(), nil
+}
+
+// firstLastState: First / Last non-null value, in the source type.
+// Strings and binary are stored per group in an arena, and common
+// fixed-width types in a typed slice, so each value is copied once on
+// the way in and once on the way out. Other types (dictionaries,
+// decimals, nested, …) go through capture: one vectorized take per
+// batch of the rows to keep. Last overwrites, so its arena and capture
+// are compacted when stale values pile up.
+type firstLastState struct {
+	first   bool
+	decided bool
+	set     []bool     // per gid: has a value
+	nset    int        // groups with a value
+	vals    flValues   // typed storage, or nil to use capture
+	capt    *flCapture // fallback storage
+}
+
+func (s *firstLastState) grow(n int) error {
+	s.set = growTo(s.set, n, false)
+	if s.vals != nil {
+		s.vals.grow(n)
+	}
+	if s.capt != nil {
+		s.capt.grow(n, !s.first)
+	}
+	return nil
+}
+
+func (s *firstLastState) release() {
+	if s.capt != nil {
+		s.capt.cap.release()
+	}
+}
+
+func (s *firstLastState) update(col Series, b *aggBatch) error {
+	if col.col == nil {
+		return nil
+	}
+	if !s.decided {
+		s.decided = true
+		s.vals = newFLValues(col.DataType())
+		if s.vals == nil {
+			s.capt = &flCapture{}
+		}
+		if err := s.grow(len(s.set)); err != nil {
+			return err
+		}
+	}
+	if s.first && s.nset == len(s.set) {
+		return nil // every group has its first value
+	}
+	if s.capt != nil {
+		err := s.capt.update(col, b, s.first, s.set)
+		s.nset = countTrue(s.set)
+		return err
+	}
+	chunks := col.col.Data().Chunks()
+	if len(chunks) == 1 {
+		chunk := chunks[0]
+		noNulls := chunk.NullN() == 0
+		for i, row := range b.rows {
+			g := b.gids[i]
+			if s.first && s.set[g] {
+				continue
+			}
+			if !noNulls && chunk.IsNull(row) {
+				continue
+			}
+			s.vals.put(g, chunk, row)
+			if !s.set[g] {
+				s.set[g] = true
+				s.nset++
 			}
 		}
 	} else {
-		for _, ks := range e.order {
-			if err := emitGroup(e.groups[ks]); err != nil {
-				return nil, err
+		loc := chunkLocator{chunks: chunks, ends: chunkEnds(chunks)}
+		for i, row := range b.rows {
+			g := b.gids[i]
+			if s.first && s.set[g] {
+				continue
+			}
+			c, _ := slices.BinarySearch(loc.ends, row+1)
+			chunk, local := chunks[c], row-(loc.ends[c]-chunks[c].Len())
+			if chunk.IsNull(local) {
+				continue
+			}
+			s.vals.put(g, chunk, local)
+			if !s.set[g] {
+				s.set[g] = true
+				s.nset++
 			}
 		}
 	}
+	if !s.first {
+		s.vals.compact(s.set)
+	}
+	return nil
+}
 
-	// Materialize each builder as an arrow.Array and assemble a
-	// RecordBatch.
-	total := len(keyBuilders) + len(aggBuilders)
-	arrs := make([]arrow.Array, 0, total)
-	defer func() {
-		for _, a := range arrs {
-			a.Release()
+func (s *firstLastState) emit(pool memory.Allocator, dt arrow.DataType, peers []aggState, order []rowRef) (arrow.Array, error) {
+	ps := peersOf[*firstLastState](peers)
+	var proto *firstLastState // a peer that saw data, to pick the storage kind
+	for _, p := range ps {
+		if p.decided {
+			proto = p
+			break
 		}
-	}()
-	for _, b := range keyBuilders {
-		arrs = append(arrs, b.NewArray())
 	}
-	for _, b := range aggBuilders {
-		arrs = append(arrs, b.NewArray())
+	if proto == nil {
+		return array.MakeArrayOfNull(pool, dt, len(order)), nil
 	}
-	nRows := int64(len(e.order))
-	if e.keyMode == keyModeInt641 {
-		nRows = int64(len(e.orderInt64))
+	if proto.capt != nil {
+		caps := make([]*valueCapture, len(ps))
+		for i, p := range ps {
+			if p.capt == nil {
+				p.capt = &flCapture{} // never updated: no values
+			}
+			caps[i] = &p.capt.cap
+		}
+		return takeCaptures(pool, dt, caps, order, func(r rowRef) int32 {
+			p := ps[r.t].capt
+			if int(r.g) >= len(p.slot) {
+				return -1
+			}
+			return p.slot[r.g]
+		})
 	}
-	// array.NewRecordBatch retains each array; we defer-Release ours.
-	return array.NewRecordBatch(e.outSchema, arrs, nRows), nil
+	if _, ok := proto.vals.(*flBytes); ok {
+		return buildBytesArray(pool, dt, len(order), func(i int) (string, bool) {
+			r := order[i]
+			p := ps[r.t]
+			if int(r.g) >= len(p.set) || !p.set[r.g] {
+				return "", false
+			}
+			return p.vals.(*flBytes).vals[r.g], true
+		})
+	}
+	bld, err := builderForType(pool, dt)
+	if err != nil {
+		return nil, err
+	}
+	defer bld.Release()
+	vs := make([]flValues, len(ps))
+	for i, p := range ps {
+		vs[i] = p.vals
+	}
+	if err := proto.vals.emit(bld, vs, ps, order); err != nil {
+		return nil, err
+	}
+	return bld.NewArray(), nil
+}
+
+func countTrue(bs []bool) int {
+	n := 0
+	for _, b := range bs {
+		if b {
+			n++
+		}
+	}
+	return n
+}
+
+func chunkEnds(chunks []arrow.Array) []int {
+	ends := make([]int, len(chunks))
+	total := 0
+	for i, c := range chunks {
+		total += c.Len()
+		ends[i] = total
+	}
+	return ends
+}
+
+// flValues is firstLastState's typed per-group storage.
+type flValues interface {
+	grow(n int)
+	// put stores chunk[i] (non-null) as group g's value.
+	put(g int32, chunk arrow.Array, i int)
+	// compact reclaims storage overwritten values left behind.
+	compact(set []bool)
+	// emit appends every group in order, nulls where unset; peers are
+	// the same aggregation's storage in every table.
+	emit(bld array.Builder, peers []flValues, states []*firstLastState, order []rowRef) error
+}
+
+// newFLValues returns typed storage for dt, or nil when dt needs the
+// take-based capture.
+func newFLValues(dt arrow.DataType) flValues {
+	switch dt.ID() {
+	case arrow.STRING, arrow.LARGE_STRING, arrow.BINARY, arrow.LARGE_BINARY:
+		return &flBytes{}
+	case arrow.INT64:
+		return &flFixed[int64]{}
+	case arrow.INT32:
+		return &flFixed[int32]{}
+	case arrow.INT16:
+		return &flFixed[int16]{}
+	case arrow.INT8:
+		return &flFixed[int8]{}
+	case arrow.UINT64:
+		return &flFixed[uint64]{}
+	case arrow.UINT32:
+		return &flFixed[uint32]{}
+	case arrow.UINT16:
+		return &flFixed[uint16]{}
+	case arrow.UINT8:
+		return &flFixed[uint8]{}
+	case arrow.FLOAT64:
+		return &flFixed[float64]{}
+	case arrow.FLOAT32:
+		return &flFixed[float32]{}
+	case arrow.BOOL:
+		return &flFixed[bool]{}
+	case arrow.TIMESTAMP:
+		return &flFixed[arrow.Timestamp]{}
+	case arrow.DATE32:
+		return &flFixed[arrow.Date32]{}
+	case arrow.DATE64:
+		return &flFixed[arrow.Date64]{}
+	}
+	return nil
+}
+
+// flBytes stores string / binary values in an arena.
+type flBytes struct {
+	vals  []string
+	arena strArena
+	used  int // arena bytes handed out
+	live  int // bytes of the current values
+}
+
+func (v *flBytes) grow(n int) { v.vals = growTo(v.vals, n, "") }
+
+func (v *flBytes) put(g int32, chunk arrow.Array, i int) {
+	var s string
+	switch a := chunk.(type) {
+	case *array.String:
+		s = a.Value(i)
+	case *array.LargeString:
+		s = a.Value(i)
+	case *array.Binary:
+		s = unsafe.String(unsafe.SliceData(a.Value(i)), len(a.Value(i)))
+	case *array.LargeBinary:
+		s = unsafe.String(unsafe.SliceData(a.Value(i)), len(a.Value(i)))
+	}
+	v.live += len(s) - len(v.vals[g])
+	v.used += len(s)
+	v.vals[g] = v.arena.string(s)
+}
+
+func (v *flBytes) compact(set []bool) {
+	if v.used < 2*v.live+strArenaBlock {
+		return
+	}
+	var fresh strArena
+	for g, ok := range set {
+		if ok {
+			v.vals[g] = fresh.string(v.vals[g])
+		}
+	}
+	v.arena, v.used = fresh, v.live
+}
+
+func (v *flBytes) emit(bld array.Builder, peers []flValues, states []*firstLastState, order []rowRef) error {
+	return errBytesEmit // flBytes is emitted by firstLastState.emit
+}
+
+var errBytesEmit = errors.New("gobi: internal: flBytes emits through buildBytesArray")
+
+// flFixed stores fixed-width values in a typed slice.
+type flFixed[T any] struct {
+	vals []T
+}
+
+func (v *flFixed[T]) grow(n int) {
+	var zero T
+	v.vals = growTo(v.vals, n, zero)
+}
+
+func (v *flFixed[T]) put(g int32, chunk arrow.Array, i int) {
+	v.vals[g] = chunk.(interface{ Value(int) T }).Value(i)
+}
+
+func (v *flFixed[T]) compact([]bool) {}
+
+func (v *flFixed[T]) emit(bld array.Builder, peers []flValues, states []*firstLastState, order []rowRef) error {
+	b, ok := bld.(interface {
+		Append(T)
+		AppendNull()
+		Reserve(int)
+	})
+	if !ok {
+		return fmt.Errorf("value %T into %T", *new(T), bld)
+	}
+	b.Reserve(len(order))
+	for _, r := range order {
+		if !states[r.t].set[r.g] {
+			b.AppendNull()
+			continue
+		}
+		b.Append(peers[r.t].(*flFixed[T]).vals[r.g])
+	}
+	return nil
+}
+
+// flCapture is the take-based storage for types without typed
+// storage: per batch, one take of the rows to keep.
+type flCapture struct {
+	slot   []int32 // per gid: capture slot, -1 = none
+	cap    valueCapture
+	dt     arrow.DataType
+	pick   []int   // scratch: rows to capture this batch
+	pickG  []int32 // scratch: their groups
+	lastAt []int32 // scratch (Last): per gid, index into pick, -1 = none
+}
+
+func (c *flCapture) grow(n int, last bool) {
+	c.slot = growTo(c.slot, n, -1)
+	if last {
+		c.lastAt = growTo(c.lastAt, n, -1)
+	}
+}
+
+func (c *flCapture) update(col Series, b *aggBatch, first bool, set []bool) error {
+	c.dt = col.DataType()
+	cur := newChunkCursor(col)
+	c.pick, c.pickG = c.pick[:0], c.pickG[:0]
+	for i, row := range b.rows {
+		g := b.gids[i]
+		if first && (set[g] || c.slot[g] == -2) {
+			continue // captured, or picked earlier in this batch
+		}
+		null, err := cur.isNull(row)
+		if err != nil {
+			return err
+		}
+		if null {
+			continue
+		}
+		switch {
+		case first:
+			c.slot[g] = -2
+			c.pick = append(c.pick, row)
+			c.pickG = append(c.pickG, g)
+		case c.lastAt[g] < 0:
+			c.lastAt[g] = int32(len(c.pick))
+			c.pick = append(c.pick, row)
+			c.pickG = append(c.pickG, g)
+		default:
+			c.pick[c.lastAt[g]] = row
+		}
+	}
+	base, err := c.cap.capture(col, c.pick)
+	if err != nil {
+		return err
+	}
+	for j, g := range c.pickG {
+		c.slot[g] = int32(base + j)
+		set[g] = true
+		if !first {
+			c.lastAt[g] = -1
+		}
+	}
+	if !first && c.cap.n > 2*len(c.slot)+1024 {
+		return c.cap.compact(c.dt, c.slot)
+	}
+	return nil
+}
+
+// accState runs one per-group aggAccumulator per group, for the kinds
+// without a columnar state (and custom IncrementalAggregators).
+type accState struct {
+	agg  Aggregation
+	accs []aggAccumulator
+}
+
+func (s *accState) grow(n int) error {
+	for len(s.accs) < n {
+		acc, err := newAccumulator(s.agg)
+		if err != nil {
+			return err
+		}
+		s.accs = append(s.accs, acc)
+	}
+	return nil
+}
+func (s *accState) release() {}
+
+func (s *accState) update(col Series, b *aggBatch) error {
+	b.byGroup()
+	for _, g := range b.touched {
+		if err := s.accs[g].Update(col, b.groupRows(g)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *accState) emit(pool memory.Allocator, dt arrow.DataType, peers []aggState, order []rowRef) (arrow.Array, error) {
+	ps := peersOf[*accState](peers)
+	bld, err := builderForType(pool, dt)
+	if err != nil {
+		return nil, err
+	}
+	defer bld.Release()
+	for _, r := range order {
+		if err := appendCustomValue(bld, ps[r.t].accs[r.g].Finalize()); err != nil {
+			return nil, err
+		}
+	}
+	return bld.NewArray(), nil
+}
+
+// peersOf asserts every table's state for one aggregation to its
+// concrete type (all tables build the same kind).
+func peersOf[T aggState](peers []aggState) []T {
+	out := make([]T, len(peers))
+	for i, p := range peers {
+		out[i] = p.(T)
+	}
+	return out
 }
 
 // readScalarAt extracts a Go-typed scalar from a Series at row. For
@@ -914,10 +2054,12 @@ func readScalarAt(s Series, row int) (any, error) {
 }
 
 // -----------------------------------------------------------------------------
-// Built-in accumulators
+// Per-group accumulators
 //
-// Deliberately match the eager Agg's output types + null semantics so
-// the two engines produce byte-identical output on the same input:
+// One object per group per aggregation. The streaming GroupBy uses
+// them (through accState) only for the kinds without a columnar state
+// — Std / Var / NUnique / Median / Mode / bitwise / custom — and Over
+// uses them for every kind. Over's sums stay Float64:
 //
 //   Count → Int64, non-null (0 for empty group counts non-null cols)
 //   Sum   → Float64, null on empty group

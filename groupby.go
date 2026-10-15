@@ -1,8 +1,10 @@
 package gobi
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"sort"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -15,6 +17,11 @@ type AggKind uint8
 
 const (
 	AggCount AggKind = iota
+	// AggSum: sum of the group's non-null values, null for an empty
+	// group. A grouped sum of an integer column (GroupBy, LazyFrame
+	// GroupBy, ResampleEvery) is Int64 — Uint64 for unsigned columns —
+	// and fails with ErrSumOverflow past that range. Other columns, and
+	// Over / rolling sums, are Float64.
 	AggSum
 	AggMean
 	AggMin
@@ -357,8 +364,14 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 				continue
 			}
 		}
-		if _, err := g.frame.Column(a.Column); err != nil {
+		src, err := g.frame.Column(a.Column)
+		if err != nil {
 			return nil, err
+		}
+		if t := intSumType(src.DataType()); a.Kind == AggSum && t != nil {
+			aggBuilders[i], _ = builderForType(pool, t)
+			aggFields[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: true}
+			continue
 		}
 		aggBuilders[i] = array.NewFloat64Builder(pool)
 		aggFields[i] = arrow.Field{
@@ -1001,6 +1014,19 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 		b.(*array.Int64Builder).Append(n)
 		return nil
 	}
+	if agg.Kind == AggSum {
+		if _, ok := b.(*array.Float64Builder); !ok {
+			s, err := g.frame.Column(agg.Column)
+			if err != nil {
+				return err
+			}
+			sum, err := sumIntRows(s, rows)
+			if err != nil {
+				return fmt.Errorf("gobi: aggregation %s: %w", aggName(agg), err)
+			}
+			return appendIntSum(b, sum)
+		}
+	}
 	// Median: buffer non-null numeric values, sort, emit the middle
 	// (or the average of the two middle values on even sizes).
 	// Output is Float64.
@@ -1303,4 +1329,112 @@ func timestampAt(s Series, i int) (arrow.Timestamp, bool, error) {
 		offset += chunk.Len()
 	}
 	return 0, false, fmt.Errorf("%w: index %d unreachable", ErrRowOutOfRange, i)
+}
+
+// ErrSumOverflow is returned when a grouped integer sum doesn't fit
+// its Int64 (or Uint64) output column.
+var ErrSumOverflow = errors.New("gobi: integer sum overflows")
+
+// intSumType is AggSum's output type for an integer source column:
+// Int64 for signed widths, Uint64 for unsigned, as in Polars and SQL.
+// nil for any other source, whose sum stays Float64.
+func intSumType(src arrow.DataType) arrow.DataType {
+	if src == nil {
+		return nil
+	}
+	switch src.ID() {
+	case arrow.INT8, arrow.INT16, arrow.INT32, arrow.INT64:
+		return arrow.PrimitiveTypes.Int64
+	case arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64:
+		return arrow.PrimitiveTypes.Uint64
+	}
+	return nil
+}
+
+// intSum is an overflow-checked integer sum: i for signed sources, u
+// for unsigned; n counts the values added (0 → null output).
+type intSum struct {
+	i int64
+	u uint64
+	n int64
+}
+
+func (s *intSum) addI(v int64) error {
+	r := s.i + v
+	if (v > 0 && r < s.i) || (v < 0 && r > s.i) {
+		return ErrSumOverflow
+	}
+	s.i = r
+	s.n++
+	return nil
+}
+
+func (s *intSum) addU(v uint64) error {
+	r, carry := bits.Add64(s.u, v, 0)
+	if carry != 0 {
+		return ErrSumOverflow
+	}
+	s.u = r
+	s.n++
+	return nil
+}
+
+// add adds the integer cell arr[i] (non-null).
+func (s *intSum) add(arr arrow.Array, i int) error {
+	switch a := arr.(type) {
+	case *array.Int64:
+		return s.addI(a.Value(i))
+	case *array.Int32:
+		return s.addI(int64(a.Value(i)))
+	case *array.Int16:
+		return s.addI(int64(a.Value(i)))
+	case *array.Int8:
+		return s.addI(int64(a.Value(i)))
+	case *array.Uint64:
+		return s.addU(a.Value(i))
+	case *array.Uint32:
+		return s.addU(uint64(a.Value(i)))
+	case *array.Uint16:
+		return s.addU(uint64(a.Value(i)))
+	case *array.Uint8:
+		return s.addU(uint64(a.Value(i)))
+	}
+	return fmt.Errorf("%w: integer sum over %s", ErrColumnTypeMismatch, arr.DataType())
+}
+
+// sumIntRows sums the non-null integer cells of s at rows.
+func sumIntRows(s Series, rows []int) (intSum, error) {
+	var sum intSum
+	cur := newChunkCursor(s)
+	for _, row := range rows {
+		chunk, local, err := cur.locate(row)
+		if err != nil {
+			return sum, err
+		}
+		if chunk.IsNull(local) {
+			continue
+		}
+		if err := sum.add(chunk, local); err != nil {
+			return sum, err
+		}
+	}
+	return sum, nil
+}
+
+// appendIntSum appends sum to an Int64 or Uint64 builder, null when no
+// value was added.
+func appendIntSum(b array.Builder, sum intSum) error {
+	if sum.n == 0 {
+		b.AppendNull()
+		return nil
+	}
+	switch tb := b.(type) {
+	case *array.Int64Builder:
+		tb.Append(sum.i)
+	case *array.Uint64Builder:
+		tb.Append(sum.u)
+	default:
+		return fmt.Errorf("integer sum into %T", b)
+	}
+	return nil
 }

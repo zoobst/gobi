@@ -582,7 +582,7 @@ func TestGroupBy_AggCustom_MixedWithBuiltIn(t *testing.T) {
 	if names[1] != "v_sum" || names[2] != "tag_ndv" {
 		t.Fatalf("col names = %v", names)
 	}
-	sums := mustCol(t, out, "v_sum").Column().Data().Chunks()[0].(*array.Float64)
+	sums := mustCol(t, out, "v_sum").Column().Data().Chunks()[0].(*array.Int64)
 	if sums.Value(0) != 4 { // 1+1+2
 		t.Errorf("A sum = %v, want 4", sums.Value(0))
 	}
@@ -1094,7 +1094,7 @@ func TestFilteredAgg_SumOnMatchingRows(t *testing.T) {
 	regions, _ := out.Column("region")
 	rArr := regions.col.Data().Chunks()[0].(*array.String)
 	sums, _ := out.Column("seg_count")
-	sArr := sums.col.Data().Chunks()[0].(*array.Float64)
+	sArr := sums.col.Data().Chunks()[0].(*array.Int64)
 	if rArr.Value(0) != "EU" || sArr.Value(0) != 3 {
 		t.Fatalf("EU seg_count = %v, want 3", sArr.Value(0))
 	}
@@ -1158,8 +1158,8 @@ func TestFilteredAgg_MultipleIndependentFilters(t *testing.T) {
 	}
 	// EU: seg_sum=3, ping_sum=20+30=50
 	// NA: seg_sum=1+2=3, ping_sum=10
-	segArr := out.series[1].col.Data().Chunks()[0].(*array.Float64)
-	pingArr := out.series[2].col.Data().Chunks()[0].(*array.Float64)
+	segArr := out.series[1].col.Data().Chunks()[0].(*array.Int64)
+	pingArr := out.series[2].col.Data().Chunks()[0].(*array.Int64)
 	if segArr.Value(0) != 3 || pingArr.Value(0) != 50 {
 		t.Fatalf("EU: seg=%v ping=%v, want (3, 50)", segArr.Value(0), pingArr.Value(0))
 	}
@@ -1182,7 +1182,7 @@ func TestFilteredAgg_NullFilterTreatedAsFalse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sumArr := out.series[1].col.Data().Chunks()[0].(*array.Float64)
+	sumArr := out.series[1].col.Data().Chunks()[0].(*array.Int64)
 	// EU non-null provider rows: 3 (seg vodafone) + 20 (ping orange) = 23
 	// NA non-null provider rows: 1 + 2 + 10 = 13
 	if sumArr.Value(0) != 23 {

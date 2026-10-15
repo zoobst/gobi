@@ -3,10 +3,6 @@ package gobi
 import (
 	"context"
 	"io"
-	"maps"
-	"slices"
-	"sort"
-	"strings"
 	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -39,10 +35,10 @@ type partitionMsg struct {
 //	computes composite key + hash for each row, partitions rows into
 //	e.workers buckets by hash mod N, and dispatches (batch, rows,
 //	keys) messages to the workers that own rows. Each worker keeps
-//	its own map[string]*aggGroup. Because rows are partitioned by
-//	hash of the same key encoding used to index the map, no key ever
-//	lands in more than one worker's map — the final merge is a
-//	simple union with no value-level combine step.
+//	its own groupTable. Because rows are partitioned by hash of the
+//	same key encoding the tables index on, no key ever lands in more
+//	than one worker's table — buildResultBatch combines them with no
+//	value-level combine step.
 //
 // Retain/release: the reader is the batch's owner. For each fan-out
 // to K recipients, the reader Retains the batch (K-1) additional
@@ -80,66 +76,45 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 		})
 	}
 
-	// Per-worker output — one flavor is populated per invocation
-	// depending on keyMode. String maps for String1 + Composite,
-	// int64 maps for Int641. The other stays nil so the merge step
-	// can skip empty branches without extra bookkeeping.
-	workerGroups := make([]map[string]*aggGroup, workers)
-	workerOrder := make([][]string, workers)
-	workerGroupsInt := make([]map[int64]*aggGroup, workers)
-	workerOrderInt := make([][]int64, workers)
+	// One group table per worker; buildResultBatch combines them.
+	tables := make([]*groupTable, workers)
+	for i := range tables {
+		t, err := newGroupTable(e.keyMode, e.keys, e.aggs)
+		if err != nil {
+			for _, t := range tables[:i] {
+				t.release()
+			}
+			return err
+		}
+		tables[i] = t
+	}
+	e.tables = tables
 
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for i := range workers {
 		go func() {
 			defer wg.Done()
-			var groups map[string]*aggGroup
-			var order []string
-			var groupsInt map[int64]*aggGroup
-			var orderInt []int64
-			if e.keyMode == keyModeInt641 {
-				groupsInt = make(map[int64]*aggGroup)
-			} else {
-				groups = make(map[string]*aggGroup)
-			}
-			// Worker-local scratch for composite key encoding.
-			// Reused across every row this worker consumes so key
-			// computation is zero-alloc except at first-touch inserts.
-			var scratch []byte
-			// touched carries the per-batch list of groups that had at
-			// least one row in the current batch — populated by
-			// workerConsume, drained by workerConsume's Update loop,
-			// then reused (as touched[:0]) on the next call. Same
-			// reuse pattern as scratch. Replaces the pre-v0.3.9
-			// `buckets map[*aggGroup][]int` that added a second map
-			// lookup per row on the hot path.
-			var touched []*aggGroup
 			for msg := range inboxes[i] {
 				// If the pipeline was cancelled we still need to drain
 				// remaining messages to unblock the reader; skip work.
 				if wctx.Err() == nil {
-					if err := workerConsume(msg, e.keys, e.aggs, e.keyMode, groups, &order, groupsInt, &orderInt, &scratch, &touched); err != nil {
+					if err := tables[i].consume(msg.batch, *msg.rows); err != nil {
 						setErr(err)
 					}
 				}
 				msg.batch.Release()
-				// Return the *[]int payload to the dispatcher's
-				// pool. Truncating to zero length preserves the
-				// capacity so the next dispatchBatch that pulls this
-				// pointer can append into it without a fresh
-				// allocation. Safe regardless of ctx cancellation
-				// (the slice is no longer aliased anywhere). The
-				// same pointer flows Get → dispatch → channel →
-				// here → Put, so no header allocation on Put —
+				// Return the *[]int payload to the dispatcher's pool,
+				// truncated so the next dispatchBatch reuses its
+				// capacity. The same pointer flows Get → dispatch →
+				// channel → here → Put, so Put allocates no header —
 				// see rowsPool docs.
 				*msg.rows = (*msg.rows)[:0]
 				e.rowsPool.Put(msg.rows)
 			}
-			workerGroups[i] = groups
-			workerOrder[i] = order
-			workerGroupsInt[i] = groupsInt
-			workerOrderInt[i] = orderInt
+			if wctx.Err() == nil {
+				tables[i].finish(e.unordered)
+			}
 		}()
 	}
 
@@ -178,39 +153,7 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 
 	wg.Wait()
 
-	if firstErr != nil {
-		return firstErr
-	}
-
-	// Merge: keys are disjoint across workers (hash-partitioned), so
-	// union then sort. Only the container flavor matching keyMode
-	// has entries; the other stays untouched.
-	if e.keyMode == keyModeInt641 {
-		total := 0
-		for _, o := range workerOrderInt {
-			total += len(o)
-		}
-		e.groupsInt64 = make(map[int64]*aggGroup, total)
-		e.orderInt64 = make([]int64, 0, total)
-		for i := range workerGroupsInt {
-			maps.Copy(e.groupsInt64, workerGroupsInt[i])
-			e.orderInt64 = append(e.orderInt64, workerOrderInt[i]...)
-		}
-		slices.Sort(e.orderInt64)
-		return nil
-	}
-	total := 0
-	for _, o := range workerOrder {
-		total += len(o)
-	}
-	e.groups = make(map[string]*aggGroup, total)
-	e.order = make([]string, 0, total)
-	for i := range workerGroups {
-		maps.Copy(e.groups, workerGroups[i])
-		e.order = append(e.order, workerOrder[i]...)
-	}
-	sort.Strings(e.order)
-	return nil
+	return firstErr
 }
 
 // dispatchBatch partitions one batch's rows across worker inboxes by
@@ -343,165 +286,6 @@ func (e *streamingAggregateExec) dispatchBatch(ctx context.Context, batch arrow.
 			return ctx.Err()
 		}
 	}
-	return nil
-}
-
-// workerConsume is the per-worker equivalent of consumeBatch: given
-// a row slice assigned by the reader's hash partitioning, updates
-// this worker's own groups map. Recomputes composite keys off the
-// batch via the worker-local scratch buffer — nothing key-shaped
-// crosses the channel from the reader.
-//
-// Same allocation profile as the serial consumeBatch: one
-// string-copy per NEW group at first-touch, zero allocations per
-// row on the probe path (compiler recognizes map[string(scratch)]).
-func workerConsume(
-	msg partitionMsg,
-	keys []string,
-	aggs []Aggregation,
-	mode keyMode,
-	// Container pair for string-keyed modes (String1 + Composite):
-	groups map[string]*aggGroup,
-	order *[]string,
-	// Container pair for int-keyed mode (Int641):
-	groupsInt map[int64]*aggGroup,
-	orderInt *[]int64,
-	scratch *[]byte,
-	touchedPtr *[]*aggGroup,
-) error {
-	frame, err := batchToFrame(msg.batch)
-	if err != nil {
-		return err
-	}
-	keySeries := make([]Series, len(keys))
-	for i, k := range keys {
-		s, err := frame.Column(k)
-		if err != nil {
-			return err
-		}
-		keySeries[i] = s
-	}
-	aggCols := make([]Series, len(aggs))
-	for i, a := range aggs {
-		if a.Column == "" {
-			continue
-		}
-		s, err := frame.Column(a.Column)
-		if err != nil {
-			return err
-		}
-		aggCols[i] = s
-	}
-
-	// Route rows to their group's per-batch scratch (g.batchRows) as
-	// we walk the key column. Tracking touched groups in a slice
-	// rather than a `map[*aggGroup][]int` bucket saves one map
-	// lookup per row — which showed up as ~9% of the CPU profile
-	// on 1BRC before this change. See aggGroup docs for the
-	// batchRows / touched invariants.
-	//
-	// msg.rows is `*[]int` (pool-managed pointer identity across
-	// batches — see partitionMsg + rowsPool docs). Deref once here
-	// for the switch branches to range over a plain slice.
-	rows := *msg.rows
-	touched := (*touchedPtr)[:0]
-	switch mode {
-	case keyModeString1:
-		strArr, err := resolveStringArray(keySeries[0])
-		if err != nil {
-			return err
-		}
-		for _, row := range rows {
-			s := strArr.value(row)
-			g, ok := groups[s]
-			if !ok {
-				ks := strings.Clone(s)
-				g, err = newAggGroupString1(ks, aggs)
-				if err != nil {
-					return err
-				}
-				groups[ks] = g
-				*order = append(*order, ks)
-			}
-			if !g.touched {
-				g.touched = true
-				g.batchRows = g.batchRows[:0]
-				touched = append(touched, g)
-			}
-			g.batchRows = append(g.batchRows, row)
-		}
-	case keyModeInt641:
-		intArr, err := resolveIntArray(keySeries[0])
-		if err != nil {
-			return err
-		}
-		for _, row := range rows {
-			k, ok := intArr.value(row)
-			if !ok {
-				// dispatchBatch also skips null-keyed rows, but a
-				// second guard here is cheap defense in depth.
-				continue
-			}
-			g, ok := groupsInt[k]
-			if !ok {
-				g, err = newAggGroup(keySeries, row, aggs)
-				if err != nil {
-					return err
-				}
-				groupsInt[k] = g
-				*orderInt = append(*orderInt, k)
-			}
-			if !g.touched {
-				g.touched = true
-				g.batchRows = g.batchRows[:0]
-				touched = append(touched, g)
-			}
-			g.batchRows = append(g.batchRows, row)
-		}
-	default:
-		for _, row := range rows {
-			buf, err := composeCompositeKeyInto((*scratch)[:0], keySeries, row)
-			if err != nil {
-				return err
-			}
-			*scratch = buf
-			g, ok := groups[string(buf)]
-			if !ok {
-				g, err = newAggGroup(keySeries, row, aggs)
-				if err != nil {
-					return err
-				}
-				ks := string(buf)
-				groups[ks] = g
-				*order = append(*order, ks)
-			}
-			if !g.touched {
-				g.touched = true
-				g.batchRows = g.batchRows[:0]
-				touched = append(touched, g)
-			}
-			g.batchRows = append(g.batchRows, row)
-		}
-	}
-
-	// Update each touched group's accumulators, then reset its
-	// per-batch state ready for the next batch. batchRows keeps
-	// its capacity — steady-state cost is one append per row.
-	for _, g := range touched {
-		for i, a := range aggs {
-			if a.Column == "" {
-				if err := g.accs[i].Update(Series{}, g.batchRows); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := g.accs[i].Update(aggCols[i], g.batchRows); err != nil {
-				return err
-			}
-		}
-		g.touched = false
-	}
-	*touchedPtr = touched[:0]
 	return nil
 }
 

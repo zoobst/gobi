@@ -112,10 +112,10 @@ func TestGroupByAligned_MatchesSlowPath(t *testing.T) {
 	// row indices should match 1:1.
 	slowRegion := slow.series[0].col.Data().Chunks()[0].(*array.String)
 	slowID := slow.series[1].col.Data().Chunks()[0].(*array.String)
-	slowSum := slow.series[2].col.Data().Chunks()[0].(*array.Float64)
+	slowSum := slow.series[2].col.Data().Chunks()[0].(*array.Int64)
 	fastRegion := fast.series[0].col.Data().Chunks()[0].(*array.String)
 	fastID := fast.series[1].col.Data().Chunks()[0].(*array.String)
-	fastSum := fast.series[2].col.Data().Chunks()[0].(*array.Float64)
+	fastSum := fast.series[2].col.Data().Chunks()[0].(*array.Int64)
 
 	for i := 0; i < slow.NumRows(); i++ {
 		if slowRegion.Value(i) != fastRegion.Value(i) || slowID.Value(i) != fastID.Value(i) {

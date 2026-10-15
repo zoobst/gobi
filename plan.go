@@ -296,6 +296,16 @@ type aggregateNode struct {
 	keys      []string
 	aggs      []Aggregation
 	outSchema *arrow.Schema
+	// unordered: output rows needn't be sorted by key
+	// (LazyGroupBy.Unordered).
+	unordered bool
+}
+
+// withInput rebuilds n over a new input, keeping its options.
+func (n *aggregateNode) withInput(input LogicalPlan) *aggregateNode {
+	out := newAggregateNode(input, n.keys, n.aggs)
+	out.unordered = n.unordered
+	return out
 }
 
 func newAggregateNode(input LogicalPlan, keys []string, aggs []Aggregation) *aggregateNode {
@@ -316,6 +326,7 @@ func newAggregateNode(input LogicalPlan, keys []string, aggs []Aggregation) *agg
 	}
 
 	// Agg output columns. Count / NUnique → Int64 non-null;
+	// Sum of an integer column → Int64 (Uint64 when unsigned);
 	// First / Last / Mode / BitOr / BitAnd / BitXor preserve the
 	// source column's arrow type;
 	// Min / Max preserve source type when the source is Timestamp
@@ -324,6 +335,13 @@ func newAggregateNode(input LogicalPlan, keys []string, aggs []Aggregation) *agg
 	// else → Float64.
 	for _, a := range aggs {
 		t := aggOutputType(a)
+		if a.Fn == nil && a.Kind == AggSum {
+			if fm, ok := inSchema.FieldsByName(a.Column); ok && len(fm) > 0 {
+				if it := intSumType(fm[0].Type); it != nil {
+					t = it
+				}
+			}
+		}
 		if a.Fn == nil && a.Kind.preservesSourceType() {
 			if fm, ok := inSchema.FieldsByName(a.Column); ok && len(fm) > 0 {
 				t = fm[0].Type
@@ -395,8 +413,12 @@ func (n *aggregateNode) String() string {
 	for i, a := range n.aggs {
 		aggParts[i] = aggName(a)
 	}
-	return fmt.Sprintf("Aggregate(keys=[%s], aggs=[%s])",
-		strings.Join(n.keys, ", "), strings.Join(aggParts, ", "))
+	order := ""
+	if n.unordered {
+		order = ", unordered"
+	}
+	return fmt.Sprintf("Aggregate(keys=[%s], aggs=[%s]%s)",
+		strings.Join(n.keys, ", "), strings.Join(aggParts, ", "), order)
 }
 
 // aggOutputType picks the arrow type Aggregate will produce for one

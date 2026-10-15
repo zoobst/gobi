@@ -198,6 +198,7 @@ func takeArrayFast(pool memory.Allocator, chunk arrow.Array, indexes []int) (arr
 	case *array.String:
 		b := array.NewStringBuilder(pool)
 		defer b.Release()
+		reserveValues(b.BinaryBuilder, a, indexes)
 		if a.NullN() == 0 {
 			for _, idx := range indexes {
 				b.Append(a.Value(idx))
@@ -215,6 +216,7 @@ func takeArrayFast(pool memory.Allocator, chunk arrow.Array, indexes []int) (arr
 	case *array.Binary:
 		b := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
 		defer b.Release()
+		reserveValues(b, a, indexes)
 		if a.NullN() == 0 {
 			for _, idx := range indexes {
 				b.Append(a.Value(idx))
@@ -501,6 +503,7 @@ func takeArraySlow(pool memory.Allocator, s Series, indexes []int) (arrow.Array,
 	case arrow.STRING:
 		b := array.NewStringBuilder(pool)
 		defer b.Release()
+		loc.reserveValues(b.BinaryBuilder, indexes)
 		for _, idx := range indexes {
 			if err := loc.append(idx, b); err != nil {
 				return nil, err
@@ -510,6 +513,7 @@ func takeArraySlow(pool memory.Allocator, s Series, indexes []int) (arrow.Array,
 	case arrow.BINARY:
 		b := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
 		defer b.Release()
+		loc.reserveValues(b, indexes)
 		for _, idx := range indexes {
 			if err := loc.append(idx, b); err != nil {
 				return nil, err
@@ -608,6 +612,49 @@ func newChunkLocator(s Series) chunkLocator {
 		ends[i] = total
 	}
 	return chunkLocator{chunks: chunks, ends: ends}
+}
+
+// reserveValues sizes b for the rows at indexes (negative indexes are
+// nulls) so appending them doesn't regrow the value buffer.
+func (l chunkLocator) reserveValues(b *array.BinaryBuilder, indexes []int) {
+	if len(l.chunks) == 1 {
+		reserveValues(b, l.chunks[0], indexes)
+		return
+	}
+	n := 0
+	for _, idx := range indexes {
+		if idx < 0 {
+			continue
+		}
+		c, _ := slices.BinarySearch(l.ends, idx+1)
+		if c < len(l.chunks) {
+			n += valueLen(l.chunks[c], idx-(l.ends[c]-l.chunks[c].Len()))
+		}
+	}
+	b.Reserve(len(indexes))
+	b.ReserveData(n)
+}
+
+// reserveValues is chunkLocator.reserveValues for one chunk.
+func reserveValues(b *array.BinaryBuilder, chunk arrow.Array, indexes []int) {
+	n := 0
+	for _, idx := range indexes {
+		if idx >= 0 && idx < chunk.Len() {
+			n += valueLen(chunk, idx)
+		}
+	}
+	b.Reserve(len(indexes))
+	b.ReserveData(n)
+}
+
+func valueLen(chunk arrow.Array, i int) int {
+	switch a := chunk.(type) {
+	case *array.String:
+		return a.ValueLen(i)
+	case *array.Binary:
+		return a.ValueLen(i)
+	}
+	return 0
 }
 
 // append appends row idx to b.

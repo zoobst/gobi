@@ -494,7 +494,9 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 		tsB.Append(arrow.Timestamp(bucketStart))
 		rows := buckets[bucketStart]
 		for i, a := range aggs {
-			appendFastAgg(aggBs[i], a, aggViews[i], rows)
+			if err := appendFastAgg(aggBs[i], a, aggViews[i], rows); err != nil {
+				return nil, err
+			}
 		}
 	}
 

@@ -5,6 +5,80 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.5.0]
+
+### Changed (breaking)
+
+- **Grouped sums of integer columns are Int64, or Uint64 for unsigned
+  columns.** This follows Polars and SQL. Before, `AggSum` always
+  produced Float64, which is exact only below 2^53. Narrow widths
+  widen: an Int8 column holding 100, 100, 100, 100 sums to 400.
+  - **Where:** `GroupBy.Agg`, `LazyFrame.GroupBy(...).Agg` (plan
+    schema and result), `ResampleEvery(...).Agg`, and `Pivot` cells
+    with `AggSum`.
+  - **Unchanged:** `Series.Sum` (float64), `Mean`, sums of float
+    columns, `Expr.Sum()` / `.Over(...)`, and rolling sums, all
+    Float64.
+  - **Overflow:** a sum past the output type's range now fails with the
+    new `ErrSumOverflow` instead of wrapping.
+  - **Migrating:** code that reads an integer sum column as
+    `*array.Float64`, or decodes it into a `float64` struct field, has
+    to switch to `*array.Int64` / `int64` (`*array.Uint64` / `uint64`
+    for unsigned sources).
+
+### Added
+
+- **`LazyGroupBy.Unordered()`** lets a lazy `GroupBy` return its rows
+  in any order instead of sorted by key. That skips sorting the
+  groups, which dominates when there are many of them. Use it when
+  the caller sorts or indexes the result itself. Values and schema are
+  the same as the sorted form. The order is unspecified, and
+  `Explain` shows `unordered` on the node.
+
+### Performance
+
+- **Lazy `GroupBy` costs far less per group.** The streaming aggregate
+  used to create about 8 heap objects per group for one sum and about
+  2 more per extra aggregation. That made it 5–20× slower than a plain
+  Go map fold once most rows were their own group.
+  - **Dense group ids:** groups are numbered as they're first seen.
+    Each aggregation keeps its state in slices indexed by that
+    number.
+  - **Key storage:** keys are copied into a shared byte arena. Key
+    columns are captured with one gather per batch.
+  - **First / Last:** values are stored per group in an arena (strings,
+    binary) or a typed slice (fixed-width types). Other types use one
+    gather per batch.
+  - **Other kinds:** n_unique, std, var, median, mode, bitwise and
+    custom incremental aggregators keep their per-group accumulators.
+    Their rows are bucketed once per batch.
+  - **Parallel builds:** each worker sorts its own groups, and the
+    sorted runs merge in parallel.
+  - **Results:** values, schema and row order are unchanged, apart
+    from integer sums (above).
+
+  `BenchmarkGroupBy_GroupCountSweep`: 200,000 rows, a string key, an
+  Int64 sum, and four String `First` columns. Apple M3 Pro, 11
+  workers. The map fold is a floor, not a like-for-like comparison:
+  it builds no Arrow output, sorts nothing, and reads only the key and
+  the summed column.
+
+  | distinct keys | aggregation | before | after | unordered | allocations (before → after) |
+  |---:|---|---:|---:|---:|---:|
+  | 200,000 | sum | 95 ms | 17.6 ms | 7.6 ms | 1,602,000 → 4,200 |
+  | 200,000 | sum + 4 first | 182 ms | 33.4 ms | 16.5 ms | 3,203,000 → 5,100 |
+  | 20,000 | sum | 6.7 ms | 3.7 ms | 2.8 ms | 202,500 → 2,800 |
+  | 20,000 | sum + 4 first | 9.6 ms | 4.8 ms | 3.5 ms | 362,800 → 3,300 |
+  | 100 | sum | 2.4 ms | 2.4 ms | 2.3 ms | 3,700 → 2,300 |
+  | 100 | sum + 4 first | 2.2 ms | 2.4 ms | 2.4 ms | 4,700 → 2,700 |
+
+  Go map fold: 6.8 ms at 200,000 keys, 2.7 ms at 20,000, 1.8 ms at
+  100.
+
+- **Taking String and Binary values sizes the value buffer up front.**
+  `Take`, `SortBy` and outer joins no longer regrow and recopy it as
+  they append.
+
 ## [v0.4.19]
 
 ### Added

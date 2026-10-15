@@ -525,6 +525,7 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 	case arrow.STRING:
 		b := array.NewStringBuilder(pool)
 		defer b.Release()
+		loc.reserveValues(b.BinaryBuilder, indexes)
 		for _, idx := range indexes {
 			if idx < 0 {
 				b.AppendNull()
@@ -538,6 +539,7 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 	case arrow.BINARY:
 		b := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
 		defer b.Release()
+		loc.reserveValues(b, indexes)
 		for _, idx := range indexes {
 			if idx < 0 {
 				b.AppendNull()

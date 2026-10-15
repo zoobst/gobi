@@ -127,7 +127,7 @@ func mapExprs(p LogicalPlan, fn func(Expr) Expr) LogicalPlan {
 		if newInput == n.input {
 			return p
 		}
-		return newAggregateNode(newInput, n.keys, n.aggs)
+		return n.withInput(newInput)
 	case *joinNode:
 		newInput = mapExprs(n.input, fn)
 		newRight = mapExprs(n.right, fn)
@@ -663,7 +663,7 @@ func pushProjection(p LogicalPlan, neededOut map[string]struct{}) (LogicalPlan, 
 		if !changed {
 			return p, false
 		}
-		return newAggregateNode(newIn, n.keys, n.aggs), true
+		return n.withInput(newIn), true
 
 	case *dropNode:
 		// Drop needs its target column present in the input to remove it,
@@ -943,7 +943,7 @@ func walkRewrite(p LogicalPlan, visit func(LogicalPlan) (LogicalPlan, bool)) (Lo
 	case *aggregateNode:
 		newIn := rewriteChild(n.input)
 		if newIn != n.input {
-			rebuilt = newAggregateNode(newIn, n.keys, n.aggs)
+			rebuilt = n.withInput(newIn)
 		}
 	case *joinNode:
 		newIn := rewriteChild(n.input)

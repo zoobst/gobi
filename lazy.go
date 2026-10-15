@@ -168,11 +168,23 @@ func (lf *LazyFrame) Explode(col string) *LazyFrame {
 }
 
 // LazyGroupBy is the intermediate builder returned by
-// LazyFrame.GroupBy. Its only method, Agg, closes the group-by out
-// into a LazyFrame.
+// LazyFrame.GroupBy. Agg closes the group-by out into a LazyFrame;
+// Unordered sets an option first.
 type LazyGroupBy struct {
-	plan LogicalPlan
-	keys []string
+	plan      LogicalPlan
+	keys      []string
+	unordered bool
+}
+
+// Unordered lets the result's rows come out in any order instead of
+// sorted by key, which saves sorting the groups — worthwhile when
+// there are many and the caller sorts or indexes the result itself.
+// The order is unspecified and may change between versions; values
+// and schema are the same as the sorted form.
+func (lg *LazyGroupBy) Unordered() *LazyGroupBy {
+	out := *lg
+	out.unordered = true
+	return &out
 }
 
 // Agg attaches the given aggregations and returns a LazyFrame whose
@@ -180,7 +192,9 @@ type LazyGroupBy struct {
 // given. Naming, type mapping, and null semantics match the eager
 // GroupBy.Agg.
 func (lg *LazyGroupBy) Agg(aggs ...Aggregation) *LazyFrame {
-	return &LazyFrame{plan: newAggregateNode(lg.plan, lg.keys, aggs)}
+	n := newAggregateNode(lg.plan, lg.keys, aggs)
+	n.unordered = lg.unordered
+	return &LazyFrame{plan: n}
 }
 
 // -----------------------------------------------------------------------------

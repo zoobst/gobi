@@ -282,8 +282,14 @@ func (g *GroupBy) buildAggBuilders(aggs []Aggregation, pool memory.Allocator) ([
 				continue
 			}
 		}
-		if _, err := g.frame.Column(a.Column); err != nil {
+		src, err := g.frame.Column(a.Column)
+		if err != nil {
 			return nil, nil, err
+		}
+		if t := intSumType(src.DataType()); a.Kind == AggSum && t != nil {
+			aggBuilders[i], _ = builderForType(pool, t)
+			aggFields[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: true}
+			continue
 		}
 		aggBuilders[i] = array.NewFloat64Builder(pool)
 		aggFields[i] = arrow.Field{
@@ -366,6 +372,19 @@ func (g *GroupBy) tryEmitContiguousSIMD(b array.Builder, a Aggregation, start, e
 	chunks := col.col.Data().Chunks()
 	if len(chunks) != 1 {
 		return false, nil
+	}
+	if ib, ok := b.(*array.Int64Builder); ok && a.Kind == AggSum {
+		arr, ok := chunks[0].(*array.Int64)
+		if !ok || arr.NullN() != 0 {
+			return false, nil
+		}
+		var sum intSum
+		for _, v := range arr.Int64Values()[start:end] {
+			if err := sum.addI(v); err != nil {
+				return false, fmt.Errorf("gobi: aggregation %s: %w", aggName(a), err)
+			}
+		}
+		return true, appendIntSum(ib, sum)
 	}
 	fb, ok := b.(*array.Float64Builder)
 	if !ok {

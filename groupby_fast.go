@@ -1,6 +1,7 @@
 package gobi
 
 import (
+	"fmt"
 	"math"
 	"slices"
 	"sort"
@@ -240,7 +241,9 @@ func (g *GroupBy) aggFastString(keyArr *array.String, aggs []Aggregation, aggVie
 		}
 		rows := groups[k]
 		for i, a := range aggs {
-			appendFastAgg(aggBuilders[i], a, aggViews[i], rows)
+			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], rows); err != nil {
+				return nil, false, err
+			}
 		}
 	}
 
@@ -279,13 +282,17 @@ func (g *GroupBy) aggFastInt64(keyArr *array.Int64, aggs []Aggregation, aggViews
 		keyB.Append(k)
 		rows := groups[k]
 		for i, a := range aggs {
-			appendFastAgg(aggBuilders[i], a, aggViews[i], rows)
+			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], rows); err != nil {
+				return nil, false, err
+			}
 		}
 	}
 	if hasNull {
 		keyB.AppendNull()
 		for i, a := range aggs {
-			appendFastAgg(aggBuilders[i], a, aggViews[i], nullRows)
+			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], nullRows); err != nil {
+				return nil, false, err
+			}
 		}
 	}
 
@@ -326,13 +333,17 @@ func (g *GroupBy) aggFastFloat64(keyArr *array.Float64, aggs []Aggregation, aggV
 		keyB.Append(k)
 		rows := groups[k]
 		for i, a := range aggs {
-			appendFastAgg(aggBuilders[i], a, aggViews[i], rows)
+			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], rows); err != nil {
+				return nil, false, err
+			}
 		}
 	}
 	if hasNull {
 		keyB.AppendNull()
 		for i, a := range aggs {
-			appendFastAgg(aggBuilders[i], a, aggViews[i], nullRows)
+			if err := appendFastAgg(aggBuilders[i], a, aggViews[i], nullRows); err != nil {
+				return nil, false, err
+			}
 		}
 	}
 
@@ -356,9 +367,10 @@ func (v aggView) numAt(i int) (float64, bool) {
 }
 
 // makeAggBuilders returns one output-array builder + field per aggregation.
-// Count / NUnique → Int64 non-null. Min / Max on Timestamp preserve the
-// source's TimestampType via tsType captured in the aggView. Everything
-// else → Float64 nullable.
+// Count / NUnique → Int64 non-null. Sum of an Int64 source → Int64
+// (the only integer view the fast path builds). Min / Max on Timestamp
+// preserve the source's TimestampType via tsType captured in the
+// aggView. Everything else → Float64 nullable.
 func makeAggBuilders(pool memory.Allocator, aggs []Aggregation, views []aggView) ([]array.Builder, []arrow.Field) {
 	bs := make([]array.Builder, len(aggs))
 	fs := make([]arrow.Field, len(aggs))
@@ -366,6 +378,11 @@ func makeAggBuilders(pool memory.Allocator, aggs []Aggregation, views []aggView)
 		if a.Kind == AggCount || a.Kind == AggNUnique {
 			bs[i] = array.NewInt64Builder(pool)
 			fs[i] = arrow.Field{Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: false}
+			continue
+		}
+		if a.Kind == AggSum && views[i].numericKind == 2 {
+			bs[i] = array.NewInt64Builder(pool)
+			fs[i] = arrow.Field{Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: true}
 			continue
 		}
 		if views[i].kind == aggViewTimestamp {
@@ -382,12 +399,13 @@ func makeAggBuilders(pool memory.Allocator, aggs []Aggregation, views []aggView)
 
 // appendFastAgg computes one aggregation output over rows and appends the
 // result to b. Uses the pre-extracted view v to avoid per-row chunk walks.
-func appendFastAgg(b array.Builder, a Aggregation, v aggView, rows []int) {
+// Errors only on integer-sum overflow.
+func appendFastAgg(b array.Builder, a Aggregation, v aggView, rows []int) error {
 	if a.Kind == AggCount {
 		ib := b.(*array.Int64Builder)
 		if a.Column == "" {
 			ib.Append(int64(len(rows)))
-			return
+			return nil
 		}
 		var n int64
 		for _, row := range rows {
@@ -396,15 +414,27 @@ func appendFastAgg(b array.Builder, a Aggregation, v aggView, rows []int) {
 			}
 		}
 		ib.Append(n)
-		return
+		return nil
 	}
 	if a.Kind == AggNUnique {
 		appendFastNUnique(b.(*array.Int64Builder), v, rows)
-		return
+		return nil
 	}
 	if v.kind == aggViewTimestamp {
 		appendFastTimestampMinMax(b.(*array.TimestampBuilder), a.Kind, v, rows)
-		return
+		return nil
+	}
+	if ib, ok := b.(*array.Int64Builder); ok && a.Kind == AggSum {
+		var sum intSum
+		for _, row := range rows {
+			if v.arr.IsNull(row) {
+				continue
+			}
+			if err := sum.addI(v.i64[row]); err != nil {
+				return fmt.Errorf("gobi: aggregation %s: %w", aggName(a), err)
+			}
+		}
+		return appendIntSum(ib, sum)
 	}
 	fb := b.(*array.Float64Builder)
 	// Welford's running mean + M2 alongside the existing sum/min/max
@@ -434,7 +464,7 @@ func appendFastAgg(b array.Builder, a Aggregation, v aggView, rows []int) {
 	}
 	if n == 0 {
 		fb.AppendNull()
-		return
+		return nil
 	}
 	switch a.Kind {
 	case AggSum:
@@ -448,18 +478,19 @@ func appendFastAgg(b array.Builder, a Aggregation, v aggView, rows []int) {
 	case AggVar:
 		if n < 2 {
 			fb.AppendNull()
-			return
+			return nil
 		}
 		fb.Append(m2 / float64(n-1))
 	case AggStd:
 		if n < 2 {
 			fb.AppendNull()
-			return
+			return nil
 		}
 		fb.Append(math.Sqrt(m2 / float64(n-1)))
 	default:
 		fb.AppendNull()
 	}
+	return nil
 }
 
 // appendFastNUnique writes the count of distinct non-null values in rows

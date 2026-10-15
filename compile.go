@@ -172,6 +172,7 @@ func compileNode(p LogicalPlan) (ExecOperator, error) {
 				outSchema: n.outSchema,
 				workers:   resolveWorkers(),
 				keyMode:   pickKeyMode(n),
+				unordered: n.unordered,
 			}
 			// New closes over an initial capacity so cold-cache
 			// Gets return an already-sized *[]int. Actual per-
