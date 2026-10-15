@@ -35,6 +35,12 @@ introduce breaking changes; check this file when upgrading.
   used to come back as a column of nulls, and a custom `Fn` as a row
   count. Both now return an error.
 
+- **Lazy `GroupBy` keeps a null key as its own group**, first in key
+  order, as eager `GroupBy` and multi-column keys already did. With a
+  single String key, null rows used to be counted under `""`, and the
+  key came back as `""` rather than null. With a single integer,
+  timestamp or boolean key, null rows were dropped.
+
 ### Added
 
 - **`LazyGroupBy.Unordered()`** lets a lazy `GroupBy` return its rows

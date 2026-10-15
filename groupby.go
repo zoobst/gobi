@@ -1252,32 +1252,31 @@ func timestampAt(s Series, i int) (arrow.Timestamp, bool, error) {
 // for the eager and aligned GroupBy paths. Types come from
 // aggResultType, the rule every engine follows; bitwise kinds also
 // check their input here.
-func (g *GroupBy) buildAggBuilders(aggs []Aggregation, pool memory.Allocator) (bs []array.Builder, fs []arrow.Field, err error) {
-	bs = make([]array.Builder, 0, len(aggs))
-	defer func() {
-		if err != nil {
-			releaseBuilders(bs)
-		}
-	}()
-	fs = make([]arrow.Field, len(aggs))
+func (g *GroupBy) buildAggBuilders(aggs []Aggregation, pool memory.Allocator) ([]array.Builder, []arrow.Field, error) {
+	bs := make([]array.Builder, 0, len(aggs))
+	fs := make([]arrow.Field, len(aggs))
+	fail := func(err error) ([]array.Builder, []arrow.Field, error) {
+		releaseBuilders(bs)
+		return nil, nil, err
+	}
 	for i, a := range aggs {
 		var src arrow.DataType
 		if a.Column != "" {
 			s, err := g.frame.Column(a.Column)
 			if err != nil {
-				return nil, nil, err
+				return fail(err)
 			}
 			src = s.DataType()
 		}
 		if a.Fn == nil && isBitwiseAgg(a.Kind) {
 			if err := checkBitwiseInput(a.Kind, a.Column, src); err != nil {
-				return nil, nil, err
+				return fail(err)
 			}
 		}
 		t := aggResultType(a, src)
 		b, err := builderForType(pool, t)
 		if err != nil {
-			return nil, nil, fmt.Errorf("gobi: aggregation %d (%s): %w", i, aggName(a), err)
+			return fail(fmt.Errorf("gobi: aggregation %d (%s): %w", i, aggName(a), err))
 		}
 		bs = append(bs, b)
 		fs[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: aggOutputNullable(a)}
@@ -1345,96 +1344,85 @@ func (s *intSum) addU(v uint64) error {
 	return nil
 }
 
-// intCell reads integer cell arr[i] as its uint64 bits plus its sign:
-// a signed value is returned as uint64(int64(x)) with neg = x < 0.
-func intCell(arr arrow.Array, i int) (v uint64, neg bool, err error) {
+// integer is the Arrow integer widths an integer sum reads.
+type integer interface {
+	int64 | int32 | int16 | int8 | uint64 | uint32 | uint16 | uint8
+}
+
+// addInt adds v to s: signed widths into i, unsigned into u. It's the
+// one per-value rule every integer-sum path (eager, aligned, fast and
+// streaming) goes through.
+func addInt[T integer](s *intSum, v T) error {
+	var zero T
+	if ^zero < 0 { // signed
+		return s.addI(int64(v))
+	}
+	return s.addU(uint64(v))
+}
+
+// add adds the integer cell arr[i] (non-null) to s.
+func (s *intSum) add(arr arrow.Array, i int) error {
 	switch a := arr.(type) {
 	case *array.Int64:
-		x := a.Value(i)
-		return uint64(x), x < 0, nil
+		return addInt(s, a.Value(i))
 	case *array.Int32:
-		x := int64(a.Value(i))
-		return uint64(x), x < 0, nil
+		return addInt(s, a.Value(i))
 	case *array.Int16:
-		x := int64(a.Value(i))
-		return uint64(x), x < 0, nil
+		return addInt(s, a.Value(i))
 	case *array.Int8:
-		x := int64(a.Value(i))
-		return uint64(x), x < 0, nil
+		return addInt(s, a.Value(i))
 	case *array.Uint64:
-		return a.Value(i), false, nil
+		return addInt(s, a.Value(i))
 	case *array.Uint32:
-		return uint64(a.Value(i)), false, nil
+		return addInt(s, a.Value(i))
 	case *array.Uint16:
-		return uint64(a.Value(i)), false, nil
+		return addInt(s, a.Value(i))
 	case *array.Uint8:
-		return uint64(a.Value(i)), false, nil
+		return addInt(s, a.Value(i))
 	}
-	return 0, false, fmt.Errorf("%w: integer sum over %s", ErrColumnTypeMismatch, arr.DataType())
-}
-
-// add adds the integer cell arr[i] (non-null) to the sum of its own
-// signedness: signed sources into i, unsigned into u.
-func (s *intSum) add(arr arrow.Array, i int) error {
-	v, _, err := intCell(arr, i)
-	if err != nil {
-		return err
-	}
-	if isSignedInt(arr.DataType()) {
-		return s.addI(int64(v)) // v holds the int64's bits
-	}
-	return s.addU(v)
-}
-
-func isSignedInt(dt arrow.DataType) bool {
-	t := intSumType(dt)
-	return t != nil && t.ID() == arrow.INT64
+	return fmt.Errorf("%w: integer sum over %s", ErrColumnTypeMismatch, arr.DataType())
 }
 
 // addRows adds the non-null cells of the single array arr at rows —
-// the one integer-sum loop the eager, fast and aligned GroupBy paths
+// the integer-sum loop the eager, fast and aligned GroupBy paths
 // share. rows nil means rows lo..hi-1.
 func (s *intSum) addRows(arr arrow.Array, rows []int, lo, hi int) error {
-	if a, ok := arr.(*array.Int64); ok {
-		vals := a.Int64Values()
-		nulls := a.NullN() > 0
-		add := func(i int) error {
-			if nulls && a.IsNull(i) {
-				return nil
-			}
-			return s.addI(vals[i])
-		}
-		if rows == nil {
-			for i := lo; i < hi; i++ {
-				if err := add(i); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-		for _, i := range rows {
-			if err := add(i); err != nil {
-				return err
-			}
-		}
-		return nil
+	switch a := arr.(type) {
+	case *array.Int64:
+		return addRowsOf(s, a, a.Int64Values(), rows, lo, hi)
+	case *array.Int32:
+		return addRowsOf(s, a, a.Int32Values(), rows, lo, hi)
+	case *array.Int16:
+		return addRowsOf(s, a, a.Int16Values(), rows, lo, hi)
+	case *array.Int8:
+		return addRowsOf(s, a, a.Int8Values(), rows, lo, hi)
+	case *array.Uint64:
+		return addRowsOf(s, a, a.Uint64Values(), rows, lo, hi)
+	case *array.Uint32:
+		return addRowsOf(s, a, a.Uint32Values(), rows, lo, hi)
+	case *array.Uint16:
+		return addRowsOf(s, a, a.Uint16Values(), rows, lo, hi)
+	case *array.Uint8:
+		return addRowsOf(s, a, a.Uint8Values(), rows, lo, hi)
 	}
-	if rows == nil {
-		for i := lo; i < hi; i++ {
-			if arr.IsNull(i) {
-				continue
-			}
-			if err := s.add(arr, i); err != nil {
-				return err
-			}
-		}
-		return nil
+	return fmt.Errorf("%w: integer sum over %s", ErrColumnTypeMismatch, arr.DataType())
+}
+
+func addRowsOf[T integer](s *intSum, arr arrow.Array, vals []T, rows []int, lo, hi int) error {
+	nulls := arr.NullN() > 0
+	n := hi - lo
+	if rows != nil {
+		n = len(rows)
 	}
-	for _, i := range rows {
-		if arr.IsNull(i) {
+	for k := range n {
+		i := lo + k
+		if rows != nil {
+			i = rows[k]
+		}
+		if nulls && arr.IsNull(i) {
 			continue
 		}
-		if err := s.add(arr, i); err != nil {
+		if err := addInt(s, vals[i]); err != nil {
 			return err
 		}
 	}

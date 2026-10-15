@@ -177,7 +177,7 @@ func TestAggInt641_EachIntType(t *testing.T) {
 // rows drop out of the int64 fast path. If we later add null-group
 // support to the fast path, this test flips to check the null bucket
 // is present.
-func TestAggInt641_NullKeyRowsAreSkipped(t *testing.T) {
+func TestAggInt641_NullKeyGroup(t *testing.T) {
 	pool := memory.DefaultAllocator
 	kb := array.NewInt64Builder(pool)
 	defer kb.Release()
@@ -207,10 +207,13 @@ func TestAggInt641_NullKeyRowsAreSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Nulls skipped → 3 groups for keys {1,2,3}. The null-keyed row
-	// (v=40) is dropped entirely.
-	if out.NumRows() != 3 {
-		t.Fatalf("rows = %d, want 3 (null-keyed row must be skipped)", out.NumRows())
+	// The null key is its own group, first, as eager GroupBy and the
+	// composite path keep it.
+	if got, want := colJSON(t, out, "k"), `[null,1,2,3]`; got != want {
+		t.Errorf("k = %s, want %s", got, want)
+	}
+	if got, want := colJSON(t, out, "s"), `[40,10,20,30]`; got != want {
+		t.Errorf("s = %s, want %s", got, want)
 	}
 }
 
@@ -834,39 +837,136 @@ func TestStreamingAggregate_FirstLastDates(t *testing.T) {
 	}
 }
 
-// TestGroupTable_PlannedTypeMismatch — a batch whose column doesn't
-// fit the planned output type is an error, not a column of nulls.
-func TestGroupTable_PlannedTypeMismatch(t *testing.T) {
-	fields := []arrow.Field{{Name: "k", Type: arrow.BinaryTypes.String}, {Name: "v", Type: arrow.PrimitiveTypes.Float64}}
-	df := chunkedFrame(t, fields, 2, 2, func(c int, b array.Builder, lo, hi int) {
-		for range hi - lo {
-			if c == 0 {
-				b.(*array.StringBuilder).Append("a")
-			} else {
-				b.(*array.Float64Builder).Append(1.5)
-			}
-		}
-	})
-	defer df.Release()
-	batch := frameToBatch(df)
-	defer batch.Release()
-	for _, tc := range []struct {
-		agg Aggregation
-		dt  arrow.DataType
-	}{
-		{Aggregation{Column: "v", Kind: AggSum}, arrow.PrimitiveTypes.Int64},
-		{Aggregation{Column: "v", Kind: AggMax}, &arrow.TimestampType{Unit: arrow.Second}},
-		{Aggregation{Column: "v", Kind: AggFirst}, arrow.BinaryTypes.String},
-	} {
-		out := arrow.NewSchema([]arrow.Field{{Name: "k", Type: arrow.BinaryTypes.String}, {Name: "x", Type: tc.dt}}, nil)
-		tbl, err := newGroupTable(keyModeString1, []string{"k"}, []Aggregation{tc.agg}, out)
+// batchOf builds a batch whose columns are parsed from JSON.
+func batchOf(t *testing.T, fields []arrow.Field, values ...string) arrow.RecordBatch {
+	t.Helper()
+	arrs := make([]arrow.Array, len(fields))
+	for i, f := range fields {
+		a, _, err := array.FromJSON(memory.DefaultAllocator, f.Type, strings.NewReader(values[i]))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := tbl.consume(batch, nil); !errors.Is(err, ErrColumnTypeMismatch) {
-			t.Errorf("%v planned %s: err = %v, want ErrColumnTypeMismatch", tc.agg.Kind, tc.dt, err)
+		defer a.Release()
+		arrs[i] = a
+	}
+	return array.NewRecordBatch(arrow.NewSchema(fields, nil), arrs, int64(arrs[0].Len()))
+}
+
+// colJSON renders column name of f as JSON.
+func colJSON(t *testing.T, f *Frame, name string) string {
+	t.Helper()
+	s, err := f.Column(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := array.Concatenate(s.col.Data().Chunks(), memory.DefaultAllocator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Release()
+	b, err := a.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// runAggExec runs a streaming aggregate planned over schema plan on
+// batches, with the given worker count.
+func runAggExec(t *testing.T, plan *arrow.Schema, keys []string, aggs []Aggregation, workers int, batches ...arrow.RecordBatch) (*Frame, error) {
+	t.Helper()
+	empty := emptyFrameFromSchema(t, plan)
+	n := newAggregateNode(&scanFrameNode{frame: empty}, keys, aggs)
+	exec := &streamingAggregateExec{
+		input:     &cancelAtEOF{batches: batches, schema: plan, cancel: func() {}},
+		keys:      n.keys,
+		aggs:      n.aggs,
+		outSchema: n.outSchema,
+		workers:   workers,
+		keyMode:   pickKeyMode(n),
+	}
+	exec.rowsPool.New = func() any { s := make([]int, 0, 128); return &s }
+	return Execute(context.Background(), exec)
+}
+
+// TestStreamingAggregate_SchemaDrift — batches whose types drift from
+// the plan are cast to it before keys are hashed or values folded, so
+// the same logical key is one group and values keep their meaning; a
+// drift that loses values is ErrColumnTypeMismatch.
+func TestStreamingAggregate_SchemaDrift(t *testing.T) {
+	i32, i64 := arrow.PrimitiveTypes.Int32, arrow.PrimitiveTypes.Int64
+	str := arrow.BinaryTypes.String
+	sec := &arrow.TimestampType{Unit: arrow.Second}
+	ms := &arrow.TimestampType{Unit: arrow.Millisecond}
+	for _, workers := range []int{1, 4} {
+		t.Run(fmt.Sprint("workers=", workers), func(t *testing.T) {
+			// Composite key (Int64, String) and an Int64 sum, then a
+			// batch with both as Int32: one group, one sum.
+			plan := arrow.NewSchema([]arrow.Field{{Name: "a", Type: i64}, {Name: "b", Type: str}, {Name: "v", Type: i64}}, nil)
+			out, err := runAggExec(t, plan, []string{"a", "b"}, []Aggregation{{Column: "v", Kind: AggSum, Alias: "s"}}, workers,
+				batchOf(t, plan.Fields(), `[1, 2]`, `["x", "y"]`, `[10, 1]`),
+				batchOf(t, []arrow.Field{{Name: "a", Type: i32}, {Name: "b", Type: str}, {Name: "v", Type: i32}}, `[1]`, `["x"]`, `[5]`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := colJSON(t, out, "a") + colJSON(t, out, "s"); got != `[1,2][15,1]` {
+				t.Errorf("composite drift: a, s = %s, want [1,2][15,1]", got)
+			}
+			out.Release()
+
+			// Int641 Timestamp[s] key and First over it, then a batch in
+			// milliseconds: the same instant is one group, and First is
+			// in seconds.
+			plan = arrow.NewSchema([]arrow.Field{{Name: "k", Type: sec}, {Name: "ts", Type: sec}}, nil)
+			out, err = runAggExec(t, plan, []string{"k"}, []Aggregation{{Column: "ts", Kind: AggFirst, Alias: "f"}, {Kind: AggCount, Alias: "n"}}, workers,
+				batchOf(t, []arrow.Field{{Name: "k", Type: ms}, {Name: "ts", Type: ms}}, `[1700000000000]`, `[1700000000000]`),
+				batchOf(t, plan.Fields(), `[1700000000]`, `[1]`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fs, _ := out.Column("f")
+			ks, _ := out.Column("k")
+			if f, k := fs.col.Data().Chunk(0).(*array.Timestamp), ks.col.Data().Chunk(0).(*array.Timestamp); out.NumRows() != 1 || f.Value(0) != 1700000000 || k.Value(0) != 1700000000 {
+				t.Errorf("timestamp drift: rows %d, k %v, f %v; want 1 row at 1700000000 s", out.NumRows(), k, f)
+			}
+			out.Release()
+
+			// Lossy drifts fail as a type mismatch, not an overflow or a
+			// wrong value.
+			for _, tc := range []struct {
+				name        string
+				plan, batch arrow.DataType
+				vals        string
+			}{
+				{"negative into unsigned", arrow.PrimitiveTypes.Uint32, i32, `[-5]`},
+				{"fraction into int", i64, arrow.PrimitiveTypes.Float64, `[1.5]`},
+			} {
+				plan := arrow.NewSchema([]arrow.Field{{Name: "k", Type: str}, {Name: "v", Type: tc.plan}}, nil)
+				_, err := runAggExec(t, plan, []string{"k"}, []Aggregation{{Column: "v", Kind: AggSum, Alias: "s"}}, workers,
+					batchOf(t, []arrow.Field{{Name: "k", Type: str}, {Name: "v", Type: tc.batch}}, `["a"]`, tc.vals))
+				if !errors.Is(err, ErrColumnTypeMismatch) {
+					t.Errorf("%s: err = %v, want ErrColumnTypeMismatch", tc.name, err)
+				}
+			}
+		})
+	}
+}
+
+// TestStreamingAggregate_NullStringKey — a null String key is its own
+// group, first and emitted as null, not folded into "".
+func TestStreamingAggregate_NullStringKey(t *testing.T) {
+	plan := arrow.NewSchema([]arrow.Field{{Name: "k", Type: arrow.BinaryTypes.String, Nullable: true}}, nil)
+	for _, workers := range []int{1, 4} {
+		out, err := runAggExec(t, plan, []string{"k"}, []Aggregation{{Kind: AggCount, Alias: "n"}}, workers,
+			batchOf(t, plan.Fields(), `["", null, "a"]`),
+			batchOf(t, plan.Fields(), `[null, "b", ""]`))
+		if err != nil {
+			t.Fatal(err)
 		}
-		tbl.release()
+		if got, want := colJSON(t, out, "k")+colJSON(t, out, "n"), `[null,"","a","b"][2,2,1,1]`; got != want {
+			t.Errorf("workers=%d: k, n = %s, want %s", workers, got, want)
+		}
+		out.Release()
 	}
 }
 
@@ -927,8 +1027,7 @@ func TestValueCapture_PiecesStayFew(t *testing.T) {
 		b.(*array.Int64Builder).Append(int64(lo))
 	})
 	defer df.Release()
-	out := arrow.NewSchema([]arrow.Field{{Name: "k", Type: arrow.PrimitiveTypes.Int64}, {Name: "n", Type: arrow.PrimitiveTypes.Int64}}, nil)
-	tbl, err := newGroupTable(keyModeInt641, []string{"k"}, []Aggregation{{Kind: AggCount, Alias: "n"}}, out)
+	tbl, err := newGroupTable(keyModeInt641, []string{"k"}, []Aggregation{{Kind: AggCount, Alias: "n"}}, df.Schema())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,6 +3,7 @@ package gobi
 import (
 	"context"
 	"io"
+	"math"
 	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -79,7 +80,7 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 	// One group table per worker; buildResultBatch combines them.
 	tables := make([]*groupTable, workers)
 	for i := range tables {
-		t, err := newGroupTable(e.keyMode, e.keys, e.aggs, e.outSchema)
+		t, err := newGroupTable(e.keyMode, e.keys, e.aggs, e.input.Schema())
 		if err != nil {
 			for _, t := range tables[:i] {
 				t.release()
@@ -119,6 +120,7 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 	}
 
 	// Reader loop.
+	cols := conformCols(e.keys, e.aggs)
 	readErr := func() error {
 		defer func() {
 			for _, ch := range inboxes {
@@ -140,11 +142,18 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 				batch.Release()
 				continue
 			}
-			if err := e.dispatchBatch(wctx, batch, inboxes); err != nil {
-				batch.Release()
+			// Conform before hashing: a drifted key type would hash
+			// (and group) apart from the planned one.
+			conformed, err := conformBatch(batch, e.input.Schema(), cols)
+			batch.Release()
+			if err != nil {
 				return err
 			}
-			batch.Release()
+			err = e.dispatchBatch(wctx, conformed, inboxes)
+			conformed.Release()
+			if err != nil {
+				return err
+			}
 		}
 	}()
 	if readErr != nil {
@@ -227,7 +236,8 @@ func (e *streamingAggregateExec) dispatchBatch(ctx context.Context, batch arrow.
 			return err
 		}
 		for row := range nRows {
-			s := strArr.value(row)
+			// A null routes as "" — see groupTable.nullGroup.
+			s, _ := strArr.value(row)
 			w := int(fnvHashString1(s) % uint64(workers))
 			*partRows[w] = append(*partRows[w], row)
 		}
@@ -235,9 +245,8 @@ func (e *streamingAggregateExec) dispatchBatch(ctx context.Context, batch arrow.
 		// Fast path: widen arrow value to int64, splatter through
 		// FNV so ints with a tiny value range still spread across
 		// workers. (A raw `key mod N` would collide all consecutive
-		// int keys onto the same worker on ordered data.) Null keys
-		// aren't routed anywhere, matching the serial build, which
-		// skips them in groupTable.consume.
+		// int keys onto the same worker on ordered data.) A null key
+		// routes as MinInt64 — see groupTable.nullGroup.
 		intArr, err := resolveIntArray(keySeries[0])
 		if err != nil {
 			return err
@@ -245,7 +254,7 @@ func (e *streamingAggregateExec) dispatchBatch(ctx context.Context, batch arrow.
 		for row := range nRows {
 			k, ok := intArr.value(row)
 			if !ok {
-				continue
+				k = math.MinInt64
 			}
 			w := int(fnvHashInt64(k) % uint64(workers))
 			*partRows[w] = append(*partRows[w], row)
