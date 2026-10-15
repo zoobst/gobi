@@ -368,15 +368,11 @@ func (g *GroupBy) Agg(aggs ...Aggregation) (*Frame, error) {
 		if err != nil {
 			return nil, err
 		}
-		if t := intSumType(src.DataType()); a.Kind == AggSum && t != nil {
-			aggBuilders[i], _ = builderForType(pool, t)
-			aggFields[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: true}
-			continue
+		t := aggResultType(a, src.DataType())
+		if aggBuilders[i], err = builderForType(pool, t); err != nil {
+			return nil, fmt.Errorf("gobi: aggregation %d (%s): %w", i, aggName(a), err)
 		}
-		aggBuilders[i] = array.NewFloat64Builder(pool)
-		aggFields[i] = arrow.Field{
-			Name: aggName(a), Type: arrow.PrimitiveTypes.Float64, Nullable: true,
-		}
+		aggFields[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: true}
 	}
 	defer releaseBuilders(aggBuilders)
 
@@ -1359,9 +1355,21 @@ type intSum struct {
 	n int64
 }
 
+// addInt64 returns a+b, ok=false on overflow.
+func addInt64(a, b int64) (int64, bool) {
+	r := a + b
+	return r, !((b > 0 && r < a) || (b < 0 && r > a))
+}
+
+// addUint64 returns a+b, ok=false on overflow.
+func addUint64(a, b uint64) (uint64, bool) {
+	r, carry := bits.Add64(a, b, 0)
+	return r, carry == 0
+}
+
 func (s *intSum) addI(v int64) error {
-	r := s.i + v
-	if (v > 0 && r < s.i) || (v < 0 && r > s.i) {
+	r, ok := addInt64(s.i, v)
+	if !ok {
 		return ErrSumOverflow
 	}
 	s.i = r
@@ -1370,8 +1378,8 @@ func (s *intSum) addI(v int64) error {
 }
 
 func (s *intSum) addU(v uint64) error {
-	r, carry := bits.Add64(s.u, v, 0)
-	if carry != 0 {
+	r, ok := addUint64(s.u, v)
+	if !ok {
 		return ErrSumOverflow
 	}
 	s.u = r

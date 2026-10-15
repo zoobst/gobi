@@ -378,12 +378,7 @@ func takeChunks(pool memory.Allocator, dt arrow.DataType, chunks []arrow.Array, 
 	if len(chunks) == 1 {
 		return takeCompute(pool, chunks[0], indexes, negIsNull)
 	}
-	ends := make([]int, len(chunks)) // ends[c]: one past chunk c's last global row
-	total := 0
-	for i, c := range chunks {
-		total += c.Len()
-		ends[i] = total
-	}
+	loc := locatorOf(chunks)
 	locals := make([][]int, len(chunks)) // per chunk, its local rows in output order
 	where := make([]int, len(indexes))   // output i → position in the concatenated pieces, or -1
 	chunkOf := make([]int, len(indexes))
@@ -392,14 +387,13 @@ func takeChunks(pool memory.Allocator, dt arrow.DataType, chunks []arrow.Array, 
 			where[i] = -1
 			continue
 		}
-		if idx < 0 || idx >= total {
-			return nil, fmt.Errorf("%w: %d not in [0,%d)", ErrRowOutOfRange, idx, total)
+		c, local, ok := loc.find(idx)
+		if !ok {
+			return nil, fmt.Errorf("%w: %d not in [0,%d)", ErrRowOutOfRange, idx, loc.total())
 		}
-		c, _ := slices.BinarySearch(ends, idx+1)
-		start := ends[c] - chunks[c].Len()
 		chunkOf[i] = c
 		where[i] = len(locals[c])
-		locals[c] = append(locals[c], idx-start)
+		locals[c] = append(locals[c], local)
 	}
 
 	var pieces []arrow.Array
@@ -604,7 +598,11 @@ type chunkLocator struct {
 }
 
 func newChunkLocator(s Series) chunkLocator {
-	chunks := s.col.Data().Chunks()
+	return locatorOf(s.col.Data().Chunks())
+}
+
+// locatorOf is newChunkLocator over a bare chunk list.
+func locatorOf(chunks []arrow.Array) chunkLocator {
 	ends := make([]int, len(chunks))
 	total := 0
 	for i, c := range chunks {
@@ -612,6 +610,36 @@ func newChunkLocator(s Series) chunkLocator {
 		ends[i] = total
 	}
 	return chunkLocator{chunks: chunks, ends: ends}
+}
+
+// total is the row count across the chunks.
+func (l chunkLocator) total() int {
+	if len(l.ends) == 0 {
+		return 0
+	}
+	return l.ends[len(l.ends)-1]
+}
+
+// find returns the index of the chunk holding row and the row's index
+// within it; ok is false when row is out of range.
+func (l chunkLocator) find(row int) (c, local int, ok bool) {
+	if row < 0 {
+		return 0, 0, false
+	}
+	c, _ = slices.BinarySearch(l.ends, row+1)
+	if c >= len(l.chunks) {
+		return 0, 0, false
+	}
+	return c, row - (l.ends[c] - l.chunks[c].Len()), true
+}
+
+// locate is find returning the chunk itself.
+func (l chunkLocator) locate(row int) (chunk arrow.Array, local int, ok bool) {
+	c, local, ok := l.find(row)
+	if !ok {
+		return nil, 0, false
+	}
+	return l.chunks[c], local, true
 }
 
 // reserveValues sizes b for the rows at indexes (negative indexes are
@@ -623,12 +651,8 @@ func (l chunkLocator) reserveValues(b *array.BinaryBuilder, indexes []int) {
 	}
 	n := 0
 	for _, idx := range indexes {
-		if idx < 0 {
-			continue
-		}
-		c, _ := slices.BinarySearch(l.ends, idx+1)
-		if c < len(l.chunks) {
-			n += valueLen(l.chunks[c], idx-(l.ends[c]-l.chunks[c].Len()))
+		if chunk, local, ok := l.locate(idx); ok {
+			n += valueLen(chunk, local)
 		}
 	}
 	b.Reserve(len(indexes))
@@ -659,9 +683,9 @@ func valueLen(chunk arrow.Array, i int) int {
 
 // append appends row idx to b.
 func (l chunkLocator) append(idx int, b array.Builder) error {
-	c, _ := slices.BinarySearch(l.ends, idx+1)
-	if idx < 0 || c >= len(l.chunks) {
+	chunk, local, ok := l.locate(idx)
+	if !ok {
 		return fmt.Errorf("%w: index %d unreachable", ErrRowOutOfRange, idx)
 	}
-	return appendFromChunk(l.chunks[c], idx-(l.ends[c]-l.chunks[c].Len()), b)
+	return appendFromChunk(chunk, local, b)
 }

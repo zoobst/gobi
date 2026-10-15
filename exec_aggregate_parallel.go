@@ -77,9 +77,10 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 	}
 
 	// One group table per worker; buildResultBatch combines them.
+	aggTypes := e.aggTypes()
 	tables := make([]*groupTable, workers)
 	for i := range tables {
-		t, err := newGroupTable(e.keyMode, e.keys, e.aggs)
+		t, err := newGroupTable(e.keyMode, e.keys, e.aggs, aggTypes)
 		if err != nil {
 			for _, t := range tables[:i] {
 				t.release()
@@ -153,7 +154,12 @@ func (e *streamingAggregateExec) buildParallel(ctx context.Context) error {
 
 	wg.Wait()
 
-	return firstErr
+	if firstErr != nil {
+		return firstErr
+	}
+	// A cancellation after the reader reached EOF sets no error, but
+	// the workers stopped early: report it rather than a partial result.
+	return ctx.Err()
 }
 
 // dispatchBatch partitions one batch's rows across worker inboxes by

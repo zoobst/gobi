@@ -286,15 +286,11 @@ func (g *GroupBy) buildAggBuilders(aggs []Aggregation, pool memory.Allocator) ([
 		if err != nil {
 			return nil, nil, err
 		}
-		if t := intSumType(src.DataType()); a.Kind == AggSum && t != nil {
-			aggBuilders[i], _ = builderForType(pool, t)
-			aggFields[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: true}
-			continue
+		t := aggResultType(a, src.DataType())
+		if aggBuilders[i], err = builderForType(pool, t); err != nil {
+			return nil, nil, fmt.Errorf("gobi: aggregation %d (%s): %w", i, aggName(a), err)
 		}
-		aggBuilders[i] = array.NewFloat64Builder(pool)
-		aggFields[i] = arrow.Field{
-			Name: aggName(a), Type: arrow.PrimitiveTypes.Float64, Nullable: true,
-		}
+		aggFields[i] = arrow.Field{Name: aggName(a), Type: t, Nullable: true}
 	}
 	return aggBuilders, aggFields, nil
 }

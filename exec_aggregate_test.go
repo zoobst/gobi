@@ -1,8 +1,10 @@
 package gobi
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 	"testing"
@@ -783,5 +785,175 @@ func TestStreamingAggregate_LastAcrossManyBatches(t *testing.T) {
 			}
 		}
 		out.Release()
+	}
+}
+
+// TestStreamingAggregate_FirstLastDates — First / Last on Date32 and
+// Date64 columns stream through the typed storage and keep the type.
+func TestStreamingAggregate_FirstLastDates(t *testing.T) {
+	fields := []arrow.Field{
+		{Name: "k", Type: arrow.BinaryTypes.String},
+		{Name: "d32", Type: arrow.FixedWidthTypes.Date32, Nullable: true},
+		{Name: "d64", Type: arrow.FixedWidthTypes.Date64, Nullable: true},
+	}
+	df := chunkedFrame(t, fields, 6, 2, func(c int, b array.Builder, lo, hi int) {
+		for r := lo; r < hi; r++ {
+			switch c {
+			case 0:
+				b.(*array.StringBuilder).Append([]string{"a", "b"}[r%2])
+			case 1:
+				if r == 0 {
+					b.AppendNull()
+				} else {
+					b.(*array.Date32Builder).Append(arrow.Date32(100 + r))
+				}
+			case 2:
+				b.(*array.Date64Builder).Append(arrow.Date64(int64(r) * 86_400_000))
+			}
+		}
+	})
+	defer df.Release()
+	out, err := df.Lazy().GroupBy("k").Agg(
+		Aggregation{Column: "d32", Kind: AggFirst, Alias: "d32_first"},
+		Aggregation{Column: "d64", Kind: AggLast, Alias: "d64_last"},
+	).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Release()
+	first, _ := out.Column("d32_first")
+	last, _ := out.Column("d64_last")
+	fa := first.col.Data().Chunks()[0].(*array.Date32)
+	la := last.col.Data().Chunks()[0].(*array.Date64)
+	// a: rows 0, 2, 4 (row 0's d32 is null); b: rows 1, 3, 5.
+	if fa.Value(0) != 102 || fa.Value(1) != 101 {
+		t.Errorf("d32 first = [%d %d], want [102 101]", fa.Value(0), fa.Value(1))
+	}
+	if la.Value(0) != 4*86_400_000 || la.Value(1) != 5*86_400_000 {
+		t.Errorf("d64 last = [%d %d]", la.Value(0), la.Value(1))
+	}
+}
+
+// TestGroupTable_PlannedTypeMismatch — a batch whose column doesn't
+// fit the planned output type is an error, not a column of nulls.
+func TestGroupTable_PlannedTypeMismatch(t *testing.T) {
+	fields := []arrow.Field{{Name: "k", Type: arrow.BinaryTypes.String}, {Name: "v", Type: arrow.PrimitiveTypes.Float64}}
+	df := chunkedFrame(t, fields, 2, 2, func(c int, b array.Builder, lo, hi int) {
+		for range hi - lo {
+			if c == 0 {
+				b.(*array.StringBuilder).Append("a")
+			} else {
+				b.(*array.Float64Builder).Append(1.5)
+			}
+		}
+	})
+	defer df.Release()
+	batch := frameToBatch(df)
+	defer batch.Release()
+	for _, tc := range []struct {
+		agg Aggregation
+		dt  arrow.DataType
+	}{
+		{Aggregation{Column: "v", Kind: AggSum}, arrow.PrimitiveTypes.Int64},
+		{Aggregation{Column: "v", Kind: AggMax}, &arrow.TimestampType{Unit: arrow.Second}},
+		{Aggregation{Column: "v", Kind: AggFirst}, arrow.BinaryTypes.String},
+	} {
+		tbl, err := newGroupTable(keyModeString1, []string{"k"}, []Aggregation{tc.agg}, []arrow.DataType{tc.dt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tbl.consume(batch, nil); !errors.Is(err, ErrColumnTypeMismatch) {
+			t.Errorf("%v planned %s: err = %v, want ErrColumnTypeMismatch", tc.agg.Kind, tc.dt, err)
+		}
+		tbl.release()
+	}
+}
+
+// cancelAtEOF yields its batches, then cancels the context as it
+// reports io.EOF.
+type cancelAtEOF struct {
+	batches []arrow.RecordBatch
+	schema  *arrow.Schema
+	cancel  context.CancelFunc
+}
+
+func (c *cancelAtEOF) Next(context.Context) (arrow.RecordBatch, error) {
+	if len(c.batches) == 0 {
+		c.cancel()
+		return nil, io.EOF
+	}
+	b := c.batches[0]
+	c.batches = c.batches[1:]
+	return b, nil
+}
+func (c *cancelAtEOF) Schema() *arrow.Schema { return c.schema }
+func (c *cancelAtEOF) Close() error          { return nil }
+
+// TestStreamingAggregate_CancelAfterEOF — a context cancelled just as
+// the input ends is reported, not turned into a partial result.
+func TestStreamingAggregate_CancelAfterEOF(t *testing.T) {
+	df := parityFrame(t)
+	defer df.Release()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	one, err := df.CompactChunks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer one.Release()
+	batch := frameToBatch(one)
+	n := newAggregateNode(&scanFrameNode{frame: df}, []string{"ks"}, []Aggregation{{Kind: AggCount, Alias: "n"}})
+	exec := &streamingAggregateExec{
+		input:     &cancelAtEOF{batches: []arrow.RecordBatch{batch}, schema: df.Schema(), cancel: cancel},
+		keys:      n.keys,
+		aggs:      n.aggs,
+		outSchema: n.outSchema,
+		workers:   4,
+		keyMode:   keyModeString1,
+	}
+	exec.rowsPool.New = func() any { s := make([]int, 0, 128); return &s }
+	if _, err := exec.Next(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// TestValueCapture_PiecesStayFew — capturing a value per batch over
+// many batches keeps a logarithmic number of pieces, in order.
+func TestValueCapture_PiecesStayFew(t *testing.T) {
+	const batches = 1000
+	fields := []arrow.Field{{Name: "k", Type: arrow.PrimitiveTypes.Int64}}
+	df := chunkedFrame(t, fields, batches, 1, func(c int, b array.Builder, lo, hi int) {
+		b.(*array.Int64Builder).Append(int64(lo))
+	})
+	defer df.Release()
+	tbl, err := newGroupTable(keyModeInt641, []string{"k"}, []Aggregation{{Kind: AggCount, Alias: "n"}}, []arrow.DataType{arrow.PrimitiveTypes.Int64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.release()
+	col, _ := df.Column("k")
+	for _, chunk := range col.col.Data().Chunks() {
+		fld := arrow.Field{Name: "k", Type: chunk.DataType()}
+		rb := array.NewRecordBatch(arrow.NewSchema([]arrow.Field{fld}, nil), []arrow.Array{chunk}, 1)
+		if err := tbl.consume(rb, nil); err != nil {
+			t.Fatal(err)
+		}
+		rb.Release()
+	}
+	if got := len(tbl.keyCaps[0].pieces); got > 12 {
+		t.Errorf("%d pieces after %d batches, want O(log n)", got, batches)
+	}
+	tbl.finish(false)
+	keys, err := takeCaptures(memory.DefaultAllocator, arrow.PrimitiveTypes.Int64,
+		[]*valueCapture{&tbl.keyCaps[0]}, outputOrder([]*groupTable{tbl}, keyModeInt641, false),
+		func(r rowRef) int32 { return r.g })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer keys.Release()
+	for i, v := range keys.(*array.Int64).Int64Values() {
+		if v != int64(i) {
+			t.Fatalf("key %d = %d", i, v)
+		}
 	}
 }

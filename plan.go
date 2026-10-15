@@ -325,38 +325,15 @@ func newAggregateNode(input LogicalPlan, keys []string, aggs []Aggregation) *agg
 		}
 	}
 
-	// Agg output columns. Count / NUnique → Int64 non-null;
-	// Sum of an integer column → Int64 (Uint64 when unsigned);
-	// First / Last / Mode / BitOr / BitAnd / BitXor preserve the
-	// source column's arrow type;
-	// Min / Max preserve source type when the source is Timestamp
-	// (so timestamp aggregation round-trips instead of collapsing to
-	// Float64); custom Aggregator uses its declared Type; everything
-	// else → Float64.
+	// Agg output columns: see aggResultType.
 	for _, a := range aggs {
-		t := aggOutputType(a)
-		if a.Fn == nil && a.Kind == AggSum {
-			if fm, ok := inSchema.FieldsByName(a.Column); ok && len(fm) > 0 {
-				if it := intSumType(fm[0].Type); it != nil {
-					t = it
-				}
-			}
-		}
-		if a.Fn == nil && a.Kind.preservesSourceType() {
-			if fm, ok := inSchema.FieldsByName(a.Column); ok && len(fm) > 0 {
-				t = fm[0].Type
-			}
-		}
-		if a.Fn == nil && (a.Kind == AggMin || a.Kind == AggMax) {
-			if fm, ok := inSchema.FieldsByName(a.Column); ok && len(fm) > 0 {
-				if _, isTS := fm[0].Type.(*arrow.TimestampType); isTS {
-					t = fm[0].Type
-				}
-			}
+		var src arrow.DataType
+		if fm, ok := inSchema.FieldsByName(a.Column); ok && len(fm) > 0 {
+			src = fm[0].Type
 		}
 		fields = append(fields, arrow.Field{
 			Name:     aggName(a),
-			Type:     t,
+			Type:     aggResultType(a, src),
 			Nullable: aggOutputNullable(a),
 		})
 	}
@@ -421,23 +398,41 @@ func (n *aggregateNode) String() string {
 		strings.Join(n.keys, ", "), strings.Join(aggParts, ", "), order)
 }
 
-// aggOutputType picks the arrow type Aggregate will produce for one
-// Aggregation. Kept aligned with the eager engine's builder-picking
-// logic in groupby.go — if the two diverge, Schema() will lie.
+// aggResultType is the output column type of a grouped aggregation over
+// a source column of type src — the one rule every engine (lazy plan,
+// streaming, eager, aligned, fast path) follows:
 //
-// For First/Last the output type depends on the source column, so the
-// LazyFrame builder (newAggregateNode) special-cases those and doesn't
-// call this — it copies the source column's type directly. When this
-// is called for First/Last (e.g. from ExplainPhysical without a
-// resolved input schema) it falls back to Float64 as the safe scalar
-// default.
-func aggOutputType(a Aggregation) arrow.DataType {
+//   - custom Aggregator: its declared Type
+//   - Count / NUnique: Int64
+//   - First / Last / Mode / BitOr / BitAnd / BitXor: src
+//   - Min / Max on a Timestamp: src
+//   - Sum on an integer column: Int64, or Uint64 when unsigned
+//   - everything else: Float64
+//
+// src may be nil (unknown column); the source-typed kinds then fall
+// back to Float64.
+func aggResultType(a Aggregation, src arrow.DataType) arrow.DataType {
 	if a.Fn != nil {
 		return a.Fn.Type()
 	}
 	switch a.Kind {
 	case AggCount, AggNUnique:
 		return arrow.PrimitiveTypes.Int64
+	}
+	if src == nil {
+		return arrow.PrimitiveTypes.Float64
+	}
+	switch {
+	case a.Kind.preservesSourceType():
+		return src
+	case a.Kind == AggMin || a.Kind == AggMax:
+		if _, ok := src.(*arrow.TimestampType); ok {
+			return src
+		}
+	case a.Kind == AggSum:
+		if t := intSumType(src); t != nil {
+			return t
+		}
 	}
 	return arrow.PrimitiveTypes.Float64
 }

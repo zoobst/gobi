@@ -24,7 +24,12 @@ introduce breaking changes; check this file when upgrading.
   - **Migrating:** code that reads an integer sum column as
     `*array.Float64`, or decodes it into a `float64` struct field, has
     to switch to `*array.Int64` / `int64` (`*array.Uint64` / `uint64`
-    for unsigned sources).
+    for unsigned sources). A missed spot shows up as:
+    - `ToStructs` into a `float64` field: `gobi: ToStructs: row 0 "v":
+      float field got int64`. Passing `StructCoerceNumbers()` also
+      accepts it.
+    - a direct cast: `panic: interface conversion: arrow.Array is
+      *array.Int64, not *array.Float64`.
 
 ### Added
 
@@ -39,8 +44,9 @@ introduce breaking changes; check this file when upgrading.
 
 - **Lazy `GroupBy` costs far less per group.** The streaming aggregate
   used to create about 8 heap objects per group for one sum and about
-  2 more per extra aggregation. That made it 5–20× slower than a plain
-  Go map fold once most rows were their own group.
+  2 more per extra aggregation. Once most rows were their own group,
+  that made it slower than a plain Go map fold by 14× for a single
+  sum, and by 27× with four `First` columns added.
   - **Dense group ids:** groups are numbered as they're first seen.
     Each aggregation keeps its state in slices indexed by that
     number.
@@ -56,6 +62,9 @@ introduce breaking changes; check this file when upgrading.
     sorted runs merge in parallel.
   - **Results:** values, schema and row order are unchanged, apart
     from integer sums (above).
+  - **Small group counts:** no change in time (about 2.3 ms at 100
+    keys either way). Memory there rises slightly, from 7.1 MB to
+    8.7 MB.
 
   `BenchmarkGroupBy_GroupCountSweep`: 200,000 rows, a string key, an
   Int64 sum, and four String `First` columns. Apple M3 Pro, 11

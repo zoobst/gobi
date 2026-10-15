@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/bits"
 	"slices"
 	"sort"
 	"strings"
@@ -219,14 +218,17 @@ func (e *streamingAggregateExec) buildIfNeeded(ctx context.Context) error {
 	}
 	e.built = true
 
+	build := e.buildSerial
 	if e.workers > 1 {
-		if err := e.buildParallel(ctx); err != nil {
-			return err
+		build = e.buildParallel
+	}
+	if err := build(ctx); err != nil {
+		// buildResultBatch won't run: free the captured arrays here.
+		for _, t := range e.tables {
+			t.release()
 		}
-	} else {
-		if err := e.buildSerial(ctx); err != nil {
-			return err
-		}
+		e.tables = nil
+		return err
 	}
 	rb, err := e.buildResultBatch()
 	if err != nil {
@@ -236,11 +238,20 @@ func (e *streamingAggregateExec) buildIfNeeded(ctx context.Context) error {
 	return nil
 }
 
+// aggTypes returns the aggregations' planned output types.
+func (e *streamingAggregateExec) aggTypes() []arrow.DataType {
+	ts := make([]arrow.DataType, len(e.aggs))
+	for i := range ts {
+		ts[i] = e.outSchema.Field(len(e.keys) + i).Type
+	}
+	return ts
+}
+
 // buildSerial folds every batch into one groupTable. Used for
 // workers <= 1 — the partitioned path pays for goroutine + channel +
 // hash overhead that isn't worth it without CPU parallelism to unlock.
 func (e *streamingAggregateExec) buildSerial(ctx context.Context) error {
-	t, err := newGroupTable(e.keyMode, e.keys, e.aggs)
+	t, err := newGroupTable(e.keyMode, e.keys, e.aggs, e.aggTypes())
 	if err != nil {
 		return err
 	}
@@ -584,7 +595,9 @@ type groupTable struct {
 	allRows []int // 0..n-1, for the serial build
 }
 
-func newGroupTable(mode keyMode, keys []string, aggs []Aggregation) (*groupTable, error) {
+// newGroupTable builds an empty table; aggTypes are the aggregations'
+// planned output types (the output schema after the key columns).
+func newGroupTable(mode keyMode, keys []string, aggs []Aggregation, aggTypes []arrow.DataType) (*groupTable, error) {
 	t := &groupTable{mode: mode, keys: keys, aggs: aggs}
 	if mode == keyModeInt641 {
 		t.intIdx = make(map[int64]int32)
@@ -596,7 +609,7 @@ func newGroupTable(mode keyMode, keys []string, aggs []Aggregation) (*groupTable
 	}
 	t.states = make([]aggState, len(aggs))
 	for i, a := range aggs {
-		st, err := newAggState(a)
+		st, err := newAggState(a, aggTypes[i])
 		if err != nil {
 			t.release()
 			return nil, err
@@ -1080,7 +1093,26 @@ func (c *valueCapture) capture(col Series, rows []int) (int, error) {
 	}
 	c.pieces = append(c.pieces, arr)
 	c.n += len(rows)
+	c.mergeTail()
 	return base, nil
+}
+
+// mergeTail keeps the piece count logarithmic: while the next-to-last
+// piece is no more than twice the last, the two are concatenated.
+// Sizes then shrink geometrically along the list, so a value is copied
+// O(log n) times in all, and a capture fed many small batches doesn't
+// pile up thousands of pieces for every lookup to search. Adjacent
+// pieces merge in order, so slots don't change.
+func (c *valueCapture) mergeTail() {
+	for n := len(c.pieces); n >= 2 && c.pieces[n-2].Len() <= 2*c.pieces[n-1].Len(); n = len(c.pieces) {
+		merged, err := array.Concatenate(c.pieces[n-2:], memory.DefaultAllocator)
+		if err != nil {
+			return // e.g. dictionaries that don't unify: leave them apart
+		}
+		c.pieces[n-2].Release()
+		c.pieces[n-1].Release()
+		c.pieces = append(c.pieces[:n-2], merged)
+	}
 }
 
 // compact keeps only the values slots still refer to, renumbering
@@ -1196,19 +1228,32 @@ type aggState interface {
 
 // newAggState picks the columnar state for the built-in kinds that
 // have one, and the per-group accumulator adapter for the rest.
-func newAggState(a Aggregation) (aggState, error) {
+// dt is the aggregation's planned output type (aggResultType); the
+// columnar states store and emit exactly that, and reject a batch
+// whose column doesn't fit it.
+func newAggState(a Aggregation, dt arrow.DataType) (aggState, error) {
 	if a.Fn == nil {
 		switch a.Kind {
 		case AggCount:
 			return &countState{star: a.Column == ""}, nil
-		case AggSum:
-			return &sumState{}, nil
-		case AggMean:
-			return &sumState{mean: true}, nil
+		case AggSum, AggMean:
+			s := &sumState{mean: a.Kind == AggMean}
+			switch dt.ID() {
+			case arrow.INT64:
+				s.integer, s.signed = true, true
+			case arrow.UINT64:
+				s.integer = true
+			}
+			return s, nil
 		case AggMin, AggMax:
-			return &minMaxState{isMin: a.Kind == AggMin}, nil
+			_, ts := dt.(*arrow.TimestampType)
+			return &minMaxState{isMin: a.Kind == AggMin, ts: ts}, nil
 		case AggFirst, AggLast:
-			return &firstLastState{first: a.Kind == AggFirst}, nil
+			s := &firstLastState{first: a.Kind == AggFirst, dt: dt, vals: newFLValues(dt)}
+			if s.vals == nil {
+				s.capt = &flCapture{last: !s.first}
+			}
+			return s, nil
 		}
 	}
 	if _, err := newAccumulator(a); err != nil {
@@ -1287,16 +1332,15 @@ func (s *countState) emit(pool memory.Allocator, dt arrow.DataType, peers []aggS
 	return bld.NewArray(), nil
 }
 
-// sumState: Sum and Mean. Mean, and Sum over a non-integer column,
-// are Float64, adding each value as float64 in row order — the same
-// arithmetic the per-group accumulators used, so results match bit for
-// bit. Sum over an integer column is an overflow-checked Int64 (signed
-// sources) or Uint64 (unsigned) sum.
+// sumState: Sum and Mean, in the planned output type. Float64 adds
+// each value as float64 in row order — the same arithmetic the
+// per-group accumulators used, so results match bit for bit. Int64 /
+// Uint64 (Sum over an integer column) is an overflow-checked integer
+// sum.
 type sumState struct {
 	mean    bool
-	decided bool
-	signed  bool // integer Sum, signed source
-	integer bool // integer Sum
+	integer bool // Int64 or Uint64 output
+	signed  bool // Int64 output
 	sum     []float64
 	isum    []int64
 	usum    []uint64
@@ -1321,27 +1365,15 @@ func (s *sumState) update(col Series, b *aggBatch) error {
 	if col.col == nil {
 		return nil
 	}
-	if !s.decided {
-		s.decided = true
-		if t := intSumType(col.DataType()); t != nil && !s.mean {
-			s.integer = true
-			s.signed = t.ID() == arrow.INT64
-			s.sum = nil
-			if err := s.grow(len(s.n)); err != nil {
-				return err
-			}
-		}
+	if !s.integer {
+		return foldNumeric(col, b, func(g int32, v float64) {
+			s.sum[g] += v
+			s.n[g]++
+		})
 	}
-	if s.integer {
-		return s.updateInt(col, b)
+	if t := intSumType(col.DataType()); t == nil || (t.ID() == arrow.INT64) != s.signed {
+		return fmt.Errorf("%w: integer sum planned, column is %s", ErrColumnTypeMismatch, col.DataType())
 	}
-	return foldNumeric(col, b, func(g int32, v float64) {
-		s.sum[g] += v
-		s.n[g]++
-	})
-}
-
-func (s *sumState) updateInt(col Series, b *aggBatch) error {
 	chunks := col.col.Data().Chunks()
 	if len(chunks) == 1 {
 		switch a := chunks[0].(type) {
@@ -1363,21 +1395,19 @@ func (s *sumState) updateInt(col Series, b *aggBatch) error {
 			return foldUnsigned(s, a, a.Uint8Values(), b)
 		}
 	}
-	cur := newChunkCursor(col)
+	loc := newChunkLocator(col)
 	for i, row := range b.rows {
-		chunk, local, err := cur.locate(row)
-		if err != nil {
-			return err
+		chunk, local, ok := loc.locate(row)
+		if !ok {
+			return fmt.Errorf("%w: row %d", ErrRowOutOfRange, row)
 		}
 		if chunk.IsNull(local) {
 			continue
 		}
 		g := b.gids[i]
-		acc := intSum{n: s.n[g]}
-		if s.signed {
-			acc.i = s.isum[g]
-		} else {
-			acc.u = s.usum[g]
+		acc := intSum{i: s.isum[g], n: s.n[g]}
+		if !s.signed {
+			acc = intSum{u: s.usum[g], n: s.n[g]}
 		}
 		if err := acc.add(chunk, local); err != nil {
 			return err
@@ -1399,9 +1429,8 @@ func foldSigned[T int64 | int32 | int16 | int8](s *sumState, a arrow.Array, vals
 			continue
 		}
 		g := b.gids[i]
-		v := int64(vals[row])
-		r := s.isum[g] + v
-		if (v > 0 && r < s.isum[g]) || (v < 0 && r > s.isum[g]) {
+		r, ok := addInt64(s.isum[g], int64(vals[row]))
+		if !ok {
 			return ErrSumOverflow
 		}
 		s.isum[g] = r
@@ -1417,8 +1446,8 @@ func foldUnsigned[T uint64 | uint32 | uint16 | uint8](s *sumState, a arrow.Array
 			continue
 		}
 		g := b.gids[i]
-		r, carry := bits.Add64(s.usum[g], uint64(vals[row]), 0)
-		if carry != 0 {
+		r, ok := addUint64(s.usum[g], uint64(vals[row]))
+		if !ok {
 			return ErrSumOverflow
 		}
 		s.usum[g] = r
@@ -1429,27 +1458,27 @@ func foldUnsigned[T uint64 | uint32 | uint16 | uint8](s *sumState, a arrow.Array
 
 func (s *sumState) emit(pool memory.Allocator, dt arrow.DataType, peers []aggState, order []rowRef) (arrow.Array, error) {
 	ps := peersOf[*sumState](peers)
-	switch dt.ID() {
-	case arrow.INT64:
+	switch {
+	case s.integer && s.signed:
 		bld := array.NewInt64Builder(pool)
 		defer bld.Release()
 		bld.Reserve(len(order))
 		for _, r := range order {
 			p := ps[r.t]
-			if int(r.g) >= len(p.isum) || p.n[r.g] == 0 {
+			if p.n[r.g] == 0 {
 				bld.UnsafeAppendBoolToBitmap(false)
 				continue
 			}
 			bld.UnsafeAppend(p.isum[r.g])
 		}
 		return bld.NewArray(), nil
-	case arrow.UINT64:
+	case s.integer:
 		bld := array.NewUint64Builder(pool)
 		defer bld.Release()
 		bld.Reserve(len(order))
 		for _, r := range order {
 			p := ps[r.t]
-			if int(r.g) >= len(p.usum) || p.n[r.g] == 0 {
+			if p.n[r.g] == 0 {
 				bld.UnsafeAppendBoolToBitmap(false)
 				continue
 			}
@@ -1463,7 +1492,7 @@ func (s *sumState) emit(pool memory.Allocator, dt arrow.DataType, peers []aggSta
 	for _, r := range order {
 		p := ps[r.t]
 		switch {
-		case int(r.g) >= len(p.sum) || p.n[r.g] == 0:
+		case p.n[r.g] == 0:
 			bld.UnsafeAppendBoolToBitmap(false)
 		case s.mean:
 			bld.UnsafeAppend(p.sum[r.g] / float64(p.n[r.g]))
@@ -1521,20 +1550,23 @@ func foldTyped[T int64 | int32 | float64 | float32](a arrow.Array, vals []T, b *
 	}
 }
 
-// minMaxState: Min / Max as Float64, or as the source Timestamp type
-// (compared as int64, so nanosecond precision survives).
+// minMaxState: Min / Max in the planned output type: Float64, or the
+// source Timestamp type (compared as int64, so nanosecond precision
+// survives).
 type minMaxState struct {
-	isMin   bool
-	decided bool
-	ts      bool
-	ext     []float64
-	tsExt   []int64
-	seen    []bool
+	isMin bool
+	ts    bool // Timestamp output
+	ext   []float64
+	tsExt []int64
+	seen  []bool
 }
 
 func (s *minMaxState) grow(n int) error {
-	s.ext = growTo(s.ext, n, 0)
-	s.tsExt = growTo(s.tsExt, n, 0)
+	if s.ts {
+		s.tsExt = growTo(s.tsExt, n, 0)
+	} else {
+		s.ext = growTo(s.ext, n, 0)
+	}
 	s.seen = growTo(s.seen, n, false)
 	return nil
 }
@@ -1543,10 +1575,6 @@ func (s *minMaxState) release() {}
 func (s *minMaxState) update(col Series, b *aggBatch) error {
 	if col.col == nil {
 		return nil
-	}
-	if !s.decided {
-		s.decided = true
-		_, s.ts = col.DataType().(*arrow.TimestampType)
 	}
 	if !s.ts {
 		// Same rule as minMaxAcc: the first value is taken as is, after
@@ -1560,6 +1588,9 @@ func (s *minMaxState) update(col Series, b *aggBatch) error {
 				s.ext[g] = v
 			}
 		})
+	}
+	if _, ok := col.DataType().(*arrow.TimestampType); !ok {
+		return fmt.Errorf("%w: timestamp min/max planned, column is %s", ErrColumnTypeMismatch, col.DataType())
 	}
 	for i, row := range b.rows {
 		v, null, err := timestampAt(col, row)
@@ -1582,8 +1613,8 @@ func (s *minMaxState) update(col Series, b *aggBatch) error {
 
 func (s *minMaxState) emit(pool memory.Allocator, dt arrow.DataType, peers []aggState, order []rowRef) (arrow.Array, error) {
 	ps := peersOf[*minMaxState](peers)
-	if tt, ok := dt.(*arrow.TimestampType); ok {
-		bld := array.NewTimestampBuilder(pool, tt)
+	if s.ts {
+		bld := array.NewTimestampBuilder(pool, dt.(*arrow.TimestampType))
 		defer bld.Release()
 		bld.Reserve(len(order))
 		for _, r := range order {
@@ -1618,21 +1649,20 @@ func (s *minMaxState) emit(pool memory.Allocator, dt arrow.DataType, peers []agg
 // batch of the rows to keep. Last overwrites, so its arena and capture
 // are compacted when stale values pile up.
 type firstLastState struct {
-	first   bool
-	decided bool
-	set     []bool     // per gid: has a value
-	nset    int        // groups with a value
-	vals    flValues   // typed storage, or nil to use capture
-	capt    *flCapture // fallback storage
+	first bool
+	dt    arrow.DataType // planned output type = source type
+	set   []bool         // per gid: has a value
+	nset  int            // groups with a value
+	vals  flValues       // typed storage; nil when capt is used
+	capt  *flCapture     // take-based storage
 }
 
 func (s *firstLastState) grow(n int) error {
 	s.set = growTo(s.set, n, false)
 	if s.vals != nil {
 		s.vals.grow(n)
-	}
-	if s.capt != nil {
-		s.capt.grow(n, !s.first)
+	} else {
+		s.capt.grow(n)
 	}
 	return nil
 }
@@ -1647,59 +1677,39 @@ func (s *firstLastState) update(col Series, b *aggBatch) error {
 	if col.col == nil {
 		return nil
 	}
-	if !s.decided {
-		s.decided = true
-		s.vals = newFLValues(col.DataType())
-		if s.vals == nil {
-			s.capt = &flCapture{}
-		}
-		if err := s.grow(len(s.set)); err != nil {
-			return err
-		}
-	}
 	if s.first && s.nset == len(s.set) {
 		return nil // every group has its first value
 	}
 	if s.capt != nil {
-		err := s.capt.update(col, b, s.first, s.set)
-		s.nset = countTrue(s.set)
+		added, err := s.capt.update(col, b, s.first, s.set)
+		s.nset += added
 		return err
 	}
-	chunks := col.col.Data().Chunks()
-	if len(chunks) == 1 {
-		chunk := chunks[0]
-		noNulls := chunk.NullN() == 0
-		for i, row := range b.rows {
-			g := b.gids[i]
-			if s.first && s.set[g] {
-				continue
-			}
-			if !noNulls && chunk.IsNull(row) {
-				continue
-			}
-			s.vals.put(g, chunk, row)
-			if !s.set[g] {
-				s.set[g] = true
-				s.nset++
+	if !arrow.TypeEqual(col.DataType(), s.dt) {
+		return fmt.Errorf("%w: %s first/last planned, column is %s", ErrColumnTypeMismatch, s.dt, col.DataType())
+	}
+	loc := newChunkLocator(col)
+	single := len(loc.chunks) == 1
+	noNulls := single && loc.chunks[0].NullN() == 0
+	for i, row := range b.rows {
+		g := b.gids[i]
+		if s.first && s.set[g] {
+			continue
+		}
+		chunk, local := loc.chunks[0], row
+		if !single {
+			var ok bool
+			if chunk, local, ok = loc.locate(row); !ok {
+				return fmt.Errorf("%w: row %d", ErrRowOutOfRange, row)
 			}
 		}
-	} else {
-		loc := chunkLocator{chunks: chunks, ends: chunkEnds(chunks)}
-		for i, row := range b.rows {
-			g := b.gids[i]
-			if s.first && s.set[g] {
-				continue
-			}
-			c, _ := slices.BinarySearch(loc.ends, row+1)
-			chunk, local := chunks[c], row-(loc.ends[c]-chunks[c].Len())
-			if chunk.IsNull(local) {
-				continue
-			}
-			s.vals.put(g, chunk, local)
-			if !s.set[g] {
-				s.set[g] = true
-				s.nset++
-			}
+		if !noNulls && chunk.IsNull(local) {
+			continue
+		}
+		s.vals.put(g, chunk, local)
+		if !s.set[g] {
+			s.set[g] = true
+			s.nset++
 		}
 	}
 	if !s.first {
@@ -1710,75 +1720,35 @@ func (s *firstLastState) update(col Series, b *aggBatch) error {
 
 func (s *firstLastState) emit(pool memory.Allocator, dt arrow.DataType, peers []aggState, order []rowRef) (arrow.Array, error) {
 	ps := peersOf[*firstLastState](peers)
-	var proto *firstLastState // a peer that saw data, to pick the storage kind
-	for _, p := range ps {
-		if p.decided {
-			proto = p
-			break
-		}
-	}
-	if proto == nil {
-		return array.MakeArrayOfNull(pool, dt, len(order)), nil
-	}
-	if proto.capt != nil {
+	if s.capt != nil {
 		caps := make([]*valueCapture, len(ps))
 		for i, p := range ps {
-			if p.capt == nil {
-				p.capt = &flCapture{} // never updated: no values
-			}
 			caps[i] = &p.capt.cap
 		}
-		return takeCaptures(pool, dt, caps, order, func(r rowRef) int32 {
-			p := ps[r.t].capt
-			if int(r.g) >= len(p.slot) {
-				return -1
-			}
-			return p.slot[r.g]
-		})
+		return takeCaptures(pool, dt, caps, order, func(r rowRef) int32 { return ps[r.t].capt.slot[r.g] })
 	}
-	if _, ok := proto.vals.(*flBytes); ok {
+	if _, ok := s.vals.(*flBytes); ok {
 		return buildBytesArray(pool, dt, len(order), func(i int) (string, bool) {
 			r := order[i]
 			p := ps[r.t]
-			if int(r.g) >= len(p.set) || !p.set[r.g] {
+			if !p.set[r.g] {
 				return "", false
 			}
 			return p.vals.(*flBytes).vals[r.g], true
 		})
 	}
-	bld, err := builderForType(pool, dt)
-	if err != nil {
-		return nil, err
-	}
+	// array.NewBuilder covers every fixed-width type flFixed stores
+	// (builderForType doesn't know Date32 / Date64).
+	bld := array.NewBuilder(pool, dt)
 	defer bld.Release()
 	vs := make([]flValues, len(ps))
 	for i, p := range ps {
 		vs[i] = p.vals
 	}
-	if err := proto.vals.emit(bld, vs, ps, order); err != nil {
+	if err := s.vals.emit(bld, vs, ps, order); err != nil {
 		return nil, err
 	}
 	return bld.NewArray(), nil
-}
-
-func countTrue(bs []bool) int {
-	n := 0
-	for _, b := range bs {
-		if b {
-			n++
-		}
-	}
-	return n
-}
-
-func chunkEnds(chunks []arrow.Array) []int {
-	ends := make([]int, len(chunks))
-	total := 0
-	for i, c := range chunks {
-		total += c.Len()
-		ends[i] = total
-	}
-	return ends
 }
 
 // flValues is firstLastState's typed per-group storage.
@@ -1916,23 +1886,24 @@ func (v *flFixed[T]) emit(bld array.Builder, peers []flValues, states []*firstLa
 // flCapture is the take-based storage for types without typed
 // storage: per batch, one take of the rows to keep.
 type flCapture struct {
+	last   bool    // Last: keep each batch's last row per group
 	slot   []int32 // per gid: capture slot, -1 = none
 	cap    valueCapture
-	dt     arrow.DataType
 	pick   []int   // scratch: rows to capture this batch
 	pickG  []int32 // scratch: their groups
 	lastAt []int32 // scratch (Last): per gid, index into pick, -1 = none
 }
 
-func (c *flCapture) grow(n int, last bool) {
+func (c *flCapture) grow(n int) {
 	c.slot = growTo(c.slot, n, -1)
-	if last {
+	if c.last {
 		c.lastAt = growTo(c.lastAt, n, -1)
 	}
 }
 
-func (c *flCapture) update(col Series, b *aggBatch, first bool, set []bool) error {
-	c.dt = col.DataType()
+// update captures the batch's values and marks their groups in set,
+// returning how many groups got their first value.
+func (c *flCapture) update(col Series, b *aggBatch, first bool, set []bool) (int, error) {
 	cur := newChunkCursor(col)
 	c.pick, c.pickG = c.pick[:0], c.pickG[:0]
 	for i, row := range b.rows {
@@ -1942,7 +1913,7 @@ func (c *flCapture) update(col Series, b *aggBatch, first bool, set []bool) erro
 		}
 		null, err := cur.isNull(row)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if null {
 			continue
@@ -1962,19 +1933,23 @@ func (c *flCapture) update(col Series, b *aggBatch, first bool, set []bool) erro
 	}
 	base, err := c.cap.capture(col, c.pick)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	added := 0
 	for j, g := range c.pickG {
 		c.slot[g] = int32(base + j)
-		set[g] = true
-		if !first {
+		if !set[g] {
+			set[g] = true
+			added++
+		}
+		if c.last {
 			c.lastAt[g] = -1
 		}
 	}
-	if !first && c.cap.n > 2*len(c.slot)+1024 {
-		return c.cap.compact(c.dt, c.slot)
+	if c.last && c.cap.n > 2*len(c.slot)+1024 {
+		return added, c.cap.compact(col.DataType(), c.slot)
 	}
-	return nil
+	return added, nil
 }
 
 // accState runs one per-group aggAccumulator per group, for the kinds

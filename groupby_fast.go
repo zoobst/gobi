@@ -367,10 +367,10 @@ func (v aggView) numAt(i int) (float64, bool) {
 }
 
 // makeAggBuilders returns one output-array builder + field per aggregation.
-// Count / NUnique → Int64 non-null. Sum of an Int64 source → Int64
-// (the only integer view the fast path builds). Min / Max on Timestamp
-// preserve the source's TimestampType via tsType captured in the
-// aggView. Everything else → Float64 nullable.
+// Types follow aggResultType: Count / NUnique → Int64 non-null; Sum of
+// an Int64 source → Int64; Min / Max on Timestamp preserve the
+// source's TimestampType via tsType captured in the aggView; everything
+// else → Float64 nullable.
 func makeAggBuilders(pool memory.Allocator, aggs []Aggregation, views []aggView) ([]array.Builder, []arrow.Field) {
 	bs := make([]array.Builder, len(aggs))
 	fs := make([]arrow.Field, len(aggs))
@@ -380,7 +380,8 @@ func makeAggBuilders(pool memory.Allocator, aggs []Aggregation, views []aggView)
 			fs[i] = arrow.Field{Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: false}
 			continue
 		}
-		if a.Kind == AggSum && views[i].numericKind == 2 {
+		if views[i].kind == aggViewNumeric && aggResultType(a, views[i].arr.DataType()).ID() == arrow.INT64 {
+			// Int64 Sum: the fast path's only integer view is Int64.
 			bs[i] = array.NewInt64Builder(pool)
 			fs[i] = arrow.Field{Name: aggName(a), Type: arrow.PrimitiveTypes.Int64, Nullable: true}
 			continue
