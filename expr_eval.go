@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -227,7 +228,11 @@ func (n *binOpNode) Eval(input *Frame) (Series, error) {
 					if err != nil {
 						return Series{}, err
 					}
-					if s, ok, err := tryScalarTimestampFastPath(n.op, left, tsLit); err != nil {
+					unit := arrow.Nanosecond
+					if dt, ok := rlit.dtype.(*arrow.TimestampType); ok {
+						unit = dt.Unit
+					}
+					if s, ok, err := tryScalarTimestampFastPath(n.op, left, tsLit, unit); err != nil {
 						return Series{}, err
 					} else if ok {
 						return s, nil
@@ -409,10 +414,12 @@ func (n *binOpNode) String() string {
 }
 
 // tryScalarTimestampFastPath emits (Timestamp-col cmp Timestamp-lit)
-// via cmpScalarTs, keeping the comparison on raw int64 values.
-// Returns ok=false when left isn't a single-chunk Timestamp column or
-// the op isn't a comparison — caller falls back to the general path.
-func tryScalarTimestampFastPath(op binOpKind, left Series, v arrow.Timestamp) (Series, bool, error) {
+// via cmpScalarTs, keeping the comparison on raw int64 values. A
+// literal in another unit (Lit(time.Time) is always nanoseconds) is
+// rescaled into the column's unit first. Returns ok=false when left
+// isn't a single-chunk Timestamp column or the op isn't a comparison —
+// caller falls back to the general path.
+func tryScalarTimestampFastPath(op binOpKind, left Series, v arrow.Timestamp, litUnit arrow.TimeUnit) (Series, bool, error) {
 	if !op.isComparison() {
 		return Series{}, false, nil
 	}
@@ -420,7 +427,76 @@ func tryScalarTimestampFastPath(op binOpKind, left Series, v arrow.Timestamp) (S
 	if !ok {
 		return Series{}, false, nil
 	}
-	return cmpScalarTS(vals, arr, v, binOpToCmpOp(op), left.name), true, nil
+	cop, iv, ok := rescaleTSComparison(binOpToCmpOp(op), int64(v), litUnit, arr.DataType().(*arrow.TimestampType).Unit)
+	if !ok {
+		return Series{}, false, nil
+	}
+	return cmpScalarTS(vals, arr, arrow.Timestamp(iv), cop, left.name), true, nil
+}
+
+// rescaleTSComparison rewrites (col op lit), lit counted in unit from
+// and col in unit to, as (col op' v) with v in unit to, so that
+// comparing raw values gives the same answer as comparing the
+// instants. Into a finer unit lit scales exactly (ok=false if that
+// overflows int64); into a coarser one it rounds the way op needs —
+// col < 1.5 is col < 2, col <= 1.5 is col <= 1 — and an Eq / Ne
+// against a lit between two column ticks becomes always-false /
+// always-true (nulls stay null).
+func rescaleTSComparison(op cmpOp, lit int64, from, to arrow.TimeUnit) (cmpOp, int64, bool) {
+	if from == to {
+		return op, lit, true
+	}
+	fm, tm := int64(from.Multiplier()), int64(to.Multiplier())
+	if tm < fm { // column finer
+		k := fm / tm
+		if lit > math.MaxInt64/k || lit < math.MinInt64/k {
+			return op, 0, false
+		}
+		return op, lit * k, true
+	}
+	k := tm / fm
+	floor := lit / k
+	if lit%k != 0 && lit < 0 {
+		floor--
+	}
+	exact := floor*k == lit
+	ceil := floor
+	if !exact {
+		ceil++
+	}
+	switch op {
+	case cmpLt:
+		return cmpLt, ceil, true
+	case cmpLe:
+		return cmpLe, floor, true
+	case cmpGt:
+		return cmpGt, floor, true
+	case cmpGe:
+		return cmpGe, ceil, true
+	case cmpEq:
+		if !exact {
+			return cmpLt, math.MinInt64, true // never true
+		}
+	case cmpNe:
+		if !exact {
+			return cmpGe, math.MinInt64, true // always true
+		}
+	}
+	return op, floor, true
+}
+
+// alignTSUnits returns a's values in unit to (finer than a's), for
+// comparing timestamp columns of different units.
+func alignTSUnits(a []arrow.Timestamp, from, to arrow.TimeUnit) ([]arrow.Timestamp, error) {
+	k := int64(from.Multiplier() / to.Multiplier())
+	out := make([]arrow.Timestamp, len(a))
+	for i, v := range a {
+		if int64(v) > math.MaxInt64/k || int64(v) < math.MinInt64/k {
+			return nil, fmt.Errorf("%w: timestamp %d %s overflows in %s", ErrExprTypeMismatch, v, from, to)
+		}
+		out[i] = v * arrow.Timestamp(k)
+	}
+	return out, nil
 }
 
 // tryScalarFastPath attempts to dispatch (col op literal) to a Series
@@ -476,12 +552,11 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 		}
 	}
 	// Timestamp col-vs-col comparisons: Series.Cmp requires isNumeric
-	// (false for Timestamp), so route here via cmpTsTs. Unit match is
-	// guaranteed by promoteForComparison in binOpNode.Type; a mismatch
-	// reaches here only through code paths that bypass Type checking.
+	// (false for Timestamp), so route here via cmpTsTs. Columns in
+	// different units are compared in the finer one.
 	if op.isComparison() {
-		if _, lok := left.DataType().(*arrow.TimestampType); lok {
-			if _, rok := right.DataType().(*arrow.TimestampType); rok {
+		if lt, lok := left.DataType().(*arrow.TimestampType); lok {
+			if rt, rok := right.DataType().(*arrow.TimestampType); rok {
 				if left.Len() != right.Len() {
 					return Series{}, fmt.Errorf("%w: %d vs %d",
 						ErrColumnLenMismatch, left.Len(), right.Len())
@@ -489,6 +564,16 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 				aVals, aArr, aOk := left.singleTS()
 				bVals, bArr, bOk := right.singleTS()
 				if aOk && bOk {
+					var err error
+					switch {
+					case lt.Unit.Multiplier() > rt.Unit.Multiplier():
+						aVals, err = alignTSUnits(aVals, lt.Unit, rt.Unit)
+					case rt.Unit.Multiplier() > lt.Unit.Multiplier():
+						bVals, err = alignTSUnits(bVals, rt.Unit, lt.Unit)
+					}
+					if err != nil {
+						return Series{}, err
+					}
 					return cmpTSTS(aVals, bVals, aArr, bArr, binOpToCmpOp(op), left.name), nil
 				}
 				// Multi-chunk Timestamp compare — fall through to
@@ -800,14 +885,10 @@ func promoteForComparison(lt, rt arrow.DataType) (arrow.DataType, error) {
 	}
 	if lts, lok := lt.(*arrow.TimestampType); lok {
 		if rts, rok := rt.(*arrow.TimestampType); rok {
-			// Different units would need a nanosecond conversion — punt
-			// until a user hits it. Callers who need to compare
-			// microsecond and nanosecond timestamps can cast one side
-			// explicitly with Expr.Cast.
-			if lts.Unit != rts.Unit {
-				return nil, fmt.Errorf(
-					"%w: Timestamp unit mismatch (%s vs %s) — cast one side first",
-					ErrExprTypeMismatch, lts.Unit, rts.Unit)
+			// Different units compare as instants (applyBinaryOp,
+			// rescaleTSComparison), in the finer unit.
+			if rts.Unit.Multiplier() < lts.Unit.Multiplier() {
+				return rt, nil
 			}
 			return lt, nil
 		}

@@ -3,6 +3,7 @@ package gpkgio
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 
@@ -85,7 +86,7 @@ func ScanFile(path string, opts *ReadOptions) *gobi.LazyFrame {
 		var pushedArgs []any
 		for _, c := range conjuncts {
 			sqlText, args, ok := gobi.ExprToSQL(c)
-			if !ok {
+			if !ok || hasTimeArg(args) {
 				continue
 			}
 			pushed = append(pushed, sqlText)
@@ -108,6 +109,21 @@ func ScanFile(path string, opts *ReadOptions) *gobi.LazyFrame {
 		return ScanFile(path, &newOpts).Plan()
 	}))
 	return gobi.NewLazyFrame(node)
+}
+
+// hasTimeArg reports whether a translated predicate binds a time
+// value. Those stay in the executor: ExprToSQL binds a time as an
+// integer count of nanoseconds, but DATETIME columns hold ISO-8601
+// text, and SQLite orders every integer before every text value, so
+// the SQL comparison would drop rows that match.
+func hasTimeArg(args []any) bool {
+	for _, a := range args {
+		switch a.(type) {
+		case arrow.Timestamp, time.Time:
+			return true
+		}
+	}
+	return false
 }
 
 // joinWhereFragments combines an existing Where fragment (from user

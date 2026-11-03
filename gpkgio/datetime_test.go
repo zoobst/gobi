@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -198,10 +199,45 @@ func TestDateTime_ReadsOtherWriters(t *testing.T) {
 	}
 	back.Release()
 
-	if _, err := db.Exec(`UPDATE l SET t = 1704164645 WHERE id = 3`); err != nil {
+	// Values that aren't ISO-8601 dates read as null, not an error.
+	if _, err := db.Exec(`UPDATE l SET t = 1704164645, d = '2024/01/02' WHERE id = 3`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gpkgio.ReadFile(path, nil); err == nil || !strings.Contains(err.Error(), "not ISO-8601") {
-		t.Errorf("numeric DATETIME: err = %v, want a not-ISO-8601 error", err)
+	if _, err := db.Exec(`UPDATE l SET t = '', d = 'unknown' WHERE id = 2`); err != nil {
+		t.Fatal(err)
+	}
+	back, err = gpkgio.ReadFile(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer back.Release()
+	if got := colJSON(t, back, "t") + colJSON(t, back, "d"); got != `["2024-01-02T03:04:05.123Z",null,null]["2024-01-02",null,null]` {
+		t.Errorf("non-ISO values: t, d = %s", got)
+	}
+}
+
+// TestDateTime_FilterNotPushedDown — a time comparison on a DATETIME
+// column stays in the executor, so it still matches rows.
+func TestDateTime_FilterNotPushedDown(t *testing.T) {
+	df := frameOf(t, []arrow.Field{{Name: "ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond}}},
+		`[1704164645000000000, 1704164646000000000, 1704164647000000000]`)
+	defer df.Release()
+	path := filepath.Join(t.TempDir(), "f.gpkg")
+	if err := gpkgio.WriteFile(df, path, &gpkgio.WriteOptions{Layer: "l"}); err != nil {
+		t.Fatal(err)
+	}
+	cut := time.Unix(1704164646, 0)
+	for name, pred := range map[string]gobi.Expr{
+		"lt": gobi.Col("ts").Lt(gobi.Lit(cut)),
+		"eq": gobi.Col("ts").Eq(gobi.Lit(cut)),
+	} {
+		out, err := gpkgio.ScanFile(path, nil).Filter(pred).Collect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.NumRows() != 1 {
+			t.Errorf("%s: %d rows, want 1", name, out.NumRows())
+		}
+		out.Release()
 	}
 }

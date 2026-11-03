@@ -547,18 +547,20 @@ func appendSQLValue(b array.Builder, v any, isGeom bool) error {
 		default:
 			return fmt.Errorf("binary column got %T", v)
 		}
+	// A DATE / DATETIME value that isn't an ISO-8601 date reads as
+	// null rather than failing the layer, as GDAL does.
 	case *array.TimestampBuilder:
-		t, err := sqlTime(v)
-		if err != nil {
-			return fmt.Errorf("datetime column: %w", err)
+		if t, err := sqlTime(v); err == nil {
+			tb.Append(arrow.Timestamp(t.UnixMilli()))
+		} else {
+			tb.AppendNull()
 		}
-		tb.Append(arrow.Timestamp(t.UnixMilli()))
 	case *array.Date32Builder:
-		t, err := sqlTime(v)
-		if err != nil {
-			return fmt.Errorf("date column: %w", err)
+		if t, err := sqlTime(v); err == nil {
+			tb.Append(arrow.Date32FromTime(t))
+		} else {
+			tb.AppendNull()
 		}
-		tb.Append(arrow.Date32FromTime(t))
 	default:
 		return fmt.Errorf("unsupported builder %T", b)
 	}
@@ -567,9 +569,10 @@ func appendSQLValue(b array.Builder, v any, isGeom bool) error {
 
 // sqlTime reads a DATE / DATETIME value. The driver parses text in
 // SQLite's date formats into a time.Time; other text (another ISO-8601
-// spelling, say) is parsed here. Numbers are rejected: SQLite reads
-// them as Julian days, other tools as Unix seconds or milliseconds, so
-// there's no safe guess.
+// spelling, say) is parsed here. Anything else is an error, which
+// appendSQLValue turns into null: numbers (Julian days to SQLite, Unix
+// seconds or milliseconds to other tools, so there's no safe guess),
+// "", and non-ISO text.
 func sqlTime(v any) (time.Time, error) {
 	switch x := v.(type) {
 	case time.Time:

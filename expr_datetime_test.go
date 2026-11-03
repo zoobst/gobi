@@ -2,7 +2,7 @@ package gobi
 
 import (
 	"errors"
-	"strings"
+	"fmt"
 	"testing"
 	"time"
 
@@ -381,21 +381,92 @@ func TestExpr_TimestampCol_LtLit_TypeInference(t *testing.T) {
 	}
 }
 
-// TestExpr_TimestampUnitMismatch_ErrorsClearly — comparing a
-// millisecond-unit Timestamp column against a nanosecond Lit
-// surfaces a clear unit-mismatch error at type-check time rather
-// than silently producing wrong results.
-func TestExpr_TimestampUnitMismatch_ErrorsClearly(t *testing.T) {
-	f := timestampFrame(t, arrow.Millisecond, []int64{1000})
-	_, err := Col("ts").Ge(Lit(time.Now())).node.Type(f.Schema())
-	if err == nil {
-		t.Fatal("expected unit-mismatch error")
+// TestExpr_TimestampMixedUnits — a Timestamp column compares with
+// Lit(time.Time) (nanoseconds) or a column in another unit as
+// instants, through every evaluation path: the scalar fast path, the
+// fused AND filter, a literal on the left, and column vs column.
+func TestExpr_TimestampMixedUnits(t *testing.T) {
+	// Column in milliseconds, including negative (pre-1970) values.
+	ms := []int64{-2001, -2000, -1999, -1, 0, 1, 999, 1000, 1001, 1500, 2000}
+	f := timestampFrame(t, arrow.Millisecond, ms)
+	defer f.Release()
+	// Cutoffs on, between and either side of millisecond ticks.
+	var cuts []time.Time
+	for _, ns := range []int64{-2_000_000_000, -1_999_999_999, -1_500_000, -1, 0, 1, 999_999, 1_000_000, 1_000_001, 1_500_000_000} {
+		cuts = append(cuts, time.Unix(0, ns))
 	}
-	if !errors.Is(err, ErrExprTypeMismatch) {
-		t.Errorf("error should wrap ErrExprTypeMismatch, got %v", err)
+	ops := []struct {
+		name string
+		mk   func(a, b Expr) Expr
+		want func(a, b int64) bool
+	}{
+		{"eq", Expr.Eq, func(a, b int64) bool { return a == b }},
+		{"ne", Expr.Ne, func(a, b int64) bool { return a != b }},
+		{"lt", Expr.Lt, func(a, b int64) bool { return a < b }},
+		{"le", Expr.Le, func(a, b int64) bool { return a <= b }},
+		{"gt", Expr.Gt, func(a, b int64) bool { return a > b }},
+		{"ge", Expr.Ge, func(a, b int64) bool { return a >= b }},
 	}
-	if !strings.Contains(err.Error(), "unit mismatch") {
-		t.Errorf("error should mention unit mismatch, got %v", err)
+	count := func(t *testing.T, e Expr) int {
+		t.Helper()
+		out, err := f.FilterExpr(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer out.Release()
+		return out.NumRows()
+	}
+	for _, op := range ops {
+		for _, cut := range cuts {
+			c := cut.UnixNano()
+			want, wantSwapped := 0, 0
+			for _, v := range ms {
+				if op.want(v*1_000_000, c) {
+					want++
+				}
+				if op.want(c, v*1_000_000) {
+					wantSwapped++
+				}
+			}
+			name := fmt.Sprintf("%s %dns", op.name, c)
+			if got := count(t, op.mk(Col("ts"), Lit(cut))); got != want {
+				t.Errorf("%s col-lit: %d rows, want %d", name, got, want)
+			}
+			fused := op.mk(Col("ts"), Lit(cut)).And(Col("ts").Ge(Lit(time.Unix(-10, 0))))
+			if got := count(t, fused); got != want {
+				t.Errorf("%s fused: %d rows, want %d", name, got, want)
+			}
+			if got := count(t, op.mk(Lit(cut), Col("ts"))); got != wantSwapped {
+				t.Errorf("%s lit-col: %d rows, want %d", name, got, wantSwapped)
+			}
+		}
+	}
+
+	// Column vs column: ms against seconds.
+	sec := timestampFrame(t, arrow.Second, []int64{-3, -2, -2, -1, 0, 0, 0, 1, 1, 1, 2})
+	defer sec.Release()
+	secCol, _ := sec.Column("ts")
+	both, err := f.WithColumn("s", secCol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer both.Release()
+	secs := []int64{-3, -2, -2, -1, 0, 0, 0, 1, 1, 1, 2}
+	for _, op := range ops {
+		want := 0
+		for i, v := range ms {
+			if op.want(v, secs[i]*1000) {
+				want++
+			}
+		}
+		out, err := both.FilterExpr(op.mk(Col("ts"), Col("s")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.NumRows() != want {
+			t.Errorf("col-col %s: %d rows, want %d", op.name, out.NumRows(), want)
+		}
+		out.Release()
 	}
 }
 
@@ -458,15 +529,19 @@ func TestExpr_TimestampFusedFilter_ParseFusedLeaf(t *testing.T) {
 	}
 }
 
-// TestExpr_TimestampFusedFilter_UnitMismatchRejected — a Timestamp col
-// with millisecond unit compared to a nanosecond Lit(time.Time) must
-// NOT be accepted by parseFusedLeaf; the general path errors at
-// Type() with a clear unit-mismatch message.
-func TestExpr_TimestampFusedFilter_UnitMismatchRejected(t *testing.T) {
+// TestExpr_TimestampFusedFilter_RescalesLiteral — a millisecond
+// column against a nanosecond Lit(time.Time) takes the fused path,
+// with the literal rounded into milliseconds the way the op needs:
+// ts >= 1.0005 s is ts >= 1001 ms.
+func TestExpr_TimestampFusedFilter_RescalesLiteral(t *testing.T) {
 	f := timestampFrame(t, arrow.Millisecond, []int64{1000, 2000})
-	e := Col("ts").Ge(Lit(time.Now())).node
-	if _, ok := parseFusedLeaf(f, e); ok {
-		t.Error("expected parseFusedLeaf to reject unit-mismatched Timestamp leaf")
+	defer f.Release()
+	leaf, ok := parseFusedLeaf(f, Col("ts").Ge(Lit(time.Unix(1, 500_000))).node)
+	if !ok {
+		t.Fatal("parseFusedLeaf rejected a mixed-unit Timestamp leaf")
+	}
+	if leaf.op != cmpGe || leaf.scalarI != 1001 {
+		t.Errorf("leaf = op %v, scalar %d; want >= 1001", leaf.op, leaf.scalarI)
 	}
 }
 

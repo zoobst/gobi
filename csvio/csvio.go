@@ -50,6 +50,8 @@ var (
 	ErrTimeParse             = errors.New("csvio: cannot parse cell as time.Time")
 	// ErrColumnMissing: a struct field's column isn't in the header.
 	ErrColumnMissing = errors.New("csvio: header has no column for struct field")
+	// ErrDuplicateField: two struct fields name the same header column.
+	ErrDuplicateField = errors.New("csvio: struct fields share a column name")
 )
 
 // DefaultTimeLayouts is the ordered list of time layouts tried by the
@@ -86,11 +88,12 @@ type ReadOptions struct {
 	Delimiter rune
 	// Comment marks lines that should be skipped when starting with this rune.
 	Comment rune
-	// SkipRows drops the first N data rows (after any header). Implemented
-	// by consuming N line-terminated records from the raw stream before
-	// the Arrow reader sees them, so quoted embedded newlines inside
-	// skipped rows will not be counted correctly — reserve SkipRows for
-	// well-behaved (no quoted newlines in the skip zone) input.
+	// SkipRows drops the first N raw lines of the input, before the
+	// header (or before the data, without one) — for preambles such as
+	// a title line above the header. Lines are counted by "\n", so a
+	// quoted field with an embedded newline in the skipped lines throws
+	// the count off. Parse errors still report line numbers from the
+	// start of the input.
 	SkipRows int
 	// CRSHint gives geometry columns a CRS when the CSV does not encode one.
 	CRSHint int32
@@ -173,17 +176,13 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 		recs = append(recs, rec)
 	}
 	if err := rdr.Err(); err != nil {
-		if errors.Is(err, io.EOF) && len(recs) == 0 && opts.hasHeader() {
-			return nil, ErrHeaderMissing
-		}
-		return nil, fmt.Errorf("csvio: %w", err)
+		return nil, sc.readErr(err)
 	}
 
 	// Concatenate the per-batch arrays into a single array per column,
 	// so the resulting Frame has single-chunk columns (matches the fast
 	// paths downstream in gobi).
-	numCols := len(plan)
-	readArrs := make([]arrow.Array, numCols)
+	readArrs := make([]arrow.Array, len(plan))
 	defer func() {
 		for _, a := range readArrs {
 			if a != nil {
@@ -191,7 +190,7 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 			}
 		}
 	}()
-	for c := range numCols {
+	for c := range plan {
 		if len(recs) == 0 { // header only
 			readArrs[c] = array.MakeArrayOfNull(pool, plan[c].readField.Type, 0)
 			continue
@@ -206,46 +205,7 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 		}
 		readArrs[c] = out
 	}
-
-	// Transform tagged columns into their output type.
-	outArrs := make([]arrow.Array, numCols)
-	for i, p := range plan {
-		switch p.transform {
-		case xformWKTToWKB:
-			bin, err := transformWKTColumn(pool, readArrs[i])
-			if err != nil {
-				return nil, fmt.Errorf("csvio: column %q: %w", p.outputField.Name, err)
-			}
-			outArrs[i] = bin
-		case xformStringToTimestamp:
-			ts, err := transformTimeColumn(pool, readArrs[i], p.timeLayout)
-			if err != nil {
-				return nil, fmt.Errorf("csvio: column %q: %w", p.outputField.Name, err)
-			}
-			outArrs[i] = ts
-		default:
-			// No transform: the read array becomes the output array. Retain
-			// it so both defers can release safely.
-			readArrs[i].Retain()
-			outArrs[i] = readArrs[i]
-		}
-	}
-	defer func() {
-		for _, a := range outArrs {
-			if a != nil {
-				a.Release()
-			}
-		}
-	}()
-
-	// Assemble the Frame with the output (post-transform) schema.
-	cols := make([]arrow.Column, numCols)
-	for i, a := range outArrs {
-		chunked := arrow.NewChunked(a.DataType(), []arrow.Array{a})
-		cols[i] = *arrow.NewColumn(sc.outFields[i], chunked)
-		chunked.Release()
-	}
-	return gobi.NewFrame(sc.outSchema, cols)
+	return sc.buildFrame(func(i int) arrow.Array { return readArrs[i] })
 }
 
 // skipBOM drops a UTF-8 byte-order mark (as Excel writes) from the
@@ -318,8 +278,8 @@ func ReadFileChunksFunc[T any](path string, opts *ReadOptions, fn func(*gobi.Fra
 // caller is then responsible for the matching Release().
 //
 // If fn returns an error, iteration stops and the error is wrapped in
-// ErrChunksAborted; errors.Is / errors.As match both. If reading fails, the underlying Arrow error is
-// returned directly.
+// ErrChunksAborted; errors.Is / errors.As match both. Empty input
+// (no header where one is expected) is ErrHeaderMissing, as in Read.
 func ReadChunksFunc[T any](r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) error) error {
 	sc, err := setupReader[T](r, opts)
 	if err != nil {
@@ -329,7 +289,7 @@ func ReadChunksFunc[T any](r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) 
 
 	for sc.rdr.Next() {
 		rec := sc.rdr.Record()
-		frame, err := recordToFrame(rec, sc.plan, sc.cols, sc.pool, sc.outSchema, sc.outFields)
+		frame, err := sc.buildFrame(func(i int) arrow.Array { return rec.Column(sc.cols[i]) })
 		if err != nil {
 			return err
 		}
@@ -340,10 +300,7 @@ func ReadChunksFunc[T any](r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) 
 		}
 	}
 	if err := sc.rdr.Err(); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		return fmt.Errorf("csvio: %w", err)
+		return sc.readErr(err)
 	}
 	return nil
 }
@@ -354,10 +311,59 @@ type setupContext struct {
 	rdr       *arrowcsv.Reader
 	plan      []columnPlan
 	cols      []int // per plan column: its column in rdr's records
+	lines     int   // input lines consumed before rdr's first
 	pool      memory.Allocator
 	outSchema *arrow.Schema
 	outFields []arrow.Field
 	release   func()
+}
+
+// readErr maps an error from rdr: a missing header (Arrow's EOF) is
+// ErrHeaderMissing, and parse errors get line numbers counted from
+// the start of the input rather than from where rdr began.
+func (s *setupContext) readErr(err error) error {
+	if errors.Is(err, io.EOF) {
+		return ErrHeaderMissing
+	}
+	return csvErr(shiftLines(err, s.lines))
+}
+
+// buildFrame turns one batch into a Frame: read(i) is plan column i as
+// read (owned by the caller), which is transformed to its output type.
+func (s *setupContext) buildFrame(read func(i int) arrow.Array) (*gobi.Frame, error) {
+	out := make([]arrow.Array, 0, len(s.plan))
+	defer func() {
+		for _, a := range out {
+			a.Release()
+		}
+	}()
+	for i, p := range s.plan {
+		a, err := transformColumn(s.pool, p, read(i))
+		if err != nil {
+			return nil, fmt.Errorf("csvio: column %q: %w", p.outputField.Name, err)
+		}
+		out = append(out, a)
+	}
+	cols := make([]arrow.Column, len(out))
+	for i, a := range out {
+		chunked := arrow.NewChunked(a.DataType(), []arrow.Array{a})
+		cols[i] = *arrow.NewColumn(s.outFields[i], chunked)
+		chunked.Release()
+	}
+	return gobi.NewFrame(s.outSchema, cols)
+}
+
+// transformColumn converts a column as read into its output type,
+// returning a new reference.
+func transformColumn(pool memory.Allocator, p columnPlan, col arrow.Array) (arrow.Array, error) {
+	switch p.transform {
+	case xformWKTToWKB:
+		return transformWKTColumn(pool, col)
+	case xformStringToTimestamp:
+		return transformTimeColumn(pool, col, p.timeLayout)
+	}
+	col.Retain()
+	return col, nil
 }
 
 func (s *setupContext) close() {
@@ -398,17 +404,10 @@ func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 	}
 	sc.plan = plan
 
-	// SkipRows drops raw lines before the header (or the data, without
-	// one).
 	br := skipBOM(r)
-	for range opts.SkipRows {
-		if _, err := br.ReadBytes('\n'); err != nil {
-			if err == io.EOF {
-				break
-			}
-			sc.close()
-			return nil, err
-		}
+	if sc.lines, err = skipLines(br, opts.SkipRows); err != nil {
+		sc.close()
+		return nil, err
 	}
 
 	readFields := planReadFields(plan)
@@ -418,11 +417,13 @@ func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 	}
 	header := opts.hasHeader()
 	if header && !opts.MatchByPosition {
-		readFields, sc.cols, err = matchHeader(br, plan, opts)
+		var lines int
+		readFields, sc.cols, lines, err = matchHeader(br, plan, opts)
 		if err != nil {
 			sc.close()
-			return nil, err
+			return nil, shiftLines(err, sc.lines)
 		}
+		sc.lines += lines
 		header = false // consumed by matchHeader
 	}
 
@@ -461,28 +462,28 @@ func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 // matchHeader reads the header record from br and lines plan's
 // columns up with it by name. It returns the fields to read, in file
 // order — matched columns typed from the plan, the others read as
-// String and dropped — and, per plan column, its position in the file.
+// String and dropped — per plan column, its position in the file, and
+// the number of lines the header took.
 //
 // br is left at the first data record: encoding/csv reads through br
 // itself (csv.NewReader reuses a *bufio.Reader) one line at a time,
 // never past the record it returns, so a quoted header cell spanning
 // lines is handled too.
-func matchHeader(br *bufio.Reader, plan []columnPlan, opts *ReadOptions) ([]arrow.Field, []int, error) {
-	cr := csv.NewReader(br)
-	cr.LazyQuotes = opts.LazyQuotes
-	if opts.Delimiter != 0 {
-		cr.Comma = opts.Delimiter
-	}
-	if opts.Comment != 0 {
-		cr.Comment = opts.Comment
-	}
+func matchHeader(br *bufio.Reader, plan []columnPlan, opts *ReadOptions) ([]arrow.Field, []int, int, error) {
+	cr := newCSVReader(br, opts)
 	header, err := cr.Read()
 	if errors.Is(err, io.EOF) {
-		return nil, nil, ErrHeaderMissing
+		return nil, nil, 0, ErrHeaderMissing
 	}
 	if err != nil {
-		return nil, nil, csvErr(err)
+		return nil, nil, 0, csvErr(err)
 	}
+	// The header ends on the line its last field starts on, plus that
+	// field's own line breaks (comment and blank lines before it are
+	// in FieldPos's count).
+	last := len(header) - 1
+	lines, _ := cr.FieldPos(last)
+	lines += strings.Count(header[last], "\n")
 	pos := make(map[string]int, len(header))
 	dup := make(map[string]bool)
 	fields := make([]arrow.Field, len(header))
@@ -496,70 +497,69 @@ func matchHeader(br *bufio.Reader, plan []columnPlan, opts *ReadOptions) ([]arro
 	}
 	cols := make([]int, len(plan))
 	var missing []string
+	fieldFor := make(map[string]bool, len(plan))
 	for i, p := range plan {
 		name := p.readField.Name
+		if fieldFor[name] {
+			return nil, nil, 0, fmt.Errorf("%w: %q", ErrDuplicateField, name)
+		}
+		fieldFor[name] = true
 		j, ok := pos[name]
 		if !ok {
 			missing = append(missing, strconv.Quote(name))
 			continue
 		}
 		if dup[name] {
-			return nil, nil, fmt.Errorf("%w: %q", ErrDuplicateHeader, name)
+			return nil, nil, 0, fmt.Errorf("%w: %q", ErrDuplicateHeader, name)
 		}
 		fields[j] = p.readField
 		cols[i] = j
 	}
 	if len(missing) > 0 {
-		return nil, nil, fmt.Errorf("%w: %s (ReadOptions.MatchByPosition reads columns by position instead)",
+		return nil, nil, 0, fmt.Errorf("%w: %s (ReadOptions.MatchByPosition reads columns by position instead)",
 			ErrColumnMissing, strings.Join(missing, ", "))
 	}
-	return fields, cols, nil
+	return fields, cols, lines, nil
 }
 
-// recordToFrame applies per-column transforms to one arrow.Record and
-// wraps the result in a Frame with the output schema. Ownership: the
-// returned Frame owns its arrays (they are Retain'd or freshly-built).
-// Release the Frame to drop those refs.
-func recordToFrame(
-	rec arrow.Record,
-	plan []columnPlan,
-	cols []int,
-	pool memory.Allocator,
-	outSchema *arrow.Schema,
-	outFields []arrow.Field,
-) (*gobi.Frame, error) {
-	numCols := len(plan)
-	outArrs := make([]arrow.Array, numCols)
-	for i, p := range plan {
-		col := rec.Column(cols[i])
-		switch p.transform {
-		case xformWKTToWKB:
-			a, err := transformWKTColumn(pool, col)
-			if err != nil {
-				return nil, fmt.Errorf("csvio: column %q: %w", p.outputField.Name, err)
+// newCSVReader is the encoding/csv reader both the header match and
+// ReadStrings parse with, configured from opts the same way Arrow's
+// reader is.
+func newCSVReader(br *bufio.Reader, opts *ReadOptions) *csv.Reader {
+	cr := csv.NewReader(br)
+	cr.LazyQuotes = opts.LazyQuotes
+	if opts.Delimiter != 0 {
+		cr.Comma = opts.Delimiter
+	}
+	if opts.Comment != 0 {
+		cr.Comment = opts.Comment
+	}
+	return cr
+}
+
+// skipLines drops n raw lines from br (ReadOptions.SkipRows) and
+// returns how many it dropped, fewer at end of input.
+func skipLines(br *bufio.Reader, n int) (int, error) {
+	for i := range n {
+		if _, err := br.ReadBytes('\n'); err != nil {
+			if err == io.EOF {
+				return i, nil
 			}
-			outArrs[i] = a
-		case xformStringToTimestamp:
-			a, err := transformTimeColumn(pool, col, p.timeLayout)
-			if err != nil {
-				return nil, fmt.Errorf("csvio: column %q: %w", p.outputField.Name, err)
-			}
-			outArrs[i] = a
-		default:
-			col.Retain()
-			outArrs[i] = col
+			return i, err
 		}
 	}
+	return n, nil
+}
 
-	frameCols := make([]arrow.Column, numCols)
-	for i, a := range outArrs {
-		chunked := arrow.NewChunked(a.DataType(), []arrow.Array{a})
-		frameCols[i] = *arrow.NewColumn(outFields[i], chunked)
-		// The Column holds its own ref via the chunked; release ours so
-		// the Frame is the sole owner.
-		a.Release()
+// shiftLines adds n to the line numbers of a parse error from a reader
+// that started n lines into the input.
+func shiftLines(err error, n int) error {
+	var pe *csv.ParseError
+	if n != 0 && errors.As(err, &pe) {
+		pe.StartLine += n
+		pe.Line += n
 	}
-	return gobi.NewFrame(outSchema, frameCols)
+	return err
 }
 
 // -----------------------------------------------------------------------------

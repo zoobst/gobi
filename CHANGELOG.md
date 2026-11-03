@@ -20,7 +20,14 @@ introduce breaking changes; check this file when upgrading.
     name are skipped. The Frame's columns stay in struct order.
   - **Errors:** a field with no matching column fails with the new
     `ErrColumnMissing`, listing every missing name. A field whose name
-    appears twice in the header fails with `ErrDuplicateHeader`.
+    appears twice in the header fails with `ErrDuplicateHeader`, and
+    two fields with the same name fail with the new
+    `ErrDuplicateField`.
+  - **Empty input:** `ReadChunksFunc`, `ReadFileChunksFunc` and
+    `ScanFile` now fail with `ErrHeaderMissing` on an empty file, as
+    `Read` and `ReadStrings` already did. They used to return no
+    chunks and no error. Without a header, empty input is still just
+    no rows.
   - **Unchanged:** files without a header (`HasHeader: false`) are read
     by position, as before. Names match exactly, case and spaces
     included.
@@ -42,20 +49,45 @@ introduce breaking changes; check this file when upgrading.
     Timestamp[ms, UTC] and `DATE` columns as Date32. Files written by
     earlier gobi versions still have `INTEGER` columns and still read
     as Int64.
+  - **Filters:** `ScanFile` no longer pushes comparisons against a
+    time literal into the SQL `WHERE`; they run in gobi instead. Pushed
+    down, the literal was bound as an integer, which SQLite orders
+    before all text, so filters on a `DATETIME` column returned the
+    wrong rows.
   - **Migrating:** code that read gobi-written timestamps back as Int64
     gets Timestamp[ms, UTC] for newly written files.
 
 ### Fixed
 
+- **Comparing timestamps of different units gives the right answer.**
+  A Timestamp column in seconds, milliseconds or microseconds compared
+  with `Lit(time.Time)` (always nanoseconds) compared the raw integers,
+  so `Lt` matched every row and `Eq` none. This affected `Filter`,
+  `FilterExpr` and `WithColumnExpr`, on Parquet files with
+  millisecond timestamps, for example. Two columns of different units
+  had the same problem. Both now compare as instants, and an exact
+  comparison never rounds a literal that falls between two ticks of
+  the column's unit. `Expr.Type` accepts mixed units instead of
+  reporting a mismatch.
 - **gpkgio reads `DATETIME` and `DATE` columns.** Files written by
   QGIS, GDAL or ogr2ogr with a date or date-time column failed to read
   with `float column got time.Time`. Values in other ISO-8601 forms,
-  such as a `+02:00` offset, are read too. A number stored in a
-  `DATETIME` column is an error, since its unit can't be known.
+  such as a `+02:00` offset, are read too. A value that isn't an
+  ISO-8601 date (`''`, `unknown`, `2024/01/02`, or a number, whose unit
+  can't be known) reads as null, as GDAL does.
 - **`csvio.ReadOptions.UseCRLF` no longer panics.** Setting it passed
   arrow's writer-only `WithCRLF` option to the CSV reader, which
   panics. It now does nothing: `"\r\n"` and `"\n"` line endings are
   both read either way.
+- **csvio parse errors report the right line.** With `SkipRows`, line
+  numbers in parse and field-count errors were counted from after the
+  skipped lines. They now count from the start of the input. The
+  `SkipRows` docs also said it skipped data rows after the header; it
+  skips raw lines before it, as it always has.
+- **`csvio.ReadChunksFunc` no longer leaks memory per chunk.** Each
+  chunk left one Arrow reference per column unreleased. A transform
+  error (bad WKT or time value) also leaked the columns already
+  converted.
 - **`csvio.Read` on a header-only file returns an empty Frame** with
   the struct's columns. It used to fail with `array/concat: must pass
   at least one array`.

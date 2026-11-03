@@ -1,7 +1,6 @@
 package csvio
 
 import (
-	"bufio"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -122,30 +121,13 @@ func readStrings(r io.Reader, opts *ReadOptions, chunk int, emit func(*gobi.Fram
 	if pool == nil {
 		pool = memory.DefaultAllocator
 	}
-	r = skipBOM(r)
-	// Same raw-line skip as Read: lines before the header count.
-	if opts.SkipRows > 0 {
-		br := bufio.NewReader(r)
-		for range opts.SkipRows {
-			if _, err := br.ReadBytes('\n'); err != nil {
-				if err == io.EOF {
-					break
-				}
-				return err
-			}
-		}
-		r = br
+	br := skipBOM(r)
+	skipped, err := skipLines(br, opts.SkipRows)
+	if err != nil {
+		return err
 	}
-
-	cr := csv.NewReader(r)
+	cr := newCSVReader(br, opts)
 	cr.ReuseRecord = true
-	cr.LazyQuotes = opts.LazyQuotes
-	if opts.Delimiter != 0 {
-		cr.Comma = opts.Delimiter
-	}
-	if opts.Comment != 0 {
-		cr.Comment = opts.Comment
-	}
 	nulls := map[string]bool{"": true}
 	for _, tok := range opts.NullTokens {
 		nulls[tok] = true
@@ -163,7 +145,7 @@ func readStrings(r io.Reader, opts *ReadOptions, chunk int, emit func(*gobi.Fram
 		return emit(empty)
 	}
 	if err != nil {
-		return csvErr(err)
+		return csvErr(shiftLines(err, skipped))
 	}
 
 	fields := make([]arrow.Field, len(first))
@@ -239,7 +221,7 @@ func readStrings(r io.Reader, opts *ReadOptions, chunk int, emit func(*gobi.Fram
 			break
 		}
 		if err != nil {
-			return csvErr(err)
+			return csvErr(shiftLines(err, skipped))
 		}
 		if err := appendRow(rec); err != nil {
 			return err

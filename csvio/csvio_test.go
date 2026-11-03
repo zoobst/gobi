@@ -3,6 +3,7 @@ package csvio_test
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
@@ -670,5 +671,67 @@ func TestOption_UseCRLF(t *testing.T) {
 	defer df.Release()
 	if got := colJSON(t, df, "id") + colJSON(t, df, "name"); got != `[1]["a"]` {
 		t.Errorf("id, name = %s", got)
+	}
+}
+
+// TestRead_ErrorLineNumbers — parse errors count lines from the start
+// of the input, including skipped lines and a header spanning lines,
+// whichever reader handled the header.
+func TestRead_ErrorLineNumbers(t *testing.T) {
+	type row struct {
+		ID   int64  `csv:"id"`
+		Name string `csv:"name"`
+	}
+	// Line 1 skipped, header on lines 2-3, rows on 4 and 5 (bad).
+	src := "title\n\"x\ny\",id,name\n0,1,a\n0,2,b,extra\n"
+	check := func(what string, err error) {
+		t.Helper()
+		var pe *csv.ParseError
+		if !errors.As(err, &pe) || pe.Line != 5 || !errors.Is(err, csvio.ErrRowFieldCountMismatch) {
+			t.Errorf("%s: err = %v, want a field-count error on line 5", what, err)
+		}
+	}
+	opts := &csvio.ReadOptions{SkipRows: 1}
+	_, err := csvio.Read[row](strings.NewReader(src), opts)
+	check("Read", err)
+	err = csvio.ReadChunksFunc[row](strings.NewReader(src), opts, func(*gobi.Frame) error { return nil })
+	check("ReadChunksFunc", err)
+	type byPos struct {
+		X    string `csv:"x"`
+		ID   int64  `csv:"id"`
+		Name string `csv:"name"`
+	}
+	_, err = csvio.Read[byPos](strings.NewReader(src), &csvio.ReadOptions{SkipRows: 1, MatchByPosition: true})
+	check("MatchByPosition", err)
+	_, err = csvio.ReadStrings(strings.NewReader(src), opts)
+	check("ReadStrings", err)
+}
+
+// TestRead_DuplicateFieldNames — two fields naming one column is an
+// error when matching by name.
+func TestRead_DuplicateFieldNames(t *testing.T) {
+	type row struct {
+		ID    int64  `csv:"id"`
+		IDRaw string `csv:"id"`
+	}
+	if _, err := csvio.Read[row](strings.NewReader("id\n1\n"), nil); !errors.Is(err, csvio.ErrDuplicateField) {
+		t.Errorf("err = %v, want ErrDuplicateField", err)
+	}
+}
+
+// TestReadChunksFunc_EmptyFile — no input at all is ErrHeaderMissing,
+// as in Read, whether columns match by name or by position.
+func TestReadChunksFunc_EmptyFile(t *testing.T) {
+	for _, opts := range []*csvio.ReadOptions{nil, {MatchByPosition: true}} {
+		err := csvio.ReadChunksFunc[basicRow](strings.NewReader(""), opts, func(*gobi.Frame) error { return nil })
+		if !errors.Is(err, csvio.ErrHeaderMissing) {
+			t.Errorf("opts %+v: err = %v, want ErrHeaderMissing", opts, err)
+		}
+	}
+	// Without a header, empty input is just no rows.
+	noHeader := false
+	if err := csvio.ReadChunksFunc[basicRow](strings.NewReader(""), &csvio.ReadOptions{HasHeader: &noHeader},
+		func(*gobi.Frame) error { return nil }); err != nil {
+		t.Errorf("no header: err = %v", err)
 	}
 }

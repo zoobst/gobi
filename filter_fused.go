@@ -289,9 +289,7 @@ func parseFusedLeaf(f *Frame, n ExprNode) (fusedFilterLeaf, bool) {
 			op: op, scalarI: iv, n: arr.Len(),
 		}, true
 	case *array.Timestamp:
-		// Timestamp cmp Timestamp-lit — unit match required
-		// (nanosecond-vs-microsecond would silently misorder).
-		// Reject non-Timestamp literals; the general path errors
+		// Timestamp cmp Timestamp-lit. Reject non-Timestamp literals; the general path errors
 		// on those at Type() anyway, so no capability lost.
 		tsLit, ok := litNode.value.(arrow.Timestamp)
 		if !ok {
@@ -299,9 +297,15 @@ func parseFusedLeaf(f *Frame, n ExprNode) (fusedFilterLeaf, bool) {
 		}
 		colTS, okCol := colTSType(colNode, f)
 		litTS, _ := litNode.dtype.(*arrow.TimestampType)
-		if !okCol || litTS == nil || colTS.Unit != litTS.Unit {
+		if !okCol || litTS == nil {
 			return fusedFilterLeaf{}, false
 		}
+		// A literal in another unit is rescaled into the column's.
+		op, scaled, ok := rescaleTSComparison(op, int64(tsLit), litTS.Unit, colTS.Unit)
+		if !ok {
+			return fusedFilterLeaf{}, false
+		}
+		tsLit = arrow.Timestamp(scaled)
 		// arrow.Timestamp is int64 under the hood; unsafe.Slice-free
 		// conversion via TimestampValues + reslice into []int64
 		// isn't safe without unsafe, so copy through the arrow view.
