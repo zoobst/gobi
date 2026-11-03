@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -74,8 +75,9 @@ type ReadOptions struct {
 // the layer's SRS.
 //
 // The layer's arrow schema is inferred from the SQLite column
-// affinities: INTEGER → Int64, REAL → Float64, TEXT → String,
-// BLOB → Binary. The geometry column always comes out as Binary
+// declared types: INTEGER → Int64, REAL → Float64, TEXT → String,
+// BLOB → Binary, DATETIME (or TIMESTAMP) → Timestamp[ms, UTC], DATE →
+// Date32. The geometry column always comes out as Binary
 // regardless of affinity so the WKB payload round-trips through
 // WriteFile without re-encoding.
 //
@@ -276,6 +278,10 @@ func schemaFromColumns(cols []columnInfo, geomCol string, srsID int32) *arrow.Sc
 	return arrow.NewSchema(fields, nil)
 }
 
+// dateTimeType is the arrow type of a GeoPackage DATETIME column: UTC,
+// to the millisecond, as the spec stores it.
+var dateTimeType = &arrow.TimestampType{Unit: arrow.Millisecond, TimeZone: "UTC"}
+
 // arrowTypeForAffinity maps a SQLite declared type to an arrow type.
 // SQLite's affinity rules are lenient; this covers the common cases
 // gobi.WriteFile emits + the handful of aliases GDAL / ogr2ogr use.
@@ -284,6 +290,10 @@ func arrowTypeForAffinity(decl string) arrow.DataType {
 	switch {
 	case u == "" || u == "BLOB":
 		return arrow.BinaryTypes.Binary
+	case strings.HasPrefix(u, "DATETIME"), strings.HasPrefix(u, "TIMESTAMP"):
+		return dateTimeType
+	case strings.HasPrefix(u, "DATE"):
+		return arrow.FixedWidthTypes.Date32
 	case strings.Contains(u, "INT"):
 		return arrow.PrimitiveTypes.Int64
 	case strings.Contains(u, "CHAR"), strings.Contains(u, "TEXT"), strings.Contains(u, "CLOB"):
@@ -537,10 +547,48 @@ func appendSQLValue(b array.Builder, v any, isGeom bool) error {
 		default:
 			return fmt.Errorf("binary column got %T", v)
 		}
+	case *array.TimestampBuilder:
+		t, err := sqlTime(v)
+		if err != nil {
+			return fmt.Errorf("datetime column: %w", err)
+		}
+		tb.Append(arrow.Timestamp(t.UnixMilli()))
+	case *array.Date32Builder:
+		t, err := sqlTime(v)
+		if err != nil {
+			return fmt.Errorf("date column: %w", err)
+		}
+		tb.Append(arrow.Date32FromTime(t))
 	default:
 		return fmt.Errorf("unsupported builder %T", b)
 	}
 	return nil
+}
+
+// sqlTime reads a DATE / DATETIME value. The driver parses text in
+// SQLite's date formats into a time.Time; other text (another ISO-8601
+// spelling, say) is parsed here. Numbers are rejected: SQLite reads
+// them as Julian days, other tools as Unix seconds or milliseconds, so
+// there's no safe guess.
+func sqlTime(v any) (time.Time, error) {
+	switch x := v.(type) {
+	case time.Time:
+		return x.UTC(), nil
+	case string:
+		return parseSQLTime(x)
+	case []byte:
+		return parseSQLTime(string(x))
+	}
+	return time.Time{}, fmt.Errorf("%T value %v is not ISO-8601 text", v, v)
+}
+
+func parseSQLTime(s string) (time.Time, error) {
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.999999999", "2006-01-02 15:04:05.999999999", dateLayout} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("%q is not an ISO-8601 date or date-time", s)
 }
 
 // stripGPBHeader parses the GPB header on a geometry blob and
@@ -618,6 +666,10 @@ func builderFor(pool memory.Allocator, t arrow.DataType) (array.Builder, error) 
 		return array.NewStringBuilder(pool), nil
 	case arrow.BINARY:
 		return array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary), nil
+	case arrow.TIMESTAMP:
+		return array.NewTimestampBuilder(pool, t.(*arrow.TimestampType)), nil
+	case arrow.DATE32:
+		return array.NewDate32Builder(pool), nil
 	}
 	return nil, fmt.Errorf("gpkg: no builder for arrow type %s", t)
 }

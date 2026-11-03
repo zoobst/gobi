@@ -2,7 +2,10 @@
 //
 // The reader infers each column's Arrow type from a user-supplied Go struct
 // whose fields carry `csv:"header"`, `geom:"true"`, and optional `time:"…"`
-// tags. Read parsing is delegated to Arrow's typed CSV reader, which parses
+// tags. Fields find their columns by header name, so the file's column
+// order doesn't matter and columns the struct doesn't name are skipped;
+// a field with no column is ErrColumnMissing. Without a header, or with
+// ReadOptions.MatchByPosition, columns are taken in field order. Read parsing is delegated to Arrow's typed CSV reader, which parses
 // each column directly into its Arrow buffer — no per-row `[]string`
 // intermediary and no per-cell reflection dispatch. Columns tagged as
 // geometry or time.Time are read as strings and post-transformed into
@@ -20,11 +23,13 @@ package csvio
 
 import (
 	"bufio"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +48,8 @@ var (
 	ErrHeaderMissing         = errors.New("csvio: expected header row not found in file")
 	ErrRowFieldCountMismatch = errors.New("csvio: row field count does not match schema")
 	ErrTimeParse             = errors.New("csvio: cannot parse cell as time.Time")
+	// ErrColumnMissing: a struct field's column isn't in the header.
+	ErrColumnMissing = errors.New("csvio: header has no column for struct field")
 )
 
 // DefaultTimeLayouts is the ordered list of time layouts tried by the
@@ -66,7 +73,14 @@ const DefaultChunkRows = 64 * 1024
 // ReadOptions controls CSV parsing.
 type ReadOptions struct {
 	// HasHeader indicates whether the first row is a header. Defaults to true.
+	// With a header, the typed readers (Read, ReadChunksFunc, ScanFile, …)
+	// match struct fields to columns by name; without one, by position.
 	HasHeader *bool
+	// MatchByPosition makes the typed readers take columns in struct
+	// field order even when there's a header, which is then skipped
+	// unread. The file must have exactly one column per field. For files
+	// whose header names don't match the struct's tags.
+	MatchByPosition bool
 	// Delimiter overrides the default comma. Any rune is accepted, e.g.
 	// '\t' for TSV or ';' for European-style CSV.
 	Delimiter rune
@@ -95,9 +109,8 @@ type ReadOptions struct {
 	// quoted field, unquoted fields that begin with a quote, etc. Off
 	// by default because it can mask genuinely malformed input.
 	LazyQuotes bool
-	// UseCRLF signals that record separators are "\r\n" rather than "\n".
-	// Rare in practice; Arrow's reader auto-handles most cases without
-	// this hint.
+	// UseCRLF has no effect: "\r\n" and "\n" line endings are both
+	// read either way. Kept so existing code compiles.
 	UseCRLF bool
 	// ChunkRows overrides DefaultChunkRows. Values ≤ 0 use the default.
 	ChunkRows int
@@ -140,69 +153,12 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 	if opts == nil {
 		opts = &ReadOptions{}
 	}
-	if opts.Compression != CodecAuto && opts.Compression != CodecNone {
-		dec, release, err := wrapCodec(r, opts.Compression)
-		if err != nil {
-			return nil, err
-		}
-		defer release()
-		r = dec
-	}
-
-	pool := opts.Allocator
-	if pool == nil {
-		pool = memory.DefaultAllocator
-	}
-
-	plan, err := planStruct[T](opts.CRSHint)
+	sc, err := setupReader[T](r, opts)
 	if err != nil {
 		return nil, err
 	}
-
-	// SkipRows is applied to the raw stream before Arrow's reader sees
-	// it, so the header row (if any) still counts against Arrow's own
-	// parser rather than being consumed here.
-	r = skipBOM(r)
-	if opts.SkipRows > 0 {
-		br := bufio.NewReader(r)
-		for range opts.SkipRows {
-			if _, err := br.ReadBytes('\n'); err != nil {
-				if err == io.EOF {
-					break
-				}
-				return nil, err
-			}
-		}
-		r = br
-	}
-
-	readSchema := arrow.NewSchema(planReadFields(plan), nil)
-
-	arrowOpts := []arrowcsv.Option{
-		arrowcsv.WithAllocator(pool),
-		arrowcsv.WithHeader(opts.hasHeader()),
-		arrowcsv.WithChunk(chunkRows(opts)),
-	}
-	if opts.Delimiter != 0 {
-		arrowOpts = append(arrowOpts, arrowcsv.WithComma(opts.Delimiter))
-	}
-	if opts.Comment != 0 {
-		arrowOpts = append(arrowOpts, arrowcsv.WithComment(opts.Comment))
-	}
-	if opts.LazyQuotes {
-		arrowOpts = append(arrowOpts, arrowcsv.WithLazyQuotes(true))
-	}
-	if opts.UseCRLF {
-		arrowOpts = append(arrowOpts, arrowcsv.WithCRLF(true))
-	}
-	// Always route empty strings + user-supplied null tokens through the
-	// null path. stringsCanBeNull=true keeps the previous behavior of
-	// mapping empty String cells to null.
-	nullTokens := append([]string{""}, opts.NullTokens...)
-	arrowOpts = append(arrowOpts, arrowcsv.WithNullReader(true, nullTokens...))
-
-	rdr := arrowcsv.NewReader(r, readSchema, arrowOpts...)
-	defer rdr.Release()
+	defer sc.close()
+	pool, plan, rdr := sc.pool, sc.plan, sc.rdr
 
 	// Collect record batches; each batch is one chunk-sized arrow.Record.
 	var recs []arrow.Record
@@ -236,9 +192,13 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 		}
 	}()
 	for c := range numCols {
+		if len(recs) == 0 { // header only
+			readArrs[c] = array.MakeArrayOfNull(pool, plan[c].readField.Type, 0)
+			continue
+		}
 		chunks := make([]arrow.Array, 0, len(recs))
 		for _, rec := range recs {
-			chunks = append(chunks, rec.Column(c))
+			chunks = append(chunks, rec.Column(sc.cols[c]))
 		}
 		out, err := array.Concatenate(chunks, pool)
 		if err != nil {
@@ -279,25 +239,20 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 	}()
 
 	// Assemble the Frame with the output (post-transform) schema.
-	outFields := make([]arrow.Field, numCols)
-	for i, p := range plan {
-		outFields[i] = p.outputField
-	}
-	outSchema := arrow.NewSchema(outFields, nil)
 	cols := make([]arrow.Column, numCols)
 	for i, a := range outArrs {
 		chunked := arrow.NewChunked(a.DataType(), []arrow.Array{a})
-		cols[i] = *arrow.NewColumn(outFields[i], chunked)
+		cols[i] = *arrow.NewColumn(sc.outFields[i], chunked)
 		chunked.Release()
 	}
-	return gobi.NewFrame(outSchema, cols)
+	return gobi.NewFrame(sc.outSchema, cols)
 }
 
 // skipBOM drops a UTF-8 byte-order mark (as Excel writes) from the
 // start of r. It has to go before the CSV parser runs: left in, it
 // makes a quoted first header cell parse as an unquoted field holding
 // a stray quote, which is a parse error.
-func skipBOM(r io.Reader) io.Reader {
+func skipBOM(r io.Reader) *bufio.Reader {
 	br := bufio.NewReader(r)
 	if b, err := br.Peek(3); err == nil && string(b) == "\xef\xbb\xbf" {
 		_, _ = br.Discard(3)
@@ -374,7 +329,7 @@ func ReadChunksFunc[T any](r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) 
 
 	for sc.rdr.Next() {
 		rec := sc.rdr.Record()
-		frame, err := recordToFrame(rec, sc.plan, sc.pool, sc.outSchema, sc.outFields)
+		frame, err := recordToFrame(rec, sc.plan, sc.cols, sc.pool, sc.outSchema, sc.outFields)
 		if err != nil {
 			return err
 		}
@@ -398,6 +353,7 @@ func ReadChunksFunc[T any](r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) 
 type setupContext struct {
 	rdr       *arrowcsv.Reader
 	plan      []columnPlan
+	cols      []int // per plan column: its column in rdr's records
 	pool      memory.Allocator
 	outSchema *arrow.Schema
 	outFields []arrow.Field
@@ -442,25 +398,38 @@ func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 	}
 	sc.plan = plan
 
-	r = skipBOM(r)
-	if opts.SkipRows > 0 {
-		br := bufio.NewReader(r)
-		for range opts.SkipRows {
-			if _, err := br.ReadBytes('\n'); err != nil {
-				if err == io.EOF {
-					break
-				}
-				sc.close()
-				return nil, err
+	// SkipRows drops raw lines before the header (or the data, without
+	// one).
+	br := skipBOM(r)
+	for range opts.SkipRows {
+		if _, err := br.ReadBytes('\n'); err != nil {
+			if err == io.EOF {
+				break
 			}
+			sc.close()
+			return nil, err
 		}
-		r = br
 	}
 
-	readSchema := arrow.NewSchema(planReadFields(plan), nil)
+	readFields := planReadFields(plan)
+	sc.cols = make([]int, len(plan))
+	for i := range sc.cols {
+		sc.cols[i] = i
+	}
+	header := opts.hasHeader()
+	if header && !opts.MatchByPosition {
+		readFields, sc.cols, err = matchHeader(br, plan, opts)
+		if err != nil {
+			sc.close()
+			return nil, err
+		}
+		header = false // consumed by matchHeader
+	}
+
+	readSchema := arrow.NewSchema(readFields, nil)
 	arrowOpts := []arrowcsv.Option{
 		arrowcsv.WithAllocator(sc.pool),
-		arrowcsv.WithHeader(opts.hasHeader()),
+		arrowcsv.WithHeader(header),
 		arrowcsv.WithChunk(chunkRows(opts)),
 	}
 	if opts.Delimiter != 0 {
@@ -472,13 +441,14 @@ func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 	if opts.LazyQuotes {
 		arrowOpts = append(arrowOpts, arrowcsv.WithLazyQuotes(true))
 	}
-	if opts.UseCRLF {
-		arrowOpts = append(arrowOpts, arrowcsv.WithCRLF(true))
-	}
+	// Empty strings and the caller's null tokens read as null.
 	nullTokens := append([]string{""}, opts.NullTokens...)
 	arrowOpts = append(arrowOpts, arrowcsv.WithNullReader(true, nullTokens...))
 
-	sc.rdr = arrowcsv.NewReader(r, readSchema, arrowOpts...)
+	// br is shared with matchHeader's csv.Reader and Arrow's:
+	// csv.NewReader reuses a *bufio.Reader it's given, so Arrow starts
+	// exactly where the header ended.
+	sc.rdr = arrowcsv.NewReader(br, readSchema, arrowOpts...)
 
 	sc.outFields = make([]arrow.Field, len(plan))
 	for i, p := range plan {
@@ -488,6 +458,64 @@ func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 	return sc, nil
 }
 
+// matchHeader reads the header record from br and lines plan's
+// columns up with it by name. It returns the fields to read, in file
+// order — matched columns typed from the plan, the others read as
+// String and dropped — and, per plan column, its position in the file.
+//
+// br is left at the first data record: encoding/csv reads through br
+// itself (csv.NewReader reuses a *bufio.Reader) one line at a time,
+// never past the record it returns, so a quoted header cell spanning
+// lines is handled too.
+func matchHeader(br *bufio.Reader, plan []columnPlan, opts *ReadOptions) ([]arrow.Field, []int, error) {
+	cr := csv.NewReader(br)
+	cr.LazyQuotes = opts.LazyQuotes
+	if opts.Delimiter != 0 {
+		cr.Comma = opts.Delimiter
+	}
+	if opts.Comment != 0 {
+		cr.Comment = opts.Comment
+	}
+	header, err := cr.Read()
+	if errors.Is(err, io.EOF) {
+		return nil, nil, ErrHeaderMissing
+	}
+	if err != nil {
+		return nil, nil, csvErr(err)
+	}
+	pos := make(map[string]int, len(header))
+	dup := make(map[string]bool)
+	fields := make([]arrow.Field, len(header))
+	for i, name := range header {
+		if _, ok := pos[name]; ok {
+			dup[name] = true
+		} else {
+			pos[name] = i
+		}
+		fields[i] = arrow.Field{Name: name, Type: arrow.BinaryTypes.String, Nullable: true}
+	}
+	cols := make([]int, len(plan))
+	var missing []string
+	for i, p := range plan {
+		name := p.readField.Name
+		j, ok := pos[name]
+		if !ok {
+			missing = append(missing, strconv.Quote(name))
+			continue
+		}
+		if dup[name] {
+			return nil, nil, fmt.Errorf("%w: %q", ErrDuplicateHeader, name)
+		}
+		fields[j] = p.readField
+		cols[i] = j
+	}
+	if len(missing) > 0 {
+		return nil, nil, fmt.Errorf("%w: %s (ReadOptions.MatchByPosition reads columns by position instead)",
+			ErrColumnMissing, strings.Join(missing, ", "))
+	}
+	return fields, cols, nil
+}
+
 // recordToFrame applies per-column transforms to one arrow.Record and
 // wraps the result in a Frame with the output schema. Ownership: the
 // returned Frame owns its arrays (they are Retain'd or freshly-built).
@@ -495,6 +523,7 @@ func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 func recordToFrame(
 	rec arrow.Record,
 	plan []columnPlan,
+	cols []int,
 	pool memory.Allocator,
 	outSchema *arrow.Schema,
 	outFields []arrow.Field,
@@ -502,7 +531,7 @@ func recordToFrame(
 	numCols := len(plan)
 	outArrs := make([]arrow.Array, numCols)
 	for i, p := range plan {
-		col := rec.Column(i)
+		col := rec.Column(cols[i])
 		switch p.transform {
 		case xformWKTToWKB:
 			a, err := transformWKTColumn(pool, col)
@@ -522,15 +551,15 @@ func recordToFrame(
 		}
 	}
 
-	cols := make([]arrow.Column, numCols)
+	frameCols := make([]arrow.Column, numCols)
 	for i, a := range outArrs {
 		chunked := arrow.NewChunked(a.DataType(), []arrow.Array{a})
-		cols[i] = *arrow.NewColumn(outFields[i], chunked)
+		frameCols[i] = *arrow.NewColumn(outFields[i], chunked)
 		// The Column holds its own ref via the chunked; release ours so
 		// the Frame is the sole owner.
 		a.Release()
 	}
-	return gobi.NewFrame(outSchema, cols)
+	return gobi.NewFrame(outSchema, frameCols)
 }
 
 // -----------------------------------------------------------------------------

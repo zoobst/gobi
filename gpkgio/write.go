@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -165,8 +166,10 @@ func defaultWriteOptions(opts *WriteOptions) WriteOptions {
 //	Bool                          → INTEGER (0 or 1)
 //	String, LargeString           → TEXT
 //	Binary, LargeBinary           → BLOB
-//	Timestamp                     → TEXT (ISO 8601)
-//	other                         → TEXT via string(v) fallback
+//	Timestamp                     → DATETIME, "YYYY-MM-DDTHH:MM:SS.SSSZ" (UTC, ms)
+//	Date32, Date64                → DATE, "YYYY-MM-DD"
+//
+// Other types are rejected.
 //
 // Batch inserts run in a single transaction of opts.BatchSize rows
 // each. Prepared statements are reused across the write.
@@ -718,23 +721,49 @@ func singleChunkColumnWriter(name string, chunk arrow.Array) (colWriter, bool) {
 			return a.Value(row), nil
 		}}, true
 	case *array.Timestamp:
+		unit := a.DataType().(*arrow.TimestampType).Unit
 		return colWriter{name: name, read: func(row int) (any, error) {
 			if a.IsNull(row) {
 				return nil, nil
 			}
-			// Store as raw int64 for simplicity — full ISO 8601 encoding
-			// requires the timestamp's declared unit which we don't
-			// track here. Users who need TEXT ISO strings can cast
-			// before writing.
-			return int64(a.Value(row)), nil
+			return formatDateTime(a.Value(row).ToTime(unit)), nil
+		}}, true
+	case *array.Date32:
+		return colWriter{name: name, read: func(row int) (any, error) {
+			if a.IsNull(row) {
+				return nil, nil
+			}
+			return a.Value(row).ToTime().Format(dateLayout), nil
+		}}, true
+	case *array.Date64:
+		return colWriter{name: name, read: func(row int) (any, error) {
+			if a.IsNull(row) {
+				return nil, nil
+			}
+			return a.Value(row).ToTime().Format(dateLayout), nil
 		}}, true
 	}
 	return colWriter{}, false
 }
 
-// sqliteAffinity picks a SQLite affinity for the arrow type. Follows
-// SQLite's 5 rules (§3 of the CREATE TABLE docs): INTEGER, TEXT,
-// BLOB, REAL, NUMERIC. Geometry columns are always BLOB.
+// GeoPackage date encodings (spec §1.1.1.1.1, Requirement 5): a DATE
+// is ISO-8601 "YYYY-MM-DD", a DATETIME "YYYY-MM-DDTHH:MM:SS.SSSZ" in
+// UTC. QGIS and GDAL recognize columns as temporal only in this form.
+const (
+	dateLayout     = "2006-01-02"
+	dateTimeLayout = "2006-01-02T15:04:05.000Z"
+)
+
+// formatDateTime renders t as a GeoPackage DATETIME. Precision below
+// a millisecond is truncated, as the format has none.
+func formatDateTime(t time.Time) string {
+	return t.UTC().Format(dateTimeLayout)
+}
+
+// sqliteAffinity picks the declared SQLite type for the arrow type:
+// one of SQLite's affinities (INTEGER, TEXT, BLOB, REAL), or the
+// GeoPackage DATE / DATETIME types for dates and timestamps. Geometry
+// columns are always BLOB.
 func sqliteAffinity(dt arrow.DataType, isGeom bool) string {
 	if isGeom {
 		return "BLOB"
@@ -742,8 +771,12 @@ func sqliteAffinity(dt arrow.DataType, isGeom bool) string {
 	switch dt.ID() {
 	case arrow.INT8, arrow.INT16, arrow.INT32, arrow.INT64,
 		arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64,
-		arrow.BOOL, arrow.TIMESTAMP:
+		arrow.BOOL:
 		return "INTEGER"
+	case arrow.TIMESTAMP:
+		return "DATETIME"
+	case arrow.DATE32, arrow.DATE64:
+		return "DATE"
 	case arrow.FLOAT16, arrow.FLOAT32, arrow.FLOAT64:
 		return "REAL"
 	case arrow.STRING, arrow.LARGE_STRING:

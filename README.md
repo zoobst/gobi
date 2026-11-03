@@ -350,8 +350,9 @@ type city struct {
 }
 
 func main() {
-    // .gz / .zst / .bz2 are auto-detected from the filename; explicit
-    // ReadOptions.Compression overrides.
+    // Fields find their columns by header name. .gz / .zst / .bz2 are
+    // auto-detected from the filename; explicit ReadOptions.Compression
+    // overrides.
     df, err := csvio.ReadFile[city]("cities.csv.gz", &csvio.ReadOptions{CRSHint: 4326})
     if err != nil { panic(err) }
     defer df.Release()

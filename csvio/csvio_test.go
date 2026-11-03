@@ -525,3 +525,150 @@ func TestOption_ChunkRows_SmallBatchProducesSameOutput(t *testing.T) {
 		}
 	}
 }
+
+// colJSON renders column name of df (one chunk) as JSON.
+func colJSON(t *testing.T, df *gobi.Frame, name string) string {
+	t.Helper()
+	s, err := df.Column(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.Column().Data().Chunks()[0].MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+type headerRow struct {
+	ID   int64     `csv:"id"`
+	Name string    `csv:"name"`
+	When time.Time `csv:"when" time:"2006-01-02"`
+	Geom string    `csv:"geom" geom:"true"`
+}
+
+// TestRead_MatchesHeaderByName — columns are found by header name, in
+// any order, with extra columns ignored; the Frame keeps struct order.
+func TestRead_MatchesHeaderByName(t *testing.T) {
+	src := "\xef\xbb\xbfextra;geom;\"na\nme\";name;when;id\n" +
+		"x;POINT (1 2);skip;alpha;2024-01-02;7\n" +
+		"y;POINT (3 4);skip;bravo;2024-03-04;9\n"
+	// The header cell "na\nme" is quoted across lines; Arrow has to start
+	// right after it.
+	opts := &csvio.ReadOptions{Delimiter: ';'}
+	check := func(what string, df *gobi.Frame) {
+		t.Helper()
+		if got := strings.Join(df.ColumnNames(), ","); got != "id,name,when,geom" {
+			t.Errorf("%s: columns = %s", what, got)
+		}
+		if got := colJSON(t, df, "id") + colJSON(t, df, "name"); got != `[7,9]["alpha","bravo"]` {
+			t.Errorf("%s: id, name = %s", what, got)
+		}
+		g, err := df.Geometry("geom", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p := g.(geometry.Point); p.X != 3 || p.Y != 4 {
+			t.Errorf("%s: geom[1] = %v", what, p)
+		}
+	}
+
+	df, err := csvio.Read[headerRow](strings.NewReader(src), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("Read", df)
+	df.Release()
+
+	err = csvio.ReadChunksFunc[headerRow](strings.NewReader(src), &csvio.ReadOptions{Delimiter: ';', ChunkRows: 1},
+		func(f *gobi.Frame) error {
+			if got := strings.Join(f.ColumnNames(), ","); got != "id,name,when,geom" {
+				t.Errorf("chunk columns = %s", got)
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "h.csv")
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	df, err = csvio.ScanFile[headerRow](path, opts).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("ScanFile", df)
+	df.Release()
+}
+
+func TestRead_HeaderErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, src string
+		want      error
+		contains  string
+	}{
+		{"missing", "id,geom,note\n1,POINT (1 2),x\n", csvio.ErrColumnMissing, `"name", "when"`},
+		{"duplicate matched", "id,name,when,geom,id\n1,a,2024-01-02,POINT (1 2),2\n", csvio.ErrDuplicateHeader, `"id"`},
+		{"empty", "", csvio.ErrHeaderMissing, ""},
+	} {
+		_, err := csvio.Read[headerRow](strings.NewReader(tc.src), nil)
+		if !errors.Is(err, tc.want) || !strings.Contains(fmt.Sprint(err), tc.contains) {
+			t.Errorf("%s: err = %v, want %v mentioning %s", tc.name, err, tc.want, tc.contains)
+		}
+	}
+	// A duplicate among the ignored columns is fine.
+	df, err := csvio.Read[headerRow](strings.NewReader("x,id,name,when,geom,x\n0,1,a,2024-01-02,POINT (1 2),0\n"), nil)
+	if err != nil {
+		t.Fatalf("duplicate unmatched column: %v", err)
+	}
+	df.Release()
+}
+
+// TestRead_MatchByPosition — the escape hatch reads columns in struct
+// order whatever the header says, and needs one column per field.
+func TestRead_MatchByPosition(t *testing.T) {
+	src := "ID,Label,Date,Shape\n1,a,2024-01-02,POINT (1 2)\n"
+	opts := &csvio.ReadOptions{MatchByPosition: true}
+	df, err := csvio.Read[headerRow](strings.NewReader(src), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := colJSON(t, df, "id") + colJSON(t, df, "name"); got != `[1]["a"]` {
+		t.Errorf("id, name = %s", got)
+	}
+	df.Release()
+	if _, err := csvio.Read[headerRow](strings.NewReader(src), nil); !errors.Is(err, csvio.ErrColumnMissing) {
+		t.Errorf("by name: err = %v, want ErrColumnMissing", err)
+	}
+	if _, err := csvio.Read[headerRow](strings.NewReader("ID,Label\n1,a\n"), opts); err == nil {
+		t.Error("by position with too few columns: no error")
+	}
+}
+
+// TestRead_HeaderOnlyByName — a header with no rows gives an empty
+// Frame with the struct's columns.
+func TestRead_HeaderOnlyByName(t *testing.T) {
+	df, err := csvio.Read[headerRow](strings.NewReader("geom,when,name,id\n"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer df.Release()
+	if rows, cols := df.Shape(); rows != 0 || cols != 4 {
+		t.Errorf("shape = (%d, %d), want (0, 4)", rows, cols)
+	}
+}
+
+// TestOption_UseCRLF — the option is accepted (it used to panic) and
+// CRLF input reads the same as LF input.
+func TestOption_UseCRLF(t *testing.T) {
+	df, err := csvio.Read[headerRow](strings.NewReader("id,name,when,geom\r\n1,a,2024-01-02,POINT (1 2)\r\n"), &csvio.ReadOptions{UseCRLF: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer df.Release()
+	if got := colJSON(t, df, "id") + colJSON(t, df, "name"); got != `[1]["a"]` {
+		t.Errorf("id, name = %s", got)
+	}
+}

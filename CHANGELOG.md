@@ -5,6 +5,61 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.5.2]
+
+### Changed (breaking)
+
+- **csvio's typed readers match columns by header name.** `Read`,
+  `ReadFile`, `ReadChunksFunc`, `ReadFileChunksFunc`, `ReadStructs` and
+  `ScanFile` used to take columns in struct field order and ignore the
+  header text. Swapping two columns of the same type then read the
+  values into the wrong fields with no error, and an extra column
+  failed the whole read.
+  - **Now:** each field's `csv:"…"` name is looked up in the header.
+    File column order doesn't matter, and columns the struct doesn't
+    name are skipped. The Frame's columns stay in struct order.
+  - **Errors:** a field with no matching column fails with the new
+    `ErrColumnMissing`, listing every missing name. A field whose name
+    appears twice in the header fails with `ErrDuplicateHeader`.
+  - **Unchanged:** files without a header (`HasHeader: false`) are read
+    by position, as before. Names match exactly, case and spaces
+    included.
+  - **Migrating:** if your header names don't match your tags, fix the
+    tags or set the new `ReadOptions.MatchByPosition` to keep reading by
+    position.
+- **gpkgio writes timestamps and dates the way the GeoPackage spec
+  says.** Timestamp columns were declared `INTEGER` and stored the raw
+  count in the column's unit, so QGIS and GDAL saw a plain number and
+  QGIS's time controller couldn't use the column. `WriteFile`'s docs
+  claimed ISO-8601 text.
+  - **Now:** a Timestamp column is declared `DATETIME` and stored as
+    UTC ISO-8601 text, `2024-01-02T03:04:05.123Z`, whatever its unit or
+    time zone. Precision below a millisecond is truncated, since the
+    format has none. Date32 and Date64 columns, which used to fail with
+    `unsupported column type`, are declared `DATE` and stored as
+    `2024-01-02`.
+  - **Reading back:** `DATETIME` (or `TIMESTAMP`) columns read as
+    Timestamp[ms, UTC] and `DATE` columns as Date32. Files written by
+    earlier gobi versions still have `INTEGER` columns and still read
+    as Int64.
+  - **Migrating:** code that read gobi-written timestamps back as Int64
+    gets Timestamp[ms, UTC] for newly written files.
+
+### Fixed
+
+- **gpkgio reads `DATETIME` and `DATE` columns.** Files written by
+  QGIS, GDAL or ogr2ogr with a date or date-time column failed to read
+  with `float column got time.Time`. Values in other ISO-8601 forms,
+  such as a `+02:00` offset, are read too. A number stored in a
+  `DATETIME` column is an error, since its unit can't be known.
+- **`csvio.ReadOptions.UseCRLF` no longer panics.** Setting it passed
+  arrow's writer-only `WithCRLF` option to the CSV reader, which
+  panics. It now does nothing: `"\r\n"` and `"\n"` line endings are
+  both read either way.
+- **`csvio.Read` on a header-only file returns an empty Frame** with
+  the struct's columns. It used to fail with `array/concat: must pass
+  at least one array`.
+
 ## [v0.5.1]
 
 ### Fixed
