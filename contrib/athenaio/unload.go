@@ -1500,7 +1500,6 @@ func (c *Client) BucketResultsFromS3URIs(ctx context.Context, uris []string, opt
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(bucketResultsFromS3URIsMaxParallel)
 	for i, uri := range uris {
-		i, uri := i, uri
 		g.Go(func() error {
 			frame, size, err := c.openBucketFrame(gctx, uri, opts)
 			if err != nil {
@@ -1541,10 +1540,7 @@ func longestCommonS3Prefix(uris []string) string {
 	}
 	prefix := uris[0]
 	for _, u := range uris[1:] {
-		n := len(prefix)
-		if len(u) < n {
-			n = len(u)
-		}
+		n := min(len(prefix), len(u))
 		i := 0
 		for ; i < n; i++ {
 			if prefix[i] != u[i] {

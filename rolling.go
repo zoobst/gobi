@@ -447,7 +447,7 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 	intervalNs := int64(r.interval)
 	buckets := make(map[int64][]int, 64)
 	var order []int64
-	for i := 0; i < n; i++ {
+	for i := range n {
 		t, valid := tsView.at(i)
 		if !valid {
 			// null time value → skip (not put in any bucket)

@@ -279,7 +279,7 @@ func (w *Writer) Write(f *gobi.Frame) error {
 		}
 		cols[j] = colCursor{chunks: s.Column().Data().Chunks(), geom: s.IsGeometry(), c: -1}
 	}
-	for r := 0; r < n; r++ {
+	for r := range n {
 		for j := range cols {
 			if j > 0 {
 				w.bw.WriteRune(w.comma)

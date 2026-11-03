@@ -24,7 +24,9 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -122,6 +124,26 @@ func TestIntegration_WriteThenRead(t *testing.T) {
 	}
 	if pt.X != 0 || pt.Y != 0 {
 		t.Errorf("row 0 point = (%v, %v), want (0, 0)", pt.X, pt.Y)
+	}
+	if crs, _ := geomS.Column().Field().Metadata.GetValue(gobi.MetaGeometryCRS); crs != "4326" {
+		t.Errorf("geometry CRS = %q, want 4326", crs)
+	}
+
+	// The streaming and lazy paths decode geometry the same way.
+	scanned, err := pgio.ScanTable(ctx, conn, table, nil).Collect()
+	if err != nil {
+		t.Fatalf("ScanTable: %v", err)
+	}
+	defer scanned.Release()
+	sg, err := scanned.Column("geom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sg.IsGeometry() {
+		t.Fatal("ScanTable: geometry column lost its geometry tag")
+	}
+	if _, err := geometry.ParseWKB(sg.Column().Data().Chunks()[0].(*array.Binary).Value(0)); err != nil {
+		t.Errorf("ScanTable: parse row 0: %v", err)
 	}
 }
 
@@ -356,5 +378,79 @@ func TestPGIOReadStructsQuery_TagPriority(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ID != 42 || rows[0].Name != "hello" || rows[0].Value != 1.5 {
 		t.Errorf("row = %+v", rows[0])
+	}
+}
+
+// TestIntegration_ScanTable_TimePushdown — comparisons against a time
+// literal on timestamptz, timestamp and date columns return the rows
+// that match, whether or not they run in PostgreSQL.
+func TestIntegration_ScanTable_TimePushdown(t *testing.T) {
+	conn, done := mustConn(t)
+	defer done()
+	ctx := context.Background()
+
+	table := uniqueTable("pgio_tp")
+	defer conn.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %q`, table))
+	for _, q := range []string{
+		fmt.Sprintf(`CREATE TABLE %q (id BIGINT, tz TIMESTAMPTZ, naive TIMESTAMP, d DATE)`, table),
+		fmt.Sprintf(`INSERT INTO %q VALUES
+			(1, '2024-01-01T00:00:00Z', '2024-01-01 00:00:00', '2024-01-01'),
+			(2, '2024-01-02T00:00:00Z', '2024-01-02 00:00:00', '2024-01-02'),
+			(3, '2024-01-03T00:00:00Z', '2024-01-03 00:00:00', '2024-01-03')`, table),
+	} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cut := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+	for _, col := range []string{"tz", "naive", "d"} {
+		for name, tc := range map[string]struct {
+			e    gobi.Expr
+			want int
+		}{
+			"lt": {gobi.Col(col).Lt(gobi.Lit(cut)), 1},
+			"ge": {gobi.Col(col).Ge(gobi.Lit(cut)), 2},
+			"eq": {gobi.Col(col).Eq(gobi.Lit(cut)), 1},
+			"in": {gobi.Col(col).IsIn([]any{cut, cut.AddDate(0, 0, 1)}), 2},
+		} {
+			out, err := pgio.ScanTable(ctx, conn, table, nil).Filter(tc.e).Collect()
+			if err != nil {
+				t.Errorf("%s %s: %v", col, name, err)
+				continue
+			}
+			if out.NumRows() != tc.want {
+				t.Errorf("%s %s: %d rows, want %d", col, name, out.NumRows(), tc.want)
+			}
+			out.Release()
+		}
+	}
+
+	// Pushed to PostgreSQL for timestamp columns; kept in gobi for
+	// dates, and for literals finer than PostgreSQL's microseconds.
+	for _, tc := range []struct {
+		e      gobi.Expr
+		pushed bool
+		want   int
+	}{
+		{gobi.Col("tz").Lt(gobi.Lit(cut)), true, 1},
+		{gobi.Col("naive").Lt(gobi.Lit(cut)), true, 1},
+		{gobi.Col("d").Lt(gobi.Lit(cut)), false, 1},
+		// Noon on the 2nd: the 2nd's date (midnight) is before it.
+		{gobi.Col("d").Lt(gobi.Lit(cut.Add(12 * time.Hour))), false, 2},
+		// 1 ns after midnight on the 2nd: the 2nd is before it.
+		{gobi.Col("tz").Lt(gobi.Lit(cut.Add(time.Nanosecond))), false, 2},
+	} {
+		lf := pgio.ScanTable(ctx, conn, table, nil).Filter(tc.e)
+		if got := strings.Contains(lf.ExplainPhysical(), "where="); got != tc.pushed {
+			t.Errorf("%s: pushed = %v, want %v", tc.e, got, tc.pushed)
+		}
+		out, err := lf.Collect()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.e, err)
+		}
+		if out.NumRows() != tc.want {
+			t.Errorf("%s: %d rows, want %d", tc.e, out.NumRows(), tc.want)
+		}
+		out.Release()
 	}
 }

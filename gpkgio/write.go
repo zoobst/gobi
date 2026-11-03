@@ -722,26 +722,11 @@ func singleChunkColumnWriter(name string, chunk arrow.Array) (colWriter, bool) {
 		}}, true
 	case *array.Timestamp:
 		unit := a.DataType().(*arrow.TimestampType).Unit
-		return colWriter{name: name, read: func(row int) (any, error) {
-			if a.IsNull(row) {
-				return nil, nil
-			}
-			return formatDateTime(a.Value(row).ToTime(unit)), nil
-		}}, true
+		return timeWriter(name, a, dateTimeLayout, func(row int) time.Time { return a.Value(row).ToTime(unit) }), true
 	case *array.Date32:
-		return colWriter{name: name, read: func(row int) (any, error) {
-			if a.IsNull(row) {
-				return nil, nil
-			}
-			return a.Value(row).ToTime().Format(dateLayout), nil
-		}}, true
+		return timeWriter(name, a, dateLayout, func(row int) time.Time { return a.Value(row).ToTime() }), true
 	case *array.Date64:
-		return colWriter{name: name, read: func(row int) (any, error) {
-			if a.IsNull(row) {
-				return nil, nil
-			}
-			return a.Value(row).ToTime().Format(dateLayout), nil
-		}}, true
+		return timeWriter(name, a, dateLayout, func(row int) time.Time { return a.Value(row).ToTime() }), true
 	}
 	return colWriter{}, false
 }
@@ -754,10 +739,22 @@ const (
 	dateTimeLayout = "2006-01-02T15:04:05.000Z"
 )
 
-// formatDateTime renders t as a GeoPackage DATETIME. Precision below
-// a millisecond is truncated, as the format has none.
-func formatDateTime(t time.Time) string {
-	return t.UTC().Format(dateTimeLayout)
+// timeWriter writes a date or timestamp column as GeoPackage text in
+// layout (dateLayout or dateTimeLayout), in UTC. Precision below a
+// millisecond is truncated, as the format has none. A year outside
+// 0000-9999 has no ISO-8601 form the format allows, so it's an error
+// rather than a string nothing reads back.
+func timeWriter(name string, a arrow.Array, layout string, at func(row int) time.Time) colWriter {
+	return colWriter{name: name, read: func(row int) (any, error) {
+		if a.IsNull(row) {
+			return nil, nil
+		}
+		t := at(row).UTC()
+		if y := t.Year(); y < 0 || y > 9999 {
+			return nil, fmt.Errorf("gpkg: column %q row %d: year %d is outside the 0000-9999 a GeoPackage date can hold", name, row, y)
+		}
+		return t.Format(layout), nil
+	}}
 }
 
 // sqliteAffinity picks the declared SQLite type for the arrow type:

@@ -23,10 +23,7 @@ func BoundsF64(xs, ys []float64) (minX, minY, maxX, maxY float64, ok bool) {
 	if len(xs) == 0 || len(ys) == 0 {
 		return 0, 0, 0, 0, false
 	}
-	n := len(xs)
-	if len(ys) < n {
-		n = len(ys)
-	}
+	n := min(len(xs), len(ys))
 	minX, minY, maxX, maxY = boundsF64ScalarNaN(xs, ys, n)
 	return minX, minY, maxX, maxY, true
 }
@@ -44,10 +41,7 @@ func BoundsF64(xs, ys []float64) (minX, minY, maxX, maxY float64, ok bool) {
 // Handles both closed and unclosed rings — a closing edge from
 // (last, first) is added iff last != first.
 func PolygonCentroidShoelace(xs, ys []float64) (cx, cy float64, ok bool) {
-	n := len(xs)
-	if len(ys) < n {
-		n = len(ys)
-	}
+	n := min(len(xs), len(ys))
 	if n < 3 {
 		return 0, 0, false
 	}

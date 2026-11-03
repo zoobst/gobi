@@ -27,12 +27,10 @@ type bitRow struct {
 	U64 *uint64
 }
 
-func ptr[T any](v T) *T { return &v }
-
 func mkBitRow(k string, v int64) bitRow {
 	return bitRow{
-		K: k, I8: ptr(int8(v)), I16: ptr(int16(v)), I32: ptr(int32(v)), I64: ptr(v),
-		U8: ptr(uint8(v)), U16: ptr(uint16(v)), U32: ptr(uint32(v)), U64: ptr(uint64(v)),
+		K: k, I8: new(int8(v)), I16: new(int16(v)), I32: new(int32(v)), I64: new(v),
+		U8: new(uint8(v)), U16: new(uint16(v)), U32: new(uint32(v)), U64: new(uint64(v)),
 	}
 }
 

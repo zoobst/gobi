@@ -11,8 +11,9 @@ import (
 
 var sinkFrame *gobi.Frame
 
-// benchFixture resolves the shared benchmarks/bench.parquet fixture built
-// by benchmarks/generate_fixture.go. Skips the benchmark if the fixture
+// benchFixture resolves the shared benchmarks/fixtures/bench.parquet
+// fixture built by benchmarks/fixtures/generate_fixture.go. Skips the
+// benchmark if the fixture
 // isn't present so `go test -bench` in CI without pre-generation is a
 // no-op rather than a failure.
 func benchFixture(b *testing.B) string {
@@ -21,10 +22,10 @@ func benchFixture(b *testing.B) string {
 	if err != nil {
 		b.Fatal(err)
 	}
-	// From parquetio/, the fixture is one level up under benchmarks/.
-	path := filepath.Join(cwd, "..", "benchmarks", "bench.parquet")
+	// From parquetio/, the fixture is one level up under benchmarks/fixtures/.
+	path := filepath.Join(cwd, "..", "benchmarks", "fixtures", "bench.parquet")
 	if _, err := os.Stat(path); err != nil {
-		b.Skipf("fixture missing (%v) — run `go run generate_fixture.go` in benchmarks/", err)
+		b.Skipf("fixture missing (%v) — run `go run generate_fixture.go` in benchmarks/fixtures/", err)
 	}
 	return path
 }

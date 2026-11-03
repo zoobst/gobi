@@ -98,7 +98,7 @@ func TestRollingWindowBoundary(t *testing.T) {
 	// Window > length: every row null.
 	out, _ = s.RollingSum(5)
 	arr = out.col.Data().Chunks()[0].(*array.Float64)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if !arr.IsNull(i) {
 			t.Errorf("row %d should be null when window > len", i)
 		}

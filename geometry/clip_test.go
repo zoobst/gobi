@@ -634,7 +634,7 @@ func TestClip_IdenticalPolygonInMultiPolygonWrap(t *testing.T) {
 	// Regular octagon, CCW.
 	n := 8
 	pts := make([]Point, n+1)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		theta := 2 * math.Pi * float64(i) / float64(n)
 		pts[i] = Point{X: 10 * math.Cos(theta), Y: 10 * math.Sin(theta)}
 	}

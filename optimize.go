@@ -1,6 +1,10 @@
 package gobi
 
-import "sort"
+import (
+	"maps"
+	"slices"
+	"sort"
+)
 
 // Rule is a single plan-tree rewrite. A rule is a pure function from
 // a plan to an equivalent plan, potentially cheaper to execute. The
@@ -181,6 +185,13 @@ func mapExprs(p LogicalPlan, fn func(Expr) Expr) LogicalPlan {
 // ExprNode pointer — a cheap "did anything change" check that
 // avoids deep equality.
 func sameNode(a, b Expr) bool { return a.node == b.node }
+
+// ExprColumns returns the names of the columns e reads, sorted. Scan
+// sources use it to decide whether a translated predicate (ExprToSQL)
+// is safe to push down for the columns involved.
+func ExprColumns(e Expr) []string {
+	return slices.Sorted(maps.Keys(referencedColumns(e)))
+}
 
 // referencedColumns returns the set of column names an Expr reads.
 // Used by rules that decide whether a predicate is safe to push

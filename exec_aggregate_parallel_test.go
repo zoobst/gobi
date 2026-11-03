@@ -30,7 +30,6 @@ func TestParallelAggregate_ParityAcrossWorkerCounts(t *testing.T) {
 	baseline := runAggWithWorkers(t, buildAgg(), 1)
 
 	for _, w := range []int{2, 4, 8, 16} {
-		w := w
 		t.Run("workers="+itoa(w), func(t *testing.T) {
 			got := runAggWithWorkers(t, buildAgg(), w)
 			if got.NumRows() != baseline.NumRows() {

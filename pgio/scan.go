@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/zoobst/gobi"
 )
@@ -40,7 +42,7 @@ func ScanTable(ctx context.Context, conn Conn, table string, opts *ReadOptions) 
 	// so the LazyFrame's schema is available for optimizer
 	// projection-pushdown. If the DB round-trip fails, the read
 	// closure below surfaces the same error at Collect time.
-	sch, schemaErr := ScanSchema(ctx, conn, table, opts)
+	sch, dateCols, schemaErr := scanSchema(ctx, conn, table, opts)
 
 	label := buildScanLabel(table, opts)
 
@@ -73,7 +75,7 @@ func ScanTable(ctx context.Context, conn Conn, table string, opts *ReadOptions) 
 		var pushedArgs []any
 		for _, c := range conjuncts {
 			sqlText, args, ok := gobi.ExprToSQL(c)
-			if !ok {
+			if !ok || !timeArgsPushable(c, args, dateCols) {
 				continue
 			}
 			// PostgreSQL doesn't accept `?` placeholders in the
@@ -104,17 +106,24 @@ func ScanTable(ctx context.Context, conn Conn, table string, opts *ReadOptions) 
 // inference is done by prepared-statement introspection against
 // PostgreSQL. Cheap: one round-trip.
 func ScanSchema(ctx context.Context, conn Conn, table string, opts *ReadOptions) (*arrow.Schema, error) {
+	sch, _, err := scanSchema(ctx, conn, table, opts)
+	return sch, err
+}
+
+// scanSchema is ScanSchema plus the set of date columns, which read as
+// Timestamp too but need their own pushdown rule (timeArgsPushable).
+func scanSchema(ctx context.Context, conn Conn, table string, opts *ReadOptions) (*arrow.Schema, map[string]bool, error) {
 	if opts == nil {
 		opts = &ReadOptions{}
 	}
 	schemaName := defaultSchema(opts.Schema)
 	geomSet, err := geometryColumnSet(ctx, conn, schemaName, table, opts.GeomColumns)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tableCols, err := listTableColumns(ctx, conn, schemaName, table)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	pick := tableCols
 	if len(opts.Columns) > 0 {
@@ -146,27 +155,63 @@ func ScanSchema(ctx context.Context, conn Conn, table string, opts *ReadOptions)
 		quoteIdent(schemaName), quoteIdent(table))
 	rows, err := conn.Query(ctx, probeSQL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 	fds := rows.FieldDescriptions()
 	geomOIDs, err := geometryOIDs(ctx, conn)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	fields := make([]arrow.Field, len(fds))
+	dateCols := make(map[string]bool)
 	for i, fd := range fds {
+		if fd.DataTypeOID == pgtype.DateOID {
+			dateCols[fd.Name] = true
+		}
 		if geomOIDs[fd.DataTypeOID] || geomSet[fd.Name] {
 			fields[i] = gobi.GeometryField(fd.Name, 0)
 			continue
 		}
 		dt, err := oidToArrowType(fd.DataTypeOID)
 		if err != nil {
-			return nil, fmt.Errorf("pgio: schema col %q: %w", fd.Name, err)
+			return nil, nil, fmt.Errorf("pgio: schema col %q: %w", fd.Name, err)
 		}
 		fields[i] = arrow.Field{Name: fd.Name, Type: dt, Nullable: true}
 	}
-	return arrow.NewSchema(fields, nil), nil
+	return arrow.NewSchema(fields, nil), dateCols, nil
+}
+
+// timeArgsPushable reports whether a translated conjunct with time
+// arguments gives PostgreSQL's answer or a superset of it (the
+// executor filters again above the scan). PostgreSQL types a
+// parameter from the column it's compared with, so two cases would
+// round the literal and lose rows:
+//   - a date column truncates it to the day: d < 12:00 on the 2nd
+//     becomes d < the 2nd, dropping the 2nd itself;
+//   - timestamp / timestamptz keep microseconds, and pgx truncates
+//     the rest: ts < 1.0000005 s becomes ts < 1 s.
+//
+// Those stay in the executor.
+func timeArgsPushable(c gobi.Expr, args []any, dateCols map[string]bool) bool {
+	hasTime := false
+	for _, a := range args {
+		if t, ok := a.(time.Time); ok {
+			hasTime = true
+			if t.Nanosecond()%1000 != 0 {
+				return false
+			}
+		}
+	}
+	if !hasTime {
+		return true
+	}
+	for _, col := range gobi.ExprColumns(c) {
+		if dateCols[col] {
+			return false
+		}
+	}
+	return true
 }
 
 // buildScanLabel is the human-readable "Scan[postgres](...)" label

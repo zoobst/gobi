@@ -414,7 +414,7 @@ func (u *roadSnapUDF) Eval(input *Frame) (Series, error) {
 		structB.Append(true)
 		n := chunk.Value(i)
 		pathB.Append(true)
-		for j := int64(0); j < n; j++ {
+		for j := range n {
 			pathValB.Append(uint64(j * 100))
 		}
 		offB.Append(n == 0) // OffRoute when the path is empty.

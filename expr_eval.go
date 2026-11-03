@@ -485,20 +485,6 @@ func rescaleTSComparison(op cmpOp, lit int64, from, to arrow.TimeUnit) (cmpOp, i
 	return op, floor, true
 }
 
-// alignTSUnits returns a's values in unit to (finer than a's), for
-// comparing timestamp columns of different units.
-func alignTSUnits(a []arrow.Timestamp, from, to arrow.TimeUnit) ([]arrow.Timestamp, error) {
-	k := int64(from.Multiplier() / to.Multiplier())
-	out := make([]arrow.Timestamp, len(a))
-	for i, v := range a {
-		if int64(v) > math.MaxInt64/k || int64(v) < math.MinInt64/k {
-			return nil, fmt.Errorf("%w: timestamp %d %s overflows in %s", ErrExprTypeMismatch, v, from, to)
-		}
-		out[i] = v * arrow.Timestamp(k)
-	}
-	return out, nil
-}
-
 // tryScalarFastPath attempts to dispatch (col op literal) to a Series
 // *Scalar method. Returns (result, true, nil) on success, (_, false,
 // nil) if the op has no fast path and the caller should fall back to
@@ -564,15 +550,12 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 				aVals, aArr, aOk := left.singleTS()
 				bVals, bArr, bOk := right.singleTS()
 				if aOk && bOk {
-					var err error
+					lm, rm := int64(lt.Unit.Multiplier()), int64(rt.Unit.Multiplier())
 					switch {
-					case lt.Unit.Multiplier() > rt.Unit.Multiplier():
-						aVals, err = alignTSUnits(aVals, lt.Unit, rt.Unit)
-					case rt.Unit.Multiplier() > lt.Unit.Multiplier():
-						bVals, err = alignTSUnits(bVals, rt.Unit, lt.Unit)
-					}
-					if err != nil {
-						return Series{}, err
+					case lm > rm:
+						return cmpTSMixed(aVals, bVals, aArr, bArr, lm/rm, binOpToCmpOp(op), left.name), nil
+					case rm > lm:
+						return cmpTSMixed(bVals, aVals, bArr, aArr, rm/lm, swapCmpOp(binOpToCmpOp(op)), left.name), nil
 					}
 					return cmpTSTS(aVals, bVals, aArr, bArr, binOpToCmpOp(op), left.name), nil
 				}

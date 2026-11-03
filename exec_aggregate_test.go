@@ -68,7 +68,6 @@ func TestAggInt641_ParityAcrossWorkers(t *testing.T) {
 	baseline := runAggWithWorkers(t, build(), 1)
 
 	for _, w := range []int{2, 4, 8} {
-		w := w
 		t.Run("workers="+itoa(w), func(t *testing.T) {
 			got := runAggWithWorkers(t, build(), w)
 			if got.NumRows() != baseline.NumRows() {
@@ -342,7 +341,7 @@ func TestAggKinds_StdVarValues(t *testing.T) {
 	// Order: EU first (n=2 → std=√200), US (n=3 → std=20).
 	wantStd := []float64{math.Sqrt(200), 20}
 	wantVar := []float64{200, 400}
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if math.Abs(stds.Value(i)-wantStd[i]) > 1e-9 {
 			t.Errorf("row %d std=%v, want %v", i, stds.Value(i), wantStd[i])
 		}
@@ -759,7 +758,7 @@ func TestGroupBy_IntegerSumTransientOverflow(t *testing.T) {
 		for _, w := range []int{1, 2} {
 			// One row per batch, so the running total crosses batches.
 			var batches []arrow.RecordBatch
-			for _, v := range strings.Split(strings.Trim(tc.vals, "[]"), ",") {
+			for v := range strings.SplitSeq(strings.Trim(tc.vals, "[]"), ",") {
 				batches = append(batches, batchOf(t, fields, `[1]`, "["+v+"]"))
 			}
 			out, err := runAggExec(t, plan, []string{"k"}, []Aggregation{agg}, w, batches...)

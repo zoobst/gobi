@@ -395,9 +395,9 @@ func TestGroupByAligned_SumWithNulls_NotSilentlyDropped(t *testing.T) {
 
 	// 2 regions × 2 ids × 3 rows/group = 12 rows. One null per
 	// group so NullN() > 0 on the source column.
-	for reg := 0; reg < 2; reg++ {
+	for reg := range 2 {
 		rn := fmt.Sprintf("r%03d", reg)
-		for id := 0; id < 2; id++ {
+		for id := range 2 {
 			in := fmt.Sprintf("id%06d", id)
 			rb.Append(rn)
 			ib.Append(in)

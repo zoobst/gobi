@@ -235,9 +235,9 @@ func sortedOverFrame(t testing.TB, nGroups, rowsPerGroup int) *Frame {
 	nRows := nGroups * rowsPerGroup
 	groupNames := make([]string, nRows)
 	values := make([]int64, nRows)
-	for g := 0; g < nGroups; g++ {
+	for g := range nGroups {
 		name := fmt.Sprintf("g%06d", g)
-		for r := 0; r < rowsPerGroup; r++ {
+		for r := range rowsPerGroup {
 			idx := g*rowsPerGroup + r
 			groupNames[idx] = name
 			values[idx] = int64(idx)

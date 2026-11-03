@@ -161,7 +161,7 @@ func PointsInPrismFromXYZ(xs, ys, zs []float64, prism ExtrudedPolygon, out []boo
 		return
 	}
 	rings := prism.Footprint.RingViews()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if zs[i] < prism.MinZ || zs[i] > prism.MaxZ {
 			out[i] = false
 			continue

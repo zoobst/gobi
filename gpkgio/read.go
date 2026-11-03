@@ -466,7 +466,7 @@ func projectedColumns(sqlText string, all []columnInfo) []columnInfo {
 	}
 	list := sqlText[start+len("SELECT ") : end]
 	names := make(map[string]struct{})
-	for _, part := range strings.Split(list, ",") {
+	for part := range strings.SplitSeq(list, ",") {
 		p := strings.TrimSpace(part)
 		p = strings.Trim(p, `"`)
 		names[p] = struct{}{}
@@ -585,9 +585,24 @@ func sqlTime(v any) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("%T value %v is not ISO-8601 text", v, v)
 }
 
+// sqlTimeLayouts are the ISO-8601 forms parseSQLTime accepts once a
+// space separator is turned into "T": seconds (with any fraction) or
+// minutes, each with "Z", an offset, or nothing (UTC); or a date.
+var sqlTimeLayouts = []string{
+	"2006-01-02T15:04:05.999999999Z07:00",
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02T15:04Z07:00",
+	"2006-01-02T15:04",
+	dateLayout,
+}
+
 func parseSQLTime(s string) (time.Time, error) {
-	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.999999999", "2006-01-02 15:04:05.999999999", dateLayout} {
-		if t, err := time.Parse(layout, s); err == nil {
+	v := strings.TrimSpace(s)
+	if len(v) > 10 && v[10] == ' ' { // SQLite's "2006-01-02 15:04:05"
+		v = v[:10] + "T" + v[11:]
+	}
+	for _, layout := range sqlTimeLayouts {
+		if t, err := time.Parse(layout, v); err == nil {
 			return t.UTC(), nil
 		}
 	}

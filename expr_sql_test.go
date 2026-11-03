@@ -1,7 +1,9 @@
 package gobi
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 )
@@ -149,3 +151,20 @@ func (fakeCustomNode) Type(*arrow.Schema) (arrow.DataType, error) {
 }
 func (fakeCustomNode) Children() []Expr { return nil }
 func (fakeCustomNode) String() string   { return "custom" }
+
+// TestExprToSQL_TimeLiteral — a time literal binds as a UTC time.Time,
+// not gobi's internal nanosecond count.
+func TestExprToSQL_TimeLiteral(t *testing.T) {
+	at := time.Date(2024, 1, 2, 3, 4, 5, 6, time.FixedZone("x", 3600))
+	sql, args, ok := ExprToSQL(Col("ts").Ge(Lit(at)))
+	if !ok || sql != `("ts" >= ?)` {
+		t.Fatalf("sql = %q, ok = %v", sql, ok)
+	}
+	got, isTime := args[0].(time.Time)
+	if !isTime || !got.Equal(at) || got.Location() != time.UTC {
+		t.Errorf("arg = %#v, want %v in UTC", args[0], at)
+	}
+	if cols := ExprColumns(Col("b").Gt(Col("a")).And(Col("b").Lt(Lit(1)))); strings.Join(cols, ",") != "a,b" {
+		t.Errorf("ExprColumns = %v, want [a b]", cols)
+	}
+}

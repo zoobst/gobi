@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -202,18 +203,14 @@ func checkCovering(f *gobi.Frame, geom string, cov Covering) error {
 }
 
 func fmtCovering(v [4]float64, valid [4]bool) string {
-	out := ""
+	parts := make([]string, len(v))
 	for i := range v {
-		if i > 0 {
-			out += " "
-		}
+		parts[i] = "null"
 		if valid[i] {
-			out += fmt.Sprintf("%g", v[i])
-		} else {
-			out += "null"
+			parts[i] = fmt.Sprintf("%g", v[i])
 		}
 	}
-	return out
+	return strings.Join(parts, " ")
 }
 
 // seqFloats reads a numeric column's values in row order as float64,

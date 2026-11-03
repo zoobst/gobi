@@ -863,10 +863,7 @@ func (e *parallelScanFileExec) Next(ctx context.Context) (arrow.RecordBatch, err
 
 func (e *parallelScanFileExec) startWorkers() {
 	for _, sub := range e.subs {
-		sub := sub
-		e.wg.Add(1)
-		go func() {
-			defer e.wg.Done()
+		e.wg.Go(func() {
 			err := sub(func(f *Frame) error {
 				// Same lifetime dance as scanFileExec: retain the
 				// frame's buffers so they survive the callback
@@ -897,7 +894,7 @@ func (e *parallelScanFileExec) startWorkers() {
 				default:
 				}
 			}
-		}()
+		})
 	}
 	// Closer goroutine: once every worker exits, close the batches
 	// channel so Next observes EOF.

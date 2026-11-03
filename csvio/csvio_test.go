@@ -520,7 +520,7 @@ func TestOption_ChunkRows_SmallBatchProducesSameOutput(t *testing.T) {
 	dN, _ := def.Column("n")
 	sArr := sN.Column().Data().Chunks()[0].(*array.Int64)
 	dArr := dN.Column().Data().Chunks()[0].(*array.Int64)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if sArr.Value(i) != dArr.Value(i) {
 			t.Fatalf("row %d differs: small=%d default=%d", i, sArr.Value(i), dArr.Value(i))
 		}
@@ -719,19 +719,63 @@ func TestRead_DuplicateFieldNames(t *testing.T) {
 	}
 }
 
-// TestReadChunksFunc_EmptyFile — no input at all is ErrHeaderMissing,
-// as in Read, whether columns match by name or by position.
-func TestReadChunksFunc_EmptyFile(t *testing.T) {
-	for _, opts := range []*csvio.ReadOptions{nil, {MatchByPosition: true}} {
-		err := csvio.ReadChunksFunc[basicRow](strings.NewReader(""), opts, func(*gobi.Frame) error { return nil })
-		if !errors.Is(err, csvio.ErrHeaderMissing) {
-			t.Errorf("opts %+v: err = %v, want ErrHeaderMissing", opts, err)
-		}
+// TestRead_EmptyFile — no input at all: Read reports ErrHeaderMissing;
+// the streaming readers and ScanFile yield no rows and no error, in
+// both matching modes.
+func TestRead_EmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.csv")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	// Without a header, empty input is just no rows.
-	noHeader := false
-	if err := csvio.ReadChunksFunc[basicRow](strings.NewReader(""), &csvio.ReadOptions{HasHeader: &noHeader},
-		func(*gobi.Frame) error { return nil }); err != nil {
-		t.Errorf("no header: err = %v", err)
+	for _, opts := range []*csvio.ReadOptions{{}, {MatchByPosition: true}} {
+		if _, err := csvio.Read[basicRow](strings.NewReader(""), opts); !errors.Is(err, csvio.ErrHeaderMissing) {
+			t.Errorf("Read %+v: err = %v, want ErrHeaderMissing", opts, err)
+		}
+		calls := 0
+		if err := csvio.ReadFileChunksFunc[basicRow](path, opts, func(*gobi.Frame) error { calls++; return nil }); err != nil || calls != 0 {
+			t.Errorf("ReadFileChunksFunc %+v: err = %v, %d chunks; want none", opts, err, calls)
+		}
+		df, err := csvio.ScanFile[basicRow](path, opts).Collect()
+		if err != nil {
+			t.Errorf("ScanFile %+v: %v", opts, err)
+			continue
+		}
+		if df.NumRows() != 0 {
+			t.Errorf("ScanFile %+v: %d rows", opts, df.NumRows())
+		}
+		df.Release()
+	}
+}
+
+// TestRead_HeaderNameFolding — with no exact match, a field finds the
+// one column equal to its name ignoring case and surrounding spaces;
+// two such columns are ambiguous.
+func TestRead_HeaderNameFolding(t *testing.T) {
+	type untagged struct {
+		ID   int64
+		Name string
+	}
+	df, err := csvio.Read[untagged](strings.NewReader("id, name \n1, a\n"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := colJSON(t, df, "ID") + colJSON(t, df, "Name"); got != `[1][" a"]` {
+		t.Errorf("ID, Name = %s", got)
+	}
+	df.Release()
+	// An exact match wins over a folded one.
+	type exact struct {
+		ID int64 `csv:"ID"`
+	}
+	df, err = csvio.Read[exact](strings.NewReader("id,ID\n1,2\n"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := colJSON(t, df, "ID"); got != `[2]` {
+		t.Errorf("exact ID = %s, want [2]", got)
+	}
+	df.Release()
+	if _, err := csvio.Read[untagged](strings.NewReader("Id,iD,name\n1,2,a\n"), nil); !errors.Is(err, csvio.ErrDuplicateHeader) {
+		t.Errorf("ambiguous: err = %v, want ErrDuplicateHeader", err)
 	}
 }

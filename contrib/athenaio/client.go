@@ -25,8 +25,7 @@ func awsString(s string) *string { return aws.String(s) }
 // to make Close idempotent — dropping an already-dropped table isn't
 // an error worth surfacing.
 func isGlueNotFound(err error) bool {
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
 		return apiErr.ErrorCode() == "EntityNotFoundException"
 	}
 	return false

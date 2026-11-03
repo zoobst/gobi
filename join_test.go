@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -105,13 +106,7 @@ func TestJoin_ColumnNameCollisionRenames(t *testing.T) {
 		t.Fatal(err)
 	}
 	names := out.ColumnNames()
-	found := false
-	for _, n := range names {
-		if n == "value_right" {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(names, "value_right")
 	if !found {
 		t.Fatalf("expected value_right column, got %v", names)
 	}

@@ -17,7 +17,7 @@ func TestExprRound_Modes(t *testing.T) {
 	in := []float64{2.5, -2.5, 2.4, -2.6, 0.5, -0.5, 3, math.Inf(1), math.NaN()}
 	rows := make([]row, 0, len(in)+1)
 	for _, v := range in {
-		rows = append(rows, row{F: ptr(v), F4: float32(v)})
+		rows = append(rows, row{F: new(v), F4: float32(v)})
 	}
 	rows = append(rows, row{F: nil, F4: 1.5})
 	f, err := FromStructs(rows)

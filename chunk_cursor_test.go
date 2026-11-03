@@ -79,14 +79,13 @@ func frameFromChunks(t *testing.T, names []string, chunks [][]arrow.Array) *Fram
 	return f
 }
 
-func sp(s string) *string { return &s }
-func ip(i int32) *int32   { return &i }
+func ip(i int32) *int32 { return new(i) }
 
 // TestToStructs_DictionaryString — Spark / Trino write low-cardinality
 // strings as dictionary<int32, string>. Before v0.4.8 every row failed
 // with "readScalarAt: unsupported type *array.Dictionary".
 func TestToStructs_DictionaryString(t *testing.T) {
-	dict := []*string{sp("us-east-1"), sp("eu-west-1"), nil}
+	dict := []*string{new("us-east-1"), new("eu-west-1"), nil}
 	// Two chunks (two row groups), each dictionary-encoded.
 	c1 := newDictStringArray(t, dict, []*int32{ip(0), ip(1), nil})
 	c2 := newDictStringArray(t, dict, []*int32{ip(1), ip(2), ip(0)})
@@ -128,7 +127,7 @@ func TestToStructs_DictionaryString(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToStructs[*string]: %v", err)
 	}
-	for i, w := range []*string{sp("us-east-1"), sp("eu-west-1"), nil, sp("eu-west-1"), nil, sp("us-east-1")} {
+	for i, w := range []*string{new("us-east-1"), new("eu-west-1"), nil, new("eu-west-1"), nil, new("us-east-1")} {
 		g := pgot[i].Region
 		switch {
 		case w == nil && g != nil:
@@ -143,7 +142,7 @@ func TestToStructs_DictionaryString(t *testing.T) {
 // string>> resolves element values through the dictionary.
 func TestToStructs_DictionaryListElements(t *testing.T) {
 	pool := memory.DefaultAllocator
-	vals := newDictStringArray(t, []*string{sp("a"), sp("b")}, []*int32{ip(1), ip(0), ip(1)})
+	vals := newDictStringArray(t, []*string{new("a"), new("b")}, []*int32{ip(1), ip(0), ip(1)})
 	defer vals.Release()
 	ob := array.NewInt32Builder(pool)
 	defer ob.Release()
@@ -173,7 +172,7 @@ func TestToStructs_DictionaryListElements(t *testing.T) {
 }
 
 func TestReadScalarAt_Dictionary(t *testing.T) {
-	arr := newDictStringArray(t, []*string{sp("x"), nil}, []*int32{ip(0), nil, ip(1)})
+	arr := newDictStringArray(t, []*string{new("x"), nil}, []*int32{ip(0), nil, ip(1)})
 	f := frameFromChunks(t, []string{"s"}, [][]arrow.Array{{arr}})
 	defer f.Release()
 	s, _ := f.Column("s")
@@ -349,7 +348,7 @@ func TestToStructs_DictionaryGeometry(t *testing.T) {
 // with readScalarAt, or check-then-read callers (First/Last, Pivot
 // headers) see "non-null" and then read nil.
 func TestIsNullAtSeries_DictionaryNullEntry(t *testing.T) {
-	arr := newDictStringArray(t, []*string{sp("x"), nil}, []*int32{ip(0), ip(1), nil})
+	arr := newDictStringArray(t, []*string{new("x"), nil}, []*int32{ip(0), ip(1), nil})
 	f := frameFromChunks(t, []string{"s"}, [][]arrow.Array{{arr}})
 	defer f.Release()
 	s, _ := f.Column("s")

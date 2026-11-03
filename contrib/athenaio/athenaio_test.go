@@ -880,12 +880,12 @@ func TestUnloadAndRead_IcebergToHiveFallback(t *testing.T) {
 	mockA := &mockCTASAthena{pollsBeforeDone: 0}
 	mockS := &mockS3{objects: map[string][]byte{}}
 	mockG := &mockGlue{tables: map[glueTableKey]*gluetypes.Table{}}
-	var attemptCount int32
+	var attemptCount atomic.Int32
 	var warnCount int
 	wrapper := &mockCTASAthenaWithSideEffect{
 		inner: mockA,
 		onStart: func(sql, outputLoc string) {
-			atomic.AddInt32(&attemptCount, 1)
+			attemptCount.Add(1)
 			if strings.Contains(sql, "table_type = 'ICEBERG'") {
 				// Iceberg attempt: force the mock to return FAILED
 				// with the engine-v2 "Iceberg not supported" reason
@@ -938,9 +938,9 @@ func TestUnloadAndRead_IcebergToHiveFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UnloadAndRead fallback: %v", err)
 	}
-	if atomic.LoadInt32(&attemptCount) != 2 {
+	if attemptCount.Load() != 2 {
 		t.Errorf("expected 2 StartQueryExecution attempts (Iceberg + Hive), got %d",
-			atomic.LoadInt32(&attemptCount))
+			attemptCount.Load())
 	}
 	if warnCount != 1 {
 		t.Errorf("warnLog should fire exactly once on fallback, got %d", warnCount)
@@ -953,12 +953,12 @@ func TestUnloadAndRead_IcebergToHiveFallback(t *testing.T) {
 	}
 
 	// Second call: hiveFallbackOnly latch skips the Iceberg attempt.
-	attemptBefore := atomic.LoadInt32(&attemptCount)
+	attemptBefore := attemptCount.Load()
 	_, err = c.UnloadAndRead(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("second UnloadAndRead: %v", err)
 	}
-	if got := atomic.LoadInt32(&attemptCount) - attemptBefore; got != 1 {
+	if got := attemptCount.Load() - attemptBefore; got != 1 {
 		t.Errorf("post-latch call should do 1 attempt (Hive only), got %d", got)
 	}
 	if warnCount != 1 {

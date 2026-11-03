@@ -15,19 +15,18 @@ introduce breaking changes; check this file when upgrading.
   header text. Swapping two columns of the same type then read the
   values into the wrong fields with no error, and an extra column
   failed the whole read.
-  - **Now:** each field's `csv:"…"` name is looked up in the header.
-    File column order doesn't matter, and columns the struct doesn't
-    name are skipped. The Frame's columns stay in struct order.
+  - **Now:** each field's name (its `csv:"…"` tag, or the field name
+    when untagged) is looked up in the header. An exact match wins;
+    otherwise the one column equal to it ignoring case and surrounding
+    spaces is used, so an untagged `ID` finds `id`, and `name` finds
+    ` name`. File column order doesn't matter, and columns the struct
+    doesn't name are skipped: Arrow still parses them, but they're
+    dropped batch by batch. The Frame's columns stay in struct order.
   - **Errors:** a field with no matching column fails with the new
     `ErrColumnMissing`, listing every missing name. A field whose name
-    appears twice in the header fails with `ErrDuplicateHeader`, and
-    two fields with the same name fail with the new
+    matches two header columns fails with `ErrDuplicateHeader`, and
+    two fields that match the same column fail with the new
     `ErrDuplicateField`.
-  - **Empty input:** `ReadChunksFunc`, `ReadFileChunksFunc` and
-    `ScanFile` now fail with `ErrHeaderMissing` on an empty file, as
-    `Read` and `ReadStrings` already did. They used to return no
-    chunks and no error. Without a header, empty input is still just
-    no rows.
   - **Unchanged:** files without a header (`HasHeader: false`) are read
     by position, as before. Names match exactly, case and spaces
     included.
@@ -44,21 +43,65 @@ introduce breaking changes; check this file when upgrading.
     time zone. Precision below a millisecond is truncated, since the
     format has none. Date32 and Date64 columns, which used to fail with
     `unsupported column type`, are declared `DATE` and stored as
-    `2024-01-02`.
+    `2024-01-02`. A year outside 0000-9999 fails the write, since the
+    format can't hold it.
   - **Reading back:** `DATETIME` (or `TIMESTAMP`) columns read as
     Timestamp[ms, UTC] and `DATE` columns as Date32. Files written by
     earlier gobi versions still have `INTEGER` columns and still read
     as Int64.
-  - **Filters:** `ScanFile` no longer pushes comparisons against a
-    time literal into the SQL `WHERE`; they run in gobi instead. Pushed
-    down, the literal was bound as an integer, which SQLite orders
-    before all text, so filters on a `DATETIME` column returned the
-    wrong rows.
+  - **Filters:** `ScanFile` keeps filters that compare against a time
+    literal or read a `DATE` / `DATETIME` column out of the SQL
+    `WHERE`; they run in gobi instead. SQLite would compare the stored
+    text, which only orders correctly between values written the same
+    way, and a time literal was bound as an integer, which SQLite
+    orders before all text.
   - **Migrating:** code that read gobi-written timestamps back as Int64
     gets Timestamp[ms, UTC] for newly written files.
 
+- **`ExprToSQL` binds a time literal as a UTC `time.Time`.** It used
+  to bind gobi's internal nanosecond count as an integer, which SQL
+  drivers can't compare with a timestamp column. Code that reads the
+  bind arguments and expected an `arrow.Timestamp` now gets a
+  `time.Time`.
+
+### Added
+
+- **`gobi.ExprColumns(e)`** lists the columns an expression reads,
+  sorted. Scan sources use it to decide which predicates are safe to
+  push down.
+
+### Dependencies
+
+Minimum versions rise, so modules depending on gobi pick these up too.
+
+- **Security fixes:** pgx v5.12.0 fixes two high-severity issues: SQL
+  injection in simple-protocol batches (GHSA-j38q-h3ph-jjpq) and a
+  `require_auth` / `channel_binding` bypass (GHSA-95fj-3fxw-g62g).
+  klauspost/compress v1.20.3 fixes a zstd crash on crafted input
+  (GHSA-fpmh-frq8-7rj8). golang.org/x/net v0.62.0 and grpc v1.85.0 fix
+  vulnerabilities govulncheck found reachable from gobi.
+- **Also upgraded:** modernc.org/sqlite v1.61.1 (SQLite 3.54.1).
+- **arrow-go stays at v18.7.0.** v18.8.0 makes parquet reads of
+  dictionary-encoded columns allocate 12-59% more and run up to 20%
+  slower; the cause is reported upstream.
+- **Go:** build with Go 1.27.2 or later. Go 1.27.0 and 1.27.1 have
+  standard-library vulnerabilities in `net/http`, `crypto/tls` and
+  `crypto/x509`, which 1.27.2 and 1.27.3 fix.
+
 ### Fixed
 
+- **pgio reads PostGIS geometry.** `ReadTable`, `ReadTableChunksFunc`
+  and `ScanTable` returned geometry columns as untagged binary still
+  holding PostGIS's SRID header, which gobi's WKB parser rejects
+  (`unsupported WKB geometry type: 536870913`). They now come back as
+  geometry columns of plain WKB, with the SRID in the column's CRS.
+- **pgio time filters work.** `ScanTable(...).Filter(...)` with a
+  comparison against `Lit(time.Time)` failed with `unable to encode
+  … into binary format for timestamptz`, because the literal was
+  bound as an integer. On `timestamptz` and `timestamp` columns it now
+  runs in PostgreSQL. Two cases stay in gobi, because PostgreSQL would
+  round the literal and drop matching rows: comparisons on `date`
+  columns, and literals finer than a microsecond.
 - **Comparing timestamps of different units gives the right answer.**
   A Timestamp column in seconds, milliseconds or microseconds compared
   with `Lit(time.Time)` (always nanoseconds) compared the raw integers,
@@ -67,13 +110,16 @@ introduce breaking changes; check this file when upgrading.
   millisecond timestamps, for example. Two columns of different units
   had the same problem. Both now compare as instants, and an exact
   comparison never rounds a literal that falls between two ticks of
-  the column's unit. `Expr.Type` accepts mixed units instead of
-  reporting a mismatch.
+  the column's unit. Columns of different units compare without
+  scaling either one, so values far outside the nanosecond range
+  (such as a 9999-12-31 end-of-time marker) still compare. `Expr.Type`
+  accepts mixed units instead of reporting a mismatch.
 - **gpkgio reads `DATETIME` and `DATE` columns.** Files written by
   QGIS, GDAL or ogr2ogr with a date or date-time column failed to read
   with `float column got time.Time`. Values in other ISO-8601 forms,
-  such as a `+02:00` offset, are read too. A value that isn't an
-  ISO-8601 date (`''`, `unknown`, `2024/01/02`, or a number, whose unit
+  such as a `+02:00` offset, a space instead of `T`, or minutes
+  without seconds, are read too, including in columns declared
+  `TIMESTAMPTZ` or `DATETIME(3)`. A value that isn't an ISO-8601 date (`''`, `unknown`, `2024/01/02`, or a number, whose unit
   can't be known) reads as null, as GDAL does.
 - **`csvio.ReadOptions.UseCRLF` no longer panics.** Setting it passed
   arrow's writer-only `WithCRLF` option to the CSV reader, which

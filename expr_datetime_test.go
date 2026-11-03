@@ -3,6 +3,8 @@ package gobi
 import (
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"testing"
 	"time"
 
@@ -560,4 +562,73 @@ func TestExpr_Cast_TimestampToInt64(t *testing.T) {
 	if arr.Value(0) != 1_500 || arr.Value(1) != 2_500 {
 		t.Errorf("raw millis = [%d, %d], want [1500, 2500]", arr.Value(0), arr.Value(1))
 	}
+}
+
+// TestExpr_TimestampMixedUnits_Extremes — comparing columns in
+// different units never overflows: second values far outside the
+// nanosecond range still compare, and junk behind a null slot is
+// ignored (the row is null).
+func TestExpr_TimestampMixedUnits_Extremes(t *testing.T) {
+	pool := memory.DefaultAllocator
+	// Seconds: end-of-time sentinel (9999-12-31), its negative, values
+	// near the ns range edge, and a null slot holding junk.
+	secs := []int64{253402214400, -253402214400, 9223372036, 9223372037, -9223372037, 1 << 62}
+	secValid := []bool{true, true, true, true, true, false}
+	nanos := []int64{0, 0, 9223372036854775807, 9223372036854775807, math.MinInt64, 0}
+	sb := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Second})
+	sb.AppendValues(toTS(secs), secValid) // the null slot keeps 1<<62
+	sArr := sb.NewArray()
+	sb.Release()
+	defer sArr.Release()
+	nb := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Nanosecond})
+	nb.AppendValues(toTS(nanos), nil)
+	nArr := nb.NewArray()
+	nb.Release()
+	defer nArr.Release()
+	if v := sArr.(*array.Timestamp).Value(5); v != 1<<62 {
+		t.Skipf("builder zeroed the null slot (%d); junk case not exercised", v)
+	}
+	fields := []arrow.Field{{Name: "s", Type: sArr.DataType(), Nullable: true}, {Name: "ns", Type: nArr.DataType()}}
+	cols := []arrow.Column{
+		*arrow.NewColumn(fields[0], arrow.NewChunked(sArr.DataType(), []arrow.Array{sArr})),
+		*arrow.NewColumn(fields[1], arrow.NewChunked(nArr.DataType(), []arrow.Array{nArr})),
+	}
+	f, err := NewFrame(arrow.NewSchema(fields, nil), cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Release()
+	for _, tc := range []struct {
+		name string
+		e    Expr
+		want string
+	}{
+		{"s>ns", Col("s").Gt(Col("ns")), `[true,false,false,true,false,null]`},
+		{"ns<s", Col("ns").Lt(Col("s")), `[true,false,false,true,false,null]`},
+		{"s<=ns", Col("s").Le(Col("ns")), `[false,true,true,false,true,null]`},
+	} {
+		out, err := tc.e.node.Eval(f)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		b, _ := out.col.Data().Chunk(0).MarshalJSON()
+		if string(b) != tc.want {
+			t.Errorf("%s = %s, want %s", tc.name, b, tc.want)
+		}
+	}
+	// Reference check with big.Int for the non-null rows.
+	for i := range 5 {
+		a := new(big.Int).Mul(big.NewInt(secs[i]), big.NewInt(1e9))
+		if got, want := a.Cmp(big.NewInt(nanos[i])) > 0, []bool{true, false, false, true, false}[i]; got != want {
+			t.Errorf("row %d: reference says %v, table says %v", i, got, want)
+		}
+	}
+}
+
+func toTS(v []int64) []arrow.Timestamp {
+	out := make([]arrow.Timestamp, len(v))
+	for i, x := range v {
+		out[i] = arrow.Timestamp(x)
+	}
+	return out
 }

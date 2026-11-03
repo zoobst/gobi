@@ -169,7 +169,7 @@ func PointsInSphereFromXYZ(xs, ys, zs []float64, s Sphere, out []bool, scratch *
 	}
 	r2 := s.R * s.R
 	if s.CRSValue.Projected() || s.CRSValue.Zero() {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			dx := xs[i] - s.X
 			dy := ys[i] - s.Y
 			dz := zs[i] - s.Z

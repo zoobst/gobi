@@ -50,7 +50,7 @@ func (f *Frame) Unique(cols ...string) (*Frame, error) {
 	seen := make(map[string]struct{})
 	keep := make([]int, 0, rows) // first-occurrence indices, preserves order
 
-	for row := 0; row < rows; row++ {
+	for row := range rows {
 		buf, err := composeCompositeKeyInto(scratch[:0], keys, row)
 		if err != nil {
 			return nil, err
@@ -82,7 +82,7 @@ func (s Series) Unique() (Series, error) {
 	var scratch []byte
 	seen := make(map[string]struct{})
 	keep := make([]int, 0, n)
-	for row := 0; row < n; row++ {
+	for row := range n {
 		null, err := isNullAtSeries(s, row)
 		if err != nil {
 			return Series{}, err
@@ -177,7 +177,7 @@ func (s Series) NUnique() (int64, error) {
 	n := s.Len()
 	var scratch []byte
 	seen := make(map[string]struct{})
-	for row := 0; row < n; row++ {
+	for row := range n {
 		null, err := isNullAtSeries(s, row)
 		if err != nil {
 			return 0, err

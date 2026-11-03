@@ -63,7 +63,7 @@ func (f *Frame) Concat(others ...*Frame) (*Frame, error) {
 	// Build per-column chunk lists spanning f + each other.
 	ncols := len(f.series)
 	cols := make([]arrow.Column, ncols)
-	for ci := 0; ci < ncols; ci++ {
+	for ci := range ncols {
 		field := f.series[ci].field
 		var chunks []arrow.Array
 		for _, chunk := range f.series[ci].col.Data().Chunks() {

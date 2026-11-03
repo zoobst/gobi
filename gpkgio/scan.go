@@ -86,7 +86,7 @@ func ScanFile(path string, opts *ReadOptions) *gobi.LazyFrame {
 		var pushedArgs []any
 		for _, c := range conjuncts {
 			sqlText, args, ok := gobi.ExprToSQL(c)
-			if !ok || hasTimeArg(args) {
+			if !ok || hasTimeArg(args) || touchesTemporal(c, sch) {
 				continue
 			}
 			pushed = append(pushed, sqlText)
@@ -120,6 +120,27 @@ func hasTimeArg(args []any) bool {
 	for _, a := range args {
 		switch a.(type) {
 		case arrow.Timestamp, time.Time:
+			return true
+		}
+	}
+	return false
+}
+
+// touchesTemporal reports whether c reads a DATE or DATETIME column.
+// Those stay in the executor too: SQLite compares their text, which
+// orders correctly only between values written the same way ("…T…Z"
+// vs "… …" or "+05:00"), where the executor compares instants.
+func touchesTemporal(c gobi.Expr, sch *arrow.Schema) bool {
+	if sch == nil {
+		return false
+	}
+	for _, col := range gobi.ExprColumns(c) {
+		fs, ok := sch.FieldsByName(col)
+		if !ok || len(fs) == 0 {
+			continue
+		}
+		switch fs[0].Type.ID() {
+		case arrow.TIMESTAMP, arrow.DATE32:
 			return true
 		}
 	}

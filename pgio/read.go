@@ -52,14 +52,14 @@ func ReadQuery(ctx context.Context, conn Conn, sql string, args ...any) (*gobi.F
 
 // ReadTable reads a whole table (with optional projection + WHERE)
 // into a Frame. Convenience wrapper over ReadQuery that builds the
-// SELECT internally, including `ST_AsBinary(geom_col) AS geom_col`
+// SELECT internally, including `ST_AsEWKB(geom_col) AS geom_col`
 // wrappers for known geometry columns — so callers don't have to
 // hand-craft the query to get WKB out.
 func ReadTable(ctx context.Context, conn Conn, table string, opts *ReadOptions) (*gobi.Frame, error) {
 	if opts == nil {
 		opts = &ReadOptions{}
 	}
-	sql, args, err := buildTableSelect(ctx, conn, table, opts)
+	sql, args, geomCols, err := buildTableSelect(ctx, conn, table, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +68,7 @@ func ReadTable(ctx context.Context, conn Conn, table string, opts *ReadOptions) 
 	// for raw SQL where the caller doesn't have a ReadOptions to
 	// consult.
 	var out *gobi.Frame
-	err = ReadQueryChunksFunc(ctx, conn, sql, args, resolveAllocator(opts), defaultChunkRows, func(f *gobi.Frame) error {
+	err = readQueryChunks(ctx, conn, sql, args, geomCols, resolveAllocator(opts), defaultChunkRows, func(f *gobi.Frame) error {
 		if out == nil {
 			out = f
 			return nil
@@ -101,6 +101,14 @@ func ReadTable(ctx context.Context, conn Conn, table string, opts *ReadOptions) 
 // wants to keep the Frame past its return, call frame.Retain() and
 // match it with a Release() later.
 func ReadQueryChunksFunc(ctx context.Context, conn Conn, sql string, args []any, pool memory.Allocator, batchSize int, fn func(*gobi.Frame) error) error {
+	return readQueryChunks(ctx, conn, sql, args, nil, pool, batchSize, fn)
+}
+
+// readQueryChunks is ReadQueryChunksFunc that also treats the columns
+// named in geomCols as geometry. ReadTable selects geometry columns as
+// ST_AsEWKB(col), which PostgreSQL types as bytea, so their type alone
+// doesn't say they hold geometry.
+func readQueryChunks(ctx context.Context, conn Conn, sql string, args []any, geomCols map[string]bool, pool memory.Allocator, batchSize int, fn func(*gobi.Frame) error) error {
 	if pool == nil {
 		pool = memory.DefaultAllocator
 	}
@@ -125,7 +133,7 @@ func ReadQueryChunksFunc(ctx context.Context, conn Conn, sql string, args []any,
 	builders := make([]array.Builder, len(fds))
 	isGeom := make([]bool, len(fds))
 	for i, fd := range fds {
-		if geomOIDs[fd.DataTypeOID] {
+		if geomOIDs[fd.DataTypeOID] || geomCols[fd.Name] {
 			isGeom[i] = true
 			fields[i] = gobi.GeometryField(fd.Name, 0) // SRID filled per-row below
 			builders[i] = array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
@@ -239,30 +247,30 @@ func ReadTableChunksFunc(ctx context.Context, conn Conn, table string, opts *Rea
 	if opts == nil {
 		opts = &ReadOptions{}
 	}
-	sql, args, err := buildTableSelect(ctx, conn, table, opts)
+	sql, args, geomCols, err := buildTableSelect(ctx, conn, table, opts)
 	if err != nil {
 		return err
 	}
-	return ReadQueryChunksFunc(ctx, conn, sql, args, resolveAllocator(opts), defaultChunkRows, fn)
+	return readQueryChunks(ctx, conn, sql, args, geomCols, resolveAllocator(opts), defaultChunkRows, fn)
 }
 
 const defaultChunkRows = 65_536
 
 // buildTableSelect assembles the SELECT for a ReadTable call:
 //   - qualifies the table with the schema
-//   - includes ST_AsBinary(col) wrappers for geometry columns so
-//     the output is plain-ish EWKB (still carries SRID header)
+//   - selects geometry columns as ST_AsEWKB(col), and returns their
+//     names so the reader decodes them (the result type is bytea)
 //   - honors opts.Columns (projection), opts.Where (predicate),
 //     opts.Limit
-func buildTableSelect(ctx context.Context, conn Conn, table string, opts *ReadOptions) (string, []any, error) {
+func buildTableSelect(ctx context.Context, conn Conn, table string, opts *ReadOptions) (string, []any, map[string]bool, error) {
 	schema := defaultSchema(opts.Schema)
 	geomSet, err := geometryColumnSet(ctx, conn, schema, table, opts.GeomColumns)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	tableCols, err := listTableColumns(ctx, conn, schema, table)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	pick := tableCols
 	if len(opts.Columns) > 0 {
@@ -301,7 +309,7 @@ func buildTableSelect(ctx context.Context, conn Conn, table string, opts *ReadOp
 	if opts.Limit > 0 {
 		sql += fmt.Sprintf(" LIMIT %d", opts.Limit)
 	}
-	return sql, args, nil
+	return sql, args, geomSet, nil
 }
 
 // listTableColumns returns column names for schema.table in the

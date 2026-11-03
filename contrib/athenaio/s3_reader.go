@@ -221,9 +221,9 @@ func parseS3URI(uri string) (bucket, key string, err error) {
 		return "", "", fmt.Errorf("athenaio: not an S3 URI: %q", uri)
 	}
 	rest := uri[len(prefix):]
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
+	before, after, ok := strings.Cut(rest, "/")
+	if !ok {
 		return rest, "", nil // bucket only, no key
 	}
-	return rest[:slash], rest[slash+1:], nil
+	return before, after, nil
 }

@@ -72,13 +72,7 @@ func (e Ellipsoid) eSquared() float64 {
 // Zero-alloc. Callers can reuse output slabs across calls by
 // wrapping them in an ECEFScratch (see the Series-level dispatchers).
 func LonLatAltToECEFSlabs(lons, lats, alts, outX, outY, outZ []float64) {
-	n := len(lons)
-	if len(lats) < n {
-		n = len(lats)
-	}
-	if len(alts) < n {
-		n = len(alts)
-	}
+	n := min(len(lons), len(lats), len(alts))
 	e2 := WGS84Ellipsoid.eSquared()
 	a := WGS84Ellipsoid.A
 	deg := math.Pi / 180
@@ -361,37 +355,11 @@ func SampleGeodesic3DFromSlabs(
 // -----------------------------------------------------------------------------
 
 func minLen3(a, b, c []float64) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	if len(c) < n {
-		n = len(c)
-	}
-	return n
+	return min(len(a), len(b), len(c))
 }
 
 func minLen6(a, b, c, d, e, f, g []float64) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	if len(c) < n {
-		n = len(c)
-	}
-	if len(d) < n {
-		n = len(d)
-	}
-	if len(e) < n {
-		n = len(e)
-	}
-	if len(f) < n {
-		n = len(f)
-	}
-	if len(g) < n {
-		n = len(g)
-	}
-	return n
+	return min(len(a), len(b), len(c), len(d), len(e), len(f), len(g))
 }
 
 // growSlab returns s resized to exactly length n. Reuses the backing

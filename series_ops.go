@@ -1,6 +1,7 @@
 package gobi
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 
@@ -1252,6 +1253,60 @@ func cmpTSTS(a, b []arrow.Timestamp, aArr, bArr *array.Timestamp, op cmpOp, name
 		validity[i] = true
 	}
 	return buildBoolSeries(name, out, validity)
+}
+
+// cmpTSMixed compares two timestamp columns in different units
+// element-wise: a counts units of k times b's (a in seconds, b in
+// milliseconds: k = 1000). It compares a with b's whole a-units plus
+// remainder rather than scaling a up, so no value can overflow, and
+// null slots are never read.
+func cmpTSMixed(a, b []arrow.Timestamp, aArr, bArr *array.Timestamp, k int64, op cmpOp, name string) Series {
+	n := len(a)
+	out := make([]bool, n)
+	var validity []bool
+	if aArr.NullN() > 0 || bArr.NullN() > 0 {
+		validity = make([]bool, n)
+	}
+	for i := range n {
+		if validity != nil {
+			if aArr.IsNull(i) || bArr.IsNull(i) {
+				continue
+			}
+			validity[i] = true
+		}
+		// b = q*k + r with 0 <= r < k; a*k vs b orders as a vs q, and
+		// on a tie a*k is below b unless r is 0.
+		q, r := int64(b[i])/k, int64(b[i])%k
+		if r < 0 {
+			q--
+			r += k
+		}
+		c := cmp.Compare(int64(a[i]), q)
+		if c == 0 && r != 0 {
+			c = -1
+		}
+		out[i] = cmpResult(op, c)
+	}
+	return buildBoolSeries(name, out, validity)
+}
+
+// cmpResult applies op to a three-way comparison result c.
+func cmpResult(op cmpOp, c int) bool {
+	switch op {
+	case cmpEq:
+		return c == 0
+	case cmpNe:
+		return c != 0
+	case cmpLt:
+		return c < 0
+	case cmpLe:
+		return c <= 0
+	case cmpGt:
+		return c > 0
+	case cmpGe:
+		return c >= 0
+	}
+	return false
 }
 
 func applyCmp(op cmpOp, a, b float64) bool {

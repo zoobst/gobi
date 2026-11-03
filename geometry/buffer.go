@@ -180,8 +180,8 @@ func (l LineString) bufferSquare(distance float64) Polygon {
 	ring = append(ring, right...)
 	ring = append(ring, rEnd)
 	ring = append(ring, lEnd)
-	for i := len(left) - 1; i >= 0; i-- {
-		ring = append(ring, left[i])
+	for _, l := range slices.Backward(left) {
+		ring = append(ring, l)
 	}
 	ring = append(ring, lStart)
 	ring = append(ring, rStart) // close

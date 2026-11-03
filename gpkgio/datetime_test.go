@@ -241,3 +241,65 @@ func TestDateTime_FilterNotPushedDown(t *testing.T) {
 		out.Release()
 	}
 }
+
+// TestDateTime_OtherSpellings — SQLite and ISO-8601 spellings the
+// driver leaves as text (columns declared TIMESTAMPTZ / DATETIME(3))
+// are parsed, not nulled.
+func TestDateTime_OtherSpellings(t *testing.T) {
+	df := frameOf(t, []arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, `[1, 2, 3, 4]`)
+	defer df.Release()
+	path := filepath.Join(t.TempDir(), "sp.gpkg")
+	if err := gpkgio.WriteFile(df, path, &gpkgio.WriteOptions{Layer: "l"}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, q := range []string{
+		`ALTER TABLE l ADD COLUMN a TIMESTAMPTZ`,
+		`ALTER TABLE l ADD COLUMN b "DATETIME(3)"`,
+		`UPDATE l SET a = '2024-01-02 03:04:05+00:00', b = '2024-01-02 03:04:05Z' WHERE id = 1`,
+		`UPDATE l SET a = '2024-01-02 05:04:05+02:00', b = '2024-01-02T03:04Z' WHERE id = 2`,
+		`UPDATE l SET a = '2024-01-02 03:04', b = '2024-01-02T03:04:05.5' WHERE id = 3`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	back, err := gpkgio.ReadFile(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer back.Release()
+	if got, want := colJSON(t, back, "a"), `["2024-01-02T03:04:05Z","2024-01-02T03:04:05Z","2024-01-02T03:04:00Z",null]`; got != want {
+		t.Errorf("a = %s, want %s", got, want)
+	}
+	if got, want := colJSON(t, back, "b"), `["2024-01-02T03:04:05Z","2024-01-02T03:04:00Z","2024-01-02T03:04:05.5Z",null]`; got != want {
+		t.Errorf("b = %s, want %s", got, want)
+	}
+
+	// Comparing two DATETIME columns stays in gobi, which compares
+	// instants: SQLite would compare "…05+00:00" and "…05Z" as text.
+	out, err := gpkgio.ScanFile(path, nil).Filter(gobi.Col("a").Eq(gobi.Col("b"))).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.NumRows() != 1 {
+		t.Errorf("a = b: %d rows, want 1", out.NumRows())
+	}
+	out.Release()
+}
+
+// TestDateTime_YearOutOfRange — a year a GeoPackage date can't hold
+// fails the write instead of storing text that reads back as null.
+func TestDateTime_YearOutOfRange(t *testing.T) {
+	// 10000-01-01 in seconds.
+	df := frameOf(t, []arrow.Field{{Name: "ts", Type: &arrow.TimestampType{Unit: arrow.Second}}}, `[253402300800]`)
+	defer df.Release()
+	err := gpkgio.WriteFile(df, filepath.Join(t.TempDir(), "y.gpkg"), &gpkgio.WriteOptions{Layer: "l"})
+	if err == nil || !strings.Contains(err.Error(), "year 10000") {
+		t.Errorf("err = %v, want a year-10000 error", err)
+	}
+}

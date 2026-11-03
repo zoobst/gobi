@@ -151,7 +151,7 @@ func TestClip_ConvexFastPath_Contained(t *testing.T) {
 // for building sliding-overlap test cases.
 func regularPolygonAt(cx, cy, r float64, n int) Polygon {
 	pts := make([]Point, n+1)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		theta := 2 * math.Pi * float64(i) / float64(n)
 		pts[i] = pt(cx+r*math.Cos(theta), cy+r*math.Sin(theta))
 	}

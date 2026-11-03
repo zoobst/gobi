@@ -149,7 +149,7 @@ func TestSeries_TimeComparisons(t *testing.T) {
 	future := time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
 	past, _ := s.GtTime(future)
 	pastArr := past.col.Data().Chunks()[0].(*array.Boolean)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if pastArr.Value(i) {
 			t.Fatalf("row %d should not be after year 2100", i)
 		}

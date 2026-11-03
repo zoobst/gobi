@@ -281,7 +281,7 @@ func TestIcebergBucket_ExprAndEdges(t *testing.T) {
 		ID  *string
 		Big int64
 	}
-	f, err := FromStructs([]row{{ptr("iceberg"), 34}, {nil, -1}})
+	f, err := FromStructs([]row{{new("iceberg"), 34}, {nil, -1}})
 	if err != nil {
 		t.Fatal(err)
 	}

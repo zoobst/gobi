@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+
+	"github.com/apache/arrow-go/v18/arrow"
 )
 
 // ExprToSQL translates a gobi.Expr into a SQL fragment + a slice of
@@ -24,7 +26,8 @@ import (
 // Column names are double-quoted per SQL:2016 identifier rules; any
 // embedded double-quote in a name is escaped by doubling. NULL
 // comparisons (`x = NULL`) are rewritten to `IS NULL` / `IS NOT NULL`
-// to match SQL's null-safe semantics.
+// to match SQL's null-safe semantics. A time literal (Lit(time.Time))
+// binds as a UTC time.Time.
 //
 // Example:
 //
@@ -68,7 +71,7 @@ func appendExprSQL(b *strings.Builder, args *[]any, n ExprNode) bool {
 			return false
 		}
 		b.WriteByte('?')
-		*args = append(*args, node.value)
+		*args = append(*args, sqlArg(node))
 		return true
 
 	case *binOpNode:
@@ -229,6 +232,20 @@ func sqlBinOpSymbol(op binOpKind) (string, bool) {
 		return "OR", true
 	}
 	return "", false
+}
+
+// sqlArg is a literal's bind value. A time literal binds as a UTC
+// time.Time, which SQL drivers encode as a timestamp, rather than the
+// integer gobi stores it as.
+func sqlArg(n *literalNode) any {
+	if ts, ok := n.value.(arrow.Timestamp); ok {
+		unit := arrow.Nanosecond
+		if dt, ok := n.dtype.(*arrow.TimestampType); ok {
+			unit = dt.Unit
+		}
+		return ts.ToTime(unit)
+	}
+	return n.value
 }
 
 // isNilLiteral reports whether n is a literal whose value is nil —

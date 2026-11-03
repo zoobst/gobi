@@ -2,6 +2,7 @@ package geometry
 
 import (
 	"math/rand"
+	"slices"
 	"sync"
 	"testing"
 )
@@ -579,13 +580,7 @@ func TestTestPrepared_MP_ConcurrentPublish_NoRace(t *testing.T) {
 	// Every target slot must be populated; no other slot should be
 	// (points targeted distinct islands, all disjoint).
 	for i := range pM.mpSubRings {
-		want := false
-		for _, tgt := range targets {
-			if tgt == i {
-				want = true
-				break
-			}
-		}
+		want := slices.Contains(targets, i)
 		got := pM.mpSubRings[i].Load() != nil
 		if got != want {
 			t.Errorf("slot %d: populated=%v, want=%v", i, got, want)

@@ -9,6 +9,20 @@ athenaio has its own `go.mod` and versions independently of the core
 gobi module. Tags for this module are prefixed with the module path —
 see [Versioning](#versioning) below.
 
+## [v0.1.21]
+
+### Dependencies
+
+- **Security fixes:** golang.org/x/net v0.62.0, golang.org/x/text
+  v0.43.0 and grpc v1.85.0 fix vulnerabilities govulncheck found
+  reachable through the S3 client.
+- **AWS SDK:** core v1.47.5, config v1.33.13, Athena v1.66.8, Glue
+  v1.172.2, S3 v1.114.6 and smithy-go v1.28.7. The Athena client now
+  parses table metadata whose `Parameters` contain a null value.
+- **arrow-go** stays at v18.7.0, as in gobi.
+- **Go:** build with Go 1.27.2 or later, for the standard-library
+  fixes in `net/http`, `crypto/tls` and `crypto/x509`.
+
 ## [v0.1.20]
 
 ### Fixed

@@ -888,7 +888,7 @@ func TestToStructsInto_Reuse(t *testing.T) {
 		S string
 	}
 	type narrow struct{ A int64 }
-	full, err := FromStructs([]row{{1, ptr(int64(10)), "x"}, {2, ptr(int64(20)), "y"}, {3, nil, "z"}})
+	full, err := FromStructs([]row{{1, new(int64(10)), "x"}, {2, new(int64(20)), "y"}, {3, nil, "z"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1102,8 +1102,8 @@ type ownRow struct {
 func ownFixture(t *testing.T) (*Frame, []byte, []byte, []byte) {
 	t.Helper()
 	f, err := FromStructs([]ownRow{
-		{Name: "alpha", Tags: []string{"x", "y"}, Raw: []byte{1, 2, 3}, PName: ptr("beta")},
-		{Name: "gamma", Tags: []string{"z"}, Raw: []byte{4}, PName: ptr("delta")},
+		{Name: "alpha", Tags: []string{"x", "y"}, Raw: []byte{1, 2, 3}, PName: new("beta")},
+		{Name: "gamma", Tags: []string{"z"}, Raw: []byte{4}, PName: new("delta")},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1249,13 +1249,11 @@ func TestStringInterner_CapAndConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	shared := NewStringInterner(0)
 	for g := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range 1000 {
 				shared.Intern(fmt.Sprintf("v%d", (i+g)%50))
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if shared.Len() != 50 {

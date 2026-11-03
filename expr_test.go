@@ -568,7 +568,7 @@ func TestLitNull_ComposesWithCollectSet(t *testing.T) {
 	}
 	providers, _ := out.Column("providers")
 	la := providers.col.Data().Chunks()[0].(*array.List)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		start, end := la.ValueOffsets(i)
 		if end != start {
 			t.Fatalf("row %d producer list should be empty; got %d values", i, end-start)
@@ -774,7 +774,7 @@ func TestExprShift_NegativeLead(t *testing.T) {
 	next, _ := out.Column("next_price")
 	arr := next.col.Data().Chunks()[0].(*array.Float64)
 	want := []float64{20, 30, 40}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if arr.IsNull(i) {
 			t.Fatalf("row %d null after Shift(-1); expected %v", i, want[i])
 		}

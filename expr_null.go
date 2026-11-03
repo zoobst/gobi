@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -236,16 +237,7 @@ func (n *coalesceNode) String() string {
 		}
 		parts[i] = op.String()
 	}
-	// Slim formatter that avoids strings.Join to stay inside expr_null.go's
-	// import set (fmt only).
-	out := "coalesce("
-	for i, p := range parts {
-		if i > 0 {
-			out += ", "
-		}
-		out += p
-	}
-	return out + ")"
+	return "coalesce(" + strings.Join(parts, ", ") + ")"
 }
 
 // copyRowValue copies src[row] to b. Handles primitive types via

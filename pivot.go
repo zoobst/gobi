@@ -98,7 +98,7 @@ func (f *Frame) Pivot(index, columns, values string, agg AggKind) (*Frame, error
 
 	idxKeys := []Series{idxCol}
 	var idxScratch []byte
-	for row := 0; row < nLong; row++ {
+	for row := range nLong {
 		buf, err := composeCompositeKeyInto(idxScratch[:0], idxKeys, row)
 		if err != nil {
 			return nil, err

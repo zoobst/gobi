@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -131,8 +132,8 @@ func ResolveFieldName(sf reflect.StructField, format string) (name string, skip 
 			continue
 		}
 		primary := v
-		if i := strings.IndexByte(v, ','); i >= 0 {
-			primary = v[:i]
+		if before, _, ok := strings.Cut(v, ","); ok {
+			primary = before
 		}
 		if primary == "-" {
 			return "", true
@@ -179,12 +180,7 @@ func fieldTagOptions(sf reflect.StructField, o *structOpts) []string {
 
 // hasTagOption reports whether sf's name tag carries option opt.
 func hasTagOption(sf reflect.StructField, o *structOpts, opt string) bool {
-	for _, x := range fieldTagOptions(sf, o) {
-		if x == opt {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(fieldTagOptions(sf, o), opt)
 }
 
 // timestampTypeFromTag reads a parquet-go-style timestamp option off
@@ -338,7 +334,7 @@ func FromStructs[T any](rows []T, opts ...StructOption) (*Frame, error) {
 
 	rowsVal := reflect.ValueOf(rows)
 	nRows := rowsVal.Len()
-	for r := 0; r < nRows; r++ {
+	for r := range nRows {
 		row := rowsVal.Index(r)
 		for i, p := range plan {
 			fv := row.Field(p.fieldIndex)
@@ -1223,7 +1219,7 @@ func appendListElement(b array.Builder, elem reflect.Value) error {
 	case *array.BinaryBuilder:
 		b.Append(elem.Bytes())
 	case *array.TimestampBuilder:
-		t, ok := elem.Interface().(time.Time)
+		t, ok := reflect.TypeAssert[time.Time](elem)
 		if !ok {
 			return fmt.Errorf("timestamp element got %T", elem.Interface())
 		}

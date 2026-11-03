@@ -101,7 +101,7 @@ func TestExprList_Get(t *testing.T) {
 		t.Fatal(err)
 	}
 	farArr := out3.series[1].col.Data().Chunks()[0].(*array.Int64)
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		if !farArr.IsNull(i) {
 			t.Errorf("far[%d] should be null (out-of-range)", i)
 		}
@@ -314,7 +314,7 @@ func (u *gridPathUDF) Eval(input *Frame) (Series, error) {
 		}
 		n := chunk.Value(i)
 		lb.Append(true)
-		for j := int64(0); j < n; j++ {
+		for j := range n {
 			inner.Append(j)
 		}
 	}
@@ -715,7 +715,7 @@ func TestListUnion_LazyChainWithCollectSet(t *testing.T) {
 	// Both columns should hold the same lists after idempotent union.
 	sLA := s.col.Data().Chunks()[0].(*array.List)
 	s2LA := s2.col.Data().Chunks()[0].(*array.List)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		s1Start, s1End := sLA.ValueOffsets(i)
 		s2Start, s2End := s2LA.ValueOffsets(i)
 		if (s1End - s1Start) != (s2End - s2Start) {

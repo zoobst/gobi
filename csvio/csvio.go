@@ -161,21 +161,36 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 		return nil, err
 	}
 	defer sc.close()
+	if sc.empty {
+		return nil, ErrHeaderMissing
+	}
 	pool, plan, rdr := sc.pool, sc.plan, sc.rdr
 
-	// Collect record batches; each batch is one chunk-sized arrow.Record.
-	var recs []arrow.Record
+	// Collect each plan column's batches. Only the struct's columns are
+	// kept: a header column the struct doesn't name is dropped with
+	// its batch.
+	chunks := make([][]arrow.Array, len(plan))
 	defer func() {
-		for _, rec := range recs {
-			rec.Release()
+		for _, cs := range chunks {
+			for _, a := range cs {
+				a.Release()
+			}
 		}
 	}()
+	batches := 0
 	for rdr.Next() {
-		rec := rdr.Record()
-		rec.Retain()
-		recs = append(recs, rec)
+		rec := rdr.RecordBatch()
+		for c := range plan {
+			a := rec.Column(sc.cols[c])
+			a.Retain()
+			chunks[c] = append(chunks[c], a)
+		}
+		batches++
 	}
 	if err := rdr.Err(); err != nil {
+		if errors.Is(err, io.EOF) && batches == 0 {
+			return nil, ErrHeaderMissing
+		}
 		return nil, sc.readErr(err)
 	}
 
@@ -191,19 +206,19 @@ func Read[T any](r io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
 		}
 	}()
 	for c := range plan {
-		if len(recs) == 0 { // header only
+		if batches == 0 { // header only
 			readArrs[c] = array.MakeArrayOfNull(pool, plan[c].readField.Type, 0)
 			continue
 		}
-		chunks := make([]arrow.Array, 0, len(recs))
-		for _, rec := range recs {
-			chunks = append(chunks, rec.Column(sc.cols[c]))
-		}
-		out, err := array.Concatenate(chunks, pool)
+		out, err := array.Concatenate(chunks[c], pool)
 		if err != nil {
 			return nil, fmt.Errorf("csvio: concatenate column %q: %w", plan[c].outputField.Name, err)
 		}
 		readArrs[c] = out
+		for _, a := range chunks[c] {
+			a.Release()
+		}
+		chunks[c] = nil
 	}
 	return sc.buildFrame(func(i int) arrow.Array { return readArrs[i] })
 }
@@ -279,16 +294,20 @@ func ReadFileChunksFunc[T any](path string, opts *ReadOptions, fn func(*gobi.Fra
 //
 // If fn returns an error, iteration stops and the error is wrapped in
 // ErrChunksAborted; errors.Is / errors.As match both. Empty input
-// (no header where one is expected) is ErrHeaderMissing, as in Read.
+// yields no chunks and no error.
 func ReadChunksFunc[T any](r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) error) error {
 	sc, err := setupReader[T](r, opts)
 	if err != nil {
 		return err
 	}
 	defer sc.close()
-
+	if sc.empty {
+		return nil
+	}
+	batches := 0
 	for sc.rdr.Next() {
-		rec := sc.rdr.Record()
+		batches++
+		rec := sc.rdr.RecordBatch()
 		frame, err := sc.buildFrame(func(i int) arrow.Array { return rec.Column(sc.cols[i]) })
 		if err != nil {
 			return err
@@ -300,6 +319,9 @@ func ReadChunksFunc[T any](r io.Reader, opts *ReadOptions, fn func(*gobi.Frame) 
 		}
 	}
 	if err := sc.rdr.Err(); err != nil {
+		if errors.Is(err, io.EOF) && batches == 0 {
+			return nil // empty input
+		}
 		return sc.readErr(err)
 	}
 	return nil
@@ -312,19 +334,18 @@ type setupContext struct {
 	plan      []columnPlan
 	cols      []int // per plan column: its column in rdr's records
 	lines     int   // input lines consumed before rdr's first
+	empty     bool  // no input at all (rdr is nil)
 	pool      memory.Allocator
 	outSchema *arrow.Schema
 	outFields []arrow.Field
 	release   func()
 }
 
-// readErr maps an error from rdr: a missing header (Arrow's EOF) is
-// ErrHeaderMissing, and parse errors get line numbers counted from
-// the start of the input rather than from where rdr began.
+// readErr maps an error from rdr: parse errors get line numbers
+// counted from the start of the input rather than from where rdr
+// began. (Arrow reports empty input, when it reads the header itself,
+// as an io.EOF error before any batch; callers check for that first.)
 func (s *setupContext) readErr(err error) error {
-	if errors.Is(err, io.EOF) {
-		return ErrHeaderMissing
-	}
 	return csvErr(shiftLines(err, s.lines))
 }
 
@@ -419,6 +440,13 @@ func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 	if header && !opts.MatchByPosition {
 		var lines int
 		readFields, sc.cols, lines, err = matchHeader(br, plan, opts)
+		if errors.Is(err, ErrHeaderMissing) {
+			// Empty input: no reader; Read reports it, the streaming
+			// readers yield no chunks.
+			sc.empty = true
+			sc.setOutSchema()
+			return sc, nil
+		}
 		if err != nil {
 			sc.close()
 			return nil, shiftLines(err, sc.lines)
@@ -451,12 +479,16 @@ func setupReader[T any](r io.Reader, opts *ReadOptions) (*setupContext, error) {
 	// exactly where the header ended.
 	sc.rdr = arrowcsv.NewReader(br, readSchema, arrowOpts...)
 
-	sc.outFields = make([]arrow.Field, len(plan))
-	for i, p := range plan {
-		sc.outFields[i] = p.outputField
-	}
-	sc.outSchema = arrow.NewSchema(sc.outFields, nil)
+	sc.setOutSchema()
 	return sc, nil
+}
+
+func (s *setupContext) setOutSchema() {
+	s.outFields = make([]arrow.Field, len(s.plan))
+	for i, p := range s.plan {
+		s.outFields[i] = p.outputField
+	}
+	s.outSchema = arrow.NewSchema(s.outFields, nil)
 }
 
 // matchHeader reads the header record from br and lines plan's
@@ -484,34 +516,38 @@ func matchHeader(br *bufio.Reader, plan []columnPlan, opts *ReadOptions) ([]arro
 	last := len(header) - 1
 	lines, _ := cr.FieldPos(last)
 	lines += strings.Count(header[last], "\n")
-	pos := make(map[string]int, len(header))
-	dup := make(map[string]bool)
+	// Each field takes the column whose header equals its name exactly,
+	// or else the one column equal to it ignoring case and surrounding
+	// spaces ("ID" finds "id", "name" finds " name").
+	exact := make(map[string][]int, len(header))
+	folded := make(map[string][]int, len(header))
 	fields := make([]arrow.Field, len(header))
 	for i, name := range header {
-		if _, ok := pos[name]; ok {
-			dup[name] = true
-		} else {
-			pos[name] = i
-		}
+		exact[name] = append(exact[name], i)
+		folded[foldHeader(name)] = append(folded[foldHeader(name)], i)
 		fields[i] = arrow.Field{Name: name, Type: arrow.BinaryTypes.String, Nullable: true}
 	}
 	cols := make([]int, len(plan))
 	var missing []string
-	fieldFor := make(map[string]bool, len(plan))
+	taken := make(map[int]string, len(plan))
 	for i, p := range plan {
 		name := p.readField.Name
-		if fieldFor[name] {
-			return nil, nil, 0, fmt.Errorf("%w: %q", ErrDuplicateField, name)
+		at := exact[name]
+		if len(at) == 0 {
+			at = folded[foldHeader(name)]
 		}
-		fieldFor[name] = true
-		j, ok := pos[name]
-		if !ok {
+		switch {
+		case len(at) == 0:
 			missing = append(missing, strconv.Quote(name))
 			continue
+		case len(at) > 1:
+			return nil, nil, 0, fmt.Errorf("%w: %q matches %d columns", ErrDuplicateHeader, name, len(at))
 		}
-		if dup[name] {
-			return nil, nil, 0, fmt.Errorf("%w: %q", ErrDuplicateHeader, name)
+		j := at[0]
+		if other, ok := taken[j]; ok {
+			return nil, nil, 0, fmt.Errorf("%w: %q and %q both read column %q", ErrDuplicateField, other, name, header[j])
 		}
+		taken[j] = name
 		fields[j] = p.readField
 		cols[i] = j
 	}
@@ -520,6 +556,12 @@ func matchHeader(br *bufio.Reader, plan []columnPlan, opts *ReadOptions) ([]arro
 			ErrColumnMissing, strings.Join(missing, ", "))
 	}
 	return fields, cols, lines, nil
+}
+
+// foldHeader is the case- and space-insensitive form of a header or
+// field name.
+func foldHeader(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 // newCSVReader is the encoding/csv reader both the header match and
