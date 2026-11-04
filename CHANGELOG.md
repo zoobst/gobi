@@ -7,6 +7,17 @@ introduce breaking changes; check this file when upgrading.
 
 ## [v0.5.3]
 
+### Changed (breaking)
+
+- **pgio reads `timestamp`, `timestamptz` and `date` columns as
+  `Timestamp[µs, UTC]`**, not `Timestamp[ns, UTC]`. Microseconds are
+  PostgreSQL's own precision, so no value loses digits. The range now
+  covers what tables really hold: a `9999-12-31` "valid to" sentinel
+  or year 1 used to come back as a silently wrapped nanosecond count.
+  Comparisons, filters, pushdown and writes all handle the unit.
+  Code that reads raw values must use the column's unit (as
+  `Series.TimeAt` does) rather than assume nanoseconds.
+
 ### Added
 
 - **`Expr.StrToTime(layout)` / `Expr.StrToDate(layout)`** (and the
@@ -24,11 +35,17 @@ introduce breaking changes; check this file when upgrading.
     `gobi.ErrTimeParse`, quoting the value. The doc comment shows
     how to null a placeholder such as `__HIVE_DEFAULT_PARTITION__`
     first.
+  - Digits past the microsecond round to the nearest microsecond,
+    as the other timestamp operators round.
   - A run of equal values (a partition key) is parsed once.
   - `Cast` stays numeric-only. Casting a string column to a time type
     now says to use these instead.
 - **`gobi.ErrTimeOutOfRange`**, for a time that doesn't fit the
   column it would go into.
+- **`gobi.TimestampOf(t, unit)`** converts a `time.Time` to an
+  `arrow.Timestamp` in any unit, with the same overflow check gobi
+  uses internally. It's for readers outside the package that fill a
+  `TimestampBuilder`. Finer precision is floored.
 
 ### Fixed
 
@@ -38,12 +55,38 @@ introduce breaking changes; check this file when upgrading.
   `SubDuration`, `TruncateTo`, `TruncateToCalendar`, `DateTruncate`
   and the `EqTime` family. Each value now goes straight to the
   column's own unit, so `9999-12-31` in a µs column works. A result
-  that can't be stored returns `ErrTimeOutOfRange`. `UnixNano` now
-  returns `ErrTimeOutOfRange` for values it can't represent, instead
-  of a wrapped number.
+  that can't be stored returns `ErrTimeOutOfRange`.
+- These now return `ErrTimeOutOfRange` instead of a wrong number:
+  - `UnixNano` on a value that has no nanosecond count.
+  - `DiffDuration` on instants more than about 292 years apart.
+    Before, it returned a difference clamped to about ±292 years.
+- `Lit(time.Time)` outside 1677–2262 is a `Timestamp[µs]` literal,
+  where before it was a wrapped nanosecond count. So a filter such as
+  `Col("dt").Lt(Lit(time.Date(1600, …)))` was keeping the wrong
+  rows. Literals inside that range are still `Timestamp[ns]`. A
+  literal no unit can hold exactly (sub-microsecond precision
+  outside the range) is `ErrTimeOutOfRange`.
+- `NewTimestampSeriesUnit` and `IsIn` no longer reject the last
+  fraction of a second before the int64 minimum of their unit.
+- `RollingBy` compares instants, not nanosecond counts. Before, a µs
+  column reaching past 1677–2262 got wrong windows or a false
+  `ErrNotMonotonic`. So did a column whose first row is null and
+  later rows are pre-1970: the null was compared as 1970.
+- `ResampleEvery` finds buckets in the column's own unit. A bucket
+  start its `Timestamp[ns]` output can't hold is now
+  `ErrTimeOutOfRange` instead of a wrapped one. A Date32 or Date64
+  time column no longer panics.
+- csvio's `time.Time` struct fields are `Timestamp[ns]`. A date
+  outside 1677–2262 is now `ErrTimeOutOfRange` instead of a wrapped
+  value. The error suggests reading the column into a string field
+  and converting it with `StrToTime`.
 
 ### Performance
 
+- `AddDuration` / `SubDuration` by a whole number of the column's
+  units, and `TruncateTo`, run as integer arithmetic in that unit:
+  -69% and -58% time on 1M µs rows. `DateTruncate` is -38%. All three
+  use a third to a half of the memory.
 - The string `Series` methods reserve their output up front: half
   the memory and a third of the allocations, at about 3% more time
   on predicates.

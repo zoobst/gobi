@@ -463,7 +463,7 @@ func isInValueSet(dt arrow.DataType, values []isInValue) (arrow.Array, error) {
 		case arrow.BOOL:
 			b.(*array.BooleanBuilder).Append(v.b)
 		case arrow.TIMESTAMP:
-			if ts, ok := timeInUnit(v.t, dt.(*arrow.TimestampType).Unit); ok {
+			if ts, ok := timeToUnit(v.t, dt.(*arrow.TimestampType).Unit, timeRoundExact); ok {
 				b.(*array.TimestampBuilder).Append(arrow.Timestamp(ts))
 			}
 		case arrow.DATE32, arrow.DATE64:
@@ -559,20 +559,4 @@ func appendIsInInt(b array.Builder, id arrow.Type, v isInValue) {
 			b.(*array.Uint64Builder).Append(u)
 		}
 	}
-}
-
-// timeInUnit converts t to a count of unit since the epoch, reporting
-// false when t has precision finer than unit or doesn't fit int64.
-func timeInUnit(t time.Time, unit arrow.TimeUnit) (int64, bool) {
-	nsPerUnit := unitToNanos(unit)
-	perSec := int64(1e9) / nsPerUnit
-	sec, nsec := t.Unix(), int64(t.Nanosecond())
-	if nsec%nsPerUnit != 0 {
-		return 0, false
-	}
-	frac := nsec / nsPerUnit
-	if sec > math.MaxInt64/perSec || sec < math.MinInt64/perSec || sec*perSec > math.MaxInt64-frac {
-		return 0, false
-	}
-	return sec*perSec + frac, true
 }

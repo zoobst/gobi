@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -89,10 +91,13 @@ func TestStrToTime(t *testing.T) {
 		},
 		{
 			// time.Parse accepts a fraction the layout doesn't spell.
-			name:   "sub-microsecond digits round toward the past",
+			// 1.9 µs, -0.1 µs, 0.5 µs, -0.5 µs: nearest, halves away
+			// from zero, as AddDuration rounds.
+			name:   "sub-microsecond digits round to nearest",
 			layout: "2006-01-02 15:04:05",
-			in:     []any{"1970-01-01 00:00:00.0000019", "1969-12-31 23:59:59.9999999"},
-			want:   []any{int64(1), int64(-1)},
+			in: []any{"1970-01-01 00:00:00.0000019", "1969-12-31 23:59:59.9999999",
+				"1970-01-01 00:00:00.0000005", "1969-12-31 23:59:59.9999995"},
+			want: []any{int64(2), int64(0), int64(1), int64(-1)},
 		},
 		{
 			name:   "years nanoseconds can't hold",
@@ -242,14 +247,24 @@ func TestCast_StringToTimeHint(t *testing.T) {
 // host's zone: an abbreviation with no fixed offset is an error
 // wherever it runs, rather than its local meaning on one machine and
 // UTC on another.
+//
+// The assertions run twice: here, under whatever zone the host has,
+// and in a child process with TZ=America/New_York, where time.Parse
+// would read "EST" as -05:00. (A child, because setting time.Local in
+// this process would race with anything else reading it.)
 func TestStrToTime_ZoneAbbreviations(t *testing.T) {
-	ny, err := time.LoadLocation("America/New_York")
-	if err != nil {
-		t.Skip("no tzdata:", err)
+	if os.Getenv("GOBI_TZ_CHILD") == "" {
+		if _, err := time.LoadLocation("America/New_York"); err != nil {
+			t.Skip("no tzdata:", err)
+		}
+		cmd := exec.Command(os.Args[0], "-test.run=^TestStrToTime_ZoneAbbreviations$", "-test.count=1")
+		cmd.Env = append(os.Environ(), "TZ=America/New_York", "GOBI_TZ_CHILD=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("under TZ=America/New_York: %v\n%s", err, out)
+		}
+	} else if name, _ := time.Now().Zone(); name != "EST" && name != "EDT" {
+		t.Fatalf("child's zone is %s, want New York's", name)
 	}
-	saved := time.Local
-	time.Local = ny // where time.Parse would read "EST" as -05:00
-	t.Cleanup(func() { time.Local = saved })
 
 	est := strChunks(t, []any{"2024-01-02 03:04:05 EST"})
 	defer est.col.Release()
@@ -452,7 +467,9 @@ func TestTimeOps_BeyondNanoRange(t *testing.T) {
 		t.Errorf("LtTime = %v, want [false true (null)]", b)
 	}
 
-	f, err := NewFrameFromSeries(renameSeries(s, "dt"))
+	dtSeries := renameSeries(s, "dt")
+	defer dtSeries.col.Release()
+	f, err := NewFrameFromSeries(dtSeries)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,5 +484,220 @@ func TestTimeOps_BeyondNanoRange(t *testing.T) {
 	defer ns.col.Release()
 	if _, err := ns.AddDuration(24 * time.Hour); !errors.Is(err, ErrTimeOutOfRange) {
 		t.Errorf("ns AddDuration past 2262: err = %v, want ErrTimeOutOfRange", err)
+	}
+}
+
+// TestDiffDuration_BeyondNanoRange — instants further apart than
+// Int64 nanoseconds reach are an error, not a saturated ±292 years.
+func TestDiffDuration_BeyondNanoRange(t *testing.T) {
+	a := strChunks(t, []any{"9999-12-31", "2000-01-01"})
+	defer a.col.Release()
+	b := strChunks(t, []any{"1970-01-01", "1970-01-01"})
+	defer b.col.Release()
+	at, err := a.StrToTime(time.DateOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer at.col.Release()
+	bt, err := b.StrToTime(time.DateOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bt.col.Release()
+	if _, err := at.DiffDuration(bt); !errors.Is(err, ErrTimeOutOfRange) || !strings.Contains(err.Error(), "index 0") {
+		t.Errorf("err = %v, want ErrTimeOutOfRange at index 0", err)
+	}
+	// In range, the difference is exact.
+	near, err := at.SubDuration(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer near.col.Release()
+	d, err := near.DiffDuration(at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.col.Release()
+	if v := d.Column().Data().Chunk(0).(*array.Int64); v.Value(0) != 0 || v.Value(1) != 0 {
+		t.Errorf("self-diff = %v, want [0 0]", v)
+	}
+}
+
+// TestLitTime_BeyondNanoRange — a time literal nanoseconds can't hold
+// is stored in microseconds and compares correctly, through the scalar
+// fast path (WithColumn) and the fused filter (Filter), against a µs
+// column and a ns one.
+func TestLitTime_BeyondNanoRange(t *testing.T) {
+	f := stringExprFrame(t, "dt", []any{"1500-06-01", "1700-01-01", "9999-12-31", nil})
+	defer f.Release()
+	parsed := Col("dt").StrToTime(time.DateOnly)
+	cut1600 := Lit(time.Date(1600, 1, 1, 0, 0, 0, 0, time.UTC))
+	cut9999 := Lit(time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC))
+
+	ty, err := cut1600.Node().Type(nil)
+	if err != nil || ty.String() != "timestamp[us]" {
+		t.Errorf("Lit(1600) type = %v, %v; want timestamp[us]", ty, err)
+	}
+	if ty, _ := Lit(time.Unix(0, 1)).Node().Type(nil); ty.String() != "timestamp[ns]" {
+		t.Errorf("Lit(1970) type = %v, want timestamp[ns]", ty)
+	}
+
+	out, err := f.Lazy().
+		WithColumn("lt1600", parsed.Lt(cut1600)).
+		WithColumn("eq9999", parsed.Eq(cut9999)).
+		Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Release()
+	for col, want := range map[string]string{
+		"lt1600": "[true false false (null)]",
+		"eq9999": "[false false true (null)]",
+	} {
+		s, err := out.Column(col)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fmt.Sprint(s.Column().Data().Chunk(0)); got != want {
+			t.Errorf("%s = %s, want %s", col, got, want)
+		}
+	}
+
+	kept, err := f.Lazy().WithColumn("dt", parsed).Filter(Col("dt").Lt(cut1600)).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kept.Release()
+	if kept.NumRows() != 1 {
+		t.Errorf("Filter(dt < 1600) kept %d rows, want 1", kept.NumRows())
+	}
+
+	// A sub-microsecond time outside the nanosecond range has no
+	// exact unit: an error, not a rounded or wrapped literal.
+	if _, err := Lit(time.Date(1600, 1, 1, 0, 0, 0, 1, time.UTC)).Node().Type(nil); !errors.Is(err, ErrTimeOutOfRange) {
+		t.Errorf("Lit(1600 + 1ns): err = %v, want ErrTimeOutOfRange", err)
+	}
+}
+
+// TestTimeToUnit_Bounds — the ends of the int64 range convert in every
+// mode: the seconds part of Timestamp[ns] MinInt64 overflows on its
+// own, but the value doesn't.
+func TestTimeToUnit_Bounds(t *testing.T) {
+	for _, v := range []int64{math.MinInt64, math.MinInt64 + 1, -1, 0, math.MaxInt64} {
+		for _, mode := range []unitRounding{timeRoundHalfAway, timeRoundFloor, timeRoundExact} {
+			got, ok := timeToUnit(time.Unix(0, v), arrow.Nanosecond, mode)
+			if !ok || int64(got) != v {
+				t.Errorf("timeToUnit(%d ns, ns, %d) = %d, %v", v, mode, got, ok)
+			}
+		}
+	}
+	// (Not seconds: time.Time itself can't hold ±2^63 seconds.)
+	for _, unit := range []arrow.TimeUnit{arrow.Millisecond, arrow.Microsecond} {
+		per := unitToNanos(unit)
+		// The smallest and largest values of the unit round-trip...
+		for _, v := range []int64{math.MinInt64, math.MaxInt64} {
+			tm := arrowTimestampToTime(arrow.Timestamp(v), unit, time.UTC)
+			if got, ok := timeToUnit(tm, unit, timeRoundExact); !ok || int64(got) != v {
+				t.Errorf("%s: %d round-trips to %d, %v", unit, v, got, ok)
+			}
+		}
+		// ...and one unit past each end doesn't fit.
+		minT := arrowTimestampToTime(math.MinInt64, unit, time.UTC)
+		if _, ok := timeToUnit(minT.Add(-time.Duration(per)), unit, timeRoundFloor); ok {
+			t.Errorf("%s: one below MinInt64 fit", unit)
+		}
+		maxT := arrowTimestampToTime(math.MaxInt64, unit, time.UTC)
+		if _, ok := timeToUnit(maxT.Add(time.Duration(per)), unit, timeRoundFloor); ok {
+			t.Errorf("%s: one above MaxInt64 fit", unit)
+		}
+	}
+	// Modes on a sub-unit remainder: 1.5 µs and -1.5 µs.
+	for _, c := range []struct {
+		ns   int64
+		mode unitRounding
+		want int64
+		ok   bool
+	}{
+		{1500, timeRoundHalfAway, 2, true}, {-1500, timeRoundHalfAway, -2, true},
+		{1500, timeRoundFloor, 1, true}, {-1500, timeRoundFloor, -2, true},
+		{1500, timeRoundExact, 0, false}, {2000, timeRoundExact, 2, true},
+	} {
+		got, ok := timeToUnit(time.Unix(0, c.ns), arrow.Microsecond, c.mode)
+		if ok != c.ok || ok && int64(got) != c.want {
+			t.Errorf("timeToUnit(%d ns, us, %d) = %d, %v; want %d, %v", c.ns, c.mode, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// TestTimeOps_NanoRangeEnds — ns values at the very ends of the range
+// pass through no-op shifts and truncations, and an op that leaves
+// the range names itself.
+func TestTimeOps_NanoRangeEnds(t *testing.T) {
+	ends := []time.Time{time.Unix(0, math.MinInt64), time.Unix(0, math.MaxInt64)}
+	s := NewTimestampSeries("ns", ends, nil)
+	defer s.col.Release()
+	same := func(name string, out Series, err error) {
+		t.Helper()
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			return
+		}
+		defer out.col.Release()
+		a := out.Column().Data().Chunk(0).(*array.Timestamp)
+		if a.Value(0) != math.MinInt64 || a.Value(1) != math.MaxInt64 {
+			t.Errorf("%s = %v, want the inputs back", name, a)
+		}
+	}
+	out, err := s.AddDuration(0)
+	same("AddDuration(0)", out, err)
+	out, err = s.AddDuration(time.Nanosecond / 2) // 0: not the integer path
+	same("AddDuration(0.5ns)", out, err)
+	out, err = s.TruncateTo(UnitNanosecond)
+	same("TruncateTo(ns)", out, err)
+
+	if _, err := s.SubDuration(time.Hour); !errors.Is(err, ErrTimeOutOfRange) ||
+		!strings.Contains(err.Error(), "SubDuration") {
+		t.Errorf("SubDuration past MinInt64: err = %v, want ErrTimeOutOfRange naming SubDuration", err)
+	}
+	if _, err := s.TruncateTo(UnitHour); !errors.Is(err, ErrTimeOutOfRange) ||
+		!strings.Contains(err.Error(), "TruncateTo") {
+		t.Errorf("TruncateTo(hour) below MinInt64: err = %v, want ErrTimeOutOfRange", err)
+	}
+	// Both shift paths agree: a whole number of units (integer) and
+	// not (time.Time), on a µs column.
+	us, err := NewTimestampSeriesUnit("us", []time.Time{time.Unix(0, 1_000_500)}, nil, arrow.Microsecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer us.col.Release()
+	whole, err := us.AddDuration(time.Microsecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer whole.col.Release()
+	part, err := us.AddDuration(1000*time.Nanosecond + 499)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer part.col.Release()
+	w := whole.Column().Data().Chunk(0).(*array.Timestamp).Value(0)
+	p := part.Column().Data().Chunk(0).(*array.Timestamp).Value(0)
+	if w != 1001 || p != 1001 {
+		t.Errorf("AddDuration(1µs) = %d, AddDuration(1.499µs) = %d; want 1001, 1001", w, p)
+	}
+}
+
+// TestTimestampOf — floors finer precision, rejects what doesn't fit.
+func TestTimestampOf(t *testing.T) {
+	got, err := TimestampOf(time.Unix(0, -1500), arrow.Microsecond)
+	if err != nil || got != -2 {
+		t.Errorf("-1.5µs → %d, %v; want -2 (floored)", got, err)
+	}
+	if _, err := TimestampOf(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), arrow.Nanosecond); !errors.Is(err, ErrTimeOutOfRange) {
+		t.Errorf("9999 in ns: err = %v, want ErrTimeOutOfRange", err)
+	}
+	if v, err := TimestampOf(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), arrow.Microsecond); err != nil ||
+		!v.ToTime(arrow.Microsecond).Equal(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("9999 in µs: %d, %v", v, err)
 	}
 }

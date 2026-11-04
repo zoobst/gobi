@@ -454,3 +454,93 @@ func TestIntegration_ScanTable_TimePushdown(t *testing.T) {
 		out.Release()
 	}
 }
+
+// TestIntegration_TimestampSentinels — timestamp, timestamptz and date
+// columns holding values past 2262 or before 1677 (a 9999-12-31
+// "valid to" sentinel, year 1) read exactly as Timestamp[µs], and
+// filter on them both pushed down and in gobi.
+func TestIntegration_TimestampSentinels(t *testing.T) {
+	conn, done := mustConn(t)
+	defer done()
+	ctx := context.Background()
+
+	table := uniqueTable("pgio_ts")
+	defer conn.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %q`, table))
+	for _, q := range []string{
+		fmt.Sprintf(`CREATE TABLE %q (id BIGINT, tz TIMESTAMPTZ, naive TIMESTAMP, d DATE)`, table),
+		fmt.Sprintf(`INSERT INTO %q VALUES
+			(1, '9999-12-31T23:59:59.999999Z', '9999-12-31 23:59:59.999999', '9999-12-31'),
+			(2, '0001-01-01T00:00:00Z', '0001-01-01 00:00:00', '0001-01-01'),
+			(3, '2024-01-02T03:04:05.123456Z', '2024-01-02 03:04:05.123456', '2024-01-02')`, table),
+	} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	df, err := pgio.ReadQuery(ctx, conn, fmt.Sprintf(`SELECT * FROM %q ORDER BY id`, table))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer df.Release()
+	want := map[string][]time.Time{
+		"tz": {
+			time.Date(9999, 12, 31, 23, 59, 59, 999999000, time.UTC),
+			time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+			time.Date(2024, 1, 2, 3, 4, 5, 123456000, time.UTC),
+		},
+		"d": {
+			time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC),
+			time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+			time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	want["naive"] = want["tz"]
+	for col, ts := range want {
+		s, err := df.Column(col)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := s.DataType().String(); got != "timestamp[us, tz=UTC]" {
+			t.Errorf("%s: type %s, want timestamp[us, tz=UTC]", col, got)
+		}
+		for i, w := range ts {
+			got, _, err := s.TimeAt(i)
+			if err != nil || !got.Equal(w) {
+				t.Errorf("%s[%d] = %s, %v; want %s", col, i, got, err, w)
+			}
+		}
+	}
+
+	far := gobi.Lit(time.Date(5000, 1, 1, 0, 0, 0, 0, time.UTC))
+	for _, col := range []string{"tz", "naive"} {
+		for _, tc := range []struct {
+			e      gobi.Expr
+			pushed bool
+		}{
+			{gobi.Col(col).Gt(far), true},
+			{gobi.Col(col).Gt(far).Or(gobi.Col("id").Eq(gobi.Lit(int64(-1)))), true},
+		} {
+			lf := pgio.ScanTable(ctx, conn, table, nil).Filter(tc.e)
+			if got := strings.Contains(lf.ExplainPhysical(), "where="); got != tc.pushed {
+				t.Errorf("%s: pushed = %v, want %v", tc.e, got, tc.pushed)
+			}
+			out, err := lf.Collect()
+			if err != nil {
+				t.Fatalf("%s: %v", tc.e, err)
+			}
+			if out.NumRows() != 1 {
+				t.Errorf("%s: %d rows, want 1", tc.e, out.NumRows())
+			}
+			out.Release()
+		}
+	}
+	// Dates filter in gobi (not pushed), on the same µs values.
+	out, err := pgio.ScanTable(ctx, conn, table, nil).Filter(gobi.Col("d").Lt(gobi.Lit(time.Date(1600, 1, 1, 0, 0, 0, 0, time.UTC)))).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Release()
+	if out.NumRows() != 1 {
+		t.Errorf("d < 1600: %d rows, want 1", out.NumRows())
+	}
+}

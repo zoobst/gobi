@@ -255,8 +255,10 @@ func (f *Frame) RollingBy(timeCol string, period time.Duration) (*TimeRolling, e
 	n := timeSer.Len()
 	// Precompute the window's left boundary (first included row) for each row i.
 	starts := make([]int, n)
-	periodNs := int64(period)
-	var lastNs int64
+	// Compared as time.Time, not nanosecond counts, which wrap for a
+	// µs / ms / s column outside 1677-2262.
+	var last time.Time
+	seen := false
 	monotonic := true
 	left := 0
 	for i := range n {
@@ -267,19 +269,19 @@ func (f *Frame) RollingBy(timeCol string, period time.Duration) (*TimeRolling, e
 			starts[i] = i + 1
 			continue
 		}
-		ns := t.UnixNano()
-		if i > 0 && ns < lastNs {
+		if seen && t.Before(last) {
 			monotonic = false
 		}
-		lastNs = ns
-		// Advance left pointer while values are older than ns - period.
+		last, seen = t, true
+		// Advance left pointer past values older than t - period
+		// (t - lt > period, i.e. lt + period < t).
 		for left <= i {
 			lt, lv := view.at(left)
 			if !lv {
 				left++
 				continue
 			}
-			if ns-lt.UnixNano() > periodNs {
+			if lt.Add(period).Before(t) {
 				left++
 				continue
 			}
@@ -445,6 +447,18 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 	// Bucket each row. bucket key is the bucket-start nanoseconds.
 	n := timeSer.Len()
 	intervalNs := int64(r.interval)
+	// When the interval is a whole number of the column's units, the
+	// bucket start is found in that unit and only it has to fit
+	// nanoseconds (the output's unit); otherwise the value does.
+	unitNs := int64(1)
+	if tsView.kind == 1 {
+		unitNs = unitToNanos(tsView.tsUnit)
+	}
+	inUnit := tsView.kind == 1 && intervalNs%unitNs == 0
+	outOfRange := func(i int, t time.Time) error {
+		return fmt.Errorf("%w: ResampleEvery: index %d: bucket for %s doesn't fit the output's Timestamp[ns]",
+			ErrTimeOutOfRange, i, t.Format(time.RFC3339Nano))
+	}
 	buckets := make(map[int64][]int, 64)
 	var order []int64
 	for i := range n {
@@ -453,10 +467,30 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 			// null time value → skip (not put in any bucket)
 			continue
 		}
-		ns := t.UnixNano()
-		floor := (ns / intervalNs) * intervalNs
-		if floor > ns { // negative timestamp integer-truncation correction
-			floor -= intervalNs
+		var floor int64
+		if inUnit {
+			v, k := int64(tsView.tsVals[i]), intervalNs/unitNs
+			f := v / k * k
+			if f > v { // / truncates toward zero; floor instead
+				if f < math.MinInt64+k {
+					return nil, outOfRange(i, t)
+				}
+				f -= k
+			}
+			if f > math.MaxInt64/unitNs || f < math.MinInt64/unitNs {
+				return nil, outOfRange(i, t)
+			}
+			floor = f * unitNs
+		} else {
+			v, ok := timeToUnit(t, arrow.Nanosecond, timeRoundExact)
+			if !ok {
+				return nil, outOfRange(i, t)
+			}
+			ns := int64(v)
+			floor = (ns / intervalNs) * intervalNs
+			if floor > ns { // negative timestamp integer-truncation correction
+				floor -= intervalNs
+			}
 		}
 		if _, seen := buckets[floor]; !seen {
 			order = append(order, floor)
@@ -495,8 +529,12 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 
 	pool := memory.DefaultAllocator
 	// Emit bucket-start timestamps in the same tz as the input.
-	origType := timeSer.DataType().(*arrow.TimestampType)
-	tsType := &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: origType.TimeZone}
+	// (A Date32 / Date64 column has no zone; a bare assertion here
+	// used to panic on one.)
+	tsType := &arrow.TimestampType{Unit: arrow.Nanosecond}
+	if origType, ok := timeSer.DataType().(*arrow.TimestampType); ok {
+		tsType.TimeZone = origType.TimeZone
+	}
 	tsB := array.NewTimestampBuilder(pool, tsType)
 	defer tsB.Release()
 

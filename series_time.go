@@ -363,22 +363,39 @@ func (s Series) timeExtract(suffix string, fn func(time.Time) int64) (Series, er
 // downstream operators reading the plan-declared schema stay in
 // sync with the runtime column. Nulls propagate.
 func (s Series) AddDuration(d time.Duration) (Series, error) {
-	return s.shiftDuration(d, s.name)
+	return s.shiftDuration("AddDuration", d)
 }
 
 // SubDuration returns a Timestamp Series with d subtracted from
 // each row. Same TimeUnit / TimeZone preservation as AddDuration.
 func (s Series) SubDuration(d time.Duration) (Series, error) {
-	return s.shiftDuration(-d, s.name)
+	return s.shiftDuration("SubDuration", -d)
 }
 
-func (s Series) shiftDuration(d time.Duration, outName string) (Series, error) {
-	return s.mapTimes("AddDuration", outName, func(t time.Time) time.Time { return t.Add(d) })
+func (s Series) shiftDuration(op string, d time.Duration) (Series, error) {
+	// When d is a whole number of the column's units, the shift is
+	// integer addition in that unit.
+	inUnit := func(u arrow.TimeUnit) func(int64) (int64, bool) {
+		per := unitToNanos(u)
+		if int64(d)%per != 0 {
+			return nil
+		}
+		k := int64(d) / per
+		return func(v int64) (int64, bool) {
+			r := v + k
+			if (k > 0 && r < v) || (k < 0 && r > v) {
+				return 0, false
+			}
+			return r, true
+		}
+	}
+	return s.mapTimes(op, s.name, func(t time.Time) time.Time { return t.Add(d) }, inUnit)
 }
 
 // DiffDuration returns an Int64 Series whose row i is
 // (s[i] - other[i]) expressed in nanoseconds. Nulls on either side
-// produce nulls in the output.
+// produce nulls in the output. A difference of more than about 292
+// years doesn't fit and returns ErrTimeOutOfRange.
 func (s Series) DiffDuration(other Series) (Series, error) {
 	if !s.IsDateTime() || !other.IsDateTime() {
 		return Series{}, ErrNotDateTime
@@ -401,7 +418,14 @@ func (s Series) DiffDuration(other Series) (Series, error) {
 		if !aok || !bok {
 			continue
 		}
-		out[i] = a.Sub(b).Nanoseconds()
+		// Sub saturates at ±292 years; a µs / ms / s column can hold
+		// instants further apart than that.
+		d := a.Sub(b)
+		if !b.Add(d).Equal(a) {
+			return Series{}, fmt.Errorf("%w: DiffDuration: index %d: %s - %s doesn't fit Int64 nanoseconds",
+				ErrTimeOutOfRange, i, a.Format(time.RFC3339Nano), b.Format(time.RFC3339Nano))
+		}
+		out[i] = d.Nanoseconds()
 		validity[i] = true
 	}
 	return buildInt64Series(s.name+"_diff", out, validity), nil
@@ -516,8 +540,27 @@ func (s Series) TruncateTo(unit TimeUnit) (Series, error) {
 	}
 	// time.Time.Truncate rounds down from the zero time, a whole
 	// number of days before the epoch, so for steps up to a day the
-	// boundaries are the epoch-aligned ones.
-	return s.mapTimes("TruncateTo", s.name, func(t time.Time) time.Time { return t.Truncate(step) })
+	// boundaries are the epoch-aligned ones, and the integer form
+	// (for a step that's a whole number of the column's units) floors
+	// to the same ones.
+	inUnit := func(u arrow.TimeUnit) func(int64) (int64, bool) {
+		per := unitToNanos(u)
+		if int64(step)%per != 0 {
+			return nil
+		}
+		k := int64(step) / per
+		return func(v int64) (int64, bool) {
+			f := v / k * k
+			if f > v { // / truncates toward zero; floor instead
+				if f < math.MinInt64+k {
+					return 0, false
+				}
+				f -= k
+			}
+			return f, true
+		}
+	}
+	return s.mapTimes("TruncateTo", s.name, func(t time.Time) time.Time { return t.Truncate(step) }, inUnit)
 }
 
 // TruncateToCalendar truncates each row to a calendar boundary (week,
@@ -530,9 +573,8 @@ func (s Series) TruncateToCalendar(unit CalendarUnit) (Series, error) {
 	}
 	loc := timeLocation(s)
 	trunc := func(t time.Time) time.Time {
-		// Interpret the row in the series' tz for boundary computation,
-		// then convert back to the same absolute instant (Add's math is
-		// preserved via time.Time.UnixNano).
+		// Interpret the row in the series' tz for boundary computation;
+		// mapTimes stores the resulting instant in the column's unit.
 		local := t.In(loc)
 		switch unit {
 		case CalendarWeek:
@@ -547,7 +589,7 @@ func (s Series) TruncateToCalendar(unit CalendarUnit) (Series, error) {
 		}
 		return t
 	}
-	return s.mapTimes("TruncateToCalendar", s.name, trunc)
+	return s.mapTimes("TruncateToCalendar", s.name, trunc, nil)
 }
 
 func unitDuration(u TimeUnit) (time.Duration, error) {
@@ -580,9 +622,10 @@ func unitDuration(u TimeUnit) (time.Duration, error) {
 // Use this ONLY for producers that legitimately emit ns-only output
 // (e.g. NewTimestampSeries, which takes user-supplied time.Time
 // values). Operators that transform an existing Timestamp column
-// should use buildTimestampSeriesLike instead — that variant
-// preserves the source column's TimeUnit + TimeZone, which
-// downstream operators depend on for schema alignment.
+// should use mapTimes instead: it keeps the source column's TimeUnit
+// and TimeZone, which downstream operators depend on for schema
+// alignment, and doesn't wrap a µs / ms / s value outside the
+// nanosecond range.
 func buildTimestampNsSeries(name string, vals []arrow.Timestamp, validity []bool) Series {
 	pool := memory.DefaultAllocator
 	tsType := &arrow.TimestampType{Unit: arrow.Nanosecond}
@@ -599,30 +642,61 @@ func buildTimestampNsSeries(name string, vals []arrow.Timestamp, validity []bool
 // result goes straight to that unit, so a µs column holding 9999-12-31
 // works, and a result that doesn't fit is ErrTimeOutOfRange rather
 // than a wrapped value. op names the caller in that error.
-func (s Series) mapTimes(op, name string, fn func(time.Time) time.Time) (Series, error) {
+//
+// inUnit, when not nil, may supply the same operation as integer
+// arithmetic on values in a Timestamp column's unit (reporting false
+// on overflow); it returns nil when there's no exact integer form,
+// and fn is used.
+func (s Series) mapTimes(op, name string, fn func(time.Time) time.Time,
+	inUnit func(arrow.TimeUnit) func(int64) (int64, bool)) (Series, error) {
 	if !s.IsDateTime() {
 		return Series{}, ErrNotDateTime
 	}
-	typ, ok := s.DataType().(*arrow.TimestampType)
-	if !ok {
+	typ, isTS := s.DataType().(*arrow.TimestampType)
+	if !isTS {
 		typ = &arrow.TimestampType{Unit: arrow.Nanosecond}
+	}
+	var intFn func(int64) (int64, bool)
+	if isTS && inUnit != nil {
+		intFn = inUnit(typ.Unit)
 	}
 	loc := timeLocation(s)
 	pool := memory.DefaultAllocator
 	b := array.NewTimestampBuilder(pool, typ)
 	defer b.Release()
 	b.Reserve(s.Len())
+	fail := func(row int, t time.Time) error {
+		return fmt.Errorf("%w: %s: index %d: %s doesn't fit %s",
+			ErrTimeOutOfRange, op, row, t.Format(time.RFC3339Nano), typ)
+	}
 	row := 0
 	for _, chunk := range s.col.Data().Chunks() {
+		ts, _ := chunk.(*array.Timestamp)
+		var vals []arrow.Timestamp
+		if ts != nil {
+			vals = ts.TimestampValues()
+		}
 		for i := range chunk.Len() {
-			if chunk.IsNull(i) {
+			switch {
+			case chunk.IsNull(i):
 				b.AppendNull()
-			} else {
-				t := fn(arrowTimeAt(chunk, i, loc))
-				v, ok := timeToUnit(t, typ.Unit)
+			case intFn != nil:
+				v, ok := intFn(int64(vals[i]))
 				if !ok {
-					return Series{}, fmt.Errorf("%w: %s: index %d: %s doesn't fit %s",
-						ErrTimeOutOfRange, op, row, t.Format(time.RFC3339Nano), typ)
+					return Series{}, fail(row, fn(arrowTimestampToTime(vals[i], typ.Unit, loc)))
+				}
+				b.UnsafeAppend(arrow.Timestamp(v))
+			default:
+				var t time.Time
+				if ts != nil {
+					t = arrowTimestampToTime(vals[i], typ.Unit, loc)
+				} else {
+					t = arrowTimeAt(chunk, i, loc)
+				}
+				t = fn(t)
+				v, ok := timeToUnit(t, typ.Unit, timeRoundHalfAway)
+				if !ok {
+					return Series{}, fail(row, t)
 				}
 				b.UnsafeAppend(v)
 			}
@@ -632,25 +706,76 @@ func (s Series) mapTimes(op, name string, fn func(time.Time) time.Time) (Series,
 	return arrayToSeries(pool, name, typ, b.NewArray())
 }
 
-// timeToUnit converts t to a Timestamp in unit; ok is false when the
-// result doesn't fit in int64. A sub-unit remainder rounds half away
-// from zero, so the rounding is the same size on both sides of 1970
-// (Go's / truncates toward zero, which would round pre-1970 values
-// up and later ones down).
-func timeToUnit(t time.Time, unit arrow.TimeUnit) (arrow.Timestamp, bool) {
+// TimestampOf returns t as an arrow.Timestamp in unit: a count of
+// units since the Unix epoch, as a Timestamp column of that unit
+// stores it. Precision finer than unit is floored (toward the past),
+// as NewTimestampSeriesUnit does. A t outside the unit's int64 range
+// (1677-2262 for nanoseconds, ±292,000 years for microseconds) is
+// ErrTimeOutOfRange rather than a wrapped value.
+//
+// It is for readers and builders outside this package that fill a
+// TimestampBuilder from time.Time values.
+func TimestampOf(t time.Time, unit arrow.TimeUnit) (arrow.Timestamp, error) {
+	switch unit {
+	case arrow.Second, arrow.Millisecond, arrow.Microsecond, arrow.Nanosecond:
+	default:
+		return 0, fmt.Errorf("gobi: TimestampOf: unknown unit %v", unit)
+	}
+	v, ok := timeToUnit(t, unit, timeRoundFloor)
+	if !ok {
+		return 0, fmt.Errorf("%w: %s doesn't fit Timestamp[%s]", ErrTimeOutOfRange, t.Format(time.RFC3339Nano), unit)
+	}
+	return v, nil
+}
+
+// unitRounding is how timeToUnit treats a time with precision finer
+// than the unit.
+type unitRounding uint8
+
+const (
+	// timeRoundHalfAway rounds to the nearest unit, halves away from zero,
+	// so the error is the same size on both sides of 1970 (Go's /
+	// truncates toward zero, which would round pre-1970 values up and
+	// later ones down). The timestamp operators and StrToTime use it.
+	timeRoundHalfAway unitRounding = iota
+	// timeRoundFloor rounds toward the past (NewTimestampSeriesUnit).
+	timeRoundFloor
+	// timeRoundExact reports false instead of rounding (IsIn, literals).
+	timeRoundExact
+)
+
+// timeToUnit converts t to a count of unit since the epoch, rounding
+// a sub-unit remainder per mode. ok is false when the result doesn't
+// fit in int64 (or, for timeRoundExact, when t is finer than unit).
+func timeToUnit(t time.Time, unit arrow.TimeUnit, mode unitRounding) (arrow.Timestamp, bool) {
 	div := unitToNanos(unit)
 	perSec := int64(time.Second) / div
 	sec, nsec := t.Unix(), int64(t.Nanosecond())
-	if sec > math.MaxInt64/perSec || sec < math.MinInt64/perSec {
+	q, r := nsec/div, nsec%div // q in [0, perSec)
+	if r != 0 && mode == timeRoundExact {
 		return 0, false
 	}
-	// v is the floor of the value in unit, r the remainder in ns.
-	v, q, r := sec*perSec, nsec/div, nsec%div
-	if v > math.MaxInt64-q {
-		return 0, false
+	// v = sec*perSec + q, the floor, computed so it can't overflow on
+	// the way: for negative sec the product alone can pass MinInt64
+	// when the sum doesn't (Timestamp[ns] MinInt64 is sec -9223372037
+	// plus 0.145s), so build it from sec+1 and step back.
+	var v int64
+	if sec >= 0 {
+		if sec > (math.MaxInt64-q)/perSec {
+			return 0, false
+		}
+		v = sec*perSec + q
+	} else {
+		if sec+1 < math.MinInt64/perSec {
+			return 0, false
+		}
+		base, back := (sec+1)*perSec, perSec-q // back in (0, perSec]
+		if base < math.MinInt64+back {
+			return 0, false
+		}
+		v = base - back
 	}
-	v += q
-	if r*2 > div || (r*2 == div && v >= 0) {
+	if mode == timeRoundHalfAway && (r*2 > div || (r*2 == div && v >= 0)) {
 		if v == math.MaxInt64 {
 			return 0, false
 		}
@@ -736,7 +861,7 @@ func (s Series) timeMapTimestamp(fn func(time.Time) time.Time, suffix string) (S
 		return Series{}, fmt.Errorf("%w: DateTruncate/Format require *arrow.TimestampType, got %s",
 			ErrColumnTypeMismatch, s.DataType())
 	}
-	return s.mapTimes("DateTruncate", s.name+"_"+suffix, fn)
+	return s.mapTimes("DateTruncate", s.name+"_"+suffix, fn, nil)
 }
 
 // timeMapString is the shared Timestamp→String driver for

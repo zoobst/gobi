@@ -2,7 +2,6 @@ package gobi
 
 import (
 	"fmt"
-	"math"
 	"strconv"
 	"time"
 
@@ -206,32 +205,22 @@ func NewBoolSeries(name string, vals []bool, validity []bool) Series {
 // range is an error rather than a wrapped value.
 func NewTimestampSeriesUnit(name string, ts []time.Time, validity []bool, unit arrow.TimeUnit) (Series, error) {
 	checkValidityLen("NewTimestampSeriesUnit", len(ts), validity)
-	var perSec int64
 	switch unit {
-	case arrow.Second:
-		perSec = 1
-	case arrow.Millisecond:
-		perSec = 1e3
-	case arrow.Microsecond:
-		perSec = 1e6
-	case arrow.Nanosecond:
-		perSec = 1e9
+	case arrow.Second, arrow.Millisecond, arrow.Microsecond, arrow.Nanosecond:
 	default:
 		return Series{}, fmt.Errorf("gobi: NewTimestampSeriesUnit: unknown unit %v", unit)
 	}
-	nsPerUnit := int64(1e9) / perSec
 	vals := make([]arrow.Timestamp, len(ts))
 	for i, t := range ts {
 		if validity != nil && !validity[i] {
 			continue
 		}
-		sec, frac := t.Unix(), int64(t.Nanosecond())/nsPerUnit
-		if sec > math.MaxInt64/perSec || sec < math.MinInt64/perSec ||
-			sec*perSec > math.MaxInt64-frac {
+		v, ok := timeToUnit(t, unit, timeRoundFloor)
+		if !ok {
 			return Series{}, fmt.Errorf("gobi: NewTimestampSeriesUnit: row %d (%s) overflows Timestamp[%s]",
 				i, t.Format(time.RFC3339Nano), unit)
 		}
-		vals[i] = arrow.Timestamp(sec*perSec + frac)
+		vals[i] = v
 	}
 	b := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: unit, TimeZone: "UTC"})
 	defer b.Release()

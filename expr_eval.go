@@ -10,11 +10,22 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
-// timestampNanoUTC is the arrow type gobi uses for time.Time literals
-// and matches the type produced by from_structs.go for time.Time
-// struct fields. TimeZone empty means "unspecified" per arrow — same
-// convention gobi uses elsewhere.
-var timestampNanoUTC = &arrow.TimestampType{Unit: arrow.Nanosecond}
+// timeLiteral is Lit(t): a Timestamp with no time zone (as from_structs.go
+// builds for time.Time struct fields), in nanoseconds when t fits them
+// and otherwise in microseconds, which reach ±292,000 years. The
+// comparisons rescale a literal to the column's unit, so the literal's
+// own unit only has to hold t exactly. A t that neither holds exactly
+// (sub-microsecond precision outside 1677-2262, or beyond microseconds)
+// is ErrTimeOutOfRange at Eval rather than a wrapped value.
+func timeLiteral(t time.Time) *literalNode {
+	for _, unit := range []arrow.TimeUnit{arrow.Nanosecond, arrow.Microsecond} {
+		if v, ok := timeToUnit(t, unit, timeRoundExact); ok {
+			return &literalNode{value: v, dtype: &arrow.TimestampType{Unit: unit}}
+		}
+	}
+	return &literalNode{err: fmt.Errorf("%w: Lit(%s): no Timestamp unit holds it exactly",
+		ErrTimeOutOfRange, t.Format(time.RFC3339Nano))}
+}
 
 // -----------------------------------------------------------------------------
 // colRefNode: `Col("x")`
@@ -66,15 +77,7 @@ func newLiteralNode(v any) *literalNode {
 	case string:
 		return &literalNode{value: v, dtype: arrow.BinaryTypes.String}
 	case time.Time:
-		// Stored as arrow.Timestamp (int64 nanoseconds since epoch)
-		// to match the wire representation of Timestamp columns.
-		// UnixNano overflows for times before 1678 or after 2262 —
-		// out of range for the workloads this literal is meant to
-		// support (recent-past bounded queries, event-stream cutoffs).
-		return &literalNode{
-			value: arrow.Timestamp(v.UnixNano()),
-			dtype: timestampNanoUTC,
-		}
+		return timeLiteral(v)
 	default:
 		return &literalNode{err: fmt.Errorf("%w: literal of type %T",
 			ErrUnsupportedLiteral, v)}

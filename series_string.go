@@ -192,7 +192,9 @@ func newStrToTimeType() *arrow.TimestampType {
 //     ("EST", "CST" and "IST" each mean several), so a layout that
 //     has one without a numeric offset rejects such values: use a
 //     numeric offset ("-0700") instead.
-//   - Digits past the microsecond are dropped (rounded toward the past).
+//   - Digits past the microsecond round to the nearest microsecond,
+//     halves away from zero, as AddDuration and the other timestamp
+//     operators round.
 //   - Nulls stay null. Any other value that doesn't match, including
 //     "", fails with ErrTimeParse: no partial column, no silent nulls.
 //     The error quotes the value and gives its index in the column
@@ -227,7 +229,9 @@ func (s Series) StrToTime(layout string) (Series, error) {
 	defer b.Release()
 	b.Reserve(s.Len())
 	p := newTimeParser(s.name, "StrToTime", layout, func(t time.Time) arrow.Timestamp {
-		return arrow.Timestamp(t.UnixMicro())
+		// time.Parse's years (0000-9999) always fit microseconds.
+		v, _ := timeToUnit(t, arrow.Microsecond, timeRoundHalfAway)
+		return v
 	})
 	err := strEach(s, b.AppendNull, func(i int, v string) error {
 		x, err := p.parse(i, v)

@@ -779,3 +779,16 @@ func TestRead_HeaderNameFolding(t *testing.T) {
 		t.Errorf("ambiguous: err = %v, want ErrDuplicateHeader", err)
 	}
 }
+
+// TestRead_TimeColumn_OutOfRange — a time.Time field is Timestamp[ns],
+// so a date past 2262 is an error pointing at StrToTime, not a
+// wrapped value.
+func TestRead_TimeColumn_OutOfRange(t *testing.T) {
+	type evt struct {
+		When time.Time `csv:"when" time:"2006-01-02"`
+	}
+	_, err := csvio.Read[evt](strings.NewReader("when\n2024-01-02\n9999-12-31\n"), nil)
+	if !errors.Is(err, gobi.ErrTimeOutOfRange) || !strings.Contains(err.Error(), "StrToTime") {
+		t.Errorf("err = %v, want ErrTimeOutOfRange pointing at StrToTime", err)
+	}
+}

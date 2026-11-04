@@ -481,10 +481,12 @@ func oidToArrowType(oid uint32) (arrow.DataType, error) {
 		return arrow.BinaryTypes.String, nil
 	case pgtype.ByteaOID:
 		return arrow.BinaryTypes.Binary, nil
-	case pgtype.TimestampOID, pgtype.TimestamptzOID:
-		return arrow.FixedWidthTypes.Timestamp_ns, nil
-	case pgtype.DateOID:
-		return arrow.FixedWidthTypes.Timestamp_ns, nil
+	case pgtype.TimestampOID, pgtype.TimestamptzOID, pgtype.DateOID:
+		// Microseconds, Postgres's own precision: every value keeps
+		// its digits, and the range reaches ±292,000 years, where
+		// nanoseconds stop at 1677-2262 and would make a table holding
+		// a 9999-12-31 sentinel unreadable.
+		return arrow.FixedWidthTypes.Timestamp_us, nil
 	case pgtype.NumericOID:
 		// Numeric can be huge; arrow's Decimal128 needs a fixed
 		// precision/scale that we can't infer without extra
@@ -608,7 +610,11 @@ func appendPGValue(b array.Builder, v any) error {
 	case *array.TimestampBuilder:
 		switch x := v.(type) {
 		case time.Time:
-			tb.Append(arrow.Timestamp(x.UnixNano()))
+			ts, err := gobi.TimestampOf(x, tb.Type().(*arrow.TimestampType).Unit)
+			if err != nil {
+				return err
+			}
+			tb.Append(ts)
 		default:
 			return fmt.Errorf("timestamp col got %T", v)
 		}

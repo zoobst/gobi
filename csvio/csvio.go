@@ -770,7 +770,11 @@ func transformTimeColumn(pool memory.Allocator, src arrow.Array, layout string) 
 		if err != nil {
 			return nil, err
 		}
-		b.Append(arrow.Timestamp(t.UnixNano()))
+		ts, err := gobi.TimestampOf(t, arrow.Nanosecond)
+		if err != nil {
+			return nil, fmt.Errorf("%w (read the column into a string field and convert it with gobi's StrToTime, which keeps microseconds)", err)
+		}
+		b.Append(ts)
 	}
 	return b.NewArray(), nil
 }

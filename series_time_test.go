@@ -599,7 +599,7 @@ func TestTimeToUnit_Symmetry(t *testing.T) {
 		{"negative_over_half_rounds_down", -1_000_501, -1_001},
 	}
 	for _, c := range cases {
-		got, ok := timeToUnit(time.Unix(0, c.v), arrow.Microsecond)
+		got, ok := timeToUnit(time.Unix(0, c.v), arrow.Microsecond, timeRoundHalfAway)
 		if !ok || int64(got) != c.want {
 			t.Errorf("%s: timeToUnit(%d ns, us) = %d, %v; want %d",
 				c.name, c.v, got, ok, c.want)
