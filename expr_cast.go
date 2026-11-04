@@ -115,7 +115,7 @@ func castSeries(s Series, target arrow.DataType) (Series, error) {
 		arrow.UINT64, arrow.UINT32:
 	default:
 		hint := ""
-		if s.DataType().ID() == arrow.STRING {
+		if isStringLike(s.DataType().ID()) {
 			switch target.ID() {
 			case arrow.TIMESTAMP, arrow.DATE32, arrow.DATE64:
 				hint = "; parse strings with StrToTime / StrToDate"

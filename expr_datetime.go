@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -266,10 +267,14 @@ func (n *unixNanoNode) Eval(input *Frame) (Series, error) {
 			ErrExprTypeMismatch, s.DataType())
 	}
 	mult := unitToNanos(dt.Unit)
+	// A µs / ms / s value outside 1677-09-21 .. 2262-04-11 has no
+	// nanosecond count; error rather than return a wrapped one.
+	lo, hi := int64(math.MinInt64)/mult, int64(math.MaxInt64)/mult
 
 	pool := memory.DefaultAllocator
 	b := array.NewInt64Builder(pool)
 	defer b.Release()
+	row := 0
 	for _, chunk := range s.col.Data().Chunks() {
 		arr, ok := chunk.(*array.Timestamp)
 		if !ok {
@@ -280,9 +285,13 @@ func (n *unixNanoNode) Eval(input *Frame) (Series, error) {
 		for i := range arr.Len() {
 			if arr.IsNull(i) {
 				b.AppendNull()
-				continue
+			} else if v := int64(arr.Value(i)); v < lo || v > hi {
+				return Series{}, fmt.Errorf("%w: UnixNano: index %d: %s is outside the nanosecond range",
+					ErrTimeOutOfRange, row, arrowTimestampToTime(arr.Value(i), dt.Unit, time.UTC).Format(time.RFC3339Nano))
+			} else {
+				b.Append(v * mult)
 			}
-			b.Append(int64(arr.Value(i)) * mult)
+			row++
 		}
 	}
 	return arrayToSeries(pool, "unix_nano", arrow.PrimitiveTypes.Int64, b.NewArray())

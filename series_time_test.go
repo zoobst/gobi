@@ -576,18 +576,17 @@ func TestSeries_SubDuration_PreservesTypeMetadata(t *testing.T) {
 	}
 }
 
-// TestRoundedDivTimestamp_Symmetry: sub-unit rescaling uses
-// round-half-away-from-zero, so a +500ns and a -500ns delta on a
-// Timestamp[us] source produce +1 μs and -1 μs of rounding
+// TestTimeToUnit_Symmetry: sub-unit rescaling uses
+// round-half-away-from-zero, so a +500ns and a -500ns remainder on a
+// Timestamp[us] target produce +1 μs and -1 μs of rounding
 // respectively — same magnitude, opposite sign. Plain integer
 // division (Go's `/`) would truncate both toward zero and drop
 // the sub-us fraction asymmetrically.
-func TestRoundedDivTimestamp_Symmetry(t *testing.T) {
-	// div = 1000 corresponds to rescaling ns → μs.
+func TestTimeToUnit_Symmetry(t *testing.T) {
 	cases := []struct {
 		name string
-		v    int64
-		want int64
+		v    int64 // ns
+		want int64 // μs
 	}{
 		{"positive_half_rounds_up", 1_000_500, 1_001},
 		{"negative_half_rounds_down", -1_000_500, -1_001},
@@ -599,12 +598,11 @@ func TestRoundedDivTimestamp_Symmetry(t *testing.T) {
 		{"positive_over_half_rounds_up", 1_000_501, 1_001},
 		{"negative_over_half_rounds_down", -1_000_501, -1_001},
 	}
-	const div arrow.Timestamp = 1000
 	for _, c := range cases {
-		got := int64(roundedDivTimestamp(arrow.Timestamp(c.v), div))
-		if got != c.want {
-			t.Errorf("%s: roundedDivTimestamp(%d, %d) = %d, want %d",
-				c.name, c.v, div, got, c.want)
+		got, ok := timeToUnit(time.Unix(0, c.v), arrow.Microsecond)
+		if !ok || int64(got) != c.want {
+			t.Errorf("%s: timeToUnit(%d ns, us) = %d, %v; want %d",
+				c.name, c.v, got, ok, c.want)
 		}
 	}
 }
@@ -612,7 +610,7 @@ func TestRoundedDivTimestamp_Symmetry(t *testing.T) {
 // TestSeries_AddDuration_SubUnitPrecisionSymmetry: at the Series
 // level, adding a +500ns duration to a Timestamp[us] pre-1970
 // and post-1970 value produces symmetric rounding (both round
-// away from zero, matching the roundedDivTimestamp helper).
+// away from zero, matching timeToUnit).
 //
 // Note: what's tested here is that the rounding DIRECTION is
 // consistent with the mathematical sign of the input. The

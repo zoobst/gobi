@@ -190,7 +190,8 @@ func (e Expr) StrRegexReplace(pattern, replacement string) Expr {
 // StrToTime returns a Timestamp[µs, UTC] Expr parsing each value with
 // the Go time layout ("" means time.RFC3339). A non-null value that
 // doesn't match fails the evaluation with ErrTimeParse. See
-// Series.StrToTime for zones and precision.
+// Series.StrToTime for zones, precision, and turning placeholder
+// values into nulls first.
 //
 //	lf.WithColumn("dt", gobi.Col("dt").StrToTime("2006-01-02 15:04:05"))
 func (e Expr) StrToTime(layout string) Expr {
@@ -299,7 +300,13 @@ func (n *strOpNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 	if err != nil {
 		return nil, err
 	}
-	if innerType.ID() != arrow.STRING {
+	if n.op == strOpToTime || n.op == strOpToDate {
+		// The parsers read every string type.
+		if !isStringLike(innerType.ID()) {
+			return nil, fmt.Errorf("%w: str.%s requires a String, LargeString or StringView column, got %s",
+				ErrExprTypeMismatch, n.op, innerType)
+		}
+	} else if innerType.ID() != arrow.STRING {
 		return nil, fmt.Errorf("%w: str.%s requires a String column, got %s",
 			ErrExprTypeMismatch, n.op, innerType)
 	}
@@ -307,7 +314,7 @@ func (n *strOpNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 	case n.op == strOpLen:
 		return arrow.PrimitiveTypes.Int64, nil
 	case n.op == strOpToTime:
-		return strToTimeType, nil
+		return newStrToTimeType(), nil
 	case n.op == strOpToDate:
 		return arrow.FixedWidthTypes.Date32, nil
 	case n.op.returnsBool():

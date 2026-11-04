@@ -10,16 +10,43 @@ introduce breaking changes; check this file when upgrading.
 ### Added
 
 - **`Expr.StrToTime(layout)` / `Expr.StrToDate(layout)`** (and the
-  matching `Series` methods) parse a String column with a Go time
-  layout into `Timestamp[µs, UTC]` or `Date32`. Values with a UTC
-  offset become that instant in UTC, and those without a zone read
-  as UTC. `StrToDate` keeps the date as written. A non-null value
-  that doesn't parse fails with the new `gobi.ErrTimeParse`, which
-  names the row. `Cast` stays numeric-only, and casting a String to a
-  time type now says to use these instead. A date-time held as text
-  (an Athena partition column, say) can now be written to a
-  GeoPackage as `DATETIME`:
+  matching `Series` methods) parse a String, LargeString or StringView
+  column with a Go time layout into `Timestamp[µs, UTC]` or `Date32`.
+  A date-time held as text (an Athena partition column, say) can now
+  be written to a GeoPackage as `DATETIME`:
   `lf.WithColumn("dt", gobi.Col("dt").StrToTime("2006-01-02 15:04:05"))`.
+  - Values with a UTC offset become that instant in UTC, and those
+    without a zone read as UTC on every host. A zone abbreviation
+    other than UTC or GMT, in a layout with no numeric offset, is
+    an error rather than a guess. `StrToDate` keeps the date as
+    written.
+  - A non-null value that doesn't parse fails with the new
+    `gobi.ErrTimeParse`, quoting the value. The doc comment shows
+    how to null a placeholder such as `__HIVE_DEFAULT_PARTITION__`
+    first.
+  - A run of equal values (a partition key) is parsed once.
+  - `Cast` stays numeric-only. Casting a string column to a time type
+    now says to use these instead.
+- **`gobi.ErrTimeOutOfRange`**, for a time that doesn't fit the
+  column it would go into.
+
+### Fixed
+
+- Timestamp ops on µs, ms and s columns no longer wrap silently
+  outside 1677–2262, the range nanoseconds can hold. Before, such a
+  value went through int64 nanoseconds. This affected `AddDuration`,
+  `SubDuration`, `TruncateTo`, `TruncateToCalendar`, `DateTruncate`
+  and the `EqTime` family. Each value now goes straight to the
+  column's own unit, so `9999-12-31` in a µs column works. A result
+  that can't be stored returns `ErrTimeOutOfRange`. `UnixNano` now
+  returns `ErrTimeOutOfRange` for values it can't represent, instead
+  of a wrapped number.
+
+### Performance
+
+- The string `Series` methods reserve their output up front: half
+  the memory and a third of the allocations, at about 3% more time
+  on predicates.
 
 ## [v0.5.2]
 

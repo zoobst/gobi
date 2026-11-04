@@ -173,27 +173,44 @@ func (s Series) strRegexReplaceCompiled(re *regexp.Regexp, replacement string) (
 	}, "_regex_replace")
 }
 
-// strToTimeType is StrToTime's output type. Microseconds rather than
-// gobi's usual nanoseconds: every year time.Parse accepts (0000-9999)
-// fits, where nanoseconds stop at 1677-2262 and would turn sentinel
-// dates such as 9999-12-31 into errors.
-var strToTimeType = &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
+// newStrToTimeType returns StrToTime's output type, fresh per call so
+// no caller can change another's by mutating it. Microseconds rather
+// than gobi's usual nanoseconds: every year time.Parse accepts
+// (0000-9999) fits, where nanoseconds stop at 1677-2262.
+func newStrToTimeType() *arrow.TimestampType {
+	return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
+}
 
 // StrToTime parses each value with the Go time layout (see the time
 // package; "" means time.RFC3339, matching DateFormat) and returns a
-// Timestamp[µs, UTC] column.
+// Timestamp[µs, UTC] column. The column may be String, LargeString or
+// StringView.
 //
-//   - A value with a UTC offset or "Z" becomes that instant in UTC;
-//     a layout without a zone reads values as UTC.
+//   - A value with a UTC offset or "Z" becomes that instant in UTC; a
+//     layout without a zone reads values as UTC, on every host.
+//   - A zone abbreviation other than UTC or GMT has no fixed offset
+//     ("EST", "CST" and "IST" each mean several), so a layout that
+//     has one without a numeric offset rejects such values: use a
+//     numeric offset ("-0700") instead.
 //   - Digits past the microsecond are dropped (rounded toward the past).
 //   - Nulls stay null. Any other value that doesn't match, including
-//     "", returns ErrTimeParse naming the row: no partial column, no
-//     silent nulls. Clean up the column first (StrTrim, or turn
-//     placeholder strings into nulls) when the data needs it.
+//     "", fails with ErrTimeParse: no partial column, no silent nulls.
+//     The error quotes the value and gives its index in the column
+//     being parsed; inside a LazyFrame that is the current batch, so
+//     search for the value rather than counting rows.
 //
-// Zone abbreviations follow time.Parse: "UTC" is UTC, but one such as
-// "EST" is only honored when it's the local zone's, and otherwise
-// reads as UTC with that name. Prefer numeric offsets ("-0700").
+// To keep placeholders such as Hive's __HIVE_DEFAULT_PARTITION__ from
+// failing the parse, turn them into nulls first. If evaluates both
+// branches on every row, so the condition goes inside the parse, not
+// around it:
+//
+//	dt := gobi.Col("dt")
+//	gobi.If(dt.Eq(gobi.Lit("__HIVE_DEFAULT_PARTITION__")),
+//	    gobi.LitNull(arrow.BinaryTypes.String), dt).StrToDate("")
+//
+// Each parse is remembered until the value changes, so a column that
+// repeats one value per file (a partition key) parses once per run of
+// equal values.
 //
 //	s.StrToTime("2006-01-02 15:04:05")   // "2024-01-02 03:04:05"
 //	s.StrToTime("")                      // "2024-01-02T03:04:05-05:00"
@@ -201,37 +218,63 @@ func (s Series) StrToTime(layout string) (Series, error) {
 	if layout == "" {
 		layout = time.RFC3339
 	}
+	if err := requireStringLike(s, "StrToTime"); err != nil {
+		return Series{}, err
+	}
+	typ := newStrToTimeType()
 	pool := memory.DefaultAllocator
-	b := array.NewTimestampBuilder(pool, strToTimeType)
+	b := array.NewTimestampBuilder(pool, typ)
 	defer b.Release()
 	b.Reserve(s.Len())
-	err := strParseTime(s, layout, "StrToTime", b.AppendNull, func(t time.Time) {
-		b.UnsafeAppend(arrow.Timestamp(t.UnixMicro()))
+	p := newTimeParser(s.name, "StrToTime", layout, func(t time.Time) arrow.Timestamp {
+		return arrow.Timestamp(t.UnixMicro())
+	})
+	err := strEach(s, b.AppendNull, func(i int, v string) error {
+		x, err := p.parse(i, v)
+		if err != nil {
+			return err
+		}
+		b.UnsafeAppend(x)
+		return nil
 	})
 	if err != nil {
 		return Series{}, err
 	}
-	return arrayToSeries(pool, s.name+"_to_time", strToTimeType, b.NewArray())
+	return arrayToSeries(pool, s.name+"_to_time", typ, b.NewArray())
 }
 
 // StrToDate parses each value with the Go time layout ("" means
 // time.DateOnly, "2006-01-02") and returns a Date32 column holding
 // the calendar date as written: "2024-01-02T23:00:00-05:00" is
-// 2024-01-02, not the UTC date of that instant. Any time of day is
-// dropped. Nulls and parse errors behave as in StrToTime.
+// 2024-01-02, not the UTC date of that instant, and a zone
+// abbreviation doesn't matter. Any time of day is dropped. Column
+// types, nulls, errors and placeholders are as in StrToTime.
 func (s Series) StrToDate(layout string) (Series, error) {
 	if layout == "" {
 		layout = time.DateOnly
+	}
+	if err := requireStringLike(s, "StrToDate"); err != nil {
+		return Series{}, err
 	}
 	pool := memory.DefaultAllocator
 	b := array.NewDate32Builder(pool)
 	defer b.Release()
 	b.Reserve(s.Len())
-	err := strParseTime(s, layout, "StrToDate", b.AppendNull, func(t time.Time) {
+	p := newTimeParser(s.name, "StrToDate", layout, func(t time.Time) arrow.Date32 {
+		// The wall-clock date, as midnight UTC: Date32FromTime
+		// truncates the instant, so it needs the date rebuilt first
+		// (as Expr.IsIn does).
 		y, m, d := t.Date()
-		// Midnight UTC is a whole number of days from the epoch, so
-		// the division is exact on both sides of 1970.
-		b.UnsafeAppend(arrow.Date32(time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix() / 86400))
+		return arrow.Date32FromTime(time.Date(y, m, d, 0, 0, 0, 0, time.UTC))
+	})
+	p.anyZone = true // the date as written doesn't depend on it
+	err := strEach(s, b.AppendNull, func(i int, v string) error {
+		x, err := p.parse(i, v)
+		if err != nil {
+			return err
+		}
+		b.UnsafeAppend(x)
+		return nil
 	})
 	if err != nil {
 		return Series{}, err
@@ -239,44 +282,109 @@ func (s Series) StrToDate(layout string) (Series, error) {
 	return arrayToSeries(pool, s.name+"_to_date", arrow.FixedWidthTypes.Date32, b.NewArray())
 }
 
+// timeParser parses one column's values for StrToTime / StrToDate
+// and converts each to the output value T, remembering the last
+// string and its value so a run of equal strings (a partition key)
+// costs a comparison per row.
+type timeParser[T any] struct {
+	col, op, layout string
+	conv            func(time.Time) T
+	// anyZone accepts a zone abbreviation with no known offset. Off
+	// (for StrToTime) when the layout names a zone only by
+	// abbreviation, so "EST" can't silently read as UTC.
+	anyZone bool
+
+	last   string
+	lastX  T
+	cached bool
+}
+
+func newTimeParser[T any](col, op, layout string, conv func(time.Time) T) *timeParser[T] {
+	// Every numeric-offset element of a layout contains "-07" or
+	// "Z07"; "MST" is the abbreviation element.
+	abbrevOnly := strings.Contains(layout, "MST") &&
+		!strings.Contains(layout, "-07") && !strings.Contains(layout, "Z07")
+	return &timeParser[T]{col: col, op: op, layout: layout, conv: conv, anyZone: !abbrevOnly}
+}
+
+func (p *timeParser[T]) parse(i int, v string) (T, error) {
+	if p.cached && v == p.last {
+		return p.lastX, nil
+	}
+	// In UTC rather than time.Parse's Local, so an abbreviation can't
+	// resolve differently from one host to the next.
+	t, err := time.ParseInLocation(p.layout, v, time.UTC)
+	if err == nil && !p.anyZone {
+		// Unresolvable abbreviations parse as a zero-offset zone of
+		// that name; UTC itself, and GMT / GMT+h (whose offset is in
+		// the name), are the ones that are right.
+		if name, _ := t.Zone(); name != "UTC" && !strings.HasPrefix(name, "GMT") {
+			err = fmt.Errorf("zone abbreviation %q in %q has no fixed offset; use a layout with a numeric offset (-0700)", name, v)
+		}
+	}
+	if err != nil {
+		var zero T
+		return zero, fmt.Errorf("%w: %s: column %q, index %d: %w", ErrTimeParse, p.op, p.col, i, err)
+	}
+	p.last, p.lastX, p.cached = v, p.conv(t), true
+	return p.lastX, nil
+}
+
 // ------------------------------------------------------------------------
 // Shared drivers
 // ------------------------------------------------------------------------
 
-// strParseTime parses every value of String column s with layout,
-// calling appendNull for null rows and appendVal for the rest. The
-// first value that doesn't parse stops the walk with ErrTimeParse.
-func strParseTime(s Series, layout, op string, appendNull func(), appendVal func(time.Time)) error {
-	if err := requireString(s); err != nil {
-		return err
-	}
+// stringArray is the read side shared by String, LargeString and
+// StringView arrays.
+type stringArray interface {
+	arrow.Array
+	Value(int) string
+}
+
+// strEach walks string column s in order, calling null for each null
+// row and val with the row's index in s and its value for the rest.
+// String, LargeString and StringView chunks are all read; callers
+// that accept fewer check the type first. An error from val stops the
+// walk.
+func strEach(s Series, null func(), val func(i int, v string) error) error {
 	row := 0
 	for _, chunk := range s.col.Data().Chunks() {
-		arr, ok := chunk.(*array.String)
-		if !ok {
-			return fmt.Errorf("%w: expected *array.String, got %T",
+		var err error
+		switch arr := chunk.(type) {
+		case *array.String:
+			// The common case, on the concrete type so Value inlines.
+			row, err = strEachChunk(arr, row, null, val)
+		case stringArray:
+			row, err = strEachChunk(arr, row, null, val)
+		default:
+			return fmt.Errorf("%w: expected a string array, got %T",
 				ErrColumnTypeMismatch, chunk)
 		}
-		for i := range arr.Len() {
-			if arr.IsNull(i) {
-				appendNull()
-			} else {
-				t, err := time.Parse(layout, arr.Value(i))
-				if err != nil {
-					return fmt.Errorf("%w: %s: column %q row %d: %w", ErrTimeParse, op, s.name, row, err)
-				}
-				appendVal(t)
-			}
-			row++
+		if err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
+// strEachChunk is strEach's loop over one chunk whose first row is
+// row; it returns the row after the chunk.
+func strEachChunk[A stringArray](arr A, row int, null func(), val func(int, string) error) (int, error) {
+	for i := range arr.Len() {
+		if arr.IsNull(i) {
+			null()
+		} else if err := val(row, arr.Value(i)); err != nil {
+			return row, err
+		}
+		row++
+	}
+	return row, nil
+}
+
 // strMapString is the shared driver for String → String ops. Type-
-// checks the input column, walks each chunk once, applies fn to
-// every non-null value, and returns a String column named
-// s.name+suffix. Nulls pass through as nulls.
+// checks the input column, walks it once, applies fn to every non-null
+// value, and returns a String column named s.name+suffix. Nulls pass
+// through as nulls.
 func strMapString(s Series, fn func(string) string, suffix string) (Series, error) {
 	if err := requireString(s); err != nil {
 		return Series{}, err
@@ -284,19 +392,11 @@ func strMapString(s Series, fn func(string) string, suffix string) (Series, erro
 	pool := memory.DefaultAllocator
 	b := array.NewStringBuilder(pool)
 	defer b.Release()
-	for _, chunk := range s.col.Data().Chunks() {
-		arr, ok := chunk.(*array.String)
-		if !ok {
-			return Series{}, fmt.Errorf("%w: expected *array.String, got %T",
-				ErrColumnTypeMismatch, chunk)
-		}
-		for i := range arr.Len() {
-			if arr.IsNull(i) {
-				b.AppendNull()
-				continue
-			}
-			b.Append(fn(arr.Value(i)))
-		}
+	if err := strEach(s, b.AppendNull, func(_ int, v string) error {
+		b.Append(fn(v))
+		return nil
+	}); err != nil {
+		return Series{}, err
 	}
 	return arrayToSeries(pool, s.name+suffix, arrow.BinaryTypes.String, b.NewArray())
 }
@@ -309,19 +409,12 @@ func strMapInt64(s Series, fn func(string) int64, suffix string) (Series, error)
 	pool := memory.DefaultAllocator
 	b := array.NewInt64Builder(pool)
 	defer b.Release()
-	for _, chunk := range s.col.Data().Chunks() {
-		arr, ok := chunk.(*array.String)
-		if !ok {
-			return Series{}, fmt.Errorf("%w: expected *array.String, got %T",
-				ErrColumnTypeMismatch, chunk)
-		}
-		for i := range arr.Len() {
-			if arr.IsNull(i) {
-				b.AppendNull()
-				continue
-			}
-			b.Append(fn(arr.Value(i)))
-		}
+	b.Reserve(s.Len())
+	if err := strEach(s, b.AppendNull, func(_ int, v string) error {
+		b.UnsafeAppend(fn(v))
+		return nil
+	}); err != nil {
+		return Series{}, err
 	}
 	return arrayToSeries(pool, s.name+suffix, arrow.PrimitiveTypes.Int64, b.NewArray())
 }
@@ -334,19 +427,12 @@ func strMapBool(s Series, fn func(string) bool, suffix string) (Series, error) {
 	pool := memory.DefaultAllocator
 	b := array.NewBooleanBuilder(pool)
 	defer b.Release()
-	for _, chunk := range s.col.Data().Chunks() {
-		arr, ok := chunk.(*array.String)
-		if !ok {
-			return Series{}, fmt.Errorf("%w: expected *array.String, got %T",
-				ErrColumnTypeMismatch, chunk)
-		}
-		for i := range arr.Len() {
-			if arr.IsNull(i) {
-				b.AppendNull()
-				continue
-			}
-			b.Append(fn(arr.Value(i)))
-		}
+	b.Reserve(s.Len())
+	if err := strEach(s, b.AppendNull, func(_ int, v string) error {
+		b.UnsafeAppend(fn(v))
+		return nil
+	}); err != nil {
+		return Series{}, err
 	}
 	return arrayToSeries(pool, s.name+suffix, arrow.FixedWidthTypes.Boolean, b.NewArray())
 }
@@ -357,6 +443,21 @@ func requireString(s Series) error {
 	if s.DataType().ID() != arrow.STRING {
 		return fmt.Errorf("%w: expected String column, got %s",
 			ErrColumnTypeMismatch, s.DataType())
+	}
+	return nil
+}
+
+// isStringLike reports whether id is a string type strEach reads.
+func isStringLike(id arrow.Type) bool {
+	return id == arrow.STRING || id == arrow.LARGE_STRING || id == arrow.STRING_VIEW
+}
+
+// requireStringLike is requireString for the ops that also read
+// LargeString and StringView.
+func requireStringLike(s Series, op string) error {
+	if !isStringLike(s.DataType().ID()) {
+		return fmt.Errorf("%w: %s: expected a String, LargeString or StringView column, got %s",
+			ErrColumnTypeMismatch, op, s.DataType())
 	}
 	return nil
 }

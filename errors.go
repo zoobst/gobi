@@ -17,4 +17,9 @@ var (
 	// value doesn't match the layout. The error names the row and wraps
 	// the *time.ParseError.
 	ErrTimeParse = errors.New("gobi: value does not match time layout")
+
+	// ErrTimeOutOfRange is returned when a time doesn't fit the column
+	// it would go into, such as UnixNano on a year past 2262, or
+	// AddDuration taking a value past the end of its unit's range.
+	ErrTimeOutOfRange = errors.New("gobi: time out of range")
 )
