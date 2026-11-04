@@ -5,6 +5,22 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.5.3]
+
+### Added
+
+- **`Expr.StrToTime(layout)` / `Expr.StrToDate(layout)`** (and the
+  matching `Series` methods) parse a String column with a Go time
+  layout into `Timestamp[µs, UTC]` or `Date32`. Values with a UTC
+  offset become that instant in UTC, and those without a zone read
+  as UTC. `StrToDate` keeps the date as written. A non-null value
+  that doesn't parse fails with the new `gobi.ErrTimeParse`, which
+  names the row. `Cast` stays numeric-only, and casting a String to a
+  time type now says to use these instead. A date-time held as text
+  (an Athena partition column, say) can now be written to a
+  GeoPackage as `DATETIME`:
+  `lf.WithColumn("dt", gobi.Col("dt").StrToTime("2006-01-02 15:04:05"))`.
+
 ## [v0.5.2]
 
 ### Changed (breaking)

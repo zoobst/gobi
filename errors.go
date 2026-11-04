@@ -12,4 +12,9 @@ var (
 	ErrNotGeometry        = errors.New("gobi: column is not a geometry column")
 	ErrExprTypeMismatch   = errors.New("gobi: expression type mismatch")
 	ErrUnsupportedLiteral = errors.New("gobi: unsupported literal type")
+
+	// ErrTimeParse is returned by StrToTime / StrToDate when a non-null
+	// value doesn't match the layout. The error names the row and wraps
+	// the *time.ParseError.
+	ErrTimeParse = errors.New("gobi: value does not match time layout")
 )

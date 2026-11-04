@@ -303,3 +303,51 @@ func TestDateTime_YearOutOfRange(t *testing.T) {
 		t.Errorf("err = %v, want a year-10000 error", err)
 	}
 }
+
+// TestDateTime_FromParsedStrings — a date-time held as text (as
+// Athena partition columns are) becomes a DATETIME column once parsed
+// with StrToTime, and a DATE column with StrToDate.
+func TestDateTime_FromParsedStrings(t *testing.T) {
+	df := frameOf(t, []arrow.Field{
+		{Name: "dt", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "day", Type: arrow.BinaryTypes.String, Nullable: true},
+	},
+		`["2024-01-02 03:04:05.123", null]`,
+		`["2024-01-02", null]`,
+	)
+	defer df.Release()
+	conv, err := df.Lazy().
+		WithColumn("dt", gobi.Col("dt").StrToTime("2006-01-02 15:04:05")).
+		WithColumn("day", gobi.Col("day").StrToDate("")).
+		Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conv.Release()
+	path := filepath.Join(t.TempDir(), "parsed.gpkg")
+	if err := gpkgio.WriteFile(conv, path, &gpkgio.WriteOptions{Layer: "events"}); err != nil {
+		t.Fatal(err)
+	}
+	back, err := gpkgio.ReadFile(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer back.Release()
+	for col, want := range map[string]string{"dt": "timestamp[ms, tz=UTC]", "day": "date32"} {
+		s, err := back.Column(col)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := s.DataType().String(); got != want {
+			t.Errorf("%s read as %s, want %s", col, got, want)
+		}
+	}
+	for col, want := range map[string]string{
+		"dt":  `["2024-01-02T03:04:05.123Z",null]`,
+		"day": `["2024-01-02",null]`,
+	} {
+		if got := colJSON(t, back, col); got != want {
+			t.Errorf("%s = %s, want %s", col, got, want)
+		}
+	}
+}

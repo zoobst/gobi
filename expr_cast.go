@@ -12,7 +12,9 @@ import (
 
 // Cast returns an expression that converts the inner column to the
 // given arrow data type. Numeric-to-numeric conversions are supported
-// today; string / boolean / date-time conversions are follow-ups.
+// today; boolean / date-time conversions are follow-ups. To turn a
+// String column into times, use StrToTime or StrToDate, which take
+// the layout to parse with.
 //
 // Supported source→target combinations (v1, numeric-to-numeric only):
 //
@@ -112,9 +114,16 @@ func castSeries(s Series, target arrow.DataType) (Series, error) {
 		arrow.INT64, arrow.INT32,
 		arrow.UINT64, arrow.UINT32:
 	default:
+		hint := ""
+		if s.DataType().ID() == arrow.STRING {
+			switch target.ID() {
+			case arrow.TIMESTAMP, arrow.DATE32, arrow.DATE64:
+				hint = "; parse strings with StrToTime / StrToDate"
+			}
+		}
 		return Series{}, fmt.Errorf(
-			"%w: Cast: unsupported target type %s (v1 covers Float32/64, Int32/64, Uint32/64)",
-			ErrExprTypeMismatch, target)
+			"%w: Cast: unsupported target type %s (v1 covers Float32/64, Int32/64, Uint32/64)%s",
+			ErrExprTypeMismatch, target, hint)
 	}
 
 	// TODO: thread ctx through castNode.Eval so an in-flight

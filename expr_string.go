@@ -38,6 +38,8 @@ const (
 	strOpConcat
 	strOpRegexMatch
 	strOpRegexReplace
+	strOpToTime
+	strOpToDate
 )
 
 // String returns the snake-case name of the op. Used by
@@ -73,6 +75,10 @@ func (o strOp) String() string {
 		return "regex_match"
 	case strOpRegexReplace:
 		return "regex_replace"
+	case strOpToTime:
+		return "to_time"
+	case strOpToDate:
+		return "to_date"
 	}
 	return fmt.Sprintf("strOp(%d)", o)
 }
@@ -181,6 +187,25 @@ func (e Expr) StrRegexReplace(pattern, replacement string) Expr {
 	}}
 }
 
+// StrToTime returns a Timestamp[µs, UTC] Expr parsing each value with
+// the Go time layout ("" means time.RFC3339). A non-null value that
+// doesn't match fails the evaluation with ErrTimeParse. See
+// Series.StrToTime for zones and precision.
+//
+//	lf.WithColumn("dt", gobi.Col("dt").StrToTime("2006-01-02 15:04:05"))
+func (e Expr) StrToTime(layout string) Expr {
+	return Expr{node: &strOpNode{op: strOpToTime, inner: e.node, args: []string{layout}}}
+}
+
+// StrToDate returns a Date32 Expr parsing each value with the Go time
+// layout ("" means time.DateOnly) and keeping the date as written. See
+// Series.StrToDate.
+//
+//	lf.WithColumn("dt", gobi.Col("dt").StrToDate("2006-01-02"))
+func (e Expr) StrToDate(layout string) Expr {
+	return Expr{node: &strOpNode{op: strOpToDate, inner: e.node, args: []string{layout}}}
+}
+
 // strUnaryExpr is the shared constructor for the arg-less string
 // unary ops (lower / upper / trim). Individual named methods make
 // the API-level docstrings explicit while sharing one node type.
@@ -191,7 +216,7 @@ func strUnaryExpr(inner ExprNode, op strOp) Expr {
 // strOpNode is the executor node for all Expr.StrX methods. `op`
 // dispatches to the matching Series driver at Eval time; `args`
 // / `ints` carry op-specific scalar parameters (regex pattern,
-// slice indices, etc.). Kept as one node type rather than 14 to
+// slice indices, etc.). Kept as one node type rather than one per op to
 // avoid boilerplate — the ExprNode interface (Eval / Type /
 // Children / String) is identical across ops modulo the dispatch
 // switch.
@@ -255,6 +280,10 @@ func (n *strOpNode) Eval(input *Frame) (Series, error) {
 		return s.strRegexMatchCompiled(n.re)
 	case strOpRegexReplace:
 		return s.strRegexReplaceCompiled(n.re, n.args[1])
+	case strOpToTime:
+		return s.StrToTime(n.args[0])
+	case strOpToDate:
+		return s.StrToDate(n.args[0])
 	}
 	return Series{}, fmt.Errorf("gobi: strOpNode: unhandled op %s", n.op)
 }
@@ -277,6 +306,10 @@ func (n *strOpNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 	switch {
 	case n.op == strOpLen:
 		return arrow.PrimitiveTypes.Int64, nil
+	case n.op == strOpToTime:
+		return strToTimeType, nil
+	case n.op == strOpToDate:
+		return arrow.FixedWidthTypes.Date32, nil
 	case n.op.returnsBool():
 		return arrow.FixedWidthTypes.Boolean, nil
 	default:

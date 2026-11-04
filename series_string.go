@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -172,9 +173,105 @@ func (s Series) strRegexReplaceCompiled(re *regexp.Regexp, replacement string) (
 	}, "_regex_replace")
 }
 
+// strToTimeType is StrToTime's output type. Microseconds rather than
+// gobi's usual nanoseconds: every year time.Parse accepts (0000-9999)
+// fits, where nanoseconds stop at 1677-2262 and would turn sentinel
+// dates such as 9999-12-31 into errors.
+var strToTimeType = &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
+
+// StrToTime parses each value with the Go time layout (see the time
+// package; "" means time.RFC3339, matching DateFormat) and returns a
+// Timestamp[µs, UTC] column.
+//
+//   - A value with a UTC offset or "Z" becomes that instant in UTC;
+//     a layout without a zone reads values as UTC.
+//   - Digits past the microsecond are dropped (rounded toward the past).
+//   - Nulls stay null. Any other value that doesn't match, including
+//     "", returns ErrTimeParse naming the row: no partial column, no
+//     silent nulls. Clean up the column first (StrTrim, or turn
+//     placeholder strings into nulls) when the data needs it.
+//
+// Zone abbreviations follow time.Parse: "UTC" is UTC, but one such as
+// "EST" is only honored when it's the local zone's, and otherwise
+// reads as UTC with that name. Prefer numeric offsets ("-0700").
+//
+//	s.StrToTime("2006-01-02 15:04:05")   // "2024-01-02 03:04:05"
+//	s.StrToTime("")                      // "2024-01-02T03:04:05-05:00"
+func (s Series) StrToTime(layout string) (Series, error) {
+	if layout == "" {
+		layout = time.RFC3339
+	}
+	pool := memory.DefaultAllocator
+	b := array.NewTimestampBuilder(pool, strToTimeType)
+	defer b.Release()
+	b.Reserve(s.Len())
+	err := strParseTime(s, layout, "StrToTime", b.AppendNull, func(t time.Time) {
+		b.UnsafeAppend(arrow.Timestamp(t.UnixMicro()))
+	})
+	if err != nil {
+		return Series{}, err
+	}
+	return arrayToSeries(pool, s.name+"_to_time", strToTimeType, b.NewArray())
+}
+
+// StrToDate parses each value with the Go time layout ("" means
+// time.DateOnly, "2006-01-02") and returns a Date32 column holding
+// the calendar date as written: "2024-01-02T23:00:00-05:00" is
+// 2024-01-02, not the UTC date of that instant. Any time of day is
+// dropped. Nulls and parse errors behave as in StrToTime.
+func (s Series) StrToDate(layout string) (Series, error) {
+	if layout == "" {
+		layout = time.DateOnly
+	}
+	pool := memory.DefaultAllocator
+	b := array.NewDate32Builder(pool)
+	defer b.Release()
+	b.Reserve(s.Len())
+	err := strParseTime(s, layout, "StrToDate", b.AppendNull, func(t time.Time) {
+		y, m, d := t.Date()
+		// Midnight UTC is a whole number of days from the epoch, so
+		// the division is exact on both sides of 1970.
+		b.UnsafeAppend(arrow.Date32(time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix() / 86400))
+	})
+	if err != nil {
+		return Series{}, err
+	}
+	return arrayToSeries(pool, s.name+"_to_date", arrow.FixedWidthTypes.Date32, b.NewArray())
+}
+
 // ------------------------------------------------------------------------
 // Shared drivers
 // ------------------------------------------------------------------------
+
+// strParseTime parses every value of String column s with layout,
+// calling appendNull for null rows and appendVal for the rest. The
+// first value that doesn't parse stops the walk with ErrTimeParse.
+func strParseTime(s Series, layout, op string, appendNull func(), appendVal func(time.Time)) error {
+	if err := requireString(s); err != nil {
+		return err
+	}
+	row := 0
+	for _, chunk := range s.col.Data().Chunks() {
+		arr, ok := chunk.(*array.String)
+		if !ok {
+			return fmt.Errorf("%w: expected *array.String, got %T",
+				ErrColumnTypeMismatch, chunk)
+		}
+		for i := range arr.Len() {
+			if arr.IsNull(i) {
+				appendNull()
+			} else {
+				t, err := time.Parse(layout, arr.Value(i))
+				if err != nil {
+					return fmt.Errorf("%w: %s: column %q row %d: %w", ErrTimeParse, op, s.name, row, err)
+				}
+				appendVal(t)
+			}
+			row++
+		}
+	}
+	return nil
+}
 
 // strMapString is the shared driver for String → String ops. Type-
 // checks the input column, walks each chunk once, applies fn to
