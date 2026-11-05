@@ -108,22 +108,41 @@ func TestResampleEvery_Ranges(t *testing.T) {
 	if fmt.Sprint(got) != "[1960-01-01T00:00:00Z=8 2024-01-01T08:00:00Z=3 2024-01-01T09:00:00Z=4]" {
 		t.Errorf("buckets = %v", got)
 	}
-	if ty := starts.DataType().String(); ty != "timestamp[ns, tz=UTC]" {
-		t.Errorf("bucket type = %s, want timestamp[ns, tz=UTC]", ty)
+	if ty := starts.DataType().String(); ty != "timestamp[us, tz=UTC]" {
+		t.Errorf("bucket type = %s, want the column's timestamp[us, tz=UTC]", ty)
 	}
 
-	// µs column past 2262: no ns bucket start.
-	far := unitTimeFrame(t, arrow.Microsecond, []*time.Time{tp(9999, 12, 31, 0, 0, 0)}, []float64{1})
+	// µs column past 2262 (a 9999-12-31 sentinel): buckets in µs.
+	far := unitTimeFrame(t, arrow.Microsecond, []*time.Time{tp(9999, 12, 31, 0, 30, 0)}, []float64{1})
 	defer far.Release()
 	r, _ = far.ResampleEvery("t", time.Hour)
-	if _, err := r.Agg(agg); !errors.Is(err, ErrTimeOutOfRange) {
-		t.Errorf("9999: err = %v, want ErrTimeOutOfRange", err)
+	fo, err := r.Agg(agg)
+	if err != nil {
+		t.Fatalf("9999: %v", err)
 	}
-	// An interval that isn't a whole number of microseconds takes the
-	// nanosecond path, with the same check.
+	defer fo.Release()
+	fs, _ := fo.Column("t")
+	if tm, _, _ := fs.TimeAt(0); !tm.Equal(*tp(9999, 12, 31, 0, 0, 0)) {
+		t.Errorf("9999 bucket = %s", tm)
+	}
+	// An interval that isn't a whole number of microseconds needs
+	// nanosecond starts, which 9999 doesn't fit.
 	r, _ = far.ResampleEvery("t", 1500*time.Nanosecond)
 	if _, err := r.Agg(agg); !errors.Is(err, ErrTimeOutOfRange) {
 		t.Errorf("9999, 1.5µs: err = %v, want ErrTimeOutOfRange", err)
+	}
+
+	// Seconds column, 500ms buckets: starts in milliseconds.
+	secs := unitTimeFrame(t, arrow.Second, []*time.Time{tp(2024, 1, 1, 0, 0, 1)}, []float64{1})
+	defer secs.Release()
+	r, _ = secs.ResampleEvery("t", 500*time.Millisecond)
+	so, err := r.Agg(agg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer so.Release()
+	if ss, _ := so.Column("t"); ss.DataType().String() != "timestamp[ms, tz=UTC]" {
+		t.Errorf("500ms on seconds: type %s, want timestamp[ms, tz=UTC]", ss.DataType())
 	}
 
 	// ns MinInt64: its hour bucket starts before the ns range.
@@ -162,5 +181,68 @@ func TestResampleEvery_Date32(t *testing.T) {
 	s, _ := out.Column("s")
 	if got := fmt.Sprint(s.Column().Data().Chunk(0)); got != "[3 4]" {
 		t.Errorf("daily sums = %s, want [3 4]", got)
+	}
+}
+
+// TestRollingBy_SubUnitPeriod — a period that isn't a whole number of
+// the column's units: with values 1 µs apart and a 1.5 µs period, a
+// row's window is itself and the row before (2 µs back is outside).
+// And a value at the bottom of the ns range doesn't underflow.
+func TestRollingBy_SubUnitPeriod(t *testing.T) {
+	ts := make([]*time.Time, 4)
+	for i := range ts {
+		v := time.UnixMicro(int64(i))
+		ts[i] = &v
+	}
+	f := unitTimeFrame(t, arrow.Microsecond, ts, []float64{1, 2, 4, 8})
+	defer f.Release()
+	r, err := f.RollingBy("t", 1500*time.Nanosecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum, err := r.Agg("a", AggSum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sum.col.Release()
+	if got := fmt.Sprint(sum.Column().Data().Chunk(0)); got != "[1 3 6 12]" {
+		t.Errorf("sums = %s, want [1 3 6 12]", got)
+	}
+
+	low := unitTimeFrame(t, arrow.Nanosecond, []*time.Time{new(time.Unix(0, math.MinInt64)), new(time.Unix(0, math.MinInt64+1))}, []float64{1, 2})
+	defer low.Release()
+	r, err = low.RollingBy("t", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum2, err := r.Agg("a", AggSum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sum2.col.Release()
+	if got := fmt.Sprint(sum2.Column().Data().Chunk(0)); got != "[1 3]" {
+		t.Errorf("MinInt64 sums = %s, want [1 3]", got)
+	}
+}
+
+// TestResampleEvery_Date32NearNanoFloor — a date whose bucket start
+// falls below the ns range is ErrTimeOutOfRange, not a bucket that
+// wraps to ~2262 and sorts last.
+func TestResampleEvery_Date32NearNanoFloor(t *testing.T) {
+	d := array.NewDate32Builder(memory.DefaultAllocator)
+	d.AppendValues([]arrow.Date32{-106751, 0}, nil) // 1677-09-22, 1970-01-01
+	ds := SeriesFromArray(arrow.Field{Name: "t", Type: arrow.FixedWidthTypes.Date32}, d.NewArray())
+	d.Release()
+	defer ds.col.Release()
+	as := NewFloat64Series("a", []float64{1, 2}, nil)
+	defer as.col.Release()
+	f, err := NewFrameFromSeries(ds, as)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Release()
+	r, _ := f.ResampleEvery("t", 30*24*time.Hour)
+	if _, err := r.Agg(Aggregation{Column: "a", Kind: AggSum, Alias: "s"}); !errors.Is(err, ErrTimeOutOfRange) {
+		t.Errorf("err = %v, want ErrTimeOutOfRange", err)
 	}
 }

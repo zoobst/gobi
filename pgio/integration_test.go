@@ -511,7 +511,7 @@ func TestIntegration_TimestampSentinels(t *testing.T) {
 		}
 	}
 
-	far := gobi.Lit(time.Date(5000, 1, 1, 0, 0, 0, 0, time.UTC))
+	far := gobi.LitTime(time.Date(5000, 1, 1, 0, 0, 0, 0, time.UTC), arrow.Microsecond)
 	for _, col := range []string{"tz", "naive"} {
 		for _, tc := range []struct {
 			e      gobi.Expr
@@ -535,7 +535,7 @@ func TestIntegration_TimestampSentinels(t *testing.T) {
 		}
 	}
 	// Dates filter in gobi (not pushed), on the same µs values.
-	out, err := pgio.ScanTable(ctx, conn, table, nil).Filter(gobi.Col("d").Lt(gobi.Lit(time.Date(1600, 1, 1, 0, 0, 0, 0, time.UTC)))).Collect()
+	out, err := pgio.ScanTable(ctx, conn, table, nil).Filter(gobi.Col("d").Lt(gobi.LitTime(time.Date(1600, 1, 1, 0, 0, 0, 0, time.UTC), arrow.Microsecond))).Collect()
 	if err != nil {
 		t.Fatal(err)
 	}

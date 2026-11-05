@@ -10,21 +10,22 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
-// timeLiteral is Lit(t): a Timestamp with no time zone (as from_structs.go
-// builds for time.Time struct fields), in nanoseconds when t fits them
-// and otherwise in microseconds, which reach ±292,000 years. The
-// comparisons rescale a literal to the column's unit, so the literal's
-// own unit only has to hold t exactly. A t that neither holds exactly
-// (sub-microsecond precision outside 1677-2262, or beyond microseconds)
-// is ErrTimeOutOfRange at Eval rather than a wrapped value.
-func timeLiteral(t time.Time) *literalNode {
-	for _, unit := range []arrow.TimeUnit{arrow.Nanosecond, arrow.Microsecond} {
-		if v, ok := timeToUnit(t, unit, timeRoundExact); ok {
-			return &literalNode{value: v, dtype: &arrow.TimestampType{Unit: unit}}
+// timeLiteral is LitTime(t, unit): a Timestamp with no time zone (as
+// from_structs.go builds for time.Time struct fields) holding t
+// exactly. A t the unit can't hold (finer precision, or outside its
+// int64 range) is ErrTimeOutOfRange at Eval, not a rounded or wrapped
+// value.
+func timeLiteral(t time.Time, unit arrow.TimeUnit) *literalNode {
+	v, ok := timeToUnit(t, unit, timeRoundExact)
+	if !ok {
+		hint := ""
+		if unit == arrow.Nanosecond {
+			hint = "; use LitTime(t, arrow.Microsecond)"
 		}
+		return &literalNode{err: fmt.Errorf("%w: %s doesn't fit Timestamp[%s] exactly%s",
+			ErrTimeOutOfRange, t.Format(time.RFC3339Nano), unit, hint)}
 	}
-	return &literalNode{err: fmt.Errorf("%w: Lit(%s): no Timestamp unit holds it exactly",
-		ErrTimeOutOfRange, t.Format(time.RFC3339Nano))}
+	return &literalNode{value: v, dtype: &arrow.TimestampType{Unit: unit}}
 }
 
 // -----------------------------------------------------------------------------
@@ -77,7 +78,7 @@ func newLiteralNode(v any) *literalNode {
 	case string:
 		return &literalNode{value: v, dtype: arrow.BinaryTypes.String}
 	case time.Time:
-		return timeLiteral(v)
+		return timeLiteral(v, arrow.Nanosecond)
 	default:
 		return &literalNode{err: fmt.Errorf("%w: literal of type %T",
 			ErrUnsupportedLiteral, v)}
@@ -105,6 +106,14 @@ func (n *literalNode) String() string {
 	}
 	if s, ok := n.value.(string); ok {
 		return fmt.Sprintf("lit(%q)", s)
+	}
+	// A timestamp as its instant and unit, not the raw count: the same
+	// count is a different instant in another unit, and String() is
+	// used as an expression's identity (parquetio's exprAlreadyApplied).
+	if ts, ok := n.value.(arrow.Timestamp); ok {
+		if dt, ok := n.dtype.(*arrow.TimestampType); ok {
+			return fmt.Sprintf("lit(%s %s)", dt, ts.ToTime(dt.Unit).Format(time.RFC3339Nano))
+		}
 	}
 	return fmt.Sprintf("lit(%v)", n.value)
 }

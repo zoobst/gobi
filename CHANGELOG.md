@@ -17,6 +17,24 @@ introduce breaking changes; check this file when upgrading.
   Comparisons, filters, pushdown and writes all handle the unit.
   Code that reads raw values must use the column's unit (as
   `Series.TimeAt` does) rather than assume nanoseconds.
+- **`ResampleEvery` bucket starts keep the time column's unit** (and
+  zone), as `AddDuration` and the truncations do. Before, they were
+  always `Timestamp[ns]`. So a µs column (from pgio, or holding a
+  `9999-12-31` sentinel) now resamples. When the interval isn't a
+  whole number of the column's unit (500ms on a seconds column), the
+  starts are in the coarsest finer unit that holds it. Date32 and
+  Date64 columns still give nanoseconds.
+- **`NewTimestampSeries` panics on a time outside 1677–2262**, as it
+  does on a wrong-length validity, instead of storing a wrapped date.
+  It can't return an error without changing its signature. Use
+  `NewTimestampSeriesUnit`, which returns an error and takes a
+  coarser unit.
+- **`Lit(time.Time)` outside 1677–2262 is `ErrTimeOutOfRange`.**
+  Before, it was a wrapped nanosecond count, so a filter such as
+  `Col("dt").Lt(Lit(time.Date(1600, …)))` silently kept the wrong
+  rows. `Lit(time.Time)` is always `Timestamp[ns]`, so the type
+  `If`, `Coalesce` and plan schemas see never depends on the date.
+  Use the new `LitTime` for other units.
 
 ### Added
 
@@ -42,6 +60,10 @@ introduce breaking changes; check this file when upgrading.
     now says to use these instead.
 - **`gobi.ErrTimeOutOfRange`**, for a time that doesn't fit the
   column it would go into.
+- **`gobi.LitTime(t, unit)`**, a `Timestamp[unit]` literal. Use it
+  for dates outside the nanosecond range, such as
+  `Col("valid_to").Eq(LitTime(sentinel, arrow.Microsecond))`, or to
+  match a column's unit in `If` / `Coalesce`.
 - **`gobi.TimestampOf(t, unit)`** converts a `time.Time` to an
   `arrow.Timestamp` in any unit, with the same overflow check gobi
   uses internally. It's for readers outside the package that fill a
@@ -60,22 +82,23 @@ introduce breaking changes; check this file when upgrading.
   - `UnixNano` on a value that has no nanosecond count.
   - `DiffDuration` on instants more than about 292 years apart.
     Before, it returned a difference clamped to about ±292 years.
-- `Lit(time.Time)` outside 1677–2262 is a `Timestamp[µs]` literal,
-  where before it was a wrapped nanosecond count. So a filter such as
-  `Col("dt").Lt(Lit(time.Date(1600, …)))` was keeping the wrong
-  rows. Literals inside that range are still `Timestamp[ns]`. A
-  literal no unit can hold exactly (sub-microsecond precision
-  outside the range) is `ErrTimeOutOfRange`.
+- A timestamp literal prints in `Explain` and `String()` as its
+  instant and unit, `lit(timestamp[ns] 2024-01-02T03:04:05Z)`, not
+  the raw count. Before, equal counts in different units printed
+  alike. That could also make parquetio's scan treat a second filter
+  as one it had already applied, and drop it.
+- `FromStructs` checks µs, ms and s `time.Time` fields for overflow,
+  as it already did for ns ones (`ErrStructFieldOverflow`, which now
+  also wraps `ErrTimeOutOfRange`).
 - `NewTimestampSeriesUnit` and `IsIn` no longer reject the last
   fraction of a second before the int64 minimum of their unit.
 - `RollingBy` compares instants, not nanosecond counts. Before, a µs
   column reaching past 1677–2262 got wrong windows or a false
   `ErrNotMonotonic`. So did a column whose first row is null and
   later rows are pre-1970: the null was compared as 1970.
-- `ResampleEvery` finds buckets in the column's own unit. A bucket
-  start its `Timestamp[ns]` output can't hold is now
-  `ErrTimeOutOfRange` instead of a wrapped one. A Date32 or Date64
-  time column no longer panics.
+- `ResampleEvery`: a bucket start that its unit can't hold is now
+  `ErrTimeOutOfRange`. Before, it wrapped and sorted to the wrong
+  end. A Date32 or Date64 time column no longer panics.
 - csvio's `time.Time` struct fields are `Timestamp[ns]`. A date
   outside 1677–2262 is now `ErrTimeOutOfRange` instead of a wrapped
   value. The error suggests reading the column into a string field
@@ -87,6 +110,10 @@ introduce breaking changes; check this file when upgrading.
   units, and `TruncateTo`, run as integer arithmetic in that unit:
   -69% and -58% time on 1M µs rows. `DateTruncate` is -38%. All three
   use a third to a half of the memory.
+- The `EqTime` family on a single-chunk Timestamp column converts the
+  target into the column's unit once and compares raw values: -66%
+  time on 1M rows. `RollingBy` finds windows on raw values too: -19%
+  for a rolling sum on 1M rows.
 - The string `Series` methods reserve their output up front: half
   the memory and a third of the allocations, at about 3% more time
   on predicates.

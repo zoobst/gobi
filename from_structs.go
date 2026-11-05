@@ -893,7 +893,7 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan, sw *s
 			tb.AppendNull()
 			return nil
 		}
-		ts, err := timestampOf(t, unit)
+		ts, err := structTimestamp(t, unit)
 		if err != nil {
 			return err
 		}
@@ -913,7 +913,7 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan, sw *s
 	if err != nil {
 		return fmt.Errorf("parse time: %w", err)
 	}
-	ts, err := timestampOf(t, unit)
+	ts, err := structTimestamp(t, unit)
 	if err != nil {
 		return err
 	}
@@ -921,21 +921,19 @@ func appendTimeField(b array.Builder, fv reflect.Value, p structFieldPlan, sw *s
 	return nil
 }
 
-// Nanosecond timestamps cover 1677-09-21 … 2262-04-11 (int64 ns from
-// the epoch); outside that, time.Time.UnixNano is undefined.
-var (
-	minNanoTime = time.Unix(0, math.MinInt64).UTC()
-	maxNanoTime = time.Unix(0, math.MaxInt64).UTC()
-)
-
-// timestampOf converts t to unit, failing instead of overflowing when
-// t is outside the nanosecond range.
-func timestampOf(t time.Time, unit arrow.TimeUnit) (arrow.Timestamp, error) {
-	if unit == arrow.Nanosecond && (t.Before(minNanoTime) || t.After(maxNanoTime)) {
-		return 0, fmt.Errorf("%w: %s is outside the Timestamp[ns] range (1677–2262); use a microsecond or millisecond unit, e.g. `timestamp(microsecond)`",
-			ErrStructFieldOverflow, t.Format(time.RFC3339))
+// structTimestamp is TimestampOf for a struct field: the same floor and
+// range check, reported as ErrStructFieldOverflow (wrapping
+// ErrTimeOutOfRange), with a pointer to a wider unit for nanoseconds.
+func structTimestamp(t time.Time, unit arrow.TimeUnit) (arrow.Timestamp, error) {
+	ts, err := TimestampOf(t, unit)
+	if err != nil {
+		hint := ""
+		if unit == arrow.Nanosecond {
+			hint = "; use a microsecond or millisecond unit, e.g. `timestamp(microsecond)`"
+		}
+		return 0, fmt.Errorf("%w: %w%s", ErrStructFieldOverflow, err, hint)
 	}
-	return arrow.TimestampFromTime(t, unit)
+	return ts, nil
 }
 
 // readFieldValue populates one row's value on the struct side by
@@ -1223,7 +1221,7 @@ func appendListElement(b array.Builder, elem reflect.Value) error {
 		if !ok {
 			return fmt.Errorf("timestamp element got %T", elem.Interface())
 		}
-		ts, err := timestampOf(t, b.Type().(*arrow.TimestampType).Unit)
+		ts, err := structTimestamp(t, b.Type().(*arrow.TimestampType).Unit)
 		if err != nil {
 			return err
 		}

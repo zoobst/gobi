@@ -523,28 +523,33 @@ func TestDiffDuration_BeyondNanoRange(t *testing.T) {
 	}
 }
 
-// TestLitTime_BeyondNanoRange — a time literal nanoseconds can't hold
-// is stored in microseconds and compares correctly, through the scalar
-// fast path (WithColumn) and the fused filter (Filter), against a µs
-// column and a ns one.
+// TestLitTime_BeyondNanoRange — Lit(time) is always Timestamp[ns]
+// (its type mustn't depend on the date), so a date outside 1677-2262
+// is an error pointing at LitTime; LitTime(t, µs) holds it and compares
+// correctly through the scalar fast path (WithColumn) and the fused
+// filter (Filter).
 func TestLitTime_BeyondNanoRange(t *testing.T) {
 	f := stringExprFrame(t, "dt", []any{"1500-06-01", "1700-01-01", "9999-12-31", nil})
 	defer f.Release()
 	parsed := Col("dt").StrToTime(time.DateOnly)
-	cut1600 := Lit(time.Date(1600, 1, 1, 0, 0, 0, 0, time.UTC))
-	cut9999 := Lit(time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC))
+	d1600 := time.Date(1600, 1, 1, 0, 0, 0, 0, time.UTC)
+	d9999 := time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC)
 
-	ty, err := cut1600.Node().Type(nil)
-	if err != nil || ty.String() != "timestamp[us]" {
-		t.Errorf("Lit(1600) type = %v, %v; want timestamp[us]", ty, err)
+	for _, tm := range []time.Time{time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), time.Unix(0, 1)} {
+		if ty, err := Lit(tm).Node().Type(nil); err != nil || ty.String() != "timestamp[ns]" {
+			t.Errorf("Lit(%s) type = %v, %v; want timestamp[ns]", tm, ty, err)
+		}
 	}
-	if ty, _ := Lit(time.Unix(0, 1)).Node().Type(nil); ty.String() != "timestamp[ns]" {
-		t.Errorf("Lit(1970) type = %v, want timestamp[ns]", ty)
+	if _, err := Lit(d9999).Node().Type(nil); !errors.Is(err, ErrTimeOutOfRange) || !strings.Contains(err.Error(), "LitTime") {
+		t.Errorf("Lit(9999): err = %v, want ErrTimeOutOfRange pointing at LitTime", err)
+	}
+	if ty, err := LitTime(d1600, arrow.Microsecond).Node().Type(nil); err != nil || ty.String() != "timestamp[us]" {
+		t.Errorf("LitTime(1600, us) type = %v, %v; want timestamp[us]", ty, err)
 	}
 
 	out, err := f.Lazy().
-		WithColumn("lt1600", parsed.Lt(cut1600)).
-		WithColumn("eq9999", parsed.Eq(cut9999)).
+		WithColumn("lt1600", parsed.Lt(LitTime(d1600, arrow.Microsecond))).
+		WithColumn("eq9999", parsed.Eq(LitTime(d9999, arrow.Second))).
 		Collect()
 	if err != nil {
 		t.Fatal(err)
@@ -563,7 +568,7 @@ func TestLitTime_BeyondNanoRange(t *testing.T) {
 		}
 	}
 
-	kept, err := f.Lazy().WithColumn("dt", parsed).Filter(Col("dt").Lt(cut1600)).Collect()
+	kept, err := f.Lazy().WithColumn("dt", parsed).Filter(Col("dt").Lt(LitTime(d1600, arrow.Microsecond))).Collect()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,10 +577,26 @@ func TestLitTime_BeyondNanoRange(t *testing.T) {
 		t.Errorf("Filter(dt < 1600) kept %d rows, want 1", kept.NumRows())
 	}
 
-	// A sub-microsecond time outside the nanosecond range has no
-	// exact unit: an error, not a rounded or wrapped literal.
-	if _, err := Lit(time.Date(1600, 1, 1, 0, 0, 0, 1, time.UTC)).Node().Type(nil); !errors.Is(err, ErrTimeOutOfRange) {
-		t.Errorf("Lit(1600 + 1ns): err = %v, want ErrTimeOutOfRange", err)
+	// A unit that can't hold t exactly is an error, not a rounded literal.
+	if _, err := LitTime(d1600.Add(time.Nanosecond), arrow.Microsecond).Node().Type(nil); !errors.Is(err, ErrTimeOutOfRange) {
+		t.Errorf("LitTime(1600 + 1ns, us): err = %v, want ErrTimeOutOfRange", err)
+	}
+	if _, err := LitTime(d1600, arrow.TimeUnit(9)).Node().Type(nil); !errors.Is(err, ErrUnsupportedLiteral) {
+		t.Errorf("LitTime(bad unit): err = %v, want ErrUnsupportedLiteral", err)
+	}
+}
+
+// TestLitTime_StringNamesInstant — a timestamp literal prints as its
+// instant and unit, so equal raw counts in different units (different
+// instants) don't print alike: String() is an expression's identity.
+func TestLitTime_StringNamesInstant(t *testing.T) {
+	ns := Lit(time.Unix(0, 9_000_000_000_000_000)) // 1970-04-15 in ns
+	us := LitTime(time.UnixMicro(9_000_000_000_000_000), arrow.Microsecond)
+	if ns.String() == us.String() {
+		t.Errorf("both print %s", ns)
+	}
+	if got := ns.String(); got != "lit(timestamp[ns] 1970-04-15T04:00:00Z)" {
+		t.Errorf("ns literal = %s", got)
 	}
 }
 
@@ -699,5 +720,72 @@ func TestTimestampOf(t *testing.T) {
 	if v, err := TimestampOf(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), arrow.Microsecond); err != nil ||
 		!v.ToTime(arrow.Microsecond).Equal(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)) {
 		t.Errorf("9999 in µs: %d, %v", v, err)
+	}
+}
+
+// TestNewTimestampSeries_OutOfRangePanics — no silently wrapped date.
+func TestNewTimestampSeries_OutOfRangePanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), "NewTimestampSeriesUnit") {
+			t.Errorf("recover() = %v, want a panic pointing at NewTimestampSeriesUnit", r)
+		}
+	}()
+	NewTimestampSeries("t", []time.Time{time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC)}, nil)
+}
+
+// TestFromStructs_MicrosecondOverflow — a µs struct field past its
+// range is ErrStructFieldOverflow too (only ns used to be checked).
+func TestFromStructs_MicrosecondOverflow(t *testing.T) {
+	type row struct {
+		T time.Time `gobi:"T,timestamp(microsecond)"`
+	}
+	_, err := FromStructs([]row{{time.Date(300000, 1, 1, 0, 0, 0, 0, time.UTC)}})
+	if !errors.Is(err, ErrStructFieldOverflow) || !errors.Is(err, ErrTimeOutOfRange) {
+		t.Errorf("err = %v, want ErrStructFieldOverflow wrapping ErrTimeOutOfRange", err)
+	}
+}
+
+// TestTimeCmp_FastPathRounding — the EqTime family on a raw-value fast
+// path rounds a target between two column ticks the way each op needs,
+// and agrees with the instant-by-instant path (two chunks).
+func TestTimeCmp_FastPathRounding(t *testing.T) {
+	ms := []time.Time{time.UnixMilli(1), time.UnixMilli(2), time.UnixMilli(-2)}
+	one, err := NewTimestampSeriesUnit("t", ms, nil, arrow.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer one.col.Release()
+	ch := arrow.NewChunked(one.DataType(), []arrow.Array{one.Column().Data().Chunk(0), one.Column().Data().Chunk(0)})
+	two := NewSeries(arrow.NewColumn(arrow.Field{Name: "t", Type: one.DataType(), Nullable: true}, ch))
+	ch.Release()
+	defer two.col.Release()
+	target := time.Unix(0, 1_500_000) // 1.5 ms
+	for _, c := range []struct {
+		name string
+		fn   func(Series, time.Time) (Series, error)
+		want string
+	}{
+		{"Lt", Series.LtTime, "[true false true]"},
+		{"Le", Series.LeTime, "[true false true]"},
+		{"Gt", Series.GtTime, "[false true false]"},
+		{"Ge", Series.GeTime, "[false true false]"},
+		{"Eq", Series.EqTime, "[false false false]"},
+		{"Ne", Series.NeTime, "[true true true]"},
+	} {
+		for name, s := range map[string]Series{"single": one, "chunked": two} {
+			out, err := c.fn(s, target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := c.want
+			if name == "chunked" { // the same three rows twice
+				in := strings.Trim(c.want, "[]")
+				want = "[" + in + " " + in + "]"
+			}
+			if got := fmt.Sprint(out.Column().Data().Chunk(0)); got != want {
+				t.Errorf("%s %s 1.5ms = %s, want %s", name, c.name, got, want)
+			}
+			out.col.Release()
+		}
 	}
 }

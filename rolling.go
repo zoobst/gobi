@@ -255,33 +255,75 @@ func (f *Frame) RollingBy(timeCol string, period time.Duration) (*TimeRolling, e
 	n := timeSer.Len()
 	// Precompute the window's left boundary (first included row) for each row i.
 	starts := make([]int, n)
-	// Compared as time.Time, not nanosecond counts, which wrap for a
-	// µs / ms / s column outside 1677-2262.
+	monotonic := true
+	if view.kind == 1 {
+		rollingStartsInUnit(view, period, starts, &monotonic)
+	} else {
+		rollingStartsTimes(view, period, starts, &monotonic)
+	}
+	if !monotonic {
+		return nil, ErrNotMonotonic
+	}
+	return &TimeRolling{frame: f, timeCol: timeCol, period: period, starts: starts}, nil
+}
+
+// rollingStartsInUnit fills starts (the first row of each row's window)
+// for a Timestamp column, on its raw values. A row at t excludes lt
+// when t - lt > period; with both counted in the column's unit and the
+// difference a whole number, that is t - lt > floor(period / unit),
+// i.e. lt < t - p. A null row gets an empty window (start past it).
+func rollingStartsInUnit(view tsView, period time.Duration, starts []int, monotonic *bool) {
+	vals := view.tsVals
+	p := int64(period) / unitToNanos(view.tsUnit)
+	var last int64
+	seen := false
+	left := 0
+	for i := range starts {
+		if view.arr.IsNull(i) {
+			starts[i] = i + 1
+			continue
+		}
+		t := int64(vals[i])
+		if seen && t < last {
+			*monotonic = false
+		}
+		last, seen = t, true
+		// When t - p would pass MinInt64, no value is that old.
+		if t >= math.MinInt64+p {
+			cut := t - p
+			for left <= i && (view.arr.IsNull(left) || int64(vals[left]) < cut) {
+				left++
+			}
+		} else {
+			for left <= i && view.arr.IsNull(left) {
+				left++
+			}
+		}
+		starts[i] = left
+	}
+}
+
+// rollingStartsTimes is rollingStartsInUnit for a Date32 / Date64
+// column, comparing the instants (not nanosecond counts, which wrap
+// outside 1677-2262).
+func rollingStartsTimes(view tsView, period time.Duration, starts []int, monotonic *bool) {
 	var last time.Time
 	seen := false
-	monotonic := true
 	left := 0
-	for i := range n {
+	for i := range starts {
 		t, valid := view.at(i)
 		if !valid {
-			// null time makes the ordering assumption impossible to check;
-			// treat this row's window as empty by leaving start > i.
 			starts[i] = i + 1
 			continue
 		}
 		if seen && t.Before(last) {
-			monotonic = false
+			*monotonic = false
 		}
 		last, seen = t, true
-		// Advance left pointer past values older than t - period
-		// (t - lt > period, i.e. lt + period < t).
+		// Advance past values older than t - period (lt + period < t).
 		for left <= i {
 			lt, lv := view.at(left)
-			if !lv {
-				left++
-				continue
-			}
-			if lt.Add(period).Before(t) {
+			if !lv || lt.Add(period).Before(t) {
 				left++
 				continue
 			}
@@ -289,10 +331,6 @@ func (f *Frame) RollingBy(timeCol string, period time.Duration) (*TimeRolling, e
 		}
 		starts[i] = left
 	}
-	if !monotonic {
-		return nil, ErrNotMonotonic
-	}
-	return &TimeRolling{frame: f, timeCol: timeCol, period: period, starts: starts}, nil
 }
 
 // Agg computes a single aggregation over each row's trailing window and
@@ -394,6 +432,22 @@ var _ = arrow.Nanosecond
 var _ = array.NewFloat64Builder
 var _ = memory.DefaultAllocator
 
+// resampleUnit returns the unit ResampleEvery emits bucket starts in
+// for a column in src: src itself when interval is a whole number of
+// it, else the coarsest finer unit that interval is a whole number of
+// (nanoseconds always is). k is interval in that unit.
+func resampleUnit(src arrow.TimeUnit, interval time.Duration) (arrow.TimeUnit, int64) {
+	for _, u := range []arrow.TimeUnit{arrow.Second, arrow.Millisecond, arrow.Microsecond, arrow.Nanosecond} {
+		if unitToNanos(u) > unitToNanos(src) {
+			continue // coarser than the column
+		}
+		if k, ok := stepInUnit(interval, u); ok {
+			return u, k
+		}
+	}
+	return arrow.Nanosecond, int64(interval)
+}
+
 // ErrNotMonotonic is returned by ops that require a time column sorted in
 // non-decreasing order (currently: Frame.RollingBy).
 var ErrNotMonotonic = fmt.Errorf("gobi: time column must be monotonically non-decreasing")
@@ -402,7 +456,14 @@ var ErrNotMonotonic = fmt.Errorf("gobi: time column must be monotonically non-de
 // Unix epoch. Use Frame.ResampleEvery to construct one, then call Agg to
 // produce a downsampled Frame.
 //
-// Bucket alignment: bucketStart = floor(unix_ns / interval_ns) * interval_ns.
+// Bucket alignment: bucketStart = floor(t / interval) * interval, t
+// counted from the Unix epoch. The bucket starts keep the time column's
+// unit and zone, so a µs column (a pgio timestamp holding a 9999-12-31
+// sentinel, say) resamples without passing through nanoseconds; when the
+// interval isn't a whole number of that unit (500ms on a seconds
+// column), they're in the coarsest finer unit it is a whole number of.
+// A Date32 / Date64 column gives nanoseconds, as AddDuration does.
+//
 // A 1-hour resample produces buckets that start on the hour in UTC —
 // regardless of any timezone label on the input series. If you need
 // calendar-aligned resampling (e.g. daily buckets that start at midnight
@@ -444,53 +505,45 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 		return nil, fmt.Errorf("gobi: ResampleEvery requires a single-chunk timestamp column")
 	}
 
-	// Bucket each row. bucket key is the bucket-start nanoseconds.
+	// Bucket each row: the key is the bucket start, an integer in the
+	// output unit (see resampleUnit), so every start is exact.
 	n := timeSer.Len()
-	intervalNs := int64(r.interval)
-	// When the interval is a whole number of the column's units, the
-	// bucket start is found in that unit and only it has to fit
-	// nanoseconds (the output's unit); otherwise the value does.
-	unitNs := int64(1)
+	srcUnit := arrow.Nanosecond // a Date32 / Date64 column, as mapTimes
 	if tsView.kind == 1 {
-		unitNs = unitToNanos(tsView.tsUnit)
+		srcUnit = tsView.tsUnit
 	}
-	inUnit := tsView.kind == 1 && intervalNs%unitNs == 0
-	outOfRange := func(i int, t time.Time) error {
-		return fmt.Errorf("%w: ResampleEvery: index %d: bucket for %s doesn't fit the output's Timestamp[ns]",
-			ErrTimeOutOfRange, i, t.Format(time.RFC3339Nano))
+	outUnit, k := resampleUnit(srcUnit, r.interval)
+	ratio := unitToNanos(srcUnit) / unitToNanos(outUnit)
+	outOfRange := func(i int) error {
+		t, _ := tsView.at(i)
+		return fmt.Errorf("%w: ResampleEvery: index %d: the bucket for %s doesn't fit Timestamp[%s]",
+			ErrTimeOutOfRange, i, t.Format(time.RFC3339Nano), outUnit)
 	}
 	buckets := make(map[int64][]int, 64)
 	var order []int64
 	for i := range n {
-		t, valid := tsView.at(i)
-		if !valid {
+		if tsView.arr.IsNull(i) {
 			// null time value → skip (not put in any bucket)
 			continue
 		}
-		var floor int64
-		if inUnit {
-			v, k := int64(tsView.tsVals[i]), intervalNs/unitNs
-			f := v / k * k
-			if f > v { // / truncates toward zero; floor instead
-				if f < math.MinInt64+k {
-					return nil, outOfRange(i, t)
-				}
-				f -= k
+		var v int64
+		if tsView.kind == 1 {
+			v = int64(tsView.tsVals[i])
+			if v > math.MaxInt64/ratio || v < math.MinInt64/ratio {
+				return nil, outOfRange(i)
 			}
-			if f > math.MaxInt64/unitNs || f < math.MinInt64/unitNs {
-				return nil, outOfRange(i, t)
-			}
-			floor = f * unitNs
+			v *= ratio
 		} else {
-			v, ok := timeToUnit(t, arrow.Nanosecond, timeRoundExact)
+			t, _ := tsView.at(i)
+			x, ok := timeToUnit(t, outUnit, timeRoundExact)
 			if !ok {
-				return nil, outOfRange(i, t)
+				return nil, outOfRange(i)
 			}
-			ns := int64(v)
-			floor = (ns / intervalNs) * intervalNs
-			if floor > ns { // negative timestamp integer-truncation correction
-				floor -= intervalNs
-			}
+			v = int64(x)
+		}
+		floor, ok := floorMultiple(v, k)
+		if !ok {
+			return nil, outOfRange(i)
 		}
 		if _, seen := buckets[floor]; !seen {
 			order = append(order, floor)
@@ -528,10 +581,10 @@ func (r *Resampler) Agg(aggs ...Aggregation) (*Frame, error) {
 	}
 
 	pool := memory.DefaultAllocator
-	// Emit bucket-start timestamps in the same tz as the input.
-	// (A Date32 / Date64 column has no zone; a bare assertion here
-	// used to panic on one.)
-	tsType := &arrow.TimestampType{Unit: arrow.Nanosecond}
+	// Emit bucket-start timestamps in the output unit and the input's
+	// zone. (A Date32 / Date64 column has no zone; a bare assertion
+	// here used to panic on one.)
+	tsType := &arrow.TimestampType{Unit: outUnit}
 	if origType, ok := timeSer.DataType().(*arrow.TimestampType); ok {
 		tsType.TimeZone = origType.TimeZone
 	}

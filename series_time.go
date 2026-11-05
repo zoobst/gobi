@@ -248,11 +248,6 @@ func arrowTimestampToTime(v arrow.Timestamp, unit arrow.TimeUnit, loc *time.Loca
 	return time.Time{}
 }
 
-// timeToNanos converts a Go time.Time to Arrow Timestamp[ns].
-func timeToNanos(t time.Time) arrow.Timestamp {
-	return arrow.Timestamp(t.UnixNano())
-}
-
 func viewTimestamp(s Series) (tsView, bool) {
 	if !s.IsDateTime() {
 		return tsView{}, false
@@ -376,11 +371,10 @@ func (s Series) shiftDuration(op string, d time.Duration) (Series, error) {
 	// When d is a whole number of the column's units, the shift is
 	// integer addition in that unit.
 	inUnit := func(u arrow.TimeUnit) func(int64) (int64, bool) {
-		per := unitToNanos(u)
-		if int64(d)%per != 0 {
+		k, ok := stepInUnit(d, u)
+		if !ok {
 			return nil
 		}
-		k := int64(d) / per
 		return func(v int64) (int64, bool) {
 			r := v + k
 			if (k > 0 && r < v) || (k < 0 && r > v) {
@@ -474,11 +468,22 @@ func (s Series) timeCmp(target time.Time, op cmpOp) (Series, error) {
 	if !s.IsDateTime() {
 		return Series{}, ErrNotDateTime
 	}
+	// A single-chunk Timestamp column compares raw values: target goes
+	// into the column's unit once, rounded the way op needs, and the
+	// integer kernel the expression fast path uses does the rest.
+	if vals, arr, ok := s.singleTS(); ok {
+		if lit, litUnit, ok := exactTimestamp(target); ok {
+			colUnit := arr.DataType().(*arrow.TimestampType).Unit
+			if cop, v, ok := rescaleTSComparison(op, int64(lit), litUnit, colUnit); ok {
+				return cmpScalarTS(vals, arr, arrow.Timestamp(v), cop, s.name), nil
+			}
+		}
+	}
+	// Otherwise compare instants, not nanosecond counts: those
+	// overflow past 2262 in a µs / ms / s column.
 	n := s.Len()
 	out := make([]bool, n)
 	validity := make([]bool, n)
-	// Compare instants, not nanosecond counts: those overflow past
-	// 2262 in a µs / ms / s column.
 	if v, ok := viewTimestamp(s); ok {
 		for i := range n {
 			t, valid := v.at(i)
@@ -544,21 +549,11 @@ func (s Series) TruncateTo(unit TimeUnit) (Series, error) {
 	// (for a step that's a whole number of the column's units) floors
 	// to the same ones.
 	inUnit := func(u arrow.TimeUnit) func(int64) (int64, bool) {
-		per := unitToNanos(u)
-		if int64(step)%per != 0 {
+		k, ok := stepInUnit(step, u)
+		if !ok {
 			return nil
 		}
-		k := int64(step) / per
-		return func(v int64) (int64, bool) {
-			f := v / k * k
-			if f > v { // / truncates toward zero; floor instead
-				if f < math.MinInt64+k {
-					return 0, false
-				}
-				f -= k
-			}
-			return f, true
-		}
+		return func(v int64) (int64, bool) { return floorMultiple(v, k) }
 	}
 	return s.mapTimes("TruncateTo", s.name, func(t time.Time) time.Time { return t.Truncate(step) }, inUnit)
 }
@@ -728,6 +723,42 @@ func TimestampOf(t time.Time, unit arrow.TimeUnit) (arrow.Timestamp, error) {
 	return v, nil
 }
 
+// exactTimestamp returns t in the finest unit that holds it exactly:
+// nanoseconds inside 1677-2262, else microseconds. ok is false for a
+// sub-microsecond time outside the nanosecond range.
+func exactTimestamp(t time.Time) (arrow.Timestamp, arrow.TimeUnit, bool) {
+	for _, unit := range []arrow.TimeUnit{arrow.Nanosecond, arrow.Microsecond} {
+		if v, ok := timeToUnit(t, unit, timeRoundExact); ok {
+			return v, unit, true
+		}
+	}
+	return 0, 0, false
+}
+
+// stepInUnit returns d as a count of unit, or false when it isn't a
+// whole number of them (so an integer path in that unit doesn't apply).
+func stepInUnit(d time.Duration, unit arrow.TimeUnit) (int64, bool) {
+	per := unitToNanos(unit)
+	if int64(d)%per != 0 {
+		return 0, false
+	}
+	return int64(d) / per, true
+}
+
+// floorMultiple returns the largest multiple of k (k > 0) at or below
+// v: an epoch-aligned bucket or truncation boundary. ok is false when
+// that is below MinInt64.
+func floorMultiple(v, k int64) (int64, bool) {
+	f := v / k * k
+	if f > v { // / truncates toward zero; floor instead
+		if f < math.MinInt64+k {
+			return 0, false
+		}
+		f -= k
+	}
+	return f, true
+}
+
 // unitRounding is how timeToUnit treats a time with precision finer
 // than the unit.
 type unitRounding uint8
@@ -788,9 +819,10 @@ func timeToUnit(t time.Time, unit arrow.TimeUnit, mode unitRounding) (arrow.Time
 // time.Time values. Passing a nil validity slice means every row is valid;
 // otherwise validity[i]==false marks row i as null (its value is ignored).
 //
-// Nanoseconds only reach 1677-09-21 to 2262-04-11; a time outside
-// that range doesn't fit (time.Time.UnixNano is undefined there). Use
-// NewTimestampSeriesUnit with a coarser unit for dates beyond it.
+// Nanoseconds only reach 1677-09-21 to 2262-04-11. A valid time
+// outside that range panics, as a wrong-length validity does, rather
+// than storing a wrapped date: use NewTimestampSeriesUnit, which
+// returns an error and takes a coarser unit for dates beyond it.
 //
 // The column has no time zone, so Parquet writes it
 // isAdjustedToUTC=false and pyarrow / pandas read it as zone-naive
@@ -802,7 +834,12 @@ func NewTimestampSeries(name string, ts []time.Time, validity []bool) Series {
 	vals := make([]arrow.Timestamp, len(ts))
 	for i, t := range ts {
 		if validity == nil || validity[i] {
-			vals[i] = timeToNanos(t)
+			v, ok := timeToUnit(t, arrow.Nanosecond, timeRoundExact)
+			if !ok {
+				panic(fmt.Sprintf("gobi: NewTimestampSeries: row %d (%s) is outside the Timestamp[ns] range (1677-2262); use NewTimestampSeriesUnit",
+					i, t.Format(time.RFC3339Nano)))
+			}
+			vals[i] = v
 		}
 	}
 	return buildTimestampNsSeries(name, vals, validity)

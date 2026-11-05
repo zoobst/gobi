@@ -2,6 +2,7 @@ package gobi
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/zoobst/gobi/geometry"
@@ -83,9 +84,12 @@ func Col(name string) Expr {
 //	int, int32, int64   → Int64
 //	float32, float64    → Float64
 //	string              → String
-//	time.Time           → Timestamp[ns] (stored as UnixNano; matches
-//	                      the type from_structs.go produces for
-//	                      time.Time struct fields)
+//	time.Time           → Timestamp[ns], no time zone (the type
+//	                      from_structs.go produces for time.Time
+//	                      struct fields). Always nanoseconds, so the
+//	                      type doesn't depend on the value; a time
+//	                      outside 1677-2262 is ErrTimeOutOfRange
+//	                      at Eval. Use LitTime for another unit.
 //
 // Values implementing geometry.Geometry (Point, LineString, Polygon,
 // etc.) route to LitGeom, so `Lit(aoi).GeomIntersects(...)` composes
@@ -99,6 +103,25 @@ func Lit(v any) Expr {
 		return LitGeom(g)
 	}
 	return Expr{node: newLiteralNode(v)}
+}
+
+// LitTime returns a Timestamp[unit] literal (no time zone) holding t,
+// for a time outside the nanosecond range Lit covers, or to match a
+// column's unit where the type must be equal (If, Coalesce):
+//
+//	// A 9999-12-31 "valid to" sentinel in a µs column.
+//	gobi.Col("valid_to").Eq(gobi.LitTime(sentinel, arrow.Microsecond))
+//
+// Comparisons rescale a literal to the column's unit, so for them the
+// unit only has to hold t. A t the unit can't hold exactly (finer
+// precision, or outside its range) is ErrTimeOutOfRange at Eval.
+func LitTime(t time.Time, unit arrow.TimeUnit) Expr {
+	switch unit {
+	case arrow.Second, arrow.Millisecond, arrow.Microsecond, arrow.Nanosecond:
+	default:
+		return Expr{node: &literalNode{err: fmt.Errorf("%w: LitTime: unknown unit %v", ErrUnsupportedLiteral, unit)}}
+	}
+	return Expr{node: timeLiteral(t, unit)}
 }
 
 // LitNull returns an expression that broadcasts a null value of the

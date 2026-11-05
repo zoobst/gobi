@@ -37,6 +37,21 @@ func BenchmarkSeries_TimeOps_1M(b *testing.B) {
 		{"AddDuration", func() (Series, error) { return s.AddDuration(time.Hour) }},
 		{"TruncateTo_hour", func() (Series, error) { return s.TruncateTo(UnitHour) }},
 		{"DateTruncate_day", func() (Series, error) { return s.DateTruncate("day") }},
+		{"LtTime", func() (Series, error) { return s.LtTime(time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC)) }},
+		{"RollingBy_1m_sum", func() (Series, error) {
+			a := NewFloat64Series("a", make([]float64, s.Len()), nil)
+			defer a.col.Release()
+			f, err := NewFrameFromSeries(s, a)
+			if err != nil {
+				return Series{}, err
+			}
+			defer f.Release()
+			r, err := f.RollingBy("ts", time.Minute)
+			if err != nil {
+				return Series{}, err
+			}
+			return r.Agg("a", AggSum)
+		}},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
