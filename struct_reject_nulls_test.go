@@ -12,7 +12,8 @@ import (
 )
 
 // frameOf builds a Frame from series and drops the caller's reference
-// on each, so the Frame owns the only one.
+// on each, so the Frame owns the only one; like frameFromArrays, it
+// releases the Frame at test cleanup.
 func frameOf(t *testing.T, series ...Series) *Frame {
 	t.Helper()
 	f, err := NewFrameFromSeries(series...)
@@ -24,6 +25,7 @@ func frameOf(t *testing.T, series ...Series) *Frame {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(f.Release)
 	return f
 }
 
@@ -46,7 +48,6 @@ func nullAndSentFrame(t *testing.T) *Frame {
 
 func TestStructRejectNulls(t *testing.T) {
 	f := nullAndSentFrame(t)
-	defer f.Release()
 
 	type plain struct {
 		OnGround bool      `csv:"on_ground"`
@@ -66,7 +67,8 @@ func TestStructRejectNulls(t *testing.T) {
 	}
 
 	// Each plain kind is rejected on its own, naming row and column.
-	for col, typ := range map[string]string{"on_ground": "bool", "alt": "int64", "source": "string", "seen": "time.Time"} {
+	// time.Time is accepted (below): FromStructs writes its zero as NULL.
+	for col, typ := range map[string]string{"on_ground": "bool", "alt": "int64", "source": "string"} {
 		sub, err := f.SelectCols(col)
 		if err != nil {
 			t.Fatal(err)
@@ -97,6 +99,24 @@ func TestStructRejectNulls(t *testing.T) {
 		t.Errorf("sent row = %+v", nrows[1])
 	}
 
+	// time.Time: a null is the zero time by gobi's convention, unless
+	// StructZeroTimeAsValue makes zero a value, or the field is required.
+	type seenOnly struct {
+		Seen time.Time `csv:"seen"`
+	}
+	type seenRequired struct {
+		Seen time.Time `csv:"seen,required"`
+	}
+	if _, err := ToStructs[seenOnly](f, StructRejectNulls()); err != nil {
+		t.Errorf("time.Time: %v", err)
+	}
+	if _, err := ToStructs[seenOnly](f, StructRejectNulls(), StructZeroTimeAsValue()); !errors.Is(err, ErrStructFieldNull) {
+		t.Errorf("time.Time + ZeroTimeAsValue: err = %v", err)
+	}
+	if _, err := ToStructs[seenRequired](f, StructRejectNulls()); !errors.Is(err, ErrStructFieldNull) {
+		t.Errorf("required time.Time: err = %v", err)
+	}
+
 	// `optional` keeps zero-fill for that field only.
 	type mixed struct {
 		Alt    int64  `csv:"alt"`
@@ -106,7 +126,7 @@ func TestStructRejectNulls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sub.Release()
+	t.Cleanup(sub.Release)
 	if _, err := ToStructs[mixed](sub, StructRejectNulls()); err != nil {
 		t.Errorf("optional field: %v", err)
 	}
@@ -119,7 +139,7 @@ func TestStructRejectNulls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sent.Release()
+	t.Cleanup(sent.Release)
 	if _, err := ToStructs[plain](sent, StructRejectNulls()); err != nil {
 		t.Errorf("all valid: %v", err)
 	}
@@ -136,7 +156,6 @@ func TestStructRejectNulls_Lists(t *testing.T) {
 	vb.Append(3)
 	f := frameOf(t, SeriesFromArray(arrow.Field{Name: "xs", Type: arrow.ListOf(arrow.PrimitiveTypes.Int64), Nullable: true}, lb.NewArray()))
 	lb.Release()
-	defer f.Release()
 
 	type vals struct {
 		Xs []int64 `csv:"xs"`
@@ -189,12 +208,87 @@ func TestStructRejectNulls_Dictionary(t *testing.T) {
 	idx.Release()
 	dict.Release()
 	f := frameOf(t, SeriesFromArray(arrow.Field{Name: "source", Type: dt, Nullable: true}, darr))
-	defer f.Release()
 
 	type withString struct {
 		Source string `csv:"source"`
 	}
 	if _, err := ToStructs[withString](f, StructRejectNulls()); !errors.Is(err, ErrStructFieldNull) || !strings.Contains(err.Error(), "row 1") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// TestStructRejectNulls_Shapes — geometry, time-layout string and
+// []byte fields, one NULL row each.
+func TestStructRejectNulls_Shapes(t *testing.T) {
+	pool := memory.DefaultAllocator
+	gb := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
+	gb.AppendNull()
+	geom := SeriesFromArray(GeometryField("geometry", 4326), gb.NewArray())
+	gb.Release()
+	bb := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
+	bb.AppendNull()
+	raw := SeriesFromArray(arrow.Field{Name: "raw", Type: arrow.BinaryTypes.Binary, Nullable: true}, bb.NewArray())
+	bb.Release()
+	day, err := NewTimestampSeriesUnit("day", []time.Time{{}}, []bool{false}, arrow.Microsecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := frameOf(t, geom, raw, day)
+
+	type wkt struct {
+		Geom string `csv:"geometry" geom:"true"`
+	}
+	type wkb struct {
+		Geom []byte `csv:"geometry" geom:"true"`
+	}
+	type layout struct {
+		Day string `csv:"day" time:"2006-01-02"`
+	}
+	type rawBytes struct {
+		Raw []byte `csv:"raw"`
+	}
+	for name, run := range map[string]func() error{
+		"geometry WKT":  func() error { _, err := ToStructs[wkt](f, StructRejectNulls()); return err },
+		"geometry WKB":  func() error { _, err := ToStructs[wkb](f, StructRejectNulls()); return err },
+		"layout string": func() error { _, err := ToStructs[layout](f, StructRejectNulls()); return err },
+	} {
+		if err := run(); err != nil {
+			t.Errorf("%s: %v (FromStructs writes this zero value as NULL)", name, err)
+		}
+	}
+	// FromStructs writes a nil []byte as an empty value, never NULL.
+	if _, err := ToStructs[rawBytes](f, StructRejectNulls()); !errors.Is(err, ErrStructFieldNull) || !strings.Contains(err.Error(), "[]uint8 field") {
+		t.Errorf("[]byte: err = %v", err)
+	}
+}
+
+// TestStructRejectNulls_RoundTrip — every zero value FromStructs
+// writes reads back under StructRejectNulls with the same struct type.
+func TestStructRejectNulls_RoundTrip(t *testing.T) {
+	type row struct {
+		OnGround bool      `csv:"on_ground"`
+		Alt      int64     `csv:"alt"`
+		Source   string    `csv:"source"`
+		Raw      []byte    `csv:"raw"`
+		Seen     time.Time `csv:"seen"`
+		Day      string    `csv:"day" time:"2006-01-02"`
+		Geom     string    `csv:"geometry" geom:"true"`
+		Xs       []int64   `csv:"xs"`
+		Ptr      *int64    `csv:"ptr"`
+	}
+	in := []row{{}, {OnGround: true, Alt: 7, Source: "adsb", Raw: []byte{1}, Seen: time.Unix(5, 0).UTC(),
+		Day: "2024-01-02", Geom: "POINT (1 2)", Xs: []int64{1, 2}}}
+	f, err := FromStructs(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(f.Release)
+	out, err := ToStructs[row](f, StructRejectNulls(), StructRequireColumns())
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	if out[0].Alt != 0 || out[0].Seen != (time.Time{}) || out[0].Geom != "" || out[0].Xs != nil ||
+		out[1].Alt != 7 || out[1].Geom != "POINT (1 2)" || !out[1].Seen.Equal(in[1].Seen) {
+		t.Errorf("round trip = %+v", out)
 	}
 }

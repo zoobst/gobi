@@ -1,6 +1,7 @@
 package parquetio_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -272,5 +273,36 @@ func TestReadStructs_InternerOption(t *testing.T) {
 	}
 	if in.Len() != 2 {
 		t.Errorf("interner holds %d values, want 2", in.Len())
+	}
+}
+
+// TestStructs_RejectNulls — WriteStructs → ReadStructs round-trips
+// zero values under StructRejectNulls; a real NULL (written from a nil
+// pointer) read into a plain field is rejected.
+func TestStructs_RejectNulls(t *testing.T) {
+	type row struct {
+		ID   int64     `parquet:"id"`
+		Name string    `parquet:"name"`
+		Seen time.Time `parquet:"seen"`
+	}
+	path := filepath.Join(t.TempDir(), "rows.parquet")
+	if err := parquetio.WriteStructs([]row{{}, {ID: 1, Name: "a", Seen: time.Unix(1, 0).UTC()}}, path, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parquetio.ReadStructs[row](path, nil, gobi.StructRejectNulls()); err != nil {
+		t.Errorf("round trip: %v", err)
+	}
+
+	type sparse struct {
+		ID *int64 `parquet:"id"`
+	}
+	if err := parquetio.WriteStructs([]sparse{{}}, path, nil); err != nil {
+		t.Fatal(err)
+	}
+	type dense struct {
+		ID int64 `parquet:"id"`
+	}
+	if _, err := parquetio.ReadStructs[dense](path, nil, gobi.StructRejectNulls()); !errors.Is(err, gobi.ErrStructFieldNull) {
+		t.Errorf("NULL into int64: err = %v", err)
 	}
 }

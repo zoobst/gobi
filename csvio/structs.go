@@ -25,6 +25,12 @@ import (
 // and don't pin read buffers. Pass gobi.StructInterner in structOpts
 // to share one copy of each value of `intern`-tagged fields across
 // calls.
+//
+// An empty cell reads as null, and WriteStructs writes "" as an empty
+// cell, so CSV can't tell an empty string from a missing one. Under
+// gobi.StructRejectNulls, give a string field that may be empty the
+// `optional` tag option (`csv:"name,optional"`), or make it *string or
+// gobi.Null[string].
 func ReadStructs[T any](path string, opts *ReadOptions, structOpts ...gobi.StructOption) ([]T, error) {
 	f, err := ReadFile[T](path, opts)
 	if err != nil {

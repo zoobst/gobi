@@ -24,18 +24,26 @@ import (
 //
 // Strings and []byte fields are copied out of the intermediate Frame,
 // which is released before returning, so the rows own their memory
-// and don't pin read buffers. (The variadic slot holds query args, so
-// there is no structOpts here; for options such as gobi.StructInterner
-// or gobi.StructRejectNulls, call ReadQuery + gobi.ToStructs directly,
-// passing gobi.StructTagFormat("pgio") and gobi.StructCopyValues()
-// to match this function.)
+// and don't pin read buffers. The variadic slot holds query args; to
+// pass struct options (gobi.StructInterner, gobi.StructRejectNulls,
+// …) use ReadStructsQueryOpts.
 func ReadStructsQuery[T any](ctx context.Context, conn Conn, sql string, args ...any) ([]T, error) {
+	return ReadStructsQueryOpts[T](ctx, conn, sql, args)
+}
+
+// ReadStructsQueryOpts is ReadStructsQuery with struct options: the
+// query args move to a slice so structOpts can be variadic.
+//
+//	rows, err := pgio.ReadStructsQueryOpts[Row](ctx, conn,
+//	    "SELECT * FROM parks WHERE state = $1", []any{"CA"},
+//	    gobi.StructRejectNulls())
+func ReadStructsQueryOpts[T any](ctx context.Context, conn Conn, sql string, args []any, structOpts ...gobi.StructOption) ([]T, error) {
 	f, err := ReadQuery(ctx, conn, sql, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Release()
-	return gobi.ToStructs[T](f, gobi.StructTagFormat("pgio"), gobi.StructCopyValues())
+	return gobi.ToStructs[T](f, append([]gobi.StructOption{gobi.StructTagFormat("pgio"), gobi.StructCopyValues()}, structOpts...)...)
 }
 
 // ReadStructsTable reads a whole table (with optional projection +
