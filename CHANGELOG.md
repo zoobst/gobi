@@ -10,18 +10,24 @@ introduce breaking changes; check this file when upgrading.
 ### Added
 
 - **`StructRejectNulls()` makes `ToStructs` reject a null it would
-  otherwise hide.** By default a null cell decoded into a plain `bool`,
-  number, `string`, `time.Time` or struct field becomes the zero value,
-  so it reads exactly like a real `false`, `0` or `""`.
-  - **The error:** with this option, such a cell returns the new
-    `ErrStructFieldNull`, naming the row and column and suggesting
-    `*T` or `Null[T]`.
-  - **Unaffected fields:** pointers, `Null[T]`, and slices, maps and
-    interfaces, since their nil already means "absent".
-  - **Dictionary columns:** a valid index pointing at a null
-    dictionary entry counts as a null.
-  - **Format packages:** it works through every format package's
-    `ReadStructs`, which pass options through.
+  otherwise hide.** By default a null decodes to the zero value, so it
+  reads exactly like a real `false`, `0` or `""`. With this option, the
+  following return the new `ErrStructFieldNull`:
+  - a null cell in a plain field: `bool`, number, `string` or
+    `time.Time`;
+  - a null element in a list field of non-pointer elements: `[1, NULL,
+    3]` into `[]int64`.
+  - **The error** names the row and column (and element), and suggests
+    `*T`, `Null[T]` or `[]*T`.
+  - **Unaffected shapes:** pointer and `Null[T]` fields, a null list
+    cell in a slice field (nil), and pointer elements.
+  - **Per-field opt-out:** tag a field `optional` (e.g.
+    `parquet:"score,optional"`) to keep zero-fill for that field only.
+  - **Where it works:** through the `ReadStructs` functions of
+    parquetio, csvio, gpkgio, kmlio and geojsonio, and through
+    `pgio.ReadStructsTable`. `pgio.ReadStructsQuery` takes no struct
+    options, because its variadic slot holds the query arguments. Use
+    `pgio.ReadQuery` with `gobi.ToStructs` there.
   - **`StructRequireColumns`:** unchanged. It still checks only that
     each column exists, and its doc now says so. Pass both options to
     reject a missing column and a missing value.

@@ -453,7 +453,7 @@ func toStructs[T any](f *Frame, dst []T, op string, opts []StructOption) ([]T, e
 		cols[i] = newChunkCursor(s)
 	}
 
-	rd := &structReader{copyValues: so.copyValues, interner: so.interner, coerce: so.coerceNumbers, rejectNulls: so.rejectNulls}
+	rd := &structReader{copyValues: so.copyValues, interner: so.interner, coerce: so.coerceNumbers}
 	if rd.interner == nil {
 		for _, p := range plan {
 			if p.intern {
@@ -514,6 +514,12 @@ type structFieldPlan struct {
 	// nullWrap: the struct field is Null[T]; the plan describes T. The
 	// read path sets Valid, the write path checks it.
 	nullWrap bool
+	// rejectNull / rejectNullElems: under StructRejectNulls, a null
+	// cell (or, for a list of non-pointer elements, a null element)
+	// would decode to a zero value here, so ToStructs errors instead.
+	// Off for fields tagged `optional`.
+	rejectNull      bool
+	rejectNullElems bool
 	// Actual reflect type of the (unwrapped) field. Used by the
 	// time.Time detection since the direct field type may be
 	// *time.Time under a nullable-time convention.
@@ -673,6 +679,17 @@ func planStructFields(tp reflect.Type, o *structOpts) ([]structFieldPlan, error)
 		case opt:
 		default:
 			out[i].required = o != nil && o.requiredFields && !out[i].isPointer && !out[i].nullWrap
+		}
+		// StructRejectNulls: fields whose shape can't hold a null.
+		// Pointers and Null[T] can; a slice holds a null cell as nil,
+		// but its non-pointer elements can't hold a null element.
+		if o != nil && o.rejectNulls && !opt && !out[i].isPointer && !out[i].nullWrap {
+			if out[i].valueType.Kind() == reflect.Slice {
+				out[i].rejectNullElems = out[i].arrowType.ID() == arrow.LIST &&
+					out[i].valueType.Elem().Kind() != reflect.Pointer
+			} else {
+				out[i].rejectNull = true
+			}
 		}
 	}
 	// `intern` tag option: string-valued fields only.
@@ -952,7 +969,10 @@ func readFieldValue(fv reflect.Value, cur *chunkCursor, row int, p structFieldPl
 	// pointer, Null[T]{Valid: false}, or zero T — which is what fv
 	// already holds (toStructs zeroes the output), so no write.
 	if null {
-		return rd.checkNull(fv, p)
+		if p.rejectNull {
+			return nullFieldError(fv.Type())
+		}
+		return nil
 	}
 	switch {
 	case p.isPointer:
@@ -969,28 +989,15 @@ func readFieldValue(fv reflect.Value, cur *chunkCursor, row int, p structFieldPl
 		fv.Field(1).SetBool(ok)
 		return nil
 	}
-	ok, err := readNonNull(fv, cur, row, p, rd)
-	if err == nil && !ok {
-		// A valid index into a null dictionary entry: still a null.
-		return rd.checkNull(fv, p)
-	}
+	_, err = readNonNull(fv, cur, row, p, rd)
 	return err
 }
 
-// checkNull is the StructRejectNulls check for a null cell decoded
-// into fv: an error when the field can't tell the null from a zero
-// value — not a pointer, not Null[T], and not a type whose nil already
-// means "absent" (slice, map, interface).
-func (r *structReader) checkNull(fv reflect.Value, p structFieldPlan) error {
-	if !r.rejectNulls || p.isPointer || p.nullWrap {
-		return nil
-	}
-	switch fv.Kind() {
-	case reflect.Slice, reflect.Map, reflect.Interface, reflect.Pointer:
-		return nil
-	}
-	return fmt.Errorf("%w: a %s field can't tell it from a zero value; use *%s or Null[%s]",
-		ErrStructFieldNull, fv.Type(), fv.Type(), fv.Type())
+// nullFieldError is StructRejectNulls' error for a null cell in a
+// field of type t.
+func nullFieldError(t reflect.Type) error {
+	return fmt.Errorf("%w: %s field can't tell it from a zero value; use *%s or Null[%s], or tag the field optional",
+		ErrStructFieldNull, t, t, t)
 }
 
 // readNonNull decodes a non-null cell into fv, which is the field's
@@ -1003,7 +1010,7 @@ func readNonNull(fv reflect.Value, cur *chunkCursor, row int, p structFieldPlan,
 	case p.isTimeTag:
 		return true, readTimeField(fv, cur, row, p)
 	case p.arrowType.ID() == arrow.LIST:
-		return true, readListField(fv, cur, row, rd, p.intern)
+		return true, readListField(fv, cur, row, rd, p.intern, p.rejectNullElems)
 	}
 	v, err := cur.scalarAt(row)
 	if err != nil || v == nil {
@@ -1259,7 +1266,7 @@ func appendListElement(b array.Builder, elem reflect.Value) error {
 // readListField reads a List cell into a Go slice field. Nil-list
 // rows already returned via the null-check in readFieldValue, so
 // this only handles non-null rows.
-func readListField(fv reflect.Value, cur *chunkCursor, row int, rd *structReader, intern bool) error {
+func readListField(fv reflect.Value, cur *chunkCursor, row int, rd *structReader, intern, rejectNullElems bool) error {
 	chunk, local, err := cur.locate(row)
 	if err != nil {
 		return err
@@ -1288,6 +1295,10 @@ func readListField(fv reflect.Value, cur *chunkCursor, row int, rd *structReader
 		if isNullArr(values, idx) {
 			// Non-pointer elements stay at zero value; pointer
 			// elements stay nil (MakeSlice's default).
+			if rejectNullElems {
+				return fmt.Errorf("elem %d: %w: %s element can't tell it from a zero value; use []*%s, or tag the field optional",
+					i, ErrStructFieldNull, elemType, elemType)
+			}
 			continue
 		}
 		if elemIsPtr {
@@ -1380,15 +1391,18 @@ func StructCoerceNumbers() StructOption {
 var ErrStructFieldNull = errors.New("gobi: null in a field that can't represent it")
 
 // StructRejectNulls makes ToStructs fail with ErrStructFieldNull when a
-// null cell lands in a field that would otherwise decode it as the
-// type's zero value — a plain bool, number, string, time.Time or
-// struct — so a missing value can't pass for a real false, 0 or "".
-// The error names the row and column.
+// null would otherwise decode as a zero value, so a missing value
+// can't pass for a real false, 0 or "". That covers a null cell in a
+// plain field (bool, number, string, time.Time) and a null element in
+// a list field of non-pointer elements ([]int64 and the like). The
+// error names the row and column.
 //
-// Fields that can represent a null are unaffected: pointers (nil),
-// Null[T] (Valid=false), and slices, maps and interfaces (nil). Pair it
-// with StructRequireColumns to reject both a missing column and a
-// missing value.
+// Shapes that can represent a null are unaffected: pointer and
+// Null[T] fields, a null list cell in a slice field (nil), and
+// pointer elements ([]*int64). To keep zero-fill for one field, tag it
+// `optional` (e.g. `parquet:"score,optional"`). Pair the option with
+// StructRequireColumns to reject both a missing column and a missing
+// value.
 func StructRejectNulls() StructOption {
 	return func(o *structOpts) { o.rejectNulls = true }
 }
@@ -1683,8 +1697,6 @@ type structReader struct {
 	copyValues bool
 	interner   *StringInterner
 	coerce     bool // StructCoerceNumbers
-	// rejectNulls: StructRejectNulls.
-	rejectNulls bool
 }
 
 // ownString applies the ownership policy to a string read from an

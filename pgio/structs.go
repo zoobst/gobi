@@ -25,8 +25,10 @@ import (
 // Strings and []byte fields are copied out of the intermediate Frame,
 // which is released before returning, so the rows own their memory
 // and don't pin read buffers. (The variadic slot holds query args, so
-// there is no structOpts here; for a shared interner call ReadQuery
-// + gobi.ToStructs with gobi.StructInterner directly.)
+// there is no structOpts here; for options such as gobi.StructInterner
+// or gobi.StructRejectNulls, call ReadQuery + gobi.ToStructs directly,
+// passing gobi.StructTagFormat("pgio") and gobi.StructCopyValues()
+// to match this function.)
 func ReadStructsQuery[T any](ctx context.Context, conn Conn, sql string, args ...any) ([]T, error) {
 	f, err := ReadQuery(ctx, conn, sql, args...)
 	if err != nil {
