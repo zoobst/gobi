@@ -40,6 +40,8 @@ type structOpts struct {
 	// StructRequireColumns.
 	coerceNumbers  bool
 	requireColumns bool
+	// rejectNulls: see StructRejectNulls.
+	rejectNulls bool
 	// FromStructs: see StructRequiredFields, StructZeroTimeAsValue,
 	// StructAllocator.
 	requiredFields  bool
@@ -370,7 +372,9 @@ func FromStructs[T any](rows []T, opts ...StructOption) (*Frame, error) {
 // Null cells populate the zero value for plain fields, nil for pointer
 // fields, and Valid=false for Null[T] fields. Use Null[T] or a pointer
 // when a null has to be told apart from a zero value; Null[T] does it
-// without the per-cell allocation a pointer needs. Type mismatches
+// without the per-cell allocation a pointer needs. To make a null in a
+// plain field an error instead of a silent zero, pass
+// StructRejectNulls. Type mismatches
 // between column and field return an error.
 //
 // Geometry columns (Binary with the geometry metadata) can be
@@ -449,7 +453,7 @@ func toStructs[T any](f *Frame, dst []T, op string, opts []StructOption) ([]T, e
 		cols[i] = newChunkCursor(s)
 	}
 
-	rd := &structReader{copyValues: so.copyValues, interner: so.interner, coerce: so.coerceNumbers}
+	rd := &structReader{copyValues: so.copyValues, interner: so.interner, coerce: so.coerceNumbers, rejectNulls: so.rejectNulls}
 	if rd.interner == nil {
 		for _, p := range plan {
 			if p.intern {
@@ -948,7 +952,7 @@ func readFieldValue(fv reflect.Value, cur *chunkCursor, row int, p structFieldPl
 	// pointer, Null[T]{Valid: false}, or zero T — which is what fv
 	// already holds (toStructs zeroes the output), so no write.
 	if null {
-		return nil
+		return rd.checkNull(fv, p)
 	}
 	switch {
 	case p.isPointer:
@@ -965,8 +969,28 @@ func readFieldValue(fv reflect.Value, cur *chunkCursor, row int, p structFieldPl
 		fv.Field(1).SetBool(ok)
 		return nil
 	}
-	_, err = readNonNull(fv, cur, row, p, rd)
+	ok, err := readNonNull(fv, cur, row, p, rd)
+	if err == nil && !ok {
+		// A valid index into a null dictionary entry: still a null.
+		return rd.checkNull(fv, p)
+	}
 	return err
+}
+
+// checkNull is the StructRejectNulls check for a null cell decoded
+// into fv: an error when the field can't tell the null from a zero
+// value — not a pointer, not Null[T], and not a type whose nil already
+// means "absent" (slice, map, interface).
+func (r *structReader) checkNull(fv reflect.Value, p structFieldPlan) error {
+	if !r.rejectNulls || p.isPointer || p.nullWrap {
+		return nil
+	}
+	switch fv.Kind() {
+	case reflect.Slice, reflect.Map, reflect.Interface, reflect.Pointer:
+		return nil
+	}
+	return fmt.Errorf("%w: a %s field can't tell it from a zero value; use *%s or Null[%s]",
+		ErrStructFieldNull, fv.Type(), fv.Type(), fv.Type())
 }
 
 // readNonNull decodes a non-null cell into fv, which is the field's
@@ -1351,10 +1375,32 @@ func StructCoerceNumbers() StructOption {
 	return func(o *structOpts) { o.coerceNumbers = true }
 }
 
+// ErrStructFieldNull is returned under StructRejectNulls when a null
+// cell lands in a struct field that would hold it as a zero value.
+var ErrStructFieldNull = errors.New("gobi: null in a field that can't represent it")
+
+// StructRejectNulls makes ToStructs fail with ErrStructFieldNull when a
+// null cell lands in a field that would otherwise decode it as the
+// type's zero value — a plain bool, number, string, time.Time or
+// struct — so a missing value can't pass for a real false, 0 or "".
+// The error names the row and column.
+//
+// Fields that can represent a null are unaffected: pointers (nil),
+// Null[T] (Valid=false), and slices, maps and interfaces (nil). Pair it
+// with StructRequireColumns to reject both a missing column and a
+// missing value.
+func StructRejectNulls() StructOption {
+	return func(o *structOpts) { o.rejectNulls = true }
+}
+
 // StructRequireColumns makes ToStructs fail with ErrColumnNotFound when
 // a struct field has no matching column, instead of leaving the field
 // at its zero value. Use it when a missing column means a schema
 // mismatch rather than an optional field.
+//
+// It checks only that each column exists: a null cell in a plain field
+// still decodes to the zero value. Add StructRejectNulls to reject
+// those too.
 func StructRequireColumns() StructOption {
 	return func(o *structOpts) { o.requireColumns = true }
 }
@@ -1637,6 +1683,8 @@ type structReader struct {
 	copyValues bool
 	interner   *StringInterner
 	coerce     bool // StructCoerceNumbers
+	// rejectNulls: StructRejectNulls.
+	rejectNulls bool
 }
 
 // ownString applies the ownership policy to a string read from an

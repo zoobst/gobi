@@ -5,6 +5,27 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.5.4]
+
+### Added
+
+- **`StructRejectNulls()` makes `ToStructs` reject a null it would
+  otherwise hide.** By default a null cell decoded into a plain `bool`,
+  number, `string`, `time.Time` or struct field becomes the zero value,
+  so it reads exactly like a real `false`, `0` or `""`.
+  - **The error:** with this option, such a cell returns the new
+    `ErrStructFieldNull`, naming the row and column and suggesting
+    `*T` or `Null[T]`.
+  - **Unaffected fields:** pointers, `Null[T]`, and slices, maps and
+    interfaces, since their nil already means "absent".
+  - **Dictionary columns:** a valid index pointing at a null
+    dictionary entry counts as a null.
+  - **Format packages:** it works through every format package's
+    `ReadStructs`, which pass options through.
+  - **`StructRequireColumns`:** unchanged. It still checks only that
+    each column exists, and its doc now says so. Pass both options to
+    reject a missing column and a missing value.
+
 ## [v0.5.3]
 
 ### Changed (breaking)
