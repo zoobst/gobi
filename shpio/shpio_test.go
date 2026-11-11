@@ -1,6 +1,7 @@
 package shpio_test
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -240,5 +241,98 @@ func TestReadFile_MissingSHPErrors(t *testing.T) {
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("want os.ErrNotExist, got %v", err)
+	}
+}
+
+// writeCities writes the 3-point fixture to a temp dir and returns its base path.
+func writeCities(t *testing.T) string {
+	t.Helper()
+	base := filepath.Join(t.TempDir(), "cities")
+	if err := shpio.WriteFile(buildPointFrame(t), base, nil); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return base
+}
+
+func openSidecar(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+func TestRead_MatchesReadFile(t *testing.T) {
+	base := writeCities(t)
+	want, err := shpio.ReadFile(base, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := shpio.Read(
+		openSidecar(t, base+".shp"), openSidecar(t, base+".dbf"), openSidecar(t, base+".prj"), nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !got.Schema().Equal(want.Schema()) {
+		t.Fatalf("schema mismatch:\n got  %v\n want %v", got.Schema(), want.Schema())
+	}
+	if gr, wr := got.NumRows(), want.NumRows(); gr != wr {
+		t.Fatalf("rows = %d, want %d", gr, wr)
+	}
+	for i := range want.NumRows() {
+		gg, _ := got.Geometry("geometry", i)
+		wg, _ := want.Geometry("geometry", i)
+		if gg.(geometry.Point).X != wg.(geometry.Point).X || gg.(geometry.Point).Y != wg.(geometry.Point).Y {
+			t.Errorf("row %d geometry = %v, want %v", i, gg, wg)
+		}
+	}
+}
+
+func TestRead_OptionalSidecarsNil(t *testing.T) {
+	base := writeCities(t)
+	f, err := shpio.Read(openSidecar(t, base+".shp"), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if names := f.ColumnNames(); len(names) != 1 || names[0] != "geometry" {
+		t.Fatalf("columns = %v, want [geometry] only", names)
+	}
+	if f.NumRows() != 3 {
+		t.Fatalf("rows = %d, want 3", f.NumRows())
+	}
+	md := f.Schema().Field(0).Metadata
+	if v, _ := md.GetValue(gobi.MetaGeometryCRS); v != "4326" {
+		t.Fatalf("CRS without .prj = %q, want 4326", v)
+	}
+}
+
+func TestRead_PRJFromReaderSetsCRS(t *testing.T) {
+	base := writeCities(t)
+	prj, err := os.ReadFile(base + ".prj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := shpio.Read(openSidecar(t, base+".shp"), nil, bytes.NewReader(prj), nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if v, _ := f.Schema().Field(0).Metadata.GetValue(gobi.MetaGeometryCRS); v != "4326" {
+		t.Fatalf("CRS = %q, want 4326", v)
+	}
+}
+
+func TestRead_NilSHPErrors(t *testing.T) {
+	if _, err := shpio.Read(nil, nil, nil, nil); !errors.Is(err, shpio.ErrInvalidShapefile) {
+		t.Fatalf("err = %v, want ErrInvalidShapefile", err)
+	}
+}
+
+func TestRead_EmptyDBFIsAnError(t *testing.T) {
+	base := writeCities(t)
+	_, err := shpio.Read(openSidecar(t, base+".shp"), bytes.NewReader(nil), nil, nil)
+	if err == nil {
+		t.Fatal("expected error for a present-but-empty .dbf")
 	}
 }

@@ -20,7 +20,9 @@ coverage.out
 coverage.html
 scratch.txt
 
+dev.ipynb
 test.ipynb
+test.txt
 
 # Benchmark harnesses + fixtures (local performance experiments only)
 /benchmarks/
@@ -29,3 +31,4 @@ csvio.test
 
 # experimental testing
 /experiments/
+testData/

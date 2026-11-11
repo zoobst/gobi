@@ -15,7 +15,8 @@
 //
 // Reader: ReadFile(base) returns a Frame with the attributes as leading
 // columns and a WKB "geometry" column at the end, tagged with the CRS
-// from <base>.prj when present.
+// from <base>.prj when present. Read(shp, dbf, prj) does the same from
+// io.Readers, for callers without a filesystem.
 //
 // Writer: WriteFile(f, base) walks the geometry column to pick the
 // Shapefile geometry type (all rows must share compatible type), emits
@@ -82,13 +83,57 @@ type WriteOptions struct{}
 // suffix) and returns a Frame with attribute columns from the .dbf plus
 // a geometry column. Pass nil opts for defaults.
 func ReadFile(base string, opts *ReadOptions) (*gobi.Frame, error) {
-	_ = opts // reserved
 	base = strings.TrimSuffix(base, ".shp")
 
 	shpBytes, err := os.ReadFile(base + ".shp")
 	if err != nil {
 		return nil, err
 	}
+	// The .dbf and .prj sidecars are optional; a missing (or unreadable)
+	// one leaves its slice nil, which readBytes treats as absent.
+	dbfBytes, _ := os.ReadFile(base + ".dbf")
+	prjBytes, _ := os.ReadFile(base + ".prj")
+	return readBytes(shpBytes, dbfBytes, prjBytes, opts)
+}
+
+// Read parses a shapefile from its component streams instead of from
+// side-by-side files on disk — for callers with no filesystem (WASM in a
+// browser, files pulled out of a .zip, object-store blobs).
+//
+// shp is required. dbf and prj are optional: pass nil to omit them, with
+// the same effect as a missing sidecar in ReadFile (no attribute columns;
+// geometry tagged EPSG:4326). The .shx index is not needed: records are
+// read sequentially from the .shp. Each non-nil reader is read to EOF;
+// Read does not close it. Pass nil opts for defaults.
+func Read(shp, dbf, prj io.Reader, opts *ReadOptions) (*gobi.Frame, error) {
+	if shp == nil {
+		return nil, fmt.Errorf("%w: nil .shp reader", ErrInvalidShapefile)
+	}
+	shpBytes, err := io.ReadAll(shp)
+	if err != nil {
+		return nil, fmt.Errorf("shpio: read .shp: %w", err)
+	}
+	var dbfBytes, prjBytes []byte
+	if dbf != nil {
+		if dbfBytes, err = io.ReadAll(dbf); err != nil {
+			return nil, fmt.Errorf("shpio: read .dbf: %w", err)
+		}
+		if dbfBytes == nil {
+			dbfBytes = []byte{} // present but empty: let parseDBF report it
+		}
+	}
+	if prj != nil {
+		if prjBytes, err = io.ReadAll(prj); err != nil {
+			return nil, fmt.Errorf("shpio: read .prj: %w", err)
+		}
+	}
+	return readBytes(shpBytes, dbfBytes, prjBytes, opts)
+}
+
+// readBytes assembles a Frame from in-memory shapefile components. A nil
+// dbf or prj means that sidecar is absent.
+func readBytes(shpBytes, dbfBytes, prjBytes []byte, opts *ReadOptions) (*gobi.Frame, error) {
+	_ = opts // reserved
 	geoms, err := parseSHP(shpBytes)
 	if err != nil {
 		return nil, err
@@ -99,7 +144,7 @@ func ReadFile(base string, opts *ReadOptions) (*gobi.Frame, error) {
 		attrFields []arrow.Field
 		attrArrs   []arrow.Array
 	)
-	if dbfBytes, err := os.ReadFile(base + ".dbf"); err == nil {
+	if dbfBytes != nil {
 		attrFields, attrArrs, err = parseDBF(dbfBytes, len(geoms))
 		if err != nil {
 			return nil, err
@@ -111,7 +156,7 @@ func ReadFile(base string, opts *ReadOptions) (*gobi.Frame, error) {
 	// (Proper WKT parsing is a project of its own; users who care can
 	// override via a follow-up ToCRS call.)
 	epsg := int32(4326)
-	if prjBytes, err := os.ReadFile(base + ".prj"); err == nil {
+	if prjBytes != nil {
 		if code := guessEPSGFromPRJ(string(prjBytes)); code != 0 {
 			epsg = code
 		}
