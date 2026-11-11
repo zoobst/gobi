@@ -5,6 +5,27 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.5.5]
+
+### Added
+
+- **`shpio.Read(shp, dbf, prj io.Reader, opts)` reads a shapefile
+  from streams instead of files on disk.** It is for callers with no
+  filesystem: WASM in a browser, files taken out of a `.zip`, or
+  objects in an object store.
+  - **`shp` is required.** A nil `shp` returns `ErrInvalidShapefile`.
+  - **`dbf` and `prj` are optional.** Pass nil to leave one out. The
+    effect is the same as a missing sidecar in `ReadFile`: no
+    attribute columns, and geometry tagged EPSG:4326.
+  - **The `.shx` index isn't needed,** because records are read in
+    order from the `.shp`.
+  - **Readers are read to EOF and not closed.**
+  - **A `dbf` reader that yields no bytes is an error,** as an empty
+    `.dbf` file already is in `ReadFile`. It is not treated as a
+    missing `.dbf`.
+- **`ReadFile` now uses the same code as `Read`.** Its behaviour is
+  unchanged.
+
 ## [v0.5.4]
 
 ### Added
