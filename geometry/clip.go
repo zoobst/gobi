@@ -11,9 +11,23 @@ import (
 // EstimateUTMCRS / ToCRS).
 var ErrGeographicCRS = errors.New("geometry: boolean ops require a projected CRS")
 
-// Clip returns the geometric intersection of subject and mask. Both must be
-// Polygon or MultiPolygon in the same projected CRS. Non-polygonal inputs
-// return an error. An empty result is a Polygon with no rings.
+// Clip returns the part of subject that lies inside mask. mask must be a
+// Polygon or MultiPolygon, and both must be in the same projected CRS
+// (or have none set).
+//
+// subject decides the kind of result:
+//   - Polygon or MultiPolygon: their intersection. An empty result is a
+//     Polygon with no rings.
+//   - Point: the point itself if it is inside mask or on its boundary,
+//     otherwise a MultiPoint with no points (gobi has no empty Point).
+//   - MultiPoint: a MultiPoint of the points that are inside.
+//   - LineString: the pieces inside mask, as a LineString when there is
+//     one piece or none (none is a LineString with no points) and a
+//     MultiLineString when there are several. See LineString.Clip for
+//     how a line touching or running along the boundary is treated.
+//   - MultiLineString: a MultiLineString of the pieces.
+//
+// Any other subject returns an error.
 func Clip(subject, mask Geometry) (Geometry, error) {
 	return Boolean(subject, mask, OpIntersection, ClipOptions{})
 }
@@ -38,6 +52,12 @@ func SymDifference(a, b Geometry) (Geometry, error) {
 // Boolean applies op to a and b using the given options. Boolean is the
 // shared entry point that Clip/Union/Difference/SymDifference route through.
 func Boolean(a, b Geometry, op BoolOp, opts ClipOptions) (Geometry, error) {
+	if op == OpIntersection {
+		switch a.(type) {
+		case Point, MultiPoint, LineString, MultiLineString:
+			return clipPointsOrLines(a, b)
+		}
+	}
 	if err := validateClipInputs(a, b); err != nil {
 		return nil, err
 	}
@@ -274,6 +294,73 @@ func enqueueGeometry(s *clipSession, g Geometry, role polyRole) error {
 	return fmt.Errorf("geometry: boolean op requires Polygon or MultiPolygon, got %T", g)
 }
 
+// clipPointsOrLines is Clip for a Point, MultiPoint, LineString or
+// MultiLineString subject. See Clip for the result types.
+func clipPointsOrLines(subject, mask Geometry) (Geometry, error) {
+	if mask == nil {
+		return nil, fmt.Errorf("geometry: boolean op: nil geometry")
+	}
+	if err := requirePolygonal(mask); err != nil {
+		return nil, err
+	}
+	if err := validateClipCRS(subject, mask); err != nil {
+		return nil, err
+	}
+	crs := resolveClipCRS(subject, mask)
+	polys := appendPolygons(nil, mask)
+	inside := func(p Point) bool {
+		for _, poly := range polys {
+			if pointInPolygon(p, poly) {
+				return true
+			}
+		}
+		return false
+	}
+	switch t := subject.(type) {
+	case Point:
+		if inside(t) {
+			t.CRSValue = crs
+			return t, nil
+		}
+		return MultiPoint{CRSValue: crs, HasZ: t.HasZ}, nil
+	case MultiPoint:
+		out := MultiPoint{CRSValue: crs, HasZ: t.HasZ}
+		for _, p := range t.Points {
+			if inside(p) {
+				out.Points = append(out.Points, p)
+			}
+		}
+		return out, nil
+	case LineString:
+		// The members of a valid MultiPolygon don't overlap, so
+		// clipping to each in turn gives every inside piece once.
+		var pieces []LineString
+		for _, poly := range polys {
+			pieces = append(pieces, t.Clip(poly)...)
+		}
+		for i := range pieces {
+			pieces[i].CRSValue = crs
+		}
+		switch len(pieces) {
+		case 0:
+			return LineString{CRSValue: crs, HasZ: t.HasZ}, nil
+		case 1:
+			return pieces[0], nil
+		}
+		return MultiLineString{Lines: pieces, CRSValue: crs, HasZ: t.HasZ}, nil
+	case MultiLineString:
+		out := MultiLineString{CRSValue: crs, HasZ: t.HasZ}
+		for _, poly := range polys {
+			out.Lines = append(out.Lines, t.Clip(poly)...)
+		}
+		for i := range out.Lines {
+			out.Lines[i].CRSValue = crs
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("geometry: clip: unsupported subject %T", subject)
+}
+
 // validateClipInputs checks input shape and CRS consistency.
 func validateClipInputs(a, b Geometry) error {
 	if a == nil || b == nil {
@@ -285,6 +372,12 @@ func validateClipInputs(a, b Geometry) error {
 	if err := requirePolygonal(b); err != nil {
 		return err
 	}
+	return validateClipCRS(a, b)
+}
+
+// validateClipCRS checks that a and b agree on a CRS (an unset CRS
+// defers to the other) and that it is projected.
+func validateClipCRS(a, b Geometry) error {
 	ac := a.CRS()
 	bc := b.CRS()
 	if !ac.Zero() && !bc.Zero() && !ac.Equal(bc) {

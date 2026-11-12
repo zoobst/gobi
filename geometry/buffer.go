@@ -1,11 +1,11 @@
 // Package geometry Buffer implementations.
 //
 // Buffer produces the set of points within a given distance of the source
-// geometry. This file supports positive (outward) buffers for Point,
-// LineString, and Polygon using rounded joins/caps. Negative (inward)
-// buffers and self-overlapping outputs from concave input rings are not
-// simplified here. Composing Buffer with Union / Difference (see
-// clip.go, v0.3.0) is the intended follow-up for those cases.
+// geometry. Positive (outward) buffers are supported for Point,
+// LineString and Polygon using rounded or square joins/caps;
+// self-overlapping outputs from concave input rings are not simplified
+// here. Negative (inward) buffers shrink polygons and are built from
+// Dissolve and Difference (see buffer_inward.go).
 
 package geometry
 
@@ -59,15 +59,31 @@ func (o BufferOptions) segments() int {
 // the set of points within distance of g. The Style option in opts
 // picks between rounded (default) and square caps/joins.
 //
-// Only positive distances are supported. Passing distance <= 0 returns
-// (nil, error). Buffering Polygon inputs assumes the input's exterior ring
-// is convex or nearly so; strongly concave inputs may produce self-
-// intersecting output rings (see file-level comment).
+// A positive distance grows the geometry. Buffering Polygon inputs
+// outward assumes the input's exterior ring is convex or nearly so;
+// strongly concave inputs may produce self-intersecting output rings
+// (see file-level comment).
+//
+// A negative distance shrinks it: the result is every point of g that
+// is more than |distance| from g's boundary.
+//   - A Polygon or MultiPolygon gives a Polygon or a MultiPolygon. It
+//     is a MultiPolygon when the input was one or when shrinking splits
+//     a polygon into separate parts, and a Polygon with no rings when
+//     nothing is left.
+//   - A Point, LineString, MultiPoint or MultiLineString has no
+//     interior, so the result is a Polygon with no rings.
+//   - Corners that point into the polygon come out rounded, using
+//     opts.Segments, in both styles. Other corners stay sharp.
+//
+// A distance of zero or NaN returns (nil, error).
 func Buffer(g Geometry, distance float64, opts BufferOptions) (Geometry, error) {
-	if distance <= 0 {
-		return nil, fmt.Errorf("buffer: distance must be > 0, got %v", distance)
+	if distance == 0 || math.IsNaN(distance) {
+		return nil, fmt.Errorf("buffer: distance must not be 0 or NaN, got %v", distance)
 	}
 	segments := opts.segments()
+	if distance < 0 {
+		return bufferInward(g, -distance, segments)
+	}
 	square := opts.Style == BufferSquare
 	pointBuf := func(p Point) Polygon {
 		if square {

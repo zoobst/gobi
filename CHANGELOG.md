@@ -5,6 +5,110 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.5.6]
+
+### Fixed
+
+- **Polygon boolean ops no longer depend on ring winding.** `Clip`,
+  `Union`, `Difference`, `SymDifference` and `Dissolve` (and the
+  `Series.Geom*` forms) gave wrong results when the two inputs shared
+  part of an edge and were wound in opposite directions.
+  - **What went wrong:** clipping a counter-clockwise polygon by a
+    clockwise copy of itself returned an empty polygon, and dissolving
+    the pair dropped both.
+  - **Why it matters:** GeoJSON and OGC shells are counter-clockwise
+    and shapefile shells are clockwise, so clipping one by the other
+    silently lost features. Holes wound the "wrong" way hit it too.
+  - **Not affected:** two single-ring convex polygons, which take a
+    fast path, and inputs that share no edge.
+- **Polygon boolean ops are now correct on arm64 for shared edges
+  that are not horizontal or vertical.** A union could drop one of two
+  polygons that shared a slanted edge, and `Dissolve` of adjoining
+  polygons could return the wrong shape.
+  - **Cause:** the sweep's collinearity test was compiled to a fused
+    multiply-subtract on arm64 (also ppc64, s390x, riscv64), so it was
+    off by a rounding error for two coincident edges unless they were
+    axis-aligned.
+  - **Not affected:** amd64 and wasm, which don't fuse.
+- **`SymDifference` no longer keeps an edge the two inputs share from
+  opposite sides.** Two squares side by side gave a malformed result
+  with the wrong area; they now give the 2×1 rectangle.
+- **Comparing Boolean values in an expression works.**
+  `Col("active").Eq(Lit(true))` passed the type check and then failed
+  at evaluation with "series is not numeric". All six comparisons now
+  work between Boolean columns and literals, with `false < true`. A
+  null on either side gives null.
+- **`geojsonio` writes an empty geometry with its `"coordinates"`.**
+  An empty LineString came out as `{"type":"LineString"}`, which RFC
+  7946 doesn't allow; it is now
+  `{"type":"LineString","coordinates":[]}`. The same goes for the
+  other types, and for `"geometries"` in an empty GeometryCollection.
+  This applies to `Marshal`, `MarshalFeature` and `Write`.
+
+### Added
+
+- **`geometry.Buffer` and `Series.GeomBuffer` accept a negative
+  distance, which shrinks polygons.** The result is every point of the
+  polygon that is more than the distance from its boundary. Before, a
+  negative distance was an error.
+  - **Result type:** a Polygon, or a MultiPolygon when the input was
+    one or when shrinking splits a polygon into separate parts.
+  - **Nothing left:** a Polygon with no rings. Points and lines have
+    no interior, so they always give this.
+  - **Corners:** a corner that points into the polygon comes out
+    rounded, using `BufferOptions.Segments`, in both styles. Other
+    corners stay sharp.
+  - **Any CRS works,** with the distance in the CRS's unit, as for
+    outward buffers.
+  - **A distance of zero or NaN is still an error.**
+- **`geometry.Clip` and `Series.GeomClip` accept points and lines as
+  the thing being clipped.** The mask must still be a Polygon or
+  MultiPolygon. Before, any non-polygon row was an error, so a mixed
+  layer couldn't be clipped.
+  - **Point:** kept if it is inside the mask or on its boundary;
+    otherwise a MultiPoint with no points (gobi has no empty Point).
+  - **MultiPoint:** the points that are inside.
+  - **LineString:** the pieces inside the mask, as a LineString for
+    one piece or none, and a MultiLineString for several.
+  - **MultiLineString:** a MultiLineString of the pieces.
+  - **A `GeomClip` row with nothing inside the mask** is an empty
+    geometry of its own kind, not a null.
+  - `Union`, `Difference` and `SymDifference` still need polygons on
+    both sides.
+
+### Changed
+
+- **`geojsonio.Write` writes properties in column order.** They used
+  to come from a map, so their order varied from feature to feature.
+
+### Performance
+
+Measured on an Apple M1, before → after.
+
+- **`SortBy` no longer sorts through reflection.** 1M rows, whole
+  frame reordered:
+
+  | Key | Before | After |
+  |---|---|---|
+  | Int64 | 529 ms | 174 ms |
+  | Float64 | 727 ms | 186 ms |
+  | String | 816 ms | 259 ms |
+  | Int64, 16 distinct values | 209 ms | 134 ms |
+  | Two keys | 762 ms | 478 ms |
+
+  A single numeric, temporal or string key sorts (value, row) pairs
+  directly. Other keys, and several keys, still go through
+  comparators, without `sort.SliceStable`'s reflection-based swaps.
+  Results are unchanged: stable, nulls last, NaN before nulls.
+- **`geojsonio.Write` appends each feature to one reused buffer,**
+  reading property values from the Arrow arrays and coordinates from
+  the WKB bytes, with no map or decoded geometry per row.
+  - 100k points: 181 ms → 25 ms, 2.2M allocations → 14.
+  - 100k five-vertex polygons: 273 ms → 59 ms.
+  - Both byte orders are read directly. WKB the fast path declines
+    (truncated, trailing bytes, an unknown type code, a NaN
+    coordinate) goes through `geometry.ParseWKB` as before.
+
 ## [v0.5.5]
 
 ### Added

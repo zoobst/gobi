@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 
@@ -48,18 +49,32 @@ func (f *Frame) SortBy(keys ...SortKey) (*Frame, error) {
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("gobi: SortBy requires at least one key")
 	}
+	arrs := make([]arrow.Array, len(keys))
 	cmps := make([]rowComparator, len(keys))
 	for i, k := range keys {
 		s, err := f.Column(k.Column)
 		if err != nil {
 			return nil, err
 		}
-		cmp, release, err := newRowComparator(s, k.Descending)
+		arr, release, err := sortKeyArray(s)
 		if err != nil {
 			return nil, fmt.Errorf("gobi: SortBy key %q: %w", k.Column, err)
 		}
 		defer release()
-		cmps[i] = cmp
+		cmp, err := arrayComparator(arr, k.Descending)
+		if err != nil {
+			return nil, fmt.Errorf("gobi: SortBy key %q: %w", k.Column, err)
+		}
+		arrs[i], cmps[i] = arr, cmp
+	}
+
+	// One numeric, temporal or string key (the common case) sorts
+	// (value, row) pairs directly, without a comparator call through
+	// the key array.
+	if len(keys) == 1 {
+		if perm, ok := sortSingleKey(arrs[0], keys[0].Descending); ok {
+			return f.take(perm)
+		}
 	}
 
 	n := f.NumRows()
@@ -67,18 +82,153 @@ func (f *Frame) SortBy(keys ...SortKey) (*Frame, error) {
 	for i := range perm {
 		perm[i] = i
 	}
-	sort.SliceStable(perm, func(a, b int) bool {
-		ra, rb := perm[a], perm[b]
+	// Breaking ties on the row number makes the order total, so an
+	// unstable sort gives exactly the stable result: rows equal on
+	// every key keep their input order.
+	slices.SortFunc(perm, func(ra, rb int) int {
 		for _, cmp := range cmps {
-			c := cmp(ra, rb)
-			if c != 0 {
-				return c < 0
+			if c := cmp(ra, rb); c != 0 {
+				return c
 			}
 		}
-		return false
+		return ra - rb
 	})
 
 	return f.take(perm)
+}
+
+// keyedRow is one row of a single-key sort: the key's value and the
+// row it came from.
+type keyedRow[T cmp.Ordered] struct {
+	key T
+	row int
+}
+
+// sortSingleKey returns the row permutation that sorts arr, for the
+// fixed-width numeric and temporal types and the string types. ok is
+// false for every other type, which goes through the comparator path.
+//
+// The result is identical to the comparator path: values in key order
+// with ties in input order, then NaNs, then nulls, the last two groups
+// in input order in either direction.
+func sortSingleKey(arr arrow.Array, descending bool) (perm []int, ok bool) {
+	switch a := arr.(type) {
+	case *array.Int64:
+		return sortKeyValues(a, a.Int64Values(), descending), true
+	case *array.Int32:
+		return sortKeyValues(a, a.Int32Values(), descending), true
+	case *array.Int16:
+		return sortKeyValues(a, a.Int16Values(), descending), true
+	case *array.Int8:
+		return sortKeyValues(a, a.Int8Values(), descending), true
+	case *array.Uint64:
+		return sortKeyValues(a, a.Uint64Values(), descending), true
+	case *array.Uint32:
+		return sortKeyValues(a, a.Uint32Values(), descending), true
+	case *array.Uint16:
+		return sortKeyValues(a, a.Uint16Values(), descending), true
+	case *array.Uint8:
+		return sortKeyValues(a, a.Uint8Values(), descending), true
+	case *array.Timestamp:
+		return sortKeyValues(a, a.TimestampValues(), descending), true
+	case *array.Date32:
+		return sortKeyValues(a, a.Date32Values(), descending), true
+	case *array.Date64:
+		return sortKeyValues(a, a.Date64Values(), descending), true
+	case *array.Time32:
+		return sortKeyValues(a, a.Time32Values(), descending), true
+	case *array.Time64:
+		return sortKeyValues(a, a.Time64Values(), descending), true
+	case *array.Duration:
+		return sortKeyValues(a, a.DurationValues(), descending), true
+	case *array.Float64:
+		return sortKeyValues(a, a.Float64Values(), descending), true
+	case *array.Float32:
+		return sortKeyValues(a, a.Float32Values(), descending), true
+	case *array.String:
+		return sortStringKey(a, descending), true
+	case *array.LargeString:
+		return sortStringKey(a, descending), true
+	case *array.StringView:
+		return sortStringKey(a, descending), true
+	}
+	return nil, false
+}
+
+// sortKeyValues sorts (value, row) pairs for one fixed-width key.
+// Nulls and NaNs are set aside first, so the comparison is a plain
+// "<" on values that are all comparable. Keeping the value next to
+// its row number avoids a cache miss into the key array on every
+// comparison, which is what the comparator path pays.
+func sortKeyValues[T cmp.Ordered](a arrow.Array, vals []T, descending bool) []int {
+	rows := make([]keyedRow[T], 0, len(vals))
+	var nans, nulls []int
+	hasNulls := a.NullN() > 0
+	for i, v := range vals {
+		switch {
+		case hasNulls && a.IsNull(i):
+			nulls = append(nulls, i)
+		case v != v: // NaN; never true for integers
+			nans = append(nans, i)
+		default:
+			rows = append(rows, keyedRow[T]{key: v, row: i})
+		}
+	}
+	return sortKeyedRows(rows, descending, nans, nulls)
+}
+
+// sortStringKey is sortKeyValues for the string array types. The
+// strings are views into the array's data buffer, not copies.
+func sortStringKey(a interface {
+	arrow.Array
+	Value(int) string
+}, descending bool) []int {
+	n := a.Len()
+	rows := make([]keyedRow[string], 0, n)
+	var nulls []int
+	hasNulls := a.NullN() > 0
+	for i := range n {
+		if hasNulls && a.IsNull(i) {
+			nulls = append(nulls, i)
+			continue
+		}
+		rows = append(rows, keyedRow[string]{key: a.Value(i), row: i})
+	}
+	return sortKeyedRows(rows, descending, nil, nulls)
+}
+
+// sortKeyedRows sorts rows by key and returns the row numbers,
+// followed by trailing (NaN rows) and then nulls, both already in
+// input order. Ties break on the row number in both directions, which
+// is what a stable sort would give.
+func sortKeyedRows[T cmp.Ordered](rows []keyedRow[T], descending bool, trailing, nulls []int) []int {
+	if descending {
+		slices.SortFunc(rows, func(x, y keyedRow[T]) int {
+			switch {
+			case x.key > y.key:
+				return -1
+			case x.key < y.key:
+				return 1
+			}
+			return x.row - y.row
+		})
+	} else {
+		slices.SortFunc(rows, func(x, y keyedRow[T]) int {
+			switch {
+			case x.key < y.key:
+				return -1
+			case x.key > y.key:
+				return 1
+			}
+			return x.row - y.row
+		})
+	}
+	perm := make([]int, 0, len(rows)+len(trailing)+len(nulls))
+	for _, r := range rows {
+		perm = append(perm, r.row)
+	}
+	perm = append(perm, trailing...)
+	return append(perm, nulls...)
 }
 
 // rowComparator returns -1 / 0 / +1 comparing rows i and j on a single
@@ -87,14 +237,28 @@ func (f *Frame) SortBy(keys ...SortKey) (*Frame, error) {
 // branch on either.
 type rowComparator func(i, j int) int
 
-// newRowComparator returns the comparator for key column s. A
-// multi-chunk key is concatenated into one array first (the key column
-// only, not the frame); release frees that copy and must be called once
-// the comparator is no longer used.
+// newRowComparator returns the comparator for key column s. release
+// frees the copy made of a multi-chunk key (see sortKeyArray) and must
+// be called once the comparator is no longer used.
 func newRowComparator(s Series, descending bool) (cmp rowComparator, release func(), err error) {
+	arr, release, err := sortKeyArray(s)
+	if err != nil {
+		return nil, release, err
+	}
+	cmp, err = arrayComparator(arr, descending)
+	if err != nil {
+		release()
+		return nil, func() {}, err
+	}
+	return cmp, release, nil
+}
+
+// sortKeyArray returns key column s as one array. A multi-chunk key is
+// concatenated first (the key column only, not the frame); release
+// frees that copy and must be called once the array is no longer used.
+func sortKeyArray(s Series) (arr arrow.Array, release func(), err error) {
 	release = func() {}
 	chunks := s.col.Data().Chunks()
-	var arr arrow.Array
 	switch len(chunks) {
 	case 0:
 		arr = array.MakeArrayOfNull(memory.DefaultAllocator, s.DataType(), 0)
@@ -108,12 +272,7 @@ func newRowComparator(s Series, descending bool) (cmp rowComparator, release fun
 		}
 		arr, release = cat, cat.Release
 	}
-	cmp, err = arrayComparator(arr, descending)
-	if err != nil {
-		release()
-		return nil, func() {}, err
-	}
-	return cmp, release, nil
+	return arr, release, nil
 }
 
 // arrayComparator dispatches on arr's concrete type. Fixed-width

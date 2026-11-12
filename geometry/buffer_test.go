@@ -92,10 +92,11 @@ func TestPolygonBuffer_ConvexAreaGrows(t *testing.T) {
 	approxRel(t, a, want, 1e-2, "Polygon.Buffer area")
 }
 
-func TestBuffer_NegativeDistanceErrors(t *testing.T) {
-	_, err := Buffer(Point{}, -1, BufferOptions{})
-	if err == nil {
-		t.Fatal("expected error for negative distance")
+func TestBuffer_ZeroOrNaNDistanceErrors(t *testing.T) {
+	for _, d := range []float64{0, math.NaN()} {
+		if _, err := Buffer(Point{}, d, BufferOptions{}); err == nil {
+			t.Fatalf("distance %v: expected an error", d)
+		}
 	}
 }
 

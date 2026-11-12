@@ -580,6 +580,14 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 			}
 		}
 	}
+	// Boolean comparisons: Series.Eq and friends are numeric-only, but
+	// binOpNode.Type accepts Boolean against Boolean, so the pair is
+	// compared here. false orders before true, as in SortBy.
+	if op.isComparison() &&
+		left.DataType() != nil && left.DataType().ID() == arrow.BOOL &&
+		right.DataType() != nil && right.DataType().ID() == arrow.BOOL {
+		return boolBinary(left, right, boolComparison(op))
+	}
 	switch op {
 	case bopAdd:
 		return left.Add(right)
@@ -609,6 +617,24 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 		return boolBinary(left, right, func(a, b bool) bool { return a || b })
 	}
 	return Series{}, fmt.Errorf("%w: unhandled op %s", ErrExprTypeMismatch, op)
+}
+
+// boolComparison returns the comparison op as a function of two
+// booleans, with false < true.
+func boolComparison(op binOpKind) func(a, b bool) bool {
+	switch op {
+	case bopNe:
+		return func(a, b bool) bool { return a != b }
+	case bopLt:
+		return func(a, b bool) bool { return !a && b }
+	case bopLe:
+		return func(a, b bool) bool { return !a || b }
+	case bopGt:
+		return func(a, b bool) bool { return a && !b }
+	case bopGe:
+		return func(a, b bool) bool { return a || !b }
+	}
+	return func(a, b bool) bool { return a == b }
 }
 
 // stringCompare returns a Boolean Series of left ==/!= right, element-

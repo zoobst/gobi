@@ -804,6 +804,8 @@ func writeFeatureCollection(w io.Writer, df *gobi.Frame, geomIdx int, indent str
 	return nil
 }
 
+var newline = []byte{'\n'}
+
 // writeLines emits one Feature per line — the `.geojsonl`
 // convention. Always compact per line so downstream tooling can
 // split on `\n` alone.
@@ -812,130 +814,9 @@ func writeLines(w io.Writer, df *gobi.Frame, geomIdx int) error {
 		if _, err := w.Write(featJSON); err != nil {
 			return err
 		}
-		_, err := w.Write([]byte{'\n'})
+		_, err := w.Write(newline)
 		return err
 	})
-}
-
-// forEachFeature iterates rows of df, builds a Feature JSON object
-// per row, and invokes fn. Kept as a helper so the FC + line
-// writers share a single row-processing loop.
-func forEachFeature(df *gobi.Frame, geomIdx int, fn func(row int, featJSON []byte) error) error {
-	names := df.ColumnNames()
-	// Pre-resolve series so per-row lookups don't repeat the
-	// name→column walk.
-	series := make([]gobi.Series, df.NumCols())
-	for i := range df.NumCols() {
-		s, err := df.ColumnAt(i)
-		if err != nil {
-			return err
-		}
-		series[i] = s
-	}
-
-	for row := 0; row < df.NumRows(); row++ {
-		props := make(map[string]any)
-		for i, s := range series {
-			if i == geomIdx {
-				continue
-			}
-			v, err := scalarAt(s, row)
-			if err != nil {
-				return fmt.Errorf("geojsonio: %s row %d: %w", names[i], row, err)
-			}
-			props[names[i]] = v
-		}
-		var g geometry.Geometry
-		if geomIdx >= 0 {
-			wkb, err := readGeomAt(series[geomIdx], row)
-			if err != nil {
-				return fmt.Errorf("geojsonio: geometry row %d: %w", row, err)
-			}
-			if wkb != nil {
-				g, err = geometry.ParseWKB(wkb)
-				if err != nil {
-					return fmt.Errorf("geojsonio: parse geometry row %d: %w", row, err)
-				}
-			}
-		}
-		featJSON, err := MarshalFeature(g, props)
-		if err != nil {
-			return err
-		}
-		if err := fn(row, featJSON); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// scalarAt reads one row from s as a Go scalar suitable for
-// json.Marshal. Handles the primitive types Frame columns commonly
-// carry; unsupported types come back as a nil.
-func scalarAt(s gobi.Series, row int) (any, error) {
-	chunks := s.Column().Data().Chunks()
-	offset := 0
-	for _, chunk := range chunks {
-		if row < offset+chunk.Len() {
-			local := row - offset
-			if chunk.IsNull(local) {
-				return nil, nil
-			}
-			switch a := chunk.(type) {
-			case *array.Int64:
-				return a.Value(local), nil
-			case *array.Int32:
-				return int64(a.Value(local)), nil
-			case *array.Uint64:
-				return a.Value(local), nil
-			case *array.Uint32:
-				return uint64(a.Value(local)), nil
-			case *array.Float64:
-				return a.Value(local), nil
-			case *array.Float32:
-				return float64(a.Value(local)), nil
-			case *array.Boolean:
-				return a.Value(local), nil
-			case *array.String:
-				return a.Value(local), nil
-			case *array.LargeString:
-				return a.Value(local), nil
-			case *array.Binary:
-				return a.Value(local), nil
-			case *array.Timestamp:
-				// Emit as RFC 3339 for round-trip-friendly JSON. Unit
-				// comes from the field's arrow type.
-				ts := a.Value(local)
-				unit := a.DataType().(*arrow.TimestampType).Unit
-				return timestampToRFC3339(int64(ts), unit), nil
-			}
-			return nil, fmt.Errorf("unsupported chunk type %T", chunk)
-		}
-		offset += chunk.Len()
-	}
-	return nil, fmt.Errorf("row %d out of range", row)
-}
-
-// readGeomAt pulls the raw WKB bytes at row from a geometry column.
-// Returns nil for a null row so the caller can emit `"geometry":null`.
-func readGeomAt(s gobi.Series, row int) ([]byte, error) {
-	chunks := s.Column().Data().Chunks()
-	offset := 0
-	for _, chunk := range chunks {
-		if row < offset+chunk.Len() {
-			local := row - offset
-			if chunk.IsNull(local) {
-				return nil, nil
-			}
-			ba, ok := chunk.(*array.Binary)
-			if !ok {
-				return nil, fmt.Errorf("geometry column not Binary, got %T", chunk)
-			}
-			return ba.Value(local), nil
-		}
-		offset += chunk.Len()
-	}
-	return nil, fmt.Errorf("row %d out of range", row)
 }
 
 // timestampToRFC3339 formats an arrow timestamp integer + unit as

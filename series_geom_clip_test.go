@@ -470,3 +470,120 @@ func planarPolygonArea(p geometry.Polygon) float64 {
 	}
 	return a
 }
+
+// GeomClip takes point and line rows as well as polygons. Rows with
+// nothing inside the mask come back as empty geometries, whether they
+// miss the mask's bounding box (the WKB fast path) or only the mask
+// itself.
+func TestSeries_GeomClip_PointsAndLines(t *testing.T) {
+	crs := geometry.PseudoMercator
+	pt := func(x, y float64) geometry.Point { return geometry.Point{X: x, Y: y, CRSValue: crs} }
+	line := func(xy ...float64) geometry.LineString {
+		l := geometry.LineString{CRSValue: crs}
+		for i := 0; i < len(xy); i += 2 {
+			l.Points = append(l.Points, geometry.Point{X: xy[i], Y: xy[i+1]})
+		}
+		return l
+	}
+	// An L-shaped mask: the 10×10 square without its top-right quarter,
+	// so (8, 8) is inside the bounding box but outside the mask.
+	mask := geometry.SimplePolygon([]geometry.Point{
+		{X: 0, Y: 0}, {X: 10, Y: 0}, {X: 10, Y: 5}, {X: 5, Y: 5}, {X: 5, Y: 10}, {X: 0, Y: 10}, {X: 0, Y: 0},
+	}, crs)
+	s := geomSeries(t, "geom", int32(crs.EPSG), []geometry.Geometry{
+		pt(2, 2),           // 0: inside
+		pt(8, 8),           // 1: in the bbox, outside the mask
+		pt(50, 50),         // 2: outside the bbox
+		pt(10, 3),          // 3: on the boundary counts as inside
+		nil,                // 4
+		line(-5, 2, 20, 2), // 5: crosses once, 10 long inside
+		line(-5, 8, 20, 8), // 6: inside only for x in 0..5
+		line(2, -5, 2, 2, 8, 2, 8, 8, 2, 8, 2, 20), // 7: leaves and re-enters: two pieces
+		line(50, 50, 60, 60),                       // 8: outside the bbox
+		geometry.MultiPoint{Points: []geometry.Point{{X: 1, Y: 1}, {X: 8, Y: 8}, {X: 3, Y: 9}}, CRSValue: crs},          // 9
+		geometry.MultiLineString{Lines: []geometry.LineString{line(-5, 1, 20, 1), line(50, 50, 60, 60)}, CRSValue: crs}, // 10
+		projectedSquare(4, 4, 2), // 11: polygon rows still work beside them
+	})
+	out, err := s.GeomClip(mask)
+	if err != nil {
+		t.Fatalf("GeomClip: %v", err)
+	}
+	if out.Len() != s.Len() {
+		t.Fatalf("len = %d, want %d", out.Len(), s.Len())
+	}
+	geom := func(row int) geometry.Geometry {
+		t.Helper()
+		g, err := out.Geometry(row)
+		if err != nil {
+			t.Fatalf("row %d: %v", row, err)
+		}
+		return g
+	}
+	lineLength := func(g geometry.Geometry) float64 {
+		var lines []geometry.LineString
+		switch v := g.(type) {
+		case geometry.LineString:
+			lines = []geometry.LineString{v}
+		case geometry.MultiLineString:
+			lines = v.Lines
+		}
+		var total float64
+		for _, l := range lines {
+			for i := 1; i < len(l.Points); i++ {
+				total += math.Hypot(l.Points[i].X-l.Points[i-1].X, l.Points[i].Y-l.Points[i-1].Y)
+			}
+		}
+		return total
+	}
+
+	for _, row := range []int{0, 3} {
+		if p, ok := geom(row).(geometry.Point); !ok {
+			t.Errorf("row %d = %T, want the Point kept", row, geom(row))
+		} else if want, _ := s.Geometry(row); p.X != want.(geometry.Point).X || p.Y != want.(geometry.Point).Y {
+			t.Errorf("row %d = %+v, want %+v", row, p, want)
+		}
+	}
+	for _, row := range []int{1, 2} {
+		if mp, ok := geom(row).(geometry.MultiPoint); !ok || len(mp.Points) != 0 {
+			t.Errorf("row %d = %T %+v, want an empty MultiPoint", row, geom(row), geom(row))
+		}
+	}
+	if !out.Nulls()[4] {
+		t.Error("row 4: null should stay null")
+	}
+	for row, want := range map[int]float64{5: 10, 6: 5} {
+		g := geom(row)
+		if _, ok := g.(geometry.LineString); !ok {
+			t.Errorf("row %d = %T, want one LineString", row, g)
+		}
+		if got := lineLength(g); math.Abs(got-want) > 1e-9 {
+			t.Errorf("row %d: length inside = %v, want %v", row, got, want)
+		}
+	}
+	// Row 7 inside the mask: (2,0)→(2,2)→(8,2)→(8,5) is 11 long, then
+	// (5,8)→(2,8)→(2,10) is 5 long.
+	if ml, ok := geom(7).(geometry.MultiLineString); !ok || len(ml.Lines) != 2 {
+		t.Errorf("row 7 = %T %+v, want a MultiLineString of 2 pieces", geom(7), geom(7))
+	} else if got := lineLength(ml); math.Abs(got-16) > 1e-9 {
+		t.Errorf("row 7: length inside = %v, want 16", got)
+	}
+	if l, ok := geom(8).(geometry.LineString); !ok || len(l.Points) != 0 {
+		t.Errorf("row 8 = %T %+v, want an empty LineString", geom(8), geom(8))
+	}
+	if mp, ok := geom(9).(geometry.MultiPoint); !ok || len(mp.Points) != 2 {
+		t.Errorf("row 9 = %T %+v, want a MultiPoint of the 2 points inside", geom(9), geom(9))
+	}
+	if ml, ok := geom(10).(geometry.MultiLineString); !ok || len(ml.Lines) != 1 || math.Abs(lineLength(ml)-10) > 1e-9 {
+		t.Errorf("row 10 = %T %+v, want a MultiLineString of one 10-long piece", geom(10), geom(10))
+	}
+	// The 2×2 square at (4,4) keeps everything except its top-right
+	// 1×1 quarter.
+	if area := polygonArea(t, geom(11)); math.Abs(area-3) > 1e-9 {
+		t.Errorf("row 11 area = %v, want 3", area)
+	}
+
+	// The other boolean ops still need polygon rows.
+	if _, err := s.GeomDifference(mask); err == nil {
+		t.Error("GeomDifference on point rows: expected an error")
+	}
+}

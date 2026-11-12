@@ -99,10 +99,20 @@ func (s *clipSession) pointsCoincide(p, q Point) bool {
 
 // enqueueRing pushes the events for a single ring onto the queue. Ring must
 // be closed (first == last); a zero-length or degenerate ring is skipped.
-func (s *clipSession) enqueueRing(ring []Point, role polyRole) {
+//
+// hole says whether the ring is an interior ring of its polygon. It is
+// used with the ring's actual winding to record, per edge, which side
+// the polygon's interior is on (see sweepEvent.polyForward), so the
+// result doesn't depend on how the input happens to be wound: OGC /
+// RFC 7946 shells are counter-clockwise, shapefile shells clockwise.
+func (s *clipSession) enqueueRing(ring []Point, role polyRole, hole bool) {
 	if len(ring) < 4 {
 		return
 	}
+	// A shell walked counter-clockwise, or a hole walked clockwise, has
+	// the polygon's interior on its left. The other two windings have it
+	// on the right, so their edges record the opposite direction.
+	interiorRight := (ringSignedArea(ring) > 0) == hole
 	for i := range len(ring) - 1 {
 		a := ring[i]
 		b := ring[i+1]
@@ -110,6 +120,10 @@ func (s *clipSession) enqueueRing(ring []Point, role polyRole) {
 			continue
 		}
 		e1, e2 := newEventPair(a, b, role)
+		if interiorRight {
+			e1.polyForward = !e1.polyForward
+			e2.polyForward = !e2.polyForward
+		}
 		s.track(e1)
 		s.track(e2)
 		s.queue.push(e1)
@@ -118,9 +132,10 @@ func (s *clipSession) enqueueRing(ring []Point, role polyRole) {
 }
 
 // enqueuePolygon pushes every ring of p onto the queue as segments of role.
+// Rings[0] is the shell; the rest are holes.
 func (s *clipSession) enqueuePolygon(p Polygon, role polyRole) {
-	for _, r := range p.Rings {
-		s.enqueueRing(closedRing(r), role)
+	for i, r := range p.Rings {
+		s.enqueueRing(closedRing(r), role, i > 0)
 	}
 }
 
@@ -221,9 +236,16 @@ func inResult(ev *sweepEvent, op BoolOp) bool {
 			return true
 		}
 	case edgeSameTransition:
+		// Both interiors on one side, neither on the other: a boundary
+		// of the intersection and of the union, but not of the
+		// difference or symmetric difference (inside both / inside
+		// neither are both excluded).
 		return op == OpIntersection || op == OpUnion
 	case edgeDifferentTransition:
-		return op == OpDifference || op == OpSymDifference
+		// Subject on one side, clipping on the other. Only the
+		// difference has a boundary here. For the symmetric difference
+		// both sides are in the result, so the shared edge is interior.
+		return op == OpDifference
 	case edgeNonContributing, edgeCancelled:
 		return false
 	}
@@ -401,10 +423,9 @@ func (s *clipSession) handleOverlap(e1, e2 *sweepEvent, q1, q2 Point) bool {
 		shared1.kind = edgeCancelled
 		shared2.kind = edgeCancelled
 	} else {
-		// Different roles: compare the two polygons' ring-walking
-		// directions along this shared edge. Matching directions →
-		// both interiors on the same side → sameTransition. Opposite
-		// directions → interiors on opposite sides → differentTransition.
+		// Different roles: compare which side of this shared edge each
+		// polygon's interior is on. Same side → sameTransition.
+		// Opposite sides → differentTransition.
 		//
 		// Using polyForward here (a stable per-event property set at
 		// enqueue) rather than inOut equality (which is derived from
@@ -505,18 +526,21 @@ type sweepEvent struct {
 	inOut      bool
 	otherInOut bool
 	inResult   bool
-	// polyForward encodes the ring-walking direction of this event's
-	// segment. Set on both left and right endpoints from the enqueuing
-	// ring: true if the LEFT event of this segment corresponds to the
-	// ring's starting vertex for this edge (i.e., the ring walks A→B
-	// where A < B in sweep-event order), false if the ring walks B→A.
+	// polyForward records which side of this segment its polygon's
+	// interior is on. It is the same on the left and right events of a
+	// segment and is carried over when the segment is split.
+	//
+	// newEventPair sets it to the ring-walking direction: true if the
+	// ring walks from the segment's left event to its right event.
+	// enqueueRing then flips it for rings wound the non-canonical way
+	// (clockwise shells, counter-clockwise holes), so that true always
+	// means the interior is to the left of a walk from the left event
+	// to the right event, however the input is wound.
 	//
 	// handleOverlap uses this to classify different-role coincident
-	// edges: matching polyForward = both polygons walk the shared edge
-	// in the same direction, both interiors on the same side →
-	// sameTransition. Opposite polyForward = polygons walk it in
-	// opposite directions, interiors on opposite sides →
-	// differentTransition. This is more robust than comparing
+	// edges: matching polyForward = both interiors on the same side →
+	// sameTransition. Opposite polyForward = interiors on opposite
+	// sides → differentTransition. This is more robust than comparing
 	// inOut/otherInOut (which drift when the coincident partners are
 	// inserted into the sweep-line status against different immediate
 	// predecessors — see the identical-octagon regression fix).
@@ -608,8 +632,18 @@ func lessEvent(a, b *sweepEvent) bool {
 
 // signedArea returns 2× the signed area of triangle (a, b, c). Sign
 // indicates orientation: >0 CCW, <0 CW, 0 collinear.
+//
+// The float64 conversions are load-bearing: they stop the compiler
+// from fusing the multiply and subtract into one FMA instruction,
+// which Go does on arm64 (and ppc64, s390x, riscv64) but not on amd64
+// or wasm. A fused x*y - z*w rounds only one of the two products, so
+// it is not exactly zero when the products are equal: two coincident
+// edges (c == b) came out "not collinear" by a rounding error unless
+// they were axis-aligned. The sweep then ordered them by that noise
+// instead of by the coincident-edge rules, and a polygon sharing a
+// slanted edge with another was dropped from their union.
 func signedArea(a, b, c Point) float64 {
-	return (b.X-a.X)*(c.Y-a.Y) - (c.X-a.X)*(b.Y-a.Y)
+	return float64((b.X-a.X)*(c.Y-a.Y)) - float64((c.X-a.X)*(b.Y-a.Y))
 }
 
 // eventQueue is a min-heap of sweep events ordered by lessEvent.

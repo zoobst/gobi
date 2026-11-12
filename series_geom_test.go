@@ -180,6 +180,44 @@ func TestSeries_GeomBuffer_RoundAndSquare(t *testing.T) {
 	}
 }
 
+// A negative distance shrinks polygons row by row. Rows with nothing
+// left, and rows with no interior to begin with, come back as empty
+// polygons; nulls stay null.
+func TestSeries_GeomBuffer_Negative(t *testing.T) {
+	s := geomSeries(t, "geom", int32(geometry.PseudoMercator.EPSG), []geometry.Geometry{
+		projectedSquare(0, 0, 10),
+		nil,
+		projectedSquare(100, 100, 1), // narrower than 2 × 1: vanishes
+		geometry.Point{X: 5, Y: 5, CRSValue: geometry.PseudoMercator},
+	})
+	got, err := s.GeomBuffer(-1, geometry.BufferOptions{})
+	if err != nil {
+		t.Fatalf("GeomBuffer(-1): %v", err)
+	}
+	if got.Len() != 4 {
+		t.Fatalf("len = %d, want 4", got.Len())
+	}
+	g0, _ := got.Geometry(0)
+	if area := polygonArea(t, g0); math.Abs(area-64) > 1e-9 {
+		t.Errorf("row 0 area = %v, want 64 (8×8)", area)
+	}
+	if nulls := got.Nulls(); !nulls[1] || nulls[0] || nulls[2] || nulls[3] {
+		t.Errorf("nulls = %v, want only row 1", nulls)
+	}
+	for _, row := range []int{2, 3} {
+		g, err := got.Geometry(row)
+		if err != nil {
+			t.Fatalf("row %d: %v", row, err)
+		}
+		if p, ok := g.(geometry.Polygon); !ok || len(p.Rings) != 0 {
+			t.Errorf("row %d = %T %+v, want an empty Polygon", row, g, g)
+		}
+	}
+	if _, err := s.GeomBuffer(0, geometry.BufferOptions{}); err == nil {
+		t.Error("GeomBuffer(0): expected an error")
+	}
+}
+
 func TestSeries_GeomSimplify(t *testing.T) {
 	// Line with a nearly-straight kink: (0,0)-(5,0.001)-(10,0). Simplify
 	// at tolerance 0.01 should drop the middle vertex.

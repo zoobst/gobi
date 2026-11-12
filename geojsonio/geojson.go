@@ -357,14 +357,21 @@ func decodeRings(data jsontext.Value) ([][]geometry.Point, bool, error) {
 // Encoders
 // -----------------------------------------------------------------------------
 
-// geomObject is a struct with fixed key order so the emitted JSON
-// looks the way tools expect. `Geometries` is used only for
-// GeometryCollection; `Coordinates` for everything else. Both are
-// tagged omitempty so the two branches emit their proper JSON.
+// geomObject is the wire shape of every geometry except a
+// GeometryCollection. "coordinates" is always written, as RFC 7946
+// §3.1 requires: an empty geometry is `"coordinates":[]`. (It used to
+// be tagged omitempty, which json/v2 applies to an empty array, so an
+// empty LineString came out as `{"type":"LineString"}`.)
 type geomObject struct {
 	Type        string         `json:"type"`
-	Coordinates jsontext.Value `json:"coordinates,omitempty"`
-	Geometries  jsontext.Value `json:"geometries,omitempty"`
+	Coordinates jsontext.Value `json:"coordinates"`
+}
+
+// collectionObject is the wire shape of a GeometryCollection.
+// "geometries" is always written, for the same reason.
+type collectionObject struct {
+	Type       string         `json:"type"`
+	Geometries jsontext.Value `json:"geometries"`
 }
 
 // marshalGeom is the encoder dispatcher — one branch per geometry
@@ -418,7 +425,7 @@ func marshalGeom(g geometry.Geometry) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		return json.Marshal(geomObject{Type: "GeometryCollection", Geometries: geoms})
+		return json.Marshal(collectionObject{Type: "GeometryCollection", Geometries: geoms})
 	}
 	return nil, fmt.Errorf("%w: unsupported geometry %T", ErrInvalidGeoJSON, g)
 }

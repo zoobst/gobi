@@ -11,10 +11,16 @@ import (
 	"github.com/zoobst/gobi/geometry"
 )
 
-// GeomClip returns a geometry Series holding the intersection of each
-// geometry in s with the mask. Null inputs pass through as null. Both s
-// and mask must be in a projected CRS (or unset), and mask must be a
-// Polygon or MultiPolygon; other geometry types return an error.
+// GeomClip returns a geometry Series holding the part of each geometry
+// in s that lies inside the mask. Null inputs pass through as null.
+// Both s and mask must be in a projected CRS (or unset), and mask must
+// be a Polygon or MultiPolygon.
+//
+// Rows may be polygons, points or lines, mixed freely; see
+// geometry.Clip for what each gives. A row with nothing inside the
+// mask becomes an empty geometry of its own kind, not a null: an empty
+// Polygon, MultiPoint or LineString (a MultiLineString row gives an
+// empty MultiLineString).
 func (s Series) GeomClip(mask geometry.Geometry) (Series, error) {
 	return geomBinaryOp(s, mask, geometry.OpIntersection, "_clip")
 }
@@ -316,8 +322,17 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 		otherIsPoly     bool
 	)
 	fastPathEligible := !otherBounds.Empty()
+	// The empty result for a row that misses the mask entirely, by the
+	// row's WKB type code (see geometry.Clip). Codes without an entry
+	// take the general path, which reports unsupported types.
+	var emptyByType [7][]byte
 	if op == geometry.OpIntersection {
 		emptyPolygonWKB = geometry.WKB(geometry.Polygon{CRSValue: crs})
+		emptyPoints := geometry.WKB(geometry.MultiPoint{CRSValue: crs})
+		emptyByType[1], emptyByType[4] = emptyPoints, emptyPoints
+		emptyByType[2] = geometry.WKB(geometry.LineString{CRSValue: crs})
+		emptyByType[5] = geometry.WKB(geometry.MultiLineString{CRSValue: crs})
+		emptyByType[3], emptyByType[6] = emptyPolygonWKB, emptyPolygonWKB
 	}
 	if op == geometry.OpUnion || op == geometry.OpSymDifference {
 		otherWKB = geometry.WKB(other)
@@ -352,8 +367,14 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 				if !rowBounds.Empty() && !rowBounds.Intersects(otherBounds) {
 					switch op {
 					case geometry.OpIntersection:
-						b.Append(emptyPolygonWKB)
-						continue
+						// A point or line row with Z takes the general
+						// path, which keeps the Z flag on its empty result.
+						typ, hasZ, err := geometry.WKBTypeCode(wkb)
+						if err == nil && typ < uint32(len(emptyByType)) && emptyByType[typ] != nil &&
+							(!hasZ || typ == 3 || typ == 6) {
+							b.Append(emptyByType[typ])
+							continue
+						}
 					case geometry.OpDifference:
 						b.Append(wkb)
 						continue

@@ -1,6 +1,7 @@
 package geometry
 
 import (
+	"errors"
 	"math"
 	"testing"
 )
@@ -259,10 +260,23 @@ func TestBoolean_UnsupportedGeometry(t *testing.T) {
 	a := unitSquare(0, 0, 10)
 	line := LineString{Points: []Point{pt(0, 0), pt(10, 10)}}
 	if _, err := Clip(a, line); err == nil {
-		t.Errorf("Clip with LineString input should error")
+		t.Errorf("Clip with a LineString mask should error")
 	}
-	if _, err := Clip(line, a); err == nil {
-		t.Errorf("Clip with LineString input should error")
+	// A line is a valid Clip subject (TestClip_PointAndLineSubjects),
+	// but the other ops need polygons on both sides, as does any
+	// subject that is neither polygon, point nor line.
+	for name, op := range map[string]func(a, b Geometry) (Geometry, error){
+		"Union": Union, "Difference": Difference, "SymDifference": SymDifference,
+	} {
+		if _, err := op(line, a); err == nil {
+			t.Errorf("%s with a LineString input should error", name)
+		}
+		if _, err := op(a, line); err == nil {
+			t.Errorf("%s with a LineString input should error", name)
+		}
+	}
+	if _, err := Clip(GeometryCollection{Geometries: []Geometry{line}}, a); err == nil {
+		t.Errorf("Clip with a GeometryCollection subject should error")
 	}
 }
 
@@ -978,5 +992,46 @@ func TestDifferenceContainment_MatchesSweep(t *testing.T) {
 				t.Errorf("area mismatch: fast=%v sweep=%v", gotArea, wantArea)
 			}
 		})
+	}
+}
+
+// Clip takes a point or line subject, but the mask must still be a
+// polygon in a matching projected CRS, and the other boolean ops stay
+// polygon-only.
+func TestClip_PointAndLineSubjects(t *testing.T) {
+	mask := SimplePolygon([]Point{pt(0, 0), pt(10, 0), pt(10, 10), pt(0, 10), pt(0, 0)}, PseudoMercator)
+	line := LineString{Points: []Point{pt(-5, 5), pt(5, 5)}}
+
+	got, err := Clip(line, mask)
+	if err != nil {
+		t.Fatalf("Clip(line): %v", err)
+	}
+	l, ok := got.(LineString)
+	if !ok || len(l.Points) != 2 || l.Points[0].X != 0 || l.Points[1].X != 5 {
+		t.Errorf("Clip(line) = %T %+v, want the piece from x=0 to x=5", got, got)
+	}
+	// An unset CRS on the subject takes the mask's.
+	if !got.CRS().Equal(PseudoMercator) {
+		t.Errorf("CRS = %v, want the mask's", got.CRS())
+	}
+
+	if got, err := Clip(pt(20, 20), mask); err != nil {
+		t.Fatalf("Clip(point outside): %v", err)
+	} else if mp, ok := got.(MultiPoint); !ok || len(mp.Points) != 0 || !IsEmpty(got) {
+		t.Errorf("Clip(point outside) = %T %+v, want an empty MultiPoint", got, got)
+	}
+
+	if _, err := Clip(line, line); err == nil {
+		t.Error("line mask: expected an error")
+	}
+	if _, err := Clip(LineString{Points: line.Points, CRSValue: WGS84}, mask); err == nil {
+		t.Error("CRS mismatch: expected an error")
+	}
+	geographic := SimplePolygon([]Point{pt(0, 0), pt(1, 0), pt(1, 1), pt(0, 0)}, WGS84)
+	if _, err := Clip(LineString{Points: line.Points, CRSValue: WGS84}, geographic); !errors.Is(err, ErrGeographicCRS) {
+		t.Errorf("geographic CRS: err = %v, want ErrGeographicCRS", err)
+	}
+	if _, err := Union(line, mask); err == nil {
+		t.Error("Union with a line: expected an error")
 	}
 }

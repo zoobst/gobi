@@ -320,6 +320,10 @@ func attachCRS(g geometry.Geometry, crs geometry.CRS) geometry.Geometry {
 // and shape (Style: BufferRound vs BufferSquare). Null rows pass
 // through as null.
 //
+// A negative distance shrinks polygons (see geometry.Buffer). A row
+// with nothing left, or with no interior to begin with (points and
+// lines), becomes an empty Polygon. A distance of zero is an error.
+//
 // Point rows take a fast path for round buffers: the circle is written
 // straight to WKB (same bytes as the general path) without building a
 // Polygon. Together with the pre-sized output buffer, that took 1M
