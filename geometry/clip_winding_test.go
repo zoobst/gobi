@@ -3,6 +3,7 @@ package geometry
 import (
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"slices"
 	"testing"
 )
@@ -176,5 +177,116 @@ func TestBoolean_SlantedSharedEdge(t *testing.T) {
 		check("identical: Clip", g, err, 49)
 		g, err = Difference(ma, mb)
 		check("identical: Difference", g, err, 0)
+	}
+}
+
+// Winding is read correctly for small rings far from the origin. The
+// shoelace sum over raw coordinates lost the sign of a centimetre-
+// scale sliver at UTM-sized coordinates about one time in three, and
+// the boolean ops classify shared edges by that sign.
+func TestRingSignedArea_SmallRingFarFromOrigin(t *testing.T) {
+	r := rand.New(rand.NewPCG(1, 1))
+	for range 5000 {
+		x0, y0 := 5e5+r.Float64()*1e3, 4.5e6+r.Float64()*1e3
+		w, h := 0.001+r.Float64()*0.05, 0.001+r.Float64()*0.01
+		// Counter-clockwise: right along the base, then up to the apex.
+		ccw := []Point{pt(x0, y0), pt(x0+w, y0+r.Float64()*h/2), pt(x0+w/2, y0+h)}
+		cw := []Point{ccw[2], ccw[1], ccw[0]}
+		if a := ringSignedArea(ccw); a <= 0 {
+			t.Fatalf("counter-clockwise sliver %v: signed area %g, want > 0", ccw, a)
+		}
+		if a := ringSignedArea(cw); a >= 0 {
+			t.Fatalf("clockwise sliver %v: signed area %g, want < 0", cw, a)
+		}
+		// A closed ring (first vertex repeated) reads the same.
+		if a, b := ringSignedArea(ccw), ringSignedArea(append(ccw[:3:3], ccw[0])); a != b {
+			t.Fatalf("closed ring area %g differs from open %g", b, a)
+		}
+	}
+
+	// The same matrix as TestBoolean_WindingIndependent's first case,
+	// on a 1 cm square at UTM coordinates: every winding combination
+	// of two identical squares clips to the whole square.
+	const x0, y0, side = 500374.5, 4500397.25, 0.015625 // exact in binary
+	// Measured with ringSignedArea: at this size and distance the
+	// package's planar area (a raw shoelace sum) reads 0.
+	area := func(g Geometry) float64 {
+		var total float64
+		for _, p := range appendPolygons(nil, g) {
+			for i, ring := range p.Rings {
+				if a := math.Abs(ringSignedArea(ring)); i == 0 {
+					total += a
+				} else {
+					total -= a
+				}
+			}
+		}
+		return total
+	}
+	for combo := range 4 {
+		a := MultiPolygon{Polygons: []Polygon{{Rings: [][]Point{windSquare(x0, y0, x0+side, y0+side, combo&1 != 0)}}}}
+		b := MultiPolygon{Polygons: []Polygon{{Rings: [][]Point{windSquare(x0, y0, x0+side, y0+side, combo&2 != 0)}}}}
+		got, err := Clip(a, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a := area(got); math.Abs(a-side*side) > 1e-12 {
+			t.Errorf("winding combination %d: clip area = %g, want %g", combo, a, side*side)
+		}
+		got, err = Dissolve([]Geometry{a, b})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a := area(got); math.Abs(a-side*side) > 1e-12 {
+			t.Errorf("winding combination %d: dissolve area = %g, want %g", combo, a, side*side)
+		}
+	}
+}
+
+// Area and centroid keep their accuracy for a small polygon far from
+// the origin, and every implementation gives the same bits. Summed
+// over raw coordinates, a 1.5 cm square at UTM-sized coordinates had
+// area 0, so its centroid fell back to the mean of its vertices.
+func TestAreaAndCentroid_SmallPolygonFarFromOrigin(t *testing.T) {
+	const x0, y0, u = 500374.5, 4500397.25, 0.015625 // exact in binary
+	// A trapezoid: (0,0) (4,0) (3,1) (0,1) in units of u. Its centroid
+	// is not the mean of its vertices, which is what a zero area gives.
+	ring := []Point{
+		pt(x0, y0), pt(x0+4*u, y0), pt(x0+3*u, y0+u), pt(x0, y0+u), pt(x0, y0),
+	}
+	wantArea := 3.5 * u * u
+	wantX, wantY := x0+u*(3*1.5+0.5*10/3)/3.5, y0+u*(3*0.5+0.5/3)/3.5
+
+	for name, r := range map[string][]Point{"closed": ring, "unclosed": ring[:4]} {
+		poly := Polygon{Rings: [][]Point{r}, CRSValue: PseudoMercator}
+		wkb := WKB(poly)
+
+		if a := PlanarRingArea(r); math.Abs(a-wantArea) > 1e-15 {
+			t.Errorf("%s: PlanarRingArea = %g, want %g", name, a, wantArea)
+		}
+		a, err := poly.Area(UnitMeters)
+		if err != nil || math.Abs(a-wantArea) > 1e-15 {
+			t.Errorf("%s: Polygon.Area = %g (%v), want %g", name, a, err, wantArea)
+		}
+		fromWKB, err := PlanarAreaFromWKB(wkb)
+		if err != nil || fromWKB != PlanarRingArea(r) {
+			t.Errorf("%s: PlanarAreaFromWKB = %g (%v), PlanarRingArea = %g: want the same bits", name, fromWKB, err, PlanarRingArea(r))
+		}
+
+		c := poly.Centroid()
+		if math.Abs(c.X-wantX) > 1e-9 || math.Abs(c.Y-wantY) > 1e-9 {
+			t.Errorf("%s: Centroid = (%.12f, %.12f), want (%.12f, %.12f)", name, c.X, c.Y, wantX, wantY)
+		}
+		scanned, err := CentroidFromWKB(wkb)
+		if err != nil || scanned.X != c.X || scanned.Y != c.Y {
+			t.Errorf("%s: CentroidFromWKB = (%v, %v) (%v), Polygon.Centroid = (%v, %v): want the same bits", name, scanned.X, scanned.Y, err, c.X, c.Y)
+		}
+	}
+
+	// The same shape near the origin, for comparison: moving a
+	// polygon must not change its area.
+	near := []Point{pt(0, 0), pt(4*u, 0), pt(3*u, u), pt(0, u), pt(0, 0)}
+	if a, b := PlanarRingArea(near), PlanarRingArea(ring); a != b {
+		t.Errorf("area near the origin %g, far from it %g: want equal", a, b)
 	}
 }

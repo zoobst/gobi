@@ -145,6 +145,10 @@ func WithinSqDistF64(lats, lons []float64, refLat, refLon, cosRefLat, sqThreshol
 	for i := range lats {
 		dLat := lats[i] - refLat
 		dLon := (lons[i] - refLon) * cosRefLat
-		out[i] = dLat*dLat+dLon*dLon <= sqThreshold
+		// Each product is rounded on its own (the conversions) so the
+		// compiler can't fuse one into the add, which it does on arm64
+		// and not on amd64 or wasm: a point right at the threshold is
+		// then in or out on every platform alike.
+		out[i] = float64(dLat*dLat)+float64(dLon*dLon) <= sqThreshold
 	}
 }

@@ -52,14 +52,14 @@ func (m MultiLineString) Centroid() Point {
 		for i := 0; i < len(l.Points)-1; i++ {
 			dx := l.Points[i+1].X - l.Points[i].X
 			dy := l.Points[i+1].Y - l.Points[i].Y
-			segLen += math.Sqrt(dx*dx + dy*dy)
+			segLen += math.Sqrt(float64(dx*dx) + float64(dy*dy))
 		}
 		if segLen == 0 {
 			continue
 		}
 		c := l.Centroid()
-		cx += c.X * segLen
-		cy += c.Y * segLen
+		cx += float64(c.X * segLen)
+		cy += float64(c.Y * segLen)
 		total += segLen
 	}
 	if total == 0 {

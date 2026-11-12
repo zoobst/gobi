@@ -3,6 +3,7 @@ package gobi
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -541,52 +542,8 @@ func tryScalarFastPath(op binOpKind, left Series, rhs float64) (Series, bool, er
 
 // applyBinaryOp performs left OP right on full-length Series.
 func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
-	// String Eq/Ne: Series.Eq is numeric-only, so route string operand
-	// pairs through a dedicated comparator here.
-	if op == bopEq || op == bopNe {
-		if left.DataType() != nil && left.DataType().ID() == arrow.STRING &&
-			right.DataType() != nil && right.DataType().ID() == arrow.STRING {
-			return stringCompare(left, right, op == bopNe)
-		}
-	}
-	// Timestamp col-vs-col comparisons: Series.Cmp requires isNumeric
-	// (false for Timestamp), so route here via cmpTsTs. Columns in
-	// different units are compared in the finer one.
 	if op.isComparison() {
-		if lt, lok := left.DataType().(*arrow.TimestampType); lok {
-			if rt, rok := right.DataType().(*arrow.TimestampType); rok {
-				if left.Len() != right.Len() {
-					return Series{}, fmt.Errorf("%w: %d vs %d",
-						ErrColumnLenMismatch, left.Len(), right.Len())
-				}
-				aVals, aArr, aOk := left.singleTS()
-				bVals, bArr, bOk := right.singleTS()
-				if aOk && bOk {
-					lm, rm := int64(lt.Unit.Multiplier()), int64(rt.Unit.Multiplier())
-					switch {
-					case lm > rm:
-						return cmpTSMixed(aVals, bVals, aArr, bArr, lm/rm, binOpToCmpOp(op), left.name), nil
-					case rm > lm:
-						return cmpTSMixed(bVals, aVals, bArr, aArr, rm/lm, swapCmpOp(binOpToCmpOp(op)), left.name), nil
-					}
-					return cmpTSTS(aVals, bVals, aArr, bArr, binOpToCmpOp(op), left.name), nil
-				}
-				// Multi-chunk Timestamp compare — fall through to
-				// error path below since Series.Eq etc. also reject.
-				return Series{}, fmt.Errorf(
-					"%w: multi-chunk Timestamp comparison not supported directly; "+
-						"call Frame.CompactChunks() first",
-					ErrExprTypeMismatch)
-			}
-		}
-	}
-	// Boolean comparisons: Series.Eq and friends are numeric-only, but
-	// binOpNode.Type accepts Boolean against Boolean, so the pair is
-	// compared here. false orders before true, as in SortBy.
-	if op.isComparison() &&
-		left.DataType() != nil && left.DataType().ID() == arrow.BOOL &&
-		right.DataType() != nil && right.DataType().ID() == arrow.BOOL {
-		return boolBinary(left, right, boolComparison(op))
+		return compareSeries(op, left, right)
 	}
 	switch op {
 	case bopAdd:
@@ -599,6 +556,38 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 		return left.Div(right)
 	case bopBitAnd, bopBitOr, bopBitXor:
 		return bitwiseColCol(left, right, op)
+	case bopAnd:
+		return boolBinary(left, right, func(a, b bool) bool { return a && b })
+	case bopOr:
+		return boolBinary(left, right, func(a, b bool) bool { return a || b })
+	}
+	return Series{}, fmt.Errorf("%w: unhandled op %s", ErrExprTypeMismatch, op)
+}
+
+// compareSeries evaluates a comparison on full-length Series. It is
+// the one place that picks a kernel by operand type, and it handles
+// every pair promoteForComparison accepts (so anything that passes
+// the type check can be evaluated): String, Boolean and Timestamp
+// pairs here, numeric pairs through Series.Eq and friends, which are
+// numeric-only. TestExpr_ComparisonsTypeCheckAndEvaluate holds the
+// two to each other.
+func compareSeries(op binOpKind, left, right Series) (Series, error) {
+	lt, rt := left.DataType(), right.DataType()
+	if lt != nil && rt != nil {
+		switch {
+		case lt.ID() == arrow.STRING && rt.ID() == arrow.STRING:
+			return stringCompare(left, right, op)
+		case lt.ID() == arrow.BOOL && rt.ID() == arrow.BOOL:
+			// false orders before true, as in SortBy.
+			return boolBinary(left, right, boolComparison(op))
+		}
+		if lts, ok := lt.(*arrow.TimestampType); ok {
+			if rts, ok := rt.(*arrow.TimestampType); ok {
+				return timestampCompare(op, left, right, lts, rts)
+			}
+		}
+	}
+	switch op {
 	case bopEq:
 		return left.Eq(right)
 	case bopNe:
@@ -611,12 +600,54 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 		return left.Gt(right)
 	case bopGe:
 		return left.Ge(right)
-	case bopAnd:
-		return boolBinary(left, right, func(a, b bool) bool { return a && b })
-	case bopOr:
-		return boolBinary(left, right, func(a, b bool) bool { return a || b })
 	}
-	return Series{}, fmt.Errorf("%w: unhandled op %s", ErrExprTypeMismatch, op)
+	return Series{}, fmt.Errorf("%w: %s is not a comparison", ErrExprTypeMismatch, op)
+}
+
+// timestampCompare compares two Timestamp columns on their raw int64
+// values. Columns in different units are compared in the finer one.
+func timestampCompare(op binOpKind, left, right Series, lt, rt *arrow.TimestampType) (Series, error) {
+	if left.Len() != right.Len() {
+		return Series{}, fmt.Errorf("%w: %d vs %d",
+			ErrColumnLenMismatch, left.Len(), right.Len())
+	}
+	aVals, aArr, aOk := left.singleTS()
+	bVals, bArr, bOk := right.singleTS()
+	if aOk && bOk {
+		lm, rm := int64(lt.Unit.Multiplier()), int64(rt.Unit.Multiplier())
+		switch {
+		case lm > rm:
+			return cmpTSMixed(aVals, bVals, aArr, bArr, lm/rm, binOpToCmpOp(op), left.name), nil
+		case rm > lm:
+			return cmpTSMixed(bVals, aVals, bArr, aArr, rm/lm, swapCmpOp(binOpToCmpOp(op)), left.name), nil
+		}
+		return cmpTSTS(aVals, bVals, aArr, bArr, binOpToCmpOp(op), left.name), nil
+	}
+	// A Timestamp column in several chunks isn't compared directly.
+	return Series{}, fmt.Errorf(
+		"%w: multi-chunk Timestamp comparison not supported directly; "+
+			"call Frame.CompactChunks() first",
+		ErrExprTypeMismatch)
+}
+
+// orderingHolds reports whether a three-way comparison result c
+// (negative, zero or positive) satisfies comparison op.
+func orderingHolds(op binOpKind, c int) bool {
+	switch op {
+	case bopEq:
+		return c == 0
+	case bopNe:
+		return c != 0
+	case bopLt:
+		return c < 0
+	case bopLe:
+		return c <= 0
+	case bopGt:
+		return c > 0
+	case bopGe:
+		return c >= 0
+	}
+	return false
 }
 
 // typedArray returns every row of s as one array of type A (see
@@ -655,10 +686,11 @@ func boolComparison(op binOpKind) func(a, b bool) bool {
 	return func(a, b bool) bool { return a == b }
 }
 
-// stringCompare returns a Boolean Series of left ==/!= right, element-
-// wise. Both inputs must be String columns of the same length; the
-// caller is expected to have already verified the type.
-func stringCompare(left, right Series, negate bool) (Series, error) {
+// stringCompare returns a Boolean Series of left op right, element-
+// wise, for any of the six comparisons. Strings order by byte value,
+// as in SortBy. Both inputs must be String columns of the same
+// length; the caller is expected to have already verified the type.
+func stringCompare(left, right Series, op binOpKind) (Series, error) {
 	if left.Len() != right.Len() {
 		return Series{}, fmt.Errorf("%w: %d vs %d",
 			ErrColumnLenMismatch, left.Len(), right.Len())
@@ -683,11 +715,7 @@ func stringCompare(left, right Series, negate bool) (Series, error) {
 			out.AppendNull()
 			continue
 		}
-		eq := la.Value(i) == ra.Value(i)
-		if negate {
-			eq = !eq
-		}
-		out.Append(eq)
+		out.Append(orderingHolds(op, strings.Compare(la.Value(i), ra.Value(i))))
 	}
 	return arrayToSeries(pool, "", arrow.FixedWidthTypes.Boolean, out.NewArray())
 }

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+
+	"github.com/zoobst/gobi/internal/detmath"
 )
 
 // ErrGeodesicRequiresGeographic is returned by SampleGeodesic /
@@ -44,7 +46,7 @@ func SampleGeodesic(a, b Point, n int) ([]Point, error) {
 	bx, by, bz := latLonToUnitVec(b.Y, b.X)
 	// Dot product = cos(Ω) where Ω is the angle between the two
 	// unit vectors. Clamp to [-1, 1] against float noise.
-	dot := ax*bx + ay*by + az*bz
+	dot := float64(ax*bx) + float64(ay*by) + float64(az*bz)
 	switch {
 	case dot > 1:
 		dot = 1
@@ -67,17 +69,17 @@ func SampleGeodesic(a, b Point, n int) ([]Point, error) {
 		}
 		return out, nil
 	}
-	omega := math.Acos(dot)
-	sinOmega := math.Sin(omega)
+	omega := detmath.Acos(dot)
+	sinOmega := detmath.Sin(omega)
 	out := make([]Point, n)
 	for i := range n {
 		t := float64(i) / float64(n-1)
 		// Slerp weights.
-		wa := math.Sin((1-t)*omega) / sinOmega
-		wb := math.Sin(t*omega) / sinOmega
-		x := wa*ax + wb*bx
-		y := wa*ay + wb*by
-		z := wa*az + wb*bz
+		wa := detmath.Sin((1-t)*omega) / sinOmega
+		wb := detmath.Sin(t*omega) / sinOmega
+		x := float64(wa*ax) + float64(wb*bx)
+		y := float64(wa*ay) + float64(wb*by)
+		z := float64(wa*az) + float64(wb*bz)
 		lat, lon := unitVecToLatLon(x, y, z)
 		out[i] = Point{X: lon, Y: lat, CRSValue: crs}
 	}
@@ -163,8 +165,8 @@ func requireGeographic(p1, p2 Point) error {
 func latLonToUnitVec(latDeg, lonDeg float64) (x, y, z float64) {
 	lat := degToRad(latDeg)
 	lon := degToRad(lonDeg)
-	cLat := math.Cos(lat)
-	return cLat * math.Cos(lon), cLat * math.Sin(lon), math.Sin(lat)
+	cLat := detmath.Cos(lat)
+	return cLat * detmath.Cos(lon), cLat * detmath.Sin(lon), detmath.Sin(lat)
 }
 
 // unitVecToLatLon inverts latLonToUnitVec. Returned lat in [-90, 90],
@@ -177,7 +179,7 @@ func unitVecToLatLon(x, y, z float64) (latDeg, lonDeg float64) {
 	case z < -1:
 		z = -1
 	}
-	lat := math.Asin(z)
-	lon := math.Atan2(y, x)
+	lat := detmath.Asin(z)
+	lon := detmath.Atan2(y, x)
 	return lat * 180 / math.Pi, lon * 180 / math.Pi
 }

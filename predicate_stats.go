@@ -276,7 +276,7 @@ func litIsBboxRectangle(g geometry.Geometry) bool {
 	if b.Empty() {
 		return false
 	}
-	bboxArea := (b.MaxX - b.MinX) * (b.MaxY - b.MinY)
+	bboxArea := float64((b.MaxX - b.MinX) * (b.MaxY - b.MinY))
 	if bboxArea <= 0 {
 		return false
 	}

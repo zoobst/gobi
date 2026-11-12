@@ -137,7 +137,7 @@ func (p Point) Distance3D(o Point, u Unit) (float64, error) {
 		dx := o.X - p.X
 		dy := o.Y - p.Y
 		dz := o.Z - p.Z
-		return convertMeters(math.Sqrt(dx*dx+dy*dy+dz*dz), u)
+		return convertMeters(math.Sqrt(float64(dx*dx)+float64(dy*dy)+float64(dz*dz)), u)
 	}
 	// Geographic path — ECEF Euclidean via WGS84.
 	//

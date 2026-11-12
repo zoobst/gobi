@@ -264,17 +264,27 @@ func openRing(ring []Point) []Point {
 	return ring
 }
 
-// ringSignedArea returns the signed shoelace area of an open ring.
+// ringSignedArea returns the signed area of a ring, open or closed.
 // Positive = CCW, negative = CW.
+//
+// Callers use the sign to tell which way a ring is wound, so it has
+// to be right for small rings far from the origin. The textbook
+// shoelace sum over raw coordinates is not: at UTM scale each
+// x[i]*y[j] term is around 1e12, the terms cancel to the area, and
+// the rounding left over (about 1e-4 per vertex) is larger than a
+// sliver of a few cm², whose winding then came out wrong about one
+// time in three. The sum here is taken relative to the first vertex,
+// as a fan of triangles, so its error scales with the ring's own
+// size and not with where it sits.
 func ringSignedArea(ring []Point) float64 {
-	if len(ring) < 3 {
+	n := len(ring)
+	if n < 3 {
 		return 0
 	}
+	ox, oy := ring[0].X, ring[0].Y
 	var a float64
-	n := len(ring)
-	for i := range n {
-		j := (i + 1) % n
-		a += ring[i].X*ring[j].Y - ring[j].X*ring[i].Y
+	for i := 1; i+1 < n; i++ {
+		a += diffOfProducts(ring[i].X-ox, ring[i+1].Y-oy, ring[i+1].X-ox, ring[i].Y-oy)
 	}
 	return a / 2
 }
@@ -309,5 +319,5 @@ func lineIntersect(a, b, c, d Point) Point {
 		return Point{X: (c.X + d.X) / 2, Y: (c.Y + d.Y) / 2}
 	}
 	t := diffOfProducts(c.X-a.X, dy2, c.Y-a.Y, dx2) / denom
-	return Point{X: a.X + t*dx1, Y: a.Y + t*dy1}
+	return Point{X: a.X + float64(t*dx1), Y: a.Y + float64(t*dy1)}
 }

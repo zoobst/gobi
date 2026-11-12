@@ -49,8 +49,8 @@ func (m MultiPolygon) Centroid() Point {
 			continue
 		}
 		c := p.Centroid()
-		cx += c.X * a
-		cy += c.Y * a
+		cx += float64(c.X * a)
+		cy += float64(c.Y * a)
 		totalArea += a
 	}
 	if totalArea == 0 {

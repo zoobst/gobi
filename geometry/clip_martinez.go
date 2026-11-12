@@ -335,8 +335,8 @@ func segmentSegmentIntersect(a1, a2, b1, b2 Point, tol float64) (p, q Point, kin
 		if lo > hi+tol {
 			return Point{}, Point{}, intersectNone
 		}
-		p = Point{X: a1.X + lo*dx1, Y: a1.Y + lo*dy1}
-		q = Point{X: a1.X + hi*dx1, Y: a1.Y + hi*dy1}
+		p = Point{X: a1.X + float64(lo*dx1), Y: a1.Y + float64(lo*dy1)}
+		q = Point{X: a1.X + float64(hi*dx1), Y: a1.Y + float64(hi*dy1)}
 		if lo >= hi-tol {
 			// Touching at a single collinear point — treat as intersectPoint.
 			return p, Point{}, intersectPoint
@@ -349,7 +349,7 @@ func segmentSegmentIntersect(a1, a2, b1, b2 Point, tol float64) (p, q Point, kin
 	if t < -tol || t > 1+tol || u < -tol || u > 1+tol {
 		return Point{}, Point{}, intersectNone
 	}
-	p = Point{X: a1.X + t*dx1, Y: a1.Y + t*dy1}
+	p = Point{X: a1.X + float64(t*dx1), Y: a1.Y + float64(t*dy1)}
 	return p, Point{}, intersectPoint
 }
 
@@ -922,7 +922,10 @@ func classifyHolesByContainment(rings []ringResult) {
 	}
 	areas := make([]float64, n)
 	for i := range rings {
-		areas[i] = planarRingArea(rings[i].points)
+		// Not planarRingArea: its raw shoelace sum loses small rings
+		// far from the origin (see ringSignedArea), and the nesting
+		// below depends on this order.
+		areas[i] = math.Abs(ringSignedArea(rings[i].points))
 	}
 	order := make([]int, n)
 	for i := range order {
@@ -1028,10 +1031,10 @@ func isCCW(pts []Point) bool {
 	}
 	var s float64
 	for i := range len(pts) - 1 {
-		s += (pts[i+1].X - pts[i].X) * (pts[i+1].Y + pts[i].Y)
+		s += float64((pts[i+1].X - pts[i].X) * (pts[i+1].Y + pts[i].Y))
 	}
 	// closing edge
-	s += (pts[0].X - pts[len(pts)-1].X) * (pts[0].Y + pts[len(pts)-1].Y)
+	s += float64((pts[0].X - pts[len(pts)-1].X) * (pts[0].Y + pts[len(pts)-1].Y))
 	// Shoelace with (x2-x1)*(y2+y1) is positive for CW; we want CCW.
 	return s < 0
 }

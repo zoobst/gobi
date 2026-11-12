@@ -3,6 +3,8 @@ package geometry
 import (
 	"fmt"
 	"math"
+
+	"github.com/zoobst/gobi/internal/detmath"
 )
 
 const (
@@ -190,13 +192,13 @@ func llToMercator(lon, lat float64) (float64, float64) {
 	λ := degToRad(lon)
 	φ := degToRad(lat)
 	x := wgs84SemiMajor * λ
-	y := wgs84SemiMajor * math.Log(math.Tan(math.Pi/4+φ/2))
+	y := wgs84SemiMajor * detmath.Log(detmath.Tan(math.Pi/4+float64(φ/2)))
 	return x, y
 }
 
 func mercatorToLL(x, y float64) (float64, float64) {
 	lon := (x / wgs84SemiMajor) * 180 / math.Pi
-	lat := (2*math.Atan(math.Exp(y/wgs84SemiMajor)) - math.Pi/2) * 180 / math.Pi
+	lat := (float64(2*detmath.Atan(detmath.Exp(y/wgs84SemiMajor))) - math.Pi/2) * 180 / math.Pi
 	return lon, lat
 }
 
@@ -277,23 +279,23 @@ func llToUTM(lon, lat float64, zone int, north bool) (float64, float64) {
 	λ := degToRad(lon)
 	φ := degToRad(lat)
 
-	sinφ := math.Sin(φ)
-	cosφ := math.Cos(φ)
+	sinφ := detmath.Sin(φ)
+	cosφ := detmath.Cos(φ)
 	tanφ := sinφ / cosφ
 
-	N := a / math.Sqrt(1-e2*sinφ*sinφ)
-	T := tanφ * tanφ
-	C := ep2 * cosφ * cosφ
-	A := cosφ * (λ - λ0)
+	N := a / math.Sqrt(1-float64(e2*sinφ*sinφ))
+	T := float64(tanφ * tanφ)
+	C := float64(ep2 * cosφ * cosφ)
+	A := float64(cosφ * (λ - λ0))
 
 	// Meridional arc M from equator to φ.
-	M := a * ((1-e2/4-3*e2*e2/64-5*e2*e2*e2/256)*φ -
-		(3*e2/8+3*e2*e2/32+45*e2*e2*e2/1024)*math.Sin(2*φ) +
-		(15*e2*e2/256+45*e2*e2*e2/1024)*math.Sin(4*φ) -
-		(35*e2*e2*e2/3072)*math.Sin(6*φ))
+	M := float64(a * (float64((1-float64(e2/4)-float64(3*e2*e2/64)-float64(5*e2*e2*e2/256))*φ) -
+		float64((float64(3*e2/8)+float64(3*e2*e2/32)+float64(45*e2*e2*e2/1024))*detmath.Sin(2*φ)) +
+		float64((float64(15*e2*e2/256)+float64(45*e2*e2*e2/1024))*detmath.Sin(4*φ)) -
+		float64((35*e2*e2*e2/3072)*detmath.Sin(6*φ))))
 
-	x := utmScaleFactor*N*(A+(1-T+C)*A*A*A/6+(5-18*T+T*T+72*C-58*ep2)*A*A*A*A*A/120) + utmFalseEasting
-	y := utmScaleFactor * (M + N*tanφ*(A*A/2+(5-T+9*C+4*C*C)*A*A*A*A/24+(61-58*T+T*T+600*C-330*ep2)*A*A*A*A*A*A/720))
+	x := float64(utmScaleFactor*N*(A+(1-T+C)*A*A*A/6+(5-float64(18*T)+float64(T*T)+float64(72*C)-float64(58*ep2))*A*A*A*A*A/120)) + utmFalseEasting
+	y := float64(utmScaleFactor * (M + float64(N*tanφ*(float64(A*A/2)+(5-T+float64(9*C)+float64(4*C*C))*A*A*A*A/24+(61-float64(58*T)+float64(T*T)+float64(600*C)-float64(330*ep2))*A*A*A*A*A*A/720))))
 
 	if !north {
 		y += utmFalseNorthingS
@@ -314,33 +316,33 @@ func utmToLL(x, y float64, zone int, north bool) (float64, float64) {
 	}
 
 	M := yShifted / utmScaleFactor
-	μ := M / (a * (1 - e2/4 - 3*e2*e2/64 - 5*e2*e2*e2/256))
+	μ := M / (a * (1 - float64(e2/4) - float64(3*e2*e2/64) - float64(5*e2*e2*e2/256)))
 
 	// Footprint latitude
 	φ1 := μ +
-		(3*e1/2-27*e1*e1*e1/32)*math.Sin(2*μ) +
-		(21*e1*e1/16-55*e1*e1*e1*e1/32)*math.Sin(4*μ) +
-		(151*e1*e1*e1/96)*math.Sin(6*μ) +
-		(1097*e1*e1*e1*e1/512)*math.Sin(8*μ)
+		float64((float64(3*e1/2)-float64(27*e1*e1*e1/32))*detmath.Sin(2*μ)) +
+		float64((float64(21*e1*e1/16)-float64(55*e1*e1*e1*e1/32))*detmath.Sin(4*μ)) +
+		float64((151*e1*e1*e1/96)*detmath.Sin(6*μ)) +
+		float64((1097*e1*e1*e1*e1/512)*detmath.Sin(8*μ))
 
-	sinφ1 := math.Sin(φ1)
-	cosφ1 := math.Cos(φ1)
+	sinφ1 := detmath.Sin(φ1)
+	cosφ1 := detmath.Cos(φ1)
 	tanφ1 := sinφ1 / cosφ1
 
-	C1 := ep2 * cosφ1 * cosφ1
-	T1 := tanφ1 * tanφ1
-	N1 := a / math.Sqrt(1-e2*sinφ1*sinφ1)
-	R1 := a * (1 - e2) / math.Pow(1-e2*sinφ1*sinφ1, 1.5)
+	C1 := float64(ep2 * cosφ1 * cosφ1)
+	T1 := float64(tanφ1 * tanφ1)
+	N1 := a / math.Sqrt(1-float64(e2*sinφ1*sinφ1))
+	R1 := a * (1 - e2) / detmath.Pow(1-float64(e2*sinφ1*sinφ1), 1.5)
 	D := xShifted / (N1 * utmScaleFactor)
 
-	φ := φ1 - (N1*tanφ1/R1)*(D*D/2-
-		(5+3*T1+10*C1-4*C1*C1-9*ep2)*D*D*D*D/24+
-		(61+90*T1+298*C1+45*T1*T1-252*ep2-3*C1*C1)*D*D*D*D*D*D/720)
+	φ := φ1 - float64((N1*tanφ1/R1)*(float64(D*D/2)-
+		(5+float64(3*T1)+float64(10*C1)-float64(4*C1*C1)-float64(9*ep2))*D*D*D*D/24+
+		(61+float64(90*T1)+float64(298*C1)+float64(45*T1*T1)-float64(252*ep2)-float64(3*C1*C1))*D*D*D*D*D*D/720))
 
 	λ0 := degToRad(float64((zone-1)*6 - 180 + 3))
 	λ := λ0 + (D-
-		(1+2*T1+C1)*D*D*D/6+
-		(5-2*C1+28*T1-3*C1*C1+8*ep2+24*T1*T1)*D*D*D*D*D/120)/cosφ1
+		(1+float64(2*T1)+C1)*D*D*D/6+
+		(5-float64(2*C1)+float64(28*T1)-float64(3*C1*C1)+float64(8*ep2)+float64(24*T1*T1))*D*D*D*D*D/120)/cosφ1
 
 	return λ * 180 / math.Pi, φ * 180 / math.Pi
 }

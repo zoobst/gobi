@@ -16,13 +16,23 @@ func polygonCentroidShoelaceScalar(xs, ys []float64, n int) (cx, cy float64, ok 
 		areaTwo float64
 		sx, sy  float64
 	)
+	// The sums are taken relative to the first vertex and the result
+	// moved back: over raw coordinates the terms are huge and cancel,
+	// and for a small ring far from the origin what is left is mostly
+	// rounding error. Each product is rounded on its own (the float64
+	// conversions), so the compiler can't fuse it into the add or
+	// subtract that follows, which it does on arm64 and not on amd64
+	// or wasm. geometry.Polygon.Centroid does the same arithmetic in
+	// the same order; the two agree to the bit on every platform.
 	px, py := fx, fy
 	for i := 1; i < n; i++ {
 		x, y := xs[i], ys[i]
-		cross := px*y - x*py
+		x0, y0 := px-fx, py-fy
+		x1, y1 := x-fx, y-fy
+		cross := float64(x0*y1) - float64(x1*y0)
 		areaTwo += cross
-		cx += (px + x) * cross
-		cy += (py + y) * cross
+		cx += float64((x0 + x1) * cross)
+		cy += float64((y0 + y1) * cross)
 		sx += px
 		sy += py
 		px, py = x, y
@@ -31,10 +41,15 @@ func polygonCentroidShoelaceScalar(xs, ys []float64, n int) (cx, cy float64, ok 
 	if px == fx && py == fy {
 		segCount = n - 1
 	} else {
-		cross := px*fy - fx*py
+		// The closing edge ends at the origin, so it adds nothing
+		// unless a coordinate is NaN or infinite, which must
+		// propagate.
+		x0, y0 := px-fx, py-fy
+		x1, y1 := fx-fx, fy-fy
+		cross := float64(x0*y1) - float64(x1*y0)
 		areaTwo += cross
-		cx += (px + fx) * cross
-		cy += (py + fy) * cross
+		cx += float64((x0 + x1) * cross)
+		cy += float64((y0 + y1) * cross)
 		sx += px
 		sy += py
 		segCount = n
@@ -42,7 +57,7 @@ func polygonCentroidShoelaceScalar(xs, ys []float64, n int) (cx, cy float64, ok 
 	if areaTwo == 0 {
 		return sx / float64(segCount), sy / float64(segCount), true
 	}
-	return cx / (3 * areaTwo), cy / (3 * areaTwo), true
+	return fx + cx/(3*areaTwo), fy + cy/(3*areaTwo), true
 }
 
 // pipCrossingCountScalar is the portable crossing-count loop.

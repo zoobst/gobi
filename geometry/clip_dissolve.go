@@ -80,11 +80,23 @@ func Dissolve(geoms []Geometry) (Geometry, error) {
 		}
 	}
 
-	// Group indices by union-find root.
-	groups := make(map[int][]int, len(geoms))
+	// Group indices by union-find root. Groups are kept in the order
+	// their first member appears in geoms, so the parts of the result
+	// come out in the same order on every run. (They used to be
+	// collected in a map and taken in its iteration order, which Go
+	// randomizes: the same call returned its polygons in a different
+	// order from one run to the next.)
+	groupOf := make(map[int]int, len(geoms))
+	var groupList [][]int
 	for i := range geoms {
 		r := uf.find(i)
-		groups[r] = append(groups[r], i)
+		g, ok := groupOf[r]
+		if !ok {
+			g = len(groupList)
+			groupOf[r] = g
+			groupList = append(groupList, nil)
+		}
+		groupList[g] = append(groupList[g], i)
 	}
 
 	// Slice 25: cluster-level parallelism. Each union-find cluster
@@ -97,10 +109,6 @@ func Dissolve(geoms []Geometry) (Geometry, error) {
 	type clusterResult struct {
 		merged Geometry
 		err    error
-	}
-	groupList := make([][]int, 0, len(groups))
-	for _, idxs := range groups {
-		groupList = append(groupList, idxs)
 	}
 	results := make([]clusterResult, len(groupList))
 	// Worker pool sized to GOMAXPROCS. Every cluster is topologically

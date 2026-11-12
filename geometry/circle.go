@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+
+	"github.com/zoobst/gobi/internal/detmath"
 )
 
 // Circle is a first-class circular shape defined by its center and
@@ -82,7 +84,7 @@ func FitCircle(points []Point, opts CircleFitOptions) (Circle, []float64, error)
 	for i, p := range points {
 		dx := p.X - c.Center.X
 		dy := p.Y - c.Center.Y
-		resid[i] = math.Sqrt(dx*dx+dy*dy) - c.Radius
+		resid[i] = math.Sqrt(float64(dx*dx)+float64(dy*dy)) - c.Radius
 	}
 	return c, resid, nil
 }
@@ -93,7 +95,7 @@ func FitCircle(points []Point, opts CircleFitOptions) (Circle, []float64, error)
 func (c Circle) Contains(p Point) bool {
 	dx := p.X - c.Center.X
 	dy := p.Y - c.Center.Y
-	return dx*dx+dy*dy <= c.Radius*c.Radius
+	return float64(dx*dx)+float64(dy*dy) <= c.Radius*c.Radius
 }
 
 // Distance returns the SIGNED distance from p to the circle's
@@ -103,7 +105,7 @@ func (c Circle) Contains(p Point) bool {
 func (c Circle) Distance(p Point) float64 {
 	dx := p.X - c.Center.X
 	dy := p.Y - c.Center.Y
-	return math.Sqrt(dx*dx+dy*dy) - c.Radius
+	return math.Sqrt(float64(dx*dx)+float64(dy*dy)) - c.Radius
 }
 
 // Area returns πr².
@@ -125,8 +127,8 @@ func (c Circle) Boundary(nVertices int) Polygon {
 	for i := range nVertices {
 		theta := 2 * math.Pi * float64(i) / float64(nVertices)
 		ring[i] = Point{
-			X:        c.Center.X + c.Radius*math.Cos(theta),
-			Y:        c.Center.Y + c.Radius*math.Sin(theta),
+			X:        c.Center.X + float64(c.Radius*detmath.Cos(theta)),
+			Y:        c.Center.Y + float64(c.Radius*detmath.Sin(theta)),
 			CRSValue: c.Center.CRSValue,
 		}
 	}
@@ -147,8 +149,8 @@ func (c Circle) BoundaryLine(nVertices int) LineString {
 	for i := range nVertices {
 		theta := 2 * math.Pi * float64(i) / float64(nVertices)
 		pts[i] = Point{
-			X:        c.Center.X + c.Radius*math.Cos(theta),
-			Y:        c.Center.Y + c.Radius*math.Sin(theta),
+			X:        c.Center.X + float64(c.Radius*detmath.Cos(theta)),
+			Y:        c.Center.Y + float64(c.Radius*detmath.Sin(theta)),
 			CRSValue: c.Center.CRSValue,
 		}
 	}
@@ -177,14 +179,14 @@ func fitCircleKasa(points []Point) (Circle, error) {
 	for _, p := range points {
 		u := p.X - mx
 		v := p.Y - my
-		z := u*u + v*v
-		sxx += u * u
-		sxy += u * v
+		z := float64(u*u) + float64(v*v)
+		sxx += float64(u * u)
+		sxy += float64(u * v)
 		sx += u
-		syy += v * v
+		syy += float64(v * v)
 		sy += v
-		sxz += u * z
-		syz += v * z
+		sxz += float64(u * z)
+		syz += float64(v * z)
 		sz += z
 	}
 	// Recentered coords have Σu = Σv = 0, but we keep sx / sy in the
@@ -193,20 +195,20 @@ func fitCircleKasa(points []Point) (Circle, error) {
 	//   [ sxx sxy sx ] [A]   [ -sxz ]
 	//   [ sxy syy sy ] [B] = [ -syz ]
 	//   [ sx  sy  n  ] [C]   [ -sz  ]
-	det := sxx*(syy*n-sy*sy) - sxy*(sxy*n-sy*sx) + sx*(sxy*sy-syy*sx)
+	det := float64(sxx*(float64(syy*n)-float64(sy*sy))) - float64(sxy*(float64(sxy*n)-float64(sy*sx))) + float64(sx*(float64(sxy*sy)-float64(syy*sx)))
 	if math.Abs(det) < 1e-30 {
 		return Circle{}, fmt.Errorf("%w: system is singular (collinear input?)", ErrCircleFit)
 	}
 	rhsA := -sxz
 	rhsB := -syz
 	rhsC := -sz
-	A := (rhsA*(syy*n-sy*sy) - sxy*(rhsB*n-sy*rhsC) + sx*(rhsB*sy-syy*rhsC)) / det
-	B := (sxx*(rhsB*n-sy*rhsC) - rhsA*(sxy*n-sy*sx) + sx*(sxy*rhsC-rhsB*sx)) / det
-	C := (sxx*(syy*rhsC-rhsB*sy) - sxy*(sxy*rhsC-rhsB*sx) + rhsA*(sxy*sy-syy*sx)) / det
+	A := (float64(rhsA*(float64(syy*n)-float64(sy*sy))) - float64(sxy*(float64(rhsB*n)-float64(sy*rhsC))) + float64(sx*(float64(rhsB*sy)-float64(syy*rhsC)))) / det
+	B := (float64(sxx*(float64(rhsB*n)-float64(sy*rhsC))) - float64(rhsA*(float64(sxy*n)-float64(sy*sx))) + float64(sx*(float64(sxy*rhsC)-float64(rhsB*sx)))) / det
+	C := (float64(sxx*(float64(syy*rhsC)-float64(rhsB*sy))) - float64(sxy*(float64(sxy*rhsC)-float64(rhsB*sx))) + float64(rhsA*(float64(sxy*sy)-float64(syy*sx)))) / det
 
-	uc := -A / 2
-	vc := -B / 2
-	r2 := uc*uc + vc*vc - C
+	uc := float64(-A / 2)
+	vc := float64(-B / 2)
+	r2 := float64(uc*uc) + float64(vc*vc) - C
 	if r2 <= 0 {
 		return Circle{}, fmt.Errorf("%w: fitted radius² is non-positive", ErrCircleFit)
 	}
@@ -243,13 +245,13 @@ func fitCircleTaubin(points []Point) (Circle, error) {
 	for _, p := range points {
 		u := p.X - mx
 		v := p.Y - my
-		z := u*u + v*v
-		Mxx += u * u
-		Mxy += u * v
-		Myy += v * v
-		Mxz += u * z
-		Myz += v * z
-		Mzz += z * z
+		z := float64(u*u) + float64(v*v)
+		Mxx += float64(u * u)
+		Mxy += float64(u * v)
+		Myy += float64(v * v)
+		Mxz += float64(u * z)
+		Myz += float64(v * z)
+		Mzz += float64(z * z)
 	}
 	Mxx /= nF
 	Mxy /= nF
@@ -262,11 +264,11 @@ func fitCircleTaubin(points []Point) (Circle, error) {
 	// We look for the smallest positive root x; the true circle
 	// corresponds to that root.
 	Mz := Mxx + Myy
-	CovXY := Mxx*Myy - Mxy*Mxy
-	A3 := 4 * Mz
-	A2 := -3*Mz*Mz - Mzz
-	A1 := Mzz*Mz + 4*CovXY*Mz - Mxz*Mxz - Myz*Myz - Mz*Mz*Mz
-	A0 := Mxz*Mxz*Myy + Myz*Myz*Mxx - Mzz*CovXY - 2*Mxz*Myz*Mxy + Mz*Mz*CovXY
+	CovXY := float64(Mxx*Myy) - float64(Mxy*Mxy)
+	A3 := float64(4 * Mz)
+	A2 := float64(-3*Mz*Mz) - Mzz
+	A1 := float64(Mzz*Mz) + float64(4*CovXY*Mz) - float64(Mxz*Mxz) - float64(Myz*Myz) - float64(Mz*Mz*Mz)
+	A0 := float64(Mxz*Mxz*Myy) + float64(Myz*Myz*Mxx) - float64(Mzz*CovXY) - float64(2*Mxz*Myz*Mxy) + float64(Mz*Mz*CovXY)
 	A22 := A2 + A2
 	A33 := A3 + A3 + A3
 
@@ -274,7 +276,7 @@ func fitCircleTaubin(points []Point) (Circle, error) {
 	x := 0.0
 	y := A0
 	for range 99 {
-		Dy := A1 + x*(A22+A33*x)
+		Dy := A1 + float64(x*(A22+float64(A33*x)))
 		if Dy == 0 {
 			break
 		}
@@ -282,7 +284,7 @@ func fitCircleTaubin(points []Point) (Circle, error) {
 		if xNew == x || math.IsNaN(xNew) {
 			break
 		}
-		yNew := A0 + xNew*(A1+xNew*(A2+xNew*A3))
+		yNew := A0 + float64(xNew*(A1+float64(xNew*(A2+float64(xNew*A3)))))
 		if math.Abs(yNew) >= math.Abs(y) {
 			break
 		}
@@ -291,13 +293,13 @@ func fitCircleTaubin(points []Point) (Circle, error) {
 	}
 
 	// Recover center and radius from the root.
-	DET := x*x - x*Mz + CovXY
+	DET := float64(x*x) - float64(x*Mz) + CovXY
 	if math.Abs(DET) < 1e-30 {
 		return Circle{}, fmt.Errorf("%w: Taubin system is singular (collinear input?)", ErrCircleFit)
 	}
-	uc := (Mxz*(Myy-x) - Myz*Mxy) / DET / 2
-	vc := (Myz*(Mxx-x) - Mxz*Mxy) / DET / 2
-	r2 := uc*uc + vc*vc + Mz
+	uc := float64((float64(Mxz*(Myy-x)) - float64(Myz*Mxy)) / DET / 2)
+	vc := float64((float64(Myz*(Mxx-x)) - float64(Mxz*Mxy)) / DET / 2)
+	r2 := float64(uc*uc) + float64(vc*vc) + Mz
 	if r2 <= 0 {
 		return Circle{}, fmt.Errorf("%w: Taubin radius² is non-positive", ErrCircleFit)
 	}
@@ -321,7 +323,7 @@ func fitCircleTaubin(points []Point) (Circle, error) {
 func CircleIntersectionPoints(c1, c2 Circle) []Point {
 	dx := c2.Center.X - c1.Center.X
 	dy := c2.Center.Y - c1.Center.Y
-	d := math.Hypot(dx, dy)
+	d := detmath.Hypot(dx, dy)
 	// Concentric — no well-defined intersection point set.
 	if d == 0 {
 		return nil
@@ -335,8 +337,8 @@ func CircleIntersectionPoints(c1, c2 Circle) []Point {
 		return nil
 	}
 	// Chord-midpoint distance from c1.Center along the c1→c2 direction.
-	a := (c1.Radius*c1.Radius - c2.Radius*c2.Radius + d*d) / (2 * d)
-	h2 := c1.Radius*c1.Radius - a*a
+	a := (float64(c1.Radius*c1.Radius) - float64(c2.Radius*c2.Radius) + float64(d*d)) / (2 * d)
+	h2 := float64(c1.Radius*c1.Radius) - float64(a*a)
 	if h2 < 0 {
 		// Numerical noise near tangent — clip to 0 so we return the
 		// single tangent point rather than nothing.
@@ -354,8 +356,8 @@ func CircleIntersectionPoints(c1, c2 Circle) []Point {
 	px := -dy / d
 	py := dx / d
 	return []Point{
-		{X: mx + h*px, Y: my + h*py, CRSValue: crs},
-		{X: mx - h*px, Y: my - h*py, CRSValue: crs},
+		{X: mx + float64(h*px), Y: my + float64(h*py), CRSValue: crs},
+		{X: mx - float64(h*px), Y: my - float64(h*py), CRSValue: crs},
 	}
 }
 
@@ -381,7 +383,7 @@ func LensPolygon(c1, c2 Circle, arcSegments int) Polygon {
 	}
 	dx := c2.Center.X - c1.Center.X
 	dy := c2.Center.Y - c1.Center.Y
-	d := math.Hypot(dx, dy)
+	d := detmath.Hypot(dx, dy)
 	crs := c1.Center.CRSValue
 
 	// Disjoint (including exact tangent — a zero-area lens is
@@ -440,9 +442,9 @@ func sampleArcThrough(center Point, radius float64, pStart, pEnd, throughPoint P
 	if nPoints < 2 {
 		nPoints = 2
 	}
-	aStart := math.Atan2(pStart.Y-center.Y, pStart.X-center.X)
-	aEnd := math.Atan2(pEnd.Y-center.Y, pEnd.X-center.X)
-	aThrough := math.Atan2(throughPoint.Y-center.Y, throughPoint.X-center.X)
+	aStart := detmath.Atan2(pStart.Y-center.Y, pStart.X-center.X)
+	aEnd := detmath.Atan2(pEnd.Y-center.Y, pEnd.X-center.X)
+	aThrough := detmath.Atan2(throughPoint.Y-center.Y, throughPoint.X-center.X)
 
 	ccwDelta := normalizeAngleTwoPi(aEnd - aStart)
 	throughDelta := normalizeAngleTwoPi(aThrough - aStart)
@@ -456,10 +458,10 @@ func sampleArcThrough(center Point, radius float64, pStart, pEnd, throughPoint P
 	out := make([]Point, nPoints)
 	for i := range nPoints {
 		t := float64(i) / float64(nPoints-1)
-		angle := aStart + t*totalDelta
+		angle := aStart + float64(t*totalDelta)
 		out[i] = Point{
-			X:        center.X + radius*math.Cos(angle),
-			Y:        center.Y + radius*math.Sin(angle),
+			X:        center.X + float64(radius*detmath.Cos(angle)),
+			Y:        center.Y + float64(radius*detmath.Sin(angle)),
 			CRSValue: center.CRSValue,
 		}
 	}

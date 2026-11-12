@@ -237,16 +237,21 @@ func PolygonCentroidShoelace(xs, ys []float64) (cx, cy float64, ok bool) {
 func polygonCentroidShoelaceSIMDBody(xs, ys []float64, n, lane int) (cx, cy float64, ok bool) {
 	zero := simd.BroadcastFloat64s(0)
 	areaAcc, cxAcc, cyAcc, sxAcc, syAcc := zero, zero, zero, zero, zero
+	// As in the scalar loop, the area sums are taken relative to the
+	// first vertex; only the segment-start sums use raw coordinates.
+	fx, fy := xs[0], ys[0]
+	fxv, fyv := simd.BroadcastFloat64s(fx), simd.BroadcastFloat64s(fy)
 
 	// Vectorized body: iterate segments in groups of `lane`.
 	// Segment index j starts at 0; each iter processes segments
 	// j..j+lane-1 (endpoints at indices j..j+lane).
 	var j int
 	for j = 0; j+lane+1 <= n; j += lane {
-		xLo := simd.LoadFloat64s(xs[j:])
-		yLo := simd.LoadFloat64s(ys[j:])
-		xHi := simd.LoadFloat64s(xs[j+1:])
-		yHi := simd.LoadFloat64s(ys[j+1:])
+		xRaw := simd.LoadFloat64s(xs[j:])
+		yRaw := simd.LoadFloat64s(ys[j:])
+		xLo, yLo := xRaw.Sub(fxv), yRaw.Sub(fyv)
+		xHi := simd.LoadFloat64s(xs[j+1:]).Sub(fxv)
+		yHi := simd.LoadFloat64s(ys[j+1:]).Sub(fyv)
 		// cross = xLo*yHi - xHi*yLo per lane
 		cross := xLo.Mul(yHi).Sub(xHi.Mul(yLo))
 		areaAcc = areaAcc.Add(cross)
@@ -255,8 +260,8 @@ func polygonCentroidShoelaceSIMDBody(xs, ys []float64, n, lane int) (cx, cy floa
 		cyAcc = cyAcc.Add(yLo.Add(yHi).Mul(cross))
 		// sx += xLo (segment-start accumulator, used only on the
 		// zero-area fallback path — matches the scalar shape).
-		sxAcc = sxAcc.Add(xLo)
-		syAcc = syAcc.Add(yLo)
+		sxAcc = sxAcc.Add(xRaw)
+		syAcc = syAcc.Add(yRaw)
 	}
 
 	// Horizontal reduce. Spill all five accumulators before reading
@@ -289,11 +294,12 @@ func polygonCentroidShoelaceSIMDBody(xs, ys []float64, n, lane int) (cx, cy floa
 	// Scalar tail: any segments the SIMD body didn't fit.
 	for ; j < n-1; j++ {
 		px, py := xs[j], ys[j]
-		x, y := xs[j+1], ys[j+1]
-		cross := px*y - x*py
+		x0, y0 := px-fx, py-fy
+		x1, y1 := xs[j+1]-fx, ys[j+1]-fy
+		cross := float64(x0*y1) - float64(x1*y0)
 		areaTwo += cross
-		cxSum += (px + x) * cross
-		cySum += (py + y) * cross
+		cxSum += float64((x0 + x1) * cross)
+		cySum += float64((y0 + y1) * cross)
 		sxSum += px
 		sySum += py
 	}
@@ -301,16 +307,17 @@ func polygonCentroidShoelaceSIMDBody(xs, ys []float64, n, lane int) (cx, cy floa
 	// Closing edge: (xs[n-1], ys[n-1]) → (xs[0], ys[0]). Add only
 	// when the ring wasn't already closed. Matches the scalar
 	// polygonCentroidShoelaceScalar semantics exactly.
-	fx, fy := xs[0], ys[0]
 	lx, ly := xs[n-1], ys[n-1]
 	var segCount int
 	if lx == fx && ly == fy {
 		segCount = n - 1
 	} else {
-		cross := lx*fy - fx*ly
+		x0, y0 := lx-fx, ly-fy
+		x1, y1 := fx-fx, fy-fy
+		cross := float64(x0*y1) - float64(x1*y0)
 		areaTwo += cross
-		cxSum += (lx + fx) * cross
-		cySum += (ly + fy) * cross
+		cxSum += float64((x0 + x1) * cross)
+		cySum += float64((y0 + y1) * cross)
 		sxSum += lx
 		sySum += ly
 		segCount = n
@@ -318,7 +325,7 @@ func polygonCentroidShoelaceSIMDBody(xs, ys []float64, n, lane int) (cx, cy floa
 	if areaTwo == 0 {
 		return sxSum / float64(segCount), sySum / float64(segCount), true
 	}
-	return cxSum / (3 * areaTwo), cySum / (3 * areaTwo), true
+	return fx + cxSum/(3*areaTwo), fy + cySum/(3*areaTwo), true
 }
 
 // runtimeLane returns the Float64s SIMD lane count on the current

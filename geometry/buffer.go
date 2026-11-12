@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"math"
 	"slices"
+
+	"github.com/zoobst/gobi/internal/detmath"
 )
 
 // DefaultBufferSegments is the number of straight segments used to
@@ -70,6 +72,8 @@ func (o BufferOptions) segments() int {
 //     is a MultiPolygon when the input was one or when shrinking splits
 //     a polygon into separate parts, and a Polygon with no rings when
 //     nothing is left.
+//   - A MultiPolygon shrinks as one region. Members that share an edge
+//     are merged first, so no gap opens along it.
 //   - A Point, LineString, MultiPoint or MultiLineString has no
 //     interior, so the result is a Polygon with no rings.
 //   - Corners that point into the polygon come out rounded, using
@@ -173,8 +177,8 @@ func (l LineString) bufferSquare(distance float64) Polygon {
 	startCapDir := unitVec(first, next)
 	// The start of the "right" side, pulled back along -startCapDir.
 	rStart := Point{
-		X:        right[0].X - distance*startCapDir.X,
-		Y:        right[0].Y - distance*startCapDir.Y,
+		X:        right[0].X - float64(distance*startCapDir.X),
+		Y:        right[0].Y - float64(distance*startCapDir.Y),
 		CRSValue: l.CRSValue,
 	}
 	// Extend the right-side last point FORWARD by distance along the
@@ -182,18 +186,18 @@ func (l LineString) bufferSquare(distance float64) Polygon {
 	last, prev := l.Points[len(l.Points)-1], l.Points[len(l.Points)-2]
 	endCapDir := unitVec(prev, last)
 	rEnd := Point{
-		X:        right[len(right)-1].X + distance*endCapDir.X,
-		Y:        right[len(right)-1].Y + distance*endCapDir.Y,
+		X:        right[len(right)-1].X + float64(distance*endCapDir.X),
+		Y:        right[len(right)-1].Y + float64(distance*endCapDir.Y),
 		CRSValue: l.CRSValue,
 	}
 	lStart := Point{
-		X:        left[0].X - distance*startCapDir.X,
-		Y:        left[0].Y - distance*startCapDir.Y,
+		X:        left[0].X - float64(distance*startCapDir.X),
+		Y:        left[0].Y - float64(distance*startCapDir.Y),
 		CRSValue: l.CRSValue,
 	}
 	lEnd := Point{
-		X:        left[len(left)-1].X + distance*endCapDir.X,
-		Y:        left[len(left)-1].Y + distance*endCapDir.Y,
+		X:        left[len(left)-1].X + float64(distance*endCapDir.X),
+		Y:        left[len(left)-1].Y + float64(distance*endCapDir.Y),
 		CRSValue: l.CRSValue,
 	}
 	ring = append(ring, rStart)
@@ -248,7 +252,7 @@ func (p Polygon) bufferSquare(distance float64) Polygon {
 // If a == b, returns zero vector.
 func unitVec(a, b Point) Point {
 	dx, dy := b.X-a.X, b.Y-a.Y
-	n := math.Sqrt(dx*dx + dy*dy)
+	n := math.Sqrt(float64(dx*dx) + float64(dy*dy))
 	if n == 0 {
 		return Point{}
 	}
@@ -263,29 +267,29 @@ func squareSideOffset(pts []Point, distance float64, side int) []Point {
 	out := make([]Point, 0, n)
 	// First point: perpendicular offset from the first segment.
 	nx0, ny0 := unitNormal(pts[0], pts[1], side)
-	out = append(out, Point{X: pts[0].X + distance*nx0, Y: pts[0].Y + distance*ny0, CRSValue: pts[0].CRSValue})
+	out = append(out, Point{X: pts[0].X + float64(distance*nx0), Y: pts[0].Y + float64(distance*ny0), CRSValue: pts[0].CRSValue})
 	// Internal vertices: mitre — intersect the two offset lines meeting
 	// at this vertex.
 	for i := 1; i < n-1; i++ {
 		nxIn, nyIn := unitNormal(pts[i-1], pts[i], side)
 		nxOut, nyOut := unitNormal(pts[i], pts[i+1], side)
 		// Offset-line points and directions.
-		p1 := Point{X: pts[i-1].X + distance*nxIn, Y: pts[i-1].Y + distance*nyIn}
+		p1 := Point{X: pts[i-1].X + float64(distance*nxIn), Y: pts[i-1].Y + float64(distance*nyIn)}
 		d1 := unitVec(pts[i-1], pts[i])
-		p2 := Point{X: pts[i+1].X + distance*nxOut, Y: pts[i+1].Y + distance*nyOut}
+		p2 := Point{X: pts[i+1].X + float64(distance*nxOut), Y: pts[i+1].Y + float64(distance*nyOut)}
 		d2 := unitVec(pts[i+1], pts[i]) // reversed so both lines "point into" the corner
 		d2.X, d2.Y = -d2.X, -d2.Y
 		x, y, ok := intersectLines(p1, d1, p2, d2)
 		if !ok {
 			// Parallel — fall back to perpendicular offset.
-			out = append(out, Point{X: pts[i].X + distance*nxIn, Y: pts[i].Y + distance*nyIn, CRSValue: pts[i].CRSValue})
+			out = append(out, Point{X: pts[i].X + float64(distance*nxIn), Y: pts[i].Y + float64(distance*nyIn), CRSValue: pts[i].CRSValue})
 			continue
 		}
 		out = append(out, Point{X: x, Y: y, CRSValue: pts[i].CRSValue})
 	}
 	// Last point: perpendicular offset from the last segment.
 	nxN, nyN := unitNormal(pts[n-2], pts[n-1], side)
-	out = append(out, Point{X: pts[n-1].X + distance*nxN, Y: pts[n-1].Y + distance*nyN, CRSValue: pts[n-1].CRSValue})
+	out = append(out, Point{X: pts[n-1].X + float64(distance*nxN), Y: pts[n-1].Y + float64(distance*nyN), CRSValue: pts[n-1].CRSValue})
 	return out
 }
 
@@ -304,14 +308,14 @@ func mitreOffsetClosedRing(ring []Point, distance float64, side int) []Point {
 		next := ring[(i+1)%n]
 		nxIn, nyIn := unitNormal(prev, cur, side)
 		nxOut, nyOut := unitNormal(cur, next, side)
-		p1 := Point{X: prev.X + distance*nxIn, Y: prev.Y + distance*nyIn}
+		p1 := Point{X: prev.X + float64(distance*nxIn), Y: prev.Y + float64(distance*nyIn)}
 		d1 := unitVec(prev, cur)
-		p2 := Point{X: next.X + distance*nxOut, Y: next.Y + distance*nyOut}
+		p2 := Point{X: next.X + float64(distance*nxOut), Y: next.Y + float64(distance*nyOut)}
 		d2 := unitVec(next, cur)
 		d2.X, d2.Y = -d2.X, -d2.Y
 		x, y, ok := intersectLines(p1, d1, p2, d2)
 		if !ok {
-			out = append(out, Point{X: cur.X + distance*nxIn, Y: cur.Y + distance*nyIn, CRSValue: cur.CRSValue})
+			out = append(out, Point{X: cur.X + float64(distance*nxIn), Y: cur.Y + float64(distance*nyIn), CRSValue: cur.CRSValue})
 			continue
 		}
 		out = append(out, Point{X: x, Y: y, CRSValue: cur.CRSValue})
@@ -323,12 +327,12 @@ func mitreOffsetClosedRing(ring []Point, distance float64, side int) []Point {
 // p1 (direction d1) and p2 (direction d2). ok is false if the lines are
 // parallel.
 func intersectLines(p1, d1, p2, d2 Point) (x, y float64, ok bool) {
-	det := d1.X*d2.Y - d1.Y*d2.X
+	det := float64(d1.X*d2.Y) - float64(d1.Y*d2.X)
 	if math.Abs(det) < 1e-15 {
 		return 0, 0, false
 	}
-	t := ((p2.X-p1.X)*d2.Y - (p2.Y-p1.Y)*d2.X) / det
-	return p1.X + t*d1.X, p1.Y + t*d1.Y, true
+	t := (float64((p2.X-p1.X)*d2.Y) - float64((p2.Y-p1.Y)*d2.X)) / det
+	return p1.X + float64(t*d1.X), p1.Y + float64(t*d1.Y), true
 }
 
 // Buffer returns a circular polygon of radius distance centered on p,
@@ -342,8 +346,8 @@ func (p Point) Buffer(distance float64, segments int) Polygon {
 	for i := range segments {
 		theta := 2 * math.Pi * float64(i) / float64(segments)
 		ring[i] = Point{
-			X:        p.X + distance*math.Cos(theta),
-			Y:        p.Y + distance*math.Sin(theta),
+			X:        p.X + float64(distance*detmath.Cos(theta)),
+			Y:        p.Y + float64(distance*detmath.Sin(theta)),
 			CRSValue: p.CRSValue,
 		}
 	}
@@ -380,7 +384,7 @@ func (l LineString) Buffer(distance float64, segments int) Polygon {
 	// End cap around the last vertex.
 	end := l.Points[len(l.Points)-1]
 	prev := l.Points[len(l.Points)-2]
-	endHeading := math.Atan2(end.Y-prev.Y, end.X-prev.X)
+	endHeading := detmath.Atan2(end.Y-prev.Y, end.X-prev.X)
 	ring = append(ring, arcAround(end, endHeading-math.Pi/2, endHeading+math.Pi/2, distance, arcSegs, l.CRSValue)...)
 
 	// Reversed left side.
@@ -391,7 +395,7 @@ func (l LineString) Buffer(distance float64, segments int) Polygon {
 	// Start cap around the first vertex.
 	start := l.Points[0]
 	next := l.Points[1]
-	startHeading := math.Atan2(next.Y-start.Y, next.X-start.X)
+	startHeading := detmath.Atan2(next.Y-start.Y, next.X-start.X)
 	// Cap goes from the "left" side around to the "right" side, i.e. from
 	// startHeading + pi/2 sweeping to startHeading + 3*pi/2.
 	ring = append(ring, arcAround(start, startHeading+math.Pi/2, startHeading+3*math.Pi/2, distance, arcSegs, l.CRSValue)...)
@@ -463,8 +467,8 @@ func offsetSideRing(pts []Point, distance float64, side, arcSegs int) []Point {
 	// First point: perpendicular offset from the first segment.
 	nx0, ny0 := unitNormal(pts[0], pts[1], side)
 	out = append(out, Point{
-		X:        pts[0].X + distance*nx0,
-		Y:        pts[0].Y + distance*ny0,
+		X:        pts[0].X + float64(distance*nx0),
+		Y:        pts[0].Y + float64(distance*ny0),
 		CRSValue: pts[0].CRSValue,
 	})
 
@@ -477,15 +481,15 @@ func offsetSideRing(pts []Point, distance float64, side, arcSegs int) []Point {
 
 		// Point just before the vertex, offset from the incoming segment.
 		out = append(out, Point{
-			X:        cur.X + distance*nxIn,
-			Y:        cur.Y + distance*nyIn,
+			X:        cur.X + float64(distance*nxIn),
+			Y:        cur.Y + float64(distance*nyIn),
 			CRSValue: cur.CRSValue,
 		})
 
 		// Decide join style based on whether we turn toward or away from
 		// this side. Cross product of (segment direction) x (offset dir)
 		// switches sign at a convex-vs-concave turn.
-		turnSign := (cur.X-prev.X)*(next.Y-cur.Y) - (cur.Y-prev.Y)*(next.X-cur.X)
+		turnSign := float64((cur.X-prev.X)*(next.Y-cur.Y)) - float64((cur.Y-prev.Y)*(next.X-cur.X))
 		// side=+1 (right) sees a convex turn when turning right (turnSign < 0).
 		// side=-1 (left)  sees a convex turn when turning left  (turnSign > 0).
 		// Convex on this offset side means the two offset lines diverge —
@@ -496,8 +500,8 @@ func offsetSideRing(pts []Point, distance float64, side, arcSegs int) []Point {
 		convex := (side > 0 && turnSign > 0) || (side < 0 && turnSign < 0)
 		if convex {
 			// Sweep a circular arc from incoming normal to outgoing normal.
-			startAng := math.Atan2(nyIn, nxIn)
-			endAng := math.Atan2(nyOut, nxOut)
+			startAng := detmath.Atan2(nyIn, nxIn)
+			endAng := detmath.Atan2(nyOut, nxOut)
 			out = append(out, arcSweep(cur, startAng, endAng, distance, side, arcSegs, cur.CRSValue)...)
 		}
 		// For concave joins we just emit the outgoing-normal offset as the
@@ -506,8 +510,8 @@ func offsetSideRing(pts []Point, distance float64, side, arcSegs int) []Point {
 		// limitation.
 
 		out = append(out, Point{
-			X:        cur.X + distance*nxOut,
-			Y:        cur.Y + distance*nyOut,
+			X:        cur.X + float64(distance*nxOut),
+			Y:        cur.Y + float64(distance*nyOut),
 			CRSValue: cur.CRSValue,
 		})
 	}
@@ -515,8 +519,8 @@ func offsetSideRing(pts []Point, distance float64, side, arcSegs int) []Point {
 	// Last point: offset from the final segment.
 	nxN, nyN := unitNormal(pts[len(pts)-2], pts[len(pts)-1], side)
 	out = append(out, Point{
-		X:        pts[len(pts)-1].X + distance*nxN,
-		Y:        pts[len(pts)-1].Y + distance*nyN,
+		X:        pts[len(pts)-1].X + float64(distance*nxN),
+		Y:        pts[len(pts)-1].Y + float64(distance*nyN),
 		CRSValue: pts[len(pts)-1].CRSValue,
 	})
 	return out
@@ -544,12 +548,12 @@ func offsetClosedRing(pts []Point, distance float64, side, arcSegs int) []Point 
 		nxOut, nyOut := unitNormal(cur, next, side)
 
 		out = append(out, Point{
-			X:        cur.X + distance*nxIn,
-			Y:        cur.Y + distance*nyIn,
+			X:        cur.X + float64(distance*nxIn),
+			Y:        cur.Y + float64(distance*nyIn),
 			CRSValue: cur.CRSValue,
 		})
 
-		turnSign := (cur.X-prev.X)*(next.Y-cur.Y) - (cur.Y-prev.Y)*(next.X-cur.X)
+		turnSign := float64((cur.X-prev.X)*(next.Y-cur.Y)) - float64((cur.Y-prev.Y)*(next.X-cur.X))
 		// Convex on this offset side means the two offset lines diverge —
 		// we need to fill the gap with a circular arc. For a segment
 		// walking in some direction:
@@ -557,13 +561,13 @@ func offsetClosedRing(pts []Point, distance float64, side, arcSegs int) []Point 
 		//   side=-1 (left side):  RIGHT turn (turnSign < 0) → outside → arc
 		convex := (side > 0 && turnSign > 0) || (side < 0 && turnSign < 0)
 		if convex {
-			startAng := math.Atan2(nyIn, nxIn)
-			endAng := math.Atan2(nyOut, nxOut)
+			startAng := detmath.Atan2(nyIn, nxIn)
+			endAng := detmath.Atan2(nyOut, nxOut)
 			out = append(out, arcSweep(cur, startAng, endAng, distance, side, arcSegs, cur.CRSValue)...)
 		}
 		out = append(out, Point{
-			X:        cur.X + distance*nxOut,
-			Y:        cur.Y + distance*nyOut,
+			X:        cur.X + float64(distance*nxOut),
+			Y:        cur.Y + float64(distance*nyOut),
 			CRSValue: cur.CRSValue,
 		})
 	}
@@ -577,7 +581,7 @@ func offsetClosedRing(pts []Point, distance float64, side, arcSegs int) []Point 
 func unitNormal(a, b Point, side int) (nx, ny float64) {
 	dx := b.X - a.X
 	dy := b.Y - a.Y
-	length := math.Sqrt(dx*dx + dy*dy)
+	length := math.Sqrt(float64(dx*dx) + float64(dy*dy))
 	if length == 0 {
 		return 0, 0
 	}
@@ -615,10 +619,10 @@ func arcSweep(center Point, startAng, endAng, radius float64, side, segments int
 	pts := make([]Point, 0, segments-1)
 	for i := 1; i < segments; i++ {
 		t := float64(i) / float64(segments)
-		ang := startAng + sweep*t
+		ang := startAng + float64(sweep*t)
 		pts = append(pts, Point{
-			X:        center.X + radius*math.Cos(ang),
-			Y:        center.Y + radius*math.Sin(ang),
+			X:        center.X + float64(radius*detmath.Cos(ang)),
+			Y:        center.Y + float64(radius*detmath.Sin(ang)),
 			CRSValue: crs,
 		})
 	}
@@ -636,10 +640,10 @@ func arcAround(center Point, startAng, endAng, radius float64, segments int, crs
 	pts := make([]Point, 0, segments+1)
 	for i := 0; i <= segments; i++ {
 		t := float64(i) / float64(segments)
-		ang := startAng + sweep*t
+		ang := startAng + float64(sweep*t)
 		pts = append(pts, Point{
-			X:        center.X + radius*math.Cos(ang),
-			Y:        center.Y + radius*math.Sin(ang),
+			X:        center.X + float64(radius*detmath.Cos(ang)),
+			Y:        center.Y + float64(radius*detmath.Sin(ang)),
 			CRSValue: crs,
 		})
 	}
@@ -648,11 +652,7 @@ func arcAround(center Point, startAng, endAng, radius float64, segments int, crs
 
 // ringIsCW reports whether the closed ring is clockwise (signed area < 0).
 func ringIsCW(ring []Point) bool {
-	var a float64
-	for i := range len(ring) - 1 {
-		a += ring[i].X*ring[i+1].Y - ring[i+1].X*ring[i].Y
-	}
-	return a < 0
+	return ringSignedArea(ring) < 0
 }
 
 // PointBufferEncoder writes round point buffers straight to WKB — the
@@ -677,8 +677,8 @@ func NewPointBufferEncoder(distance float64, opts BufferOptions) *PointBufferEnc
 	for i := range segments {
 		// Same expression as Point.Buffer, so vertices are bit-identical.
 		theta := 2 * math.Pi * float64(i) / float64(segments)
-		e.cos[i] = math.Cos(theta)
-		e.sin[i] = math.Sin(theta)
+		e.cos[i] = detmath.Cos(theta)
+		e.sin[i] = detmath.Sin(theta)
 	}
 	return e
 }
@@ -694,11 +694,11 @@ func (e *PointBufferEncoder) AppendWKB(buf []byte, x, y float64) []byte {
 	buf = appendUint32LE(buf, 1) // one ring
 	buf = appendUint32LE(buf, uint32(len(e.cos)+1))
 	for i := range e.cos {
-		buf = appendFloat64LE(buf, x+e.distance*e.cos[i])
-		buf = appendFloat64LE(buf, y+e.distance*e.sin[i])
+		buf = appendFloat64LE(buf, x+float64(e.distance*e.cos[i]))
+		buf = appendFloat64LE(buf, y+float64(e.distance*e.sin[i]))
 	}
 	// Closing vertex repeats the first, as Point.Buffer's ring does.
-	buf = appendFloat64LE(buf, x+e.distance*e.cos[0])
-	buf = appendFloat64LE(buf, y+e.distance*e.sin[0])
+	buf = appendFloat64LE(buf, x+float64(e.distance*e.cos[0]))
+	buf = appendFloat64LE(buf, y+float64(e.distance*e.sin[0]))
 	return buf
 }

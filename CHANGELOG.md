@@ -34,14 +34,43 @@ introduce breaking changes; check this file when upgrading.
     riscv64), which is off by a rounding error exactly where the
     answer should be zero, unless the edge is axis-aligned. They now
     round each product first, as amd64 and wasm always did.
+- **Ring winding is read correctly for small rings far from the
+  origin.** The boolean ops and buffers tell which way a ring is wound
+  from the sign of its area, which was summed over raw coordinates. At
+  UTM-sized coordinates that lost the sign of a sliver a few cm²
+  across about one time in three, so a shared edge could be classified
+  the wrong way round, or a buffer could go inward instead of outward.
+  The sum is now taken relative to the ring's first vertex.
+- **Area and centroid are right for small polygons far from the
+  origin.** They were summed over raw coordinates, like the winding
+  above: a 1.5 cm square at UTM coordinates had planar area 0, and its
+  centroid fell back to the mean of its vertices. Both are now summed
+  relative to the ring's first vertex. This covers `PlanarRingArea`,
+  `Polygon.Area` and `GeomArea` in a projected CRS,
+  `PlanarAreaFromWKB`, `Polygon.Centroid`, `CentroidFromWKB` and
+  `compute.PolygonCentroidShoelace`, which still agree with each other
+  to the bit.
+- **`shpio` reads the winding of small rings correctly.** A shapefile
+  tells shells from holes by winding, and the same raw sum could read
+  a small shell at UTM coordinates as a hole.
+- **`Dissolve` returns its parts in the same order every time,** the
+  order their first members come in. Separate clusters used to come
+  out in map-iteration order, so the same call could return its
+  polygons in a different order from one run to the next.
 - **`SymDifference` no longer keeps an edge the two inputs share from
   opposite sides.** Two squares side by side gave a malformed result
   with the wrong area; they now give the 2×1 rectangle.
-- **Comparing Boolean values in an expression works.**
-  `Col("active").Eq(Lit(true))` passed the type check and then failed
-  at evaluation with "series is not numeric". All six comparisons now
-  work between Boolean columns and literals, with `false < true`. A
-  null on either side gives null.
+- **Every comparison that passes the type check can be evaluated.**
+  Two kinds passed it and then failed at evaluation with "series is
+  not numeric":
+  - **Boolean values,** all six comparisons:
+    `Col("active").Eq(Lit(true))`. They now work between Boolean
+    columns and literals, with `false < true`.
+  - **String ordering,** `<`, `<=`, `>`, `>=`:
+    `Col("name").Lt(Lit("m"))`. Strings order by byte value, as in
+    `SortBy`. (`Eq` and `Ne` already worked.)
+
+  A null on either side gives null.
 - **`And`, `Or`, `Not` and string `Eq` / `Ne` read every chunk of
   their columns.** They read the first chunk only, so on a frame built
   from several batches the result was as long as that chunk, and a
@@ -76,6 +105,8 @@ introduce breaking changes; check this file when upgrading.
     outward buffers.
   - **The result is 2D,** as an outward buffer's already was: a 3D
     polygon's Z values are dropped.
+  - **A MultiPolygon shrinks as one region.** Members that share an
+    edge are merged first, so no gap opens along it.
   - **A distance of zero or NaN is still an error.**
 - **`geometry.Clip` and `Series.GeomClip` accept points and lines as
   the thing being clipped.** The mask must still be a Polygon or
@@ -97,6 +128,18 @@ introduce breaking changes; check this file when upgrading.
     `SymDifference` still need polygons on both sides, so
     `Boolean(line, polygon, OpIntersection, …)` is an error; call
     `Clip`.
+- **`geometry.ClipMask` prepares a mask for clipping many
+  geometries.** `NewClipMask(mask)` then `m.Clip(subject)` is
+  `Clip(subject, mask)` with the mask's part of the work done once.
+  `GeomClip` uses it.
+  - **Points** are tested only against the mask members whose bounds
+    they are in.
+  - **Lines** are compared with the mask edges near each segment, not
+    with every edge. The edge index is built once enough has been
+    clipped to pay for it, so one short line never builds it. A
+    10k-vertex line against a 100k-vertex polygon takes 51 ms;
+    scanning every edge takes about 1.3 s (measured on a tenth of the
+    line and scaled).
 - **`geometry.WKBTypePoint` … `geometry.WKBTypeGeometryCollection`**
   name the type codes `WKBTypeCode` returns.
 
@@ -111,6 +154,46 @@ introduce breaking changes; check this file when upgrading.
   whose bounds reached the mask, so the same call succeeded or failed
   depending on where the rows were, and succeeded on a series with
   none near it.
+- **`GeomDifference` rejects a point or line row wherever it is.** It
+  returned such a row unchanged when the row's bounds missed the mask
+  and failed when they didn't. `GeomUnion` and `GeomSymDifference`
+  already rejected it either way; `GeomClip` is the one that takes
+  points and lines.
+
+- **Geometry gives the same bits on arm64, amd64 and wasm.** A
+  buffer, clip, reprojection, area or distance computed in a browser
+  is now byte-for-byte what a server computes. Before, most results
+  differed in their last bit between platforms.
+  - **Why they differed:** Go may fuse `x*y + z` into one instruction
+    that rounds once instead of twice. It does on arm64 (also ppc64,
+    s390x, riscv64 and amd64 at `GOAMD64=v3`) and not on wasm or
+    default amd64. The standard `math` functions are written with
+    such expressions, so `math.Sin`, `Cos`, `Atan2`, `Hypot`, `Log`
+    and most others differ between platforms too, and `Exp` has
+    separate assembly on amd64 and arm64.
+  - **What changed in gobi's code:** every product that feeds an add
+    or subtract is rounded first (`float64(x*y) + z`), in `geometry`,
+    `compute`, `shpio` and the root package. That also covers the
+    variance aggregates, the haversine expression and the
+    within-distance comparison.
+  - **What changed for trigonometry:** `geometry` and the haversine
+    expression take `Sin`, `Cos`, `Tan`, `Atan`, `Atan2`, `Asin`,
+    `Acos`, `Hypot`, `Exp`, `Log` and `Pow` from a new
+    `internal/detmath`. It is the standard library's own code (BSD
+    licence, kept in `internal/detmath/LICENSE-go`) with the fusing
+    removed and no assembly. On wasm it returns exactly what `math`
+    does; elsewhere it differs from `math` in the last bit or two.
+  - **Results change slightly.** Outputs on arm64 move by a unit or
+    two in the last place from v0.5.5, and those that go through
+    `Exp` or `Pow` do on amd64 as well. Accuracy is the standard
+    library's.
+  - **Cost,** on an Apple M1: round buffers are 7–17% slower and
+    reprojection 9–16% (WGS 84 → UTM, 1,000 points: 40.5 → 47.0 µs).
+    Other operations were not benchmarked for this change.
+  - **Kept that way by tests:** `TestNoFusedMultiplyAdd` compiles each
+    package for arm64 and fails on any fused instruction, and
+    `TestSameResultsOnEveryPlatform` compares digests of real
+    operations against values all three platforms reproduce.
 
 ### Performance
 

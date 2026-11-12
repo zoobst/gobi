@@ -9,6 +9,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/zoobst/gobi/geometry"
+	"github.com/zoobst/gobi/internal/detmath"
 )
 
 // PointExpr bundles a Lat + Lon Expr pair for use with
@@ -193,10 +194,10 @@ func haversineKernel(fromLon, fromLat, toLon, toLat, scale float64) float64 {
 	phi2 := toLat * deg2rad
 	dphi := (toLat - fromLat) * deg2rad
 	dlam := (toLon - fromLon) * deg2rad
-	sinHP := math.Sin(dphi / 2)
-	sinHL := math.Sin(dlam / 2)
-	a := sinHP*sinHP + math.Cos(phi1)*math.Cos(phi2)*sinHL*sinHL
-	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	sinHP := detmath.Sin(dphi / 2)
+	sinHL := detmath.Sin(dlam / 2)
+	a := float64(sinHP*sinHP) + float64(detmath.Cos(phi1)*detmath.Cos(phi2)*sinHL*sinHL)
+	c := 2 * detmath.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 	return scale * c
 }
 

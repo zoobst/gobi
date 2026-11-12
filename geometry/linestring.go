@@ -74,14 +74,14 @@ func (l LineString) Centroid() Point {
 		a, b := l.Points[i], l.Points[i+1]
 		dx := b.X - a.X
 		dy := b.Y - a.Y
-		segLen := math.Sqrt(dx*dx + dy*dy)
+		segLen := math.Sqrt(float64(dx*dx) + float64(dy*dy))
 		if segLen == 0 {
 			continue
 		}
 		mx := (a.X + b.X) / 2
 		my := (a.Y + b.Y) / 2
-		cx += mx * segLen
-		cy += my * segLen
+		cx += float64(mx * segLen)
+		cy += float64(my * segLen)
 		total += segLen
 	}
 	if total == 0 {

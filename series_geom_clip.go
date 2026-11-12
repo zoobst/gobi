@@ -15,9 +15,11 @@ import (
 // in s that lies inside the mask. Null inputs pass through as null.
 // s must be in a projected CRS (or unset), and mask must be a Polygon
 // or MultiPolygon, which is taken to be in s's CRS. Both are checked
-// before any row is clipped, so the call fails or not on its inputs
-// and never on where the rows happen to sit; the same goes for
-// GeomUnion, GeomDifference and GeomSymDifference.
+// before any row is clipped, so the call fails or not on what it is
+// given and never on where the rows happen to sit. The same goes for
+// GeomUnion, GeomDifference and GeomSymDifference, which also need
+// every non-null row to be a Polygon or MultiPolygon: a point or line
+// row is an error for them, whether or not it is near the mask.
 //
 // Rows may be polygons, points or lines, mixed freely; see
 // geometry.Clip for what each gives. A row with nothing inside the
@@ -288,6 +290,12 @@ func aIsPolygon(wkb []byte) bool {
 	return err == nil && typ == 3
 }
 
+// isPolygonCode reports whether a WKB type code (as WKBTypeCode
+// returns it) is a Polygon or MultiPolygon.
+func isPolygonCode(typ uint32) bool {
+	return typ == geometry.WKBTypePolygon || typ == geometry.WKBTypeMultiPolygon
+}
+
 // geomBinaryOp is the shared driver for row-wise geometry × scalar-mask
 // boolean operations. Writes results as WKB into a new Binary column that
 // inherits s's CRS metadata. Follows the release pattern from
@@ -337,23 +345,33 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 		otherIsPoly     bool
 	)
 	fastPathEligible := !otherBounds.Empty()
-	// The empty result for a row that misses the mask entirely, by the
-	// row's WKB type code (see geometry.Clip). Codes without an entry
-	// take the general path, which reports unsupported types.
-	var emptyByType [geometry.WKBTypeGeometryCollection][]byte
+	// The empty result for a row that misses the mask entirely, by
+	// whether the row has Z and by its WKB type code: exactly what
+	// geometry.Clip returns for it, so such a row needn't be decoded.
+	// Codes without an entry take the general path, which reports
+	// unsupported types.
+	var emptyByType [2][geometry.WKBTypeGeometryCollection][]byte
+	// mask is other prepared once for every row (see geometry.ClipMask).
+	var mask *geometry.ClipMask
 	if op == geometry.OpIntersection {
+		var err error
+		if mask, err = geometry.NewClipMask(other); err != nil {
+			return Series{}, err
+		}
 		emptyPolygonWKB = geometry.WKB(geometry.Polygon{CRSValue: crs})
-		emptyPoints := geometry.WKB(geometry.MultiPoint{CRSValue: crs})
-		emptyByType[geometry.WKBTypePoint] = emptyPoints
-		emptyByType[geometry.WKBTypeMultiPoint] = emptyPoints
-		emptyByType[geometry.WKBTypeLineString] = geometry.WKB(geometry.LineString{CRSValue: crs})
-		emptyByType[geometry.WKBTypeMultiLineString] = geometry.WKB(geometry.MultiLineString{CRSValue: crs})
-		emptyByType[geometry.WKBTypePolygon] = emptyPolygonWKB
-		emptyByType[geometry.WKBTypeMultiPolygon] = emptyPolygonWKB
+		for z, hasZ := range []bool{false, true} {
+			e := &emptyByType[z]
+			points := geometry.WKB(geometry.MultiPoint{CRSValue: crs, HasZ: hasZ})
+			e[geometry.WKBTypePoint], e[geometry.WKBTypeMultiPoint] = points, points
+			e[geometry.WKBTypeLineString] = geometry.WKB(geometry.LineString{CRSValue: crs, HasZ: hasZ})
+			e[geometry.WKBTypeMultiLineString] = geometry.WKB(geometry.MultiLineString{CRSValue: crs, HasZ: hasZ})
+			// The polygon intersection is 2D whatever the input.
+			e[geometry.WKBTypePolygon], e[geometry.WKBTypeMultiPolygon] = emptyPolygonWKB, emptyPolygonWKB
+		}
 	}
 	if op == geometry.OpUnion || op == geometry.OpSymDifference {
 		otherWKB = geometry.WKB(other)
-		if typ, _, err := geometry.WKBTypeCode(otherWKB); err == nil && (typ == 3 || typ == 6) {
+		if typ, _, err := geometry.WKBTypeCode(otherWKB); err == nil && isPolygonCode(typ) {
 			otherIsPoly = true
 		} else {
 			// Non-polygon `other` — fast path can't build the
@@ -384,21 +402,29 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 				if !rowBounds.Empty() && !rowBounds.Intersects(otherBounds) {
 					switch op {
 					case geometry.OpIntersection:
-						// A point or line row with Z takes the general
-						// path, which keeps the Z flag on its empty result.
 						typ, hasZ, err := geometry.WKBTypeCode(wkb)
-						if err == nil && typ < uint32(len(emptyByType)) && emptyByType[typ] != nil &&
-							(!hasZ || typ == geometry.WKBTypePolygon || typ == geometry.WKBTypeMultiPolygon) {
-							b.Append(emptyByType[typ])
+						z := 0
+						if hasZ {
+							z = 1
+						}
+						if err == nil && typ < uint32(len(emptyByType[z])) && emptyByType[z][typ] != nil {
+							b.Append(emptyByType[z][typ])
 							continue
 						}
 					case geometry.OpDifference:
-						b.Append(wkb)
-						continue
+						// Only a polygon row is returned as it is. Any
+						// other row goes on to the general path, which
+						// rejects it, as it would have had the row
+						// reached the mask: whether a row is accepted
+						// must not depend on where it sits.
+						if typ, _, err := geometry.WKBTypeCode(wkb); err == nil && isPolygonCode(typ) {
+							b.Append(wkb)
+							continue
+						}
 					case geometry.OpUnion, geometry.OpSymDifference:
 						if otherIsPoly {
 							rowTyp, _, err := geometry.WKBTypeCode(wkb)
-							if err == nil && (rowTyp == 3 || rowTyp == 6) {
+							if err == nil && isPolygonCode(rowTyp) {
 								if combined, ok := combineDisjointMultiPolygonWKB(wkb, otherWKB); ok {
 									b.Append(combined)
 									continue
@@ -419,7 +445,7 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 			// that takes point and line rows.
 			var result geometry.Geometry
 			if op == geometry.OpIntersection {
-				result, err = geometry.Clip(g, other)
+				result, err = mask.Clip(g)
 			} else {
 				result, err = geometry.Boolean(g, other, op, geometry.ClipOptions{})
 			}

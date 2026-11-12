@@ -2606,7 +2606,10 @@ func (a *stdVarAcc) Update(col Series, rows []int) error {
 		a.n++
 		delta := v - a.mean
 		a.mean += delta / float64(a.n)
-		a.m2 += delta * (v - a.mean)
+		// The product is rounded on its own (the conversion) so the
+		// compiler can't fuse it into the add, which it does on arm64 and
+		// not on amd64 or wasm: the result is the same bits everywhere.
+		a.m2 += float64(delta * (v - a.mean))
 	}
 	return nil
 }

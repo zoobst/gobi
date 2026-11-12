@@ -375,3 +375,21 @@ func oracleToggle(xs, ys []float64, tx, ty float64) bool {
 	}
 	return inside
 }
+
+// TestPolygonCentroidShoelace_SmallRingFarFromOrigin — the centroid
+// of a small ring keeps its accuracy at UTM-sized coordinates. Summed
+// over raw coordinates the area cancelled to 0 and the kernel fell
+// back to the mean of the vertices.
+func TestPolygonCentroidShoelace_SmallRingFarFromOrigin(t *testing.T) {
+	const x0, y0, u = 500374.5, 4500397.25, 0.015625 // exact in binary
+	// A trapezoid: (0,0) (4,0) (3,1) (0,1) in units of u.
+	xs := []float64{x0, x0 + 4*u, x0 + 3*u, x0, x0}
+	ys := []float64{y0, y0, y0 + u, y0 + u, y0}
+	wantX, wantY := x0+u*(3*1.5+0.5*10/3)/3.5, y0+u*(3*0.5+0.5/3)/3.5
+	for name, n := range map[string]int{"closed": 5, "unclosed": 4} {
+		cx, cy, ok := PolygonCentroidShoelace(xs[:n], ys[:n])
+		if !ok || math.Abs(cx-wantX) > 1e-9 || math.Abs(cy-wantY) > 1e-9 {
+			t.Errorf("%s: centroid = (%.12f, %.12f) ok=%v, want (%.12f, %.12f)", name, cx, cy, ok, wantX, wantY)
+		}
+	}
+}

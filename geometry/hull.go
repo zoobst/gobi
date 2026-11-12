@@ -143,7 +143,7 @@ func ConvexHullFromXY(xs, ys []float64) (hullXs, hullYs []float64) {
 // clockwise. Reads coords directly from the slabs — no Point
 // struct materialization.
 func crossSign(xs, ys []float64, a, b, c int) float64 {
-	return (xs[b]-xs[a])*(ys[c]-ys[a]) - (ys[b]-ys[a])*(xs[c]-xs[a])
+	return float64((xs[b]-xs[a])*(ys[c]-ys[a])) - float64((ys[b]-ys[a])*(xs[c]-xs[a]))
 }
 
 // ConvexHull materializes the convex hull of v as a fresh

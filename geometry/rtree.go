@@ -305,7 +305,7 @@ func (t *RTree) nodeBboxDist(idx int32, x, y float64) float64 {
 	} else if y > t.nodeMaxY[idx] {
 		dy = y - t.nodeMaxY[idx]
 	}
-	return dx*dx + dy*dy
+	return float64(dx*dx) + float64(dy*dy)
 }
 
 // itemBboxDist is the leaf-level counterpart to nodeBboxDist.
@@ -321,7 +321,7 @@ func (t *RTree) itemBboxDist(id int32, x, y float64) float64 {
 	} else if y > t.itemMaxY[id] {
 		dy = y - t.itemMaxY[id]
 	}
-	return dx*dx + dy*dy
+	return float64(dx*dx) + float64(dy*dy)
 }
 
 // --- build ---

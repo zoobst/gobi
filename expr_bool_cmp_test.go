@@ -3,6 +3,7 @@ package gobi
 import (
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -184,5 +185,82 @@ func TestExpr_BoolAndStringOps_MultiChunk(t *testing.T) {
 		if out.Len() != 0 {
 			t.Errorf("no chunks, %s: len = %d, want 0", name, out.Len())
 		}
+	}
+}
+
+// Every operand pair the type check accepts for a comparison can be
+// evaluated, for all six comparisons. String ordering and all Boolean
+// comparisons used to pass the type check and then fail at
+// evaluation, because each type was routed to its kernel by its own
+// special case and some were missing.
+func TestExpr_ComparisonsTypeCheckAndEvaluate(t *testing.T) {
+	f, err := NewFrameFromSeries(
+		NewInt64Series("int", []int64{1, 2, 3}, nil),
+		NewFloat64Series("float", []float64{1.5, 2, 2.5}, nil),
+		NewStringSeries("str", []string{"b", "a", "b"}, []bool{true, true, false}),
+		NewStringSeries("str2", []string{"a", "a", "c"}, nil),
+		NewBoolSeries("bool", []bool{true, false, true}, nil),
+		NewBoolSeries("bool2", []bool{false, false, true}, nil),
+		NewTimestampSeries("ts", []time.Time{time.Unix(1, 0), time.Unix(2, 0), time.Unix(3, 0)}, nil),
+		NewTimestampSeries("ts2", []time.Time{time.Unix(2, 0), time.Unix(2, 0), time.Unix(2, 0)}, nil),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Release()
+	ops := map[string]func(a, b Expr) Expr{
+		"=": Expr.Eq, "!=": Expr.Ne, "<": Expr.Lt, "<=": Expr.Le, ">": Expr.Gt, ">=": Expr.Ge,
+	}
+	names := f.ColumnNames()
+	for _, a := range names {
+		for _, b := range names {
+			for opName, op := range ops {
+				e := op(Col(a), Col(b))
+				_, typeErr := e.node.Type(f.Schema())
+				_, evalErr := e.node.Eval(f)
+				if (typeErr == nil) != (evalErr == nil) {
+					t.Errorf("%s %s %s: type check err = %v, evaluation err = %v", a, opName, b, typeErr, evalErr)
+				}
+			}
+		}
+	}
+
+	// String ordering is by byte value; a null on either side is null.
+	for name, c := range map[string]struct {
+		expr Expr
+		want []bool // row 2 is null in "str"
+	}{
+		"str < str2":   {Col("str").Lt(Col("str2")), []bool{false, false}},
+		"str <= str2":  {Col("str").Le(Col("str2")), []bool{false, true}},
+		"str > str2":   {Col("str").Gt(Col("str2")), []bool{true, false}},
+		"str >= str2":  {Col("str").Ge(Col("str2")), []bool{true, true}},
+		`str2 < "b"`:   {Col("str2").Lt(Lit("b")), []bool{true, true, false}},
+		`str2 >= "aa"`: {Col("str2").Ge(Lit("aa")), []bool{false, false, true}},
+	} {
+		out, err := c.expr.node.Eval(f)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		got, err := out.Bools()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got[:len(c.want)], c.want) {
+			t.Errorf("%s = %v, want %v", name, got, c.want)
+		}
+		if len(c.want) == 2 && !out.Nulls()[2] {
+			t.Errorf("%s: row 2 should be null (null operand)", name)
+		}
+	}
+
+	// And through a filter, as a query would use it.
+	out, err := f.FilterExpr(Col("str2").Lt(Lit("b")))
+	if err != nil {
+		t.Fatalf("FilterExpr: %v", err)
+	}
+	defer out.Release()
+	if out.NumRows() != 2 {
+		t.Errorf("str2 < \"b\" kept %d rows, want 2", out.NumRows())
 	}
 }

@@ -173,7 +173,7 @@ func PointsInSphereFromXYZ(xs, ys, zs []float64, s Sphere, out []bool, scratch *
 			dx := xs[i] - s.X
 			dy := ys[i] - s.Y
 			dz := zs[i] - s.Z
-			out[i] = (dx*dx + dy*dy + dz*dz) <= r2
+			out[i] = (float64(dx*dx) + float64(dy*dy) + float64(dz*dz)) <= r2
 		}
 		return
 	}
@@ -194,7 +194,7 @@ func PointsInSphereFromXYZ(xs, ys, zs []float64, s Sphere, out []bool, scratch *
 		dx := scratch.X1[i] - cX[0]
 		dy := scratch.Y1[i] - cY[0]
 		dz := scratch.Z1[i] - cZ[0]
-		out[i] = (dx*dx + dy*dy + dz*dz) <= r2
+		out[i] = (float64(dx*dx) + float64(dy*dy) + float64(dz*dz)) <= r2
 	}
 }
 
@@ -229,7 +229,7 @@ func PointsInCapsuleFromXYZ(xs, ys, zs []float64, c Capsule, out []bool) {
 	abx := c.Bx - c.Ax
 	aby := c.By - c.Ay
 	abz := c.Bz - c.Az
-	segLen2 := abx*abx + aby*aby + abz*abz
+	segLen2 := float64(abx*abx) + float64(aby*aby) + float64(abz*abz)
 	r2 := c.R * c.R
 	if segLen2 == 0 {
 		// Degenerate capsule — collapses to a sphere at A.
@@ -237,7 +237,7 @@ func PointsInCapsuleFromXYZ(xs, ys, zs []float64, c Capsule, out []bool) {
 			dx := xs[i] - c.Ax
 			dy := ys[i] - c.Ay
 			dz := zs[i] - c.Az
-			out[i] = (dx*dx + dy*dy + dz*dz) <= r2
+			out[i] = (float64(dx*dx) + float64(dy*dy) + float64(dz*dz)) <= r2
 		}
 		return
 	}
@@ -247,20 +247,20 @@ func PointsInCapsuleFromXYZ(xs, ys, zs []float64, c Capsule, out []bool) {
 		apy := ys[i] - c.Ay
 		apz := zs[i] - c.Az
 		// t = clamp((AP · AB) / |AB|², 0, 1)
-		t := (apx*abx + apy*aby + apz*abz) * invSegLen2
+		t := (float64(apx*abx) + float64(apy*aby) + float64(apz*abz)) * invSegLen2
 		if t < 0 {
 			t = 0
 		} else if t > 1 {
 			t = 1
 		}
 		// Nearest point on segment: A + t * AB
-		nx := c.Ax + t*abx
-		ny := c.Ay + t*aby
-		nz := c.Az + t*abz
+		nx := c.Ax + float64(t*abx)
+		ny := c.Ay + float64(t*aby)
+		nz := c.Az + float64(t*abz)
 		dx := xs[i] - nx
 		dy := ys[i] - ny
 		dz := zs[i] - nz
-		out[i] = (dx*dx + dy*dy + dz*dz) <= r2
+		out[i] = (float64(dx*dx) + float64(dy*dy) + float64(dz*dz)) <= r2
 	}
 }
 

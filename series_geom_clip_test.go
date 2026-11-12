@@ -1,6 +1,7 @@
 package gobi
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"testing"
@@ -633,4 +634,95 @@ func TestSeries_GeomClip_ChecksInputsUpFront(t *testing.T) {
 	if g, _ := out.Geometry(0); !geometry.IsEmpty(g) {
 		t.Errorf("row 0 = %+v, want an empty polygon", g)
 	}
+}
+
+// GeomUnion, GeomDifference and GeomSymDifference need polygon rows,
+// and say so wherever the row is. GeomDifference used to hand back a
+// point row that missed the mask's bounds and reject the same row
+// once it was inside them.
+func TestSeries_GeomBooleans_RejectNonPolygonRowsAnywhere(t *testing.T) {
+	crs := geometry.PseudoMercator
+	mask := projectedSquare(0, 0, 10)
+	for where, p := range map[string]geometry.Point{
+		"far from the mask": {X: 500, Y: 500, CRSValue: crs},
+		"inside the mask":   {X: 5, Y: 5, CRSValue: crs},
+	} {
+		s := geomSeries(t, "geom", int32(crs.EPSG), []geometry.Geometry{projectedSquare(100, 100, 1), p})
+		for name, op := range map[string]func(geometry.Geometry) (Series, error){
+			"GeomUnion": s.GeomUnion, "GeomDifference": s.GeomDifference, "GeomSymDifference": s.GeomSymDifference,
+		} {
+			if _, err := op(mask); err == nil {
+				t.Errorf("%s with a point row %s: expected an error", name, where)
+			}
+		}
+		// GeomClip is the one that takes it.
+		if _, err := s.GeomClip(mask); err != nil {
+			t.Errorf("GeomClip with a point row %s: %v", where, err)
+		}
+	}
+	// Polygon rows away from the mask still come back unchanged.
+	s := geomSeries(t, "geom", int32(crs.EPSG), []geometry.Geometry{projectedSquare(100, 100, 2)})
+	out, err := s.GeomDifference(mask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := out.Geometry(0); math.Abs(polygonArea(t, g)-4) > 1e-9 {
+		t.Errorf("polygon row away from the mask = %+v, want it unchanged", g)
+	}
+}
+
+// A row that misses the mask's bounds gets its empty result without
+// being decoded, and it is the same result geometry.Clip gives,
+// including the Z flag of a 3D point or line row.
+func TestSeries_GeomClip_EmptyResultsMatchClip(t *testing.T) {
+	crs := geometry.PseudoMercator
+	mask := projectedSquare(0, 0, 10)
+	z := func(x, y float64) geometry.Point { return geometry.Point{X: x, Y: y, Z: 7, HasZ: true} }
+	rows := []geometry.Geometry{
+		geometry.Point{X: 500, Y: 500},
+		z(500, 500),
+		geometry.MultiPoint{Points: []geometry.Point{{X: 500, Y: 500}}},
+		geometry.MultiPoint{Points: []geometry.Point{z(500, 500)}, HasZ: true},
+		geometry.LineString{Points: []geometry.Point{{X: 500, Y: 500}, {X: 510, Y: 510}}},
+		geometry.LineString{Points: []geometry.Point{z(500, 500), z(510, 510)}, HasZ: true},
+		geometry.MultiLineString{Lines: []geometry.LineString{{Points: []geometry.Point{{X: 500, Y: 500}, {X: 510, Y: 510}}}}},
+		geometry.MultiLineString{Lines: []geometry.LineString{{Points: []geometry.Point{z(500, 500), z(510, 510)}, HasZ: true}}, HasZ: true},
+		projectedSquare(500, 500, 1),
+	}
+	s := geomSeries(t, "geom", int32(crs.EPSG), rows)
+	out, err := s.GeomClip(mask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := geomBytesOf(t, out)
+	for i, row := range rows {
+		want, err := geometry.Clip(attachCRS(row, crs), mask)
+		if err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+		if !geometry.IsEmpty(want) {
+			t.Fatalf("row %d: test row isn't outside the mask", i)
+		}
+		if !bytes.Equal(got[i], geometry.WKB(want)) {
+			g, _ := out.Geometry(i)
+			t.Errorf("row %d (%T): GeomClip gave %T (3D=%v), Clip gives %T (3D=%v)", i, row, g, g.Is3D(), want, want.Is3D())
+		}
+	}
+}
+
+// geomBytesOf returns each row's WKB (nil for a null row).
+func geomBytesOf(t *testing.T, s Series) [][]byte {
+	t.Helper()
+	var out [][]byte
+	for _, chunk := range s.Column().Data().Chunks() {
+		b := chunk.(*array.Binary)
+		for i := range b.Len() {
+			if b.IsNull(i) {
+				out = append(out, nil)
+				continue
+			}
+			out = append(out, b.Value(i))
+		}
+	}
+	return out
 }

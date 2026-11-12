@@ -1,6 +1,10 @@
 package geometry
 
-import "math"
+import (
+	"math"
+
+	"github.com/zoobst/gobi/internal/detmath"
+)
 
 // -----------------------------------------------------------------------------
 // 3D geodesic math — ECEF conversion + slab-form distance kernels.
@@ -57,7 +61,7 @@ var WGS84Ellipsoid = Ellipsoid{
 // loop doesn't recompute per iteration.
 func (e Ellipsoid) eSquared() float64 {
 	f := 1.0 / e.FInv
-	return 2*f - f*f
+	return float64(2*f) - float64(f*f)
 }
 
 // LonLatAltToECEFSlabs converts N geographic points (lons, lats in
@@ -79,13 +83,13 @@ func LonLatAltToECEFSlabs(lons, lats, alts, outX, outY, outZ []float64) {
 	for i := range n {
 		latRad := lats[i] * deg
 		lonRad := lons[i] * deg
-		sinLat, cosLat := math.Sincos(latRad)
-		sinLon, cosLon := math.Sincos(lonRad)
-		N := a / math.Sqrt(1-e2*sinLat*sinLat)
+		sinLat, cosLat := detmath.Sincos(latRad)
+		sinLon, cosLon := detmath.Sincos(lonRad)
+		N := a / math.Sqrt(1-float64(e2*sinLat*sinLat))
 		nph := N + alts[i]
 		outX[i] = nph * cosLat * cosLon
 		outY[i] = nph * cosLat * sinLon
-		outZ[i] = (N*(1-e2) + alts[i]) * sinLat
+		outZ[i] = (float64(N*(1-e2)) + alts[i]) * sinLat
 	}
 }
 
@@ -104,7 +108,7 @@ func Distance3DProjectedFromSlabs(xs1, ys1, zs1, xs2, ys2, zs2, out []float64) {
 		dx := xs2[i] - xs1[i]
 		dy := ys2[i] - ys1[i]
 		dz := zs2[i] - zs1[i]
-		out[i] = math.Sqrt(dx*dx + dy*dy + dz*dz)
+		out[i] = math.Sqrt(float64(dx*dx) + float64(dy*dy) + float64(dz*dz))
 	}
 }
 
@@ -183,7 +187,7 @@ func Distance3DProjectedFromSlabsToPoint(xs, ys, zs []float64, tx, ty, tz float6
 		dx := xs[i] - tx
 		dy := ys[i] - ty
 		dz := zs[i] - tz
-		out[i] = math.Sqrt(dx*dx + dy*dy + dz*dz)
+		out[i] = math.Sqrt(float64(dx*dx) + float64(dy*dy) + float64(dz*dz))
 	}
 }
 
@@ -243,7 +247,7 @@ func LineString3DProjectedLengthFromXYZ(xs, ys, zs []float64) float64 {
 		dx := xs[i] - xs[i-1]
 		dy := ys[i] - ys[i-1]
 		dz := zs[i] - zs[i-1]
-		total += math.Sqrt(dx*dx + dy*dy + dz*dz)
+		total += math.Sqrt(float64(dx*dx) + float64(dy*dy) + float64(dz*dz))
 	}
 	return total
 }
@@ -280,7 +284,7 @@ func LineString3DGeodesicLengthFromXYZ(lons, lats, alts []float64, scratch *ECEF
 		dx := scratch.X1[i] - scratch.X1[i-1]
 		dy := scratch.Y1[i] - scratch.Y1[i-1]
 		dz := scratch.Z1[i] - scratch.Z1[i-1]
-		total += math.Sqrt(dx*dx + dy*dy + dz*dz)
+		total += math.Sqrt(float64(dx*dx) + float64(dy*dy) + float64(dz*dz))
 	}
 	return total
 }
@@ -307,10 +311,10 @@ func SampleGeodesic3DFromSlabs(
 	}
 	deg := math.Pi / 180
 	// Endpoint unit vectors on the unit sphere.
-	sinLat1, cosLat1 := math.Sincos(lat1 * deg)
-	sinLon1, cosLon1 := math.Sincos(lon1 * deg)
-	sinLat2, cosLat2 := math.Sincos(lat2 * deg)
-	sinLon2, cosLon2 := math.Sincos(lon2 * deg)
+	sinLat1, cosLat1 := detmath.Sincos(lat1 * deg)
+	sinLon1, cosLon1 := detmath.Sincos(lon1 * deg)
+	sinLat2, cosLat2 := detmath.Sincos(lat2 * deg)
+	sinLon2, cosLon2 := detmath.Sincos(lon2 * deg)
 	x1 := cosLat1 * cosLon1
 	y1 := cosLat1 * sinLon1
 	z1 := sinLat1
@@ -319,14 +323,14 @@ func SampleGeodesic3DFromSlabs(
 	z2 := sinLat2
 	// Central angle via dot product; clamp for numerical safety
 	// against |cos| slightly > 1 when endpoints coincide.
-	dot := x1*x2 + y1*y2 + z1*z2
+	dot := float64(x1*x2) + float64(y1*y2) + float64(z1*z2)
 	if dot > 1 {
 		dot = 1
 	} else if dot < -1 {
 		dot = -1
 	}
-	omega := math.Acos(dot)
-	sinOmega := math.Sin(omega)
+	omega := detmath.Acos(dot)
+	sinOmega := detmath.Sin(omega)
 	radToDeg := 180.0 / math.Pi
 	for i := range n {
 		t := float64(i) / float64(n-1)
@@ -337,15 +341,15 @@ func SampleGeodesic3DFromSlabs(
 			a = 1 - t
 			b = t
 		} else {
-			a = math.Sin((1-t)*omega) / sinOmega
-			b = math.Sin(t*omega) / sinOmega
+			a = detmath.Sin((1-t)*omega) / sinOmega
+			b = detmath.Sin(t*omega) / sinOmega
 		}
-		x := a*x1 + b*x2
-		y := a*y1 + b*y2
-		z := a*z1 + b*z2
-		outLats[i] = math.Asin(z) * radToDeg
-		outLons[i] = math.Atan2(y, x) * radToDeg
-		outAlts[i] = alt1 + (alt2-alt1)*t
+		x := float64(a*x1) + float64(b*x2)
+		y := float64(a*y1) + float64(b*y2)
+		z := float64(a*z1) + float64(b*z2)
+		outLats[i] = detmath.Asin(z) * radToDeg
+		outLons[i] = detmath.Atan2(y, x) * radToDeg
+		outAlts[i] = alt1 + float64((alt2-alt1)*t)
 	}
 }
 

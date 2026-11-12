@@ -415,9 +415,19 @@ func parsePartsAndPoints(body []byte, hasZ bool) (parts []int, points []geometry
 // under Cartesian orientation, which is Shapefile's exterior-ring
 // convention).
 func ringIsCW(ring []geometry.Point) bool {
+	if len(ring) < 3 {
+		return false
+	}
+	// Summed relative to the first vertex, as a fan of triangles.
+	// Over raw coordinates each term is around 1e12 at UTM scale and
+	// the terms cancel to the area, so the rounding left over is
+	// larger than a small ring's area and its winding came out wrong:
+	// a shell could be read as a hole. The products are rounded one
+	// at a time so every platform gets the same sign.
+	ox, oy := ring[0].X, ring[0].Y
 	var a float64
-	for i := 0; i < len(ring)-1; i++ {
-		a += ring[i].X*ring[i+1].Y - ring[i+1].X*ring[i].Y
+	for i := 1; i+1 < len(ring); i++ {
+		a += float64((ring[i].X-ox)*(ring[i+1].Y-oy)) - float64((ring[i+1].X-ox)*(ring[i].Y-oy))
 	}
 	return a < 0
 }

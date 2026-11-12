@@ -3,6 +3,8 @@ package geometry
 import (
 	"fmt"
 	"math"
+
+	"github.com/zoobst/gobi/internal/detmath"
 )
 
 // EarthRadiusKM is the mean Earth radius used by haversine calculations.
@@ -73,9 +75,9 @@ func Haversine(from, to Point, u Unit) (float64, error) {
 	φ2 := degToRad(to.Y)
 	dφ := degToRad(to.Y - from.Y)
 	dλ := degToRad(to.X - from.X)
-	a := math.Sin(dφ/2)*math.Sin(dφ/2) +
-		math.Cos(φ1)*math.Cos(φ2)*math.Sin(dλ/2)*math.Sin(dλ/2)
-	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	a := float64(detmath.Sin(dφ/2)*detmath.Sin(dφ/2)) +
+		float64(detmath.Cos(φ1)*detmath.Cos(φ2)*detmath.Sin(dλ/2)*detmath.Sin(dλ/2))
+	c := 2 * detmath.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 	distMeters := EarthRadiusKM * 1000 * c
 	return distMeters / perM, nil
 }
@@ -129,10 +131,10 @@ func HaversineBatch(from, to []Point, u Unit) ([]float64, error) {
 		phi2 := q.Y * deg2rad
 		dphi := (q.Y - p.Y) * deg2rad
 		dlam := (q.X - p.X) * deg2rad
-		sinHP := math.Sin(dphi / 2)
-		sinHL := math.Sin(dlam / 2)
-		a := sinHP*sinHP + math.Cos(phi1)*math.Cos(phi2)*sinHL*sinHL
-		c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+		sinHP := detmath.Sin(dphi / 2)
+		sinHL := detmath.Sin(dlam / 2)
+		a := float64(sinHP*sinHP) + float64(detmath.Cos(phi1)*detmath.Cos(phi2)*sinHL*sinHL)
+		c := 2 * detmath.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 		out[i] = scale * c
 	}
 	return out, nil
@@ -149,7 +151,7 @@ func HaversineBatch(from, to []Point, u Unit) ([]float64, error) {
 func Euclidean(from, to Point, u Unit) (float64, error) {
 	dx := to.X - from.X
 	dy := to.Y - from.Y
-	return convertMeters(math.Sqrt(dx*dx+dy*dy), u)
+	return convertMeters(math.Sqrt(float64(dx*dx)+float64(dy*dy)), u)
 }
 
 // PointToSegmentDistanceSqXY returns the squared Euclidean distance
@@ -177,21 +179,21 @@ func Euclidean(from, to Point, u Unit) (float64, error) {
 // squared distance from p to a directly.
 func PointToSegmentDistanceSqXY(px, py, ax, ay, bx, by float64) float64 {
 	dx, dy := bx-ax, by-ay
-	lenSq := dx*dx + dy*dy
+	lenSq := float64(dx*dx) + float64(dy*dy)
 	if lenSq == 0 {
 		ex, ey := px-ax, py-ay
-		return ex*ex + ey*ey
+		return float64(ex*ex) + float64(ey*ey)
 	}
-	t := ((px-ax)*dx + (py-ay)*dy) / lenSq
+	t := (float64((px-ax)*dx) + float64((py-ay)*dy)) / lenSq
 	if t < 0 {
 		t = 0
 	} else if t > 1 {
 		t = 1
 	}
-	fx := ax + t*dx
-	fy := ay + t*dy
+	fx := ax + float64(t*dx)
+	fy := ay + float64(t*dy)
 	ex, ey := px-fx, py-fy
-	return ex*ex + ey*ey
+	return float64(ex*ex) + float64(ey*ey)
 }
 
 // PointToPolylineMinDistanceSq returns the minimum squared
@@ -212,7 +214,7 @@ func PointToPolylineMinDistanceSq(px, py float64, xs, ys []float64, closed bool)
 	}
 	if n == 1 {
 		ex, ey := px-xs[0], py-ys[0]
-		return ex*ex + ey*ey
+		return float64(ex*ex) + float64(ey*ey)
 	}
 	best := math.Inf(1)
 	for i := 0; i < n-1; i++ {
@@ -347,7 +349,7 @@ func planarMinDistanceSquared(a, b *distanceGeometry) float64 {
 		for k := range b.pointXs {
 			ex := px - b.pointXs[k]
 			ey := py - b.pointYs[k]
-			d2 := ex*ex + ey*ey
+			d2 := float64(ex*ex) + float64(ey*ey)
 			if d2 < best {
 				best = d2
 			}
@@ -444,19 +446,19 @@ func planarMinDistance(a, b Geometry) float64 {
 // segment (a, b). Handles a==b as point-to-point.
 func pointToSegmentDistance(p, a, b Point) float64 {
 	dx, dy := b.X-a.X, b.Y-a.Y
-	lenSq := dx*dx + dy*dy
+	lenSq := float64(dx*dx) + float64(dy*dy)
 	if lenSq == 0 {
-		return math.Hypot(p.X-a.X, p.Y-a.Y)
+		return detmath.Hypot(p.X-a.X, p.Y-a.Y)
 	}
-	t := ((p.X-a.X)*dx + (p.Y-a.Y)*dy) / lenSq
+	t := (float64((p.X-a.X)*dx) + float64((p.Y-a.Y)*dy)) / lenSq
 	if t < 0 {
 		t = 0
 	} else if t > 1 {
 		t = 1
 	}
-	fx := a.X + t*dx
-	fy := a.Y + t*dy
-	return math.Hypot(p.X-fx, p.Y-fy)
+	fx := a.X + float64(t*dx)
+	fy := a.Y + float64(t*dy)
+	return detmath.Hypot(p.X-fx, p.Y-fy)
 }
 
 func forEachVertex(g Geometry, fn func(Point)) {
@@ -605,5 +607,5 @@ func bboxMinDistance(a, b Bounds) float64 {
 	case b.MaxY < a.MinY:
 		dy = a.MinY - b.MaxY
 	}
-	return math.Hypot(dx, dy)
+	return detmath.Hypot(dx, dy)
 }

@@ -1153,7 +1153,10 @@ func (g *GroupBy) appendAgg(b array.Builder, agg Aggregation, rows []int) error 
 		n++
 		delta := v - mean
 		mean += delta / float64(n)
-		m2 += delta * (v - mean)
+		// The product is rounded on its own (the conversion) so the
+		// compiler can't fuse it into the add, which it does on arm64 and
+		// not on amd64 or wasm: the result is the same bits everywhere.
+		m2 += float64(delta * (v - mean))
 	}
 	fb := b.(*array.Float64Builder)
 	if n == 0 {

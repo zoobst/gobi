@@ -3,6 +3,8 @@ package geometry
 import (
 	"fmt"
 	"math"
+
+	"github.com/zoobst/gobi/internal/detmath"
 )
 
 // bufferInward shrinks g by d > 0: the result is every point of g
@@ -16,10 +18,25 @@ func bufferInward(g Geometry, d float64, segments int) (Geometry, error) {
 	case Polygon:
 		return erodePolygon(t, d, segments)
 	case MultiPolygon:
-		// The members of a valid MultiPolygon don't overlap, so each
-		// one shrinks on its own.
+		// Members are merged first. Where two share an edge (adjoining
+		// parcels or tiles) that edge is inside the region, not part
+		// of its boundary, and shrinking each member on its own would
+		// open a gap 2d wide along it.
+		members := t.Polygons
+		if len(members) > 1 {
+			parts := make([]Geometry, len(members))
+			for i, p := range members {
+				parts[i] = Polygon{Rings: p.Rings}
+			}
+			merged, err := Dissolve(parts)
+			if err != nil {
+				return nil, fmt.Errorf("buffer: %w", err)
+			}
+			members = appendPolygons(nil, merged)
+		}
 		var polys []Polygon
-		for _, p := range t.Polygons {
+		for _, p := range members {
+			p.CRSValue = t.CRSValue
 			out, err := erodePolygon(p, d, segments)
 			if err != nil {
 				return nil, err
@@ -113,19 +130,23 @@ func boundaryBand(band []Geometry, ring []Point, d float64, segments int) []Geom
 	type corners struct{ rightIn, leftIn, rightOut, leftOut Point }
 	at := make([]corners, n)
 	offset := func(v Point, nx, ny, sign float64) Point {
-		return Point{X: v.X + sign*d*nx, Y: v.Y + sign*d*ny}
+		return Point{X: v.X + float64(sign*d*nx), Y: v.Y + float64(sign*d*ny)}
 	}
 	for i, v := range ring {
 		prev, next := ring[(i-1+n)%n], ring[(i+1)%n]
 		inX, inY := unitNormal(prev, v, 1)
 		outX, outY := unitNormal(v, next, 1)
 		// Unit normals, so these are the sine and cosine of the turn.
-		sin := inX*outY - inY*outX
-		cos := inX*outX + inY*outY
+		// Their signs pick the branch below, so the products are
+		// rounded one at a time (see diffOfProducts): fused, a turn
+		// right at a threshold could go one way on arm64 and the
+		// other on amd64 and wasm.
+		sin := diffOfProducts(inX, outY, inY, outX)
+		cos := float64(inX*outX) + float64(inY*outY)
 		if cos > 0 && math.Abs(sin) < straightTurn {
 			// Straight on: both rectangles end on the bisector.
 			mx, my := inX+outX, inY+outY
-			l := math.Hypot(mx, my)
+			l := detmath.Hypot(mx, my)
 			mx, my = mx/l, my/l
 			right, left := offset(v, mx, my, 1), offset(v, mx, my, -1)
 			at[i] = corners{rightIn: right, rightOut: right, leftIn: left, leftOut: left}
@@ -141,11 +162,11 @@ func boundaryBand(band []Geometry, ring []Point, d float64, segments int) []Geom
 		// leaving edge's; a right turn opens one on the left, swept
 		// clockwise.
 		from, to := c.rightIn, c.rightOut
-		start := math.Atan2(inY, inX)
-		sweep := math.Atan2(sin, cos)
+		start := detmath.Atan2(inY, inX)
+		sweep := detmath.Atan2(sin, cos)
 		if sin < 0 {
 			from, to = c.leftIn, c.leftOut
-			start = math.Atan2(-inY, -inX)
+			start = detmath.Atan2(-inY, -inX)
 		} else if sweep <= 0 {
 			sweep = math.Pi // a full reversal
 		}
@@ -154,7 +175,7 @@ func boundaryBand(band []Geometry, ring []Point, d float64, segments int) []Geom
 		fan = append(fan, Point{X: v.X, Y: v.Y}, from)
 		for k := 1; k < steps; k++ {
 			a := start + sweep*float64(k)/float64(steps)
-			fan = append(fan, Point{X: v.X + d*math.Cos(a), Y: v.Y + d*math.Sin(a)})
+			fan = append(fan, Point{X: v.X + float64(d*detmath.Cos(a)), Y: v.Y + float64(d*detmath.Sin(a))})
 		}
 		fan = append(fan, to, fan[0])
 		band = append(band, Polygon{Rings: [][]Point{fan}})

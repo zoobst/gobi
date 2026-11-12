@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+
+	"github.com/zoobst/gobi/internal/detmath"
 )
 
 // Ellipse is an axis-aligned-then-rotated elliptical shape. Like
@@ -49,7 +51,7 @@ func EllipseFromFoci(f1, f2 Point, majorAxis float64) (Ellipse, error) {
 	}
 	dx := f2.X - f1.X
 	dy := f2.Y - f1.Y
-	focalDist := math.Hypot(dx, dy)
+	focalDist := detmath.Hypot(dx, dy)
 	if majorAxis < focalDist {
 		return Ellipse{}, fmt.Errorf("%w: majorAxis %v < |f1-f2| %v",
 			ErrEllipseFromFoci, majorAxis, focalDist)
@@ -59,13 +61,13 @@ func EllipseFromFoci(f1, f2 Point, majorAxis float64) (Ellipse, error) {
 	// b = sqrt(a² - c²) where c is the linear eccentricity (half the
 	// focal distance).
 	c := focalDist / 2
-	semiB := math.Sqrt(semiA*semiA - c*c)
+	semiB := math.Sqrt(float64(semiA*semiA) - float64(c*c))
 	// Rotation from +X axis to the f1→f2 direction. If the foci
 	// coincide (focalDist == 0) the ellipse is a circle and the
 	// rotation is irrelevant — set to 0.
 	rotation := 0.0
 	if focalDist > 0 {
-		rotation = math.Atan2(dy, dx)
+		rotation = detmath.Atan2(dy, dx)
 	}
 	return Ellipse{
 		Center: Point{
@@ -86,10 +88,10 @@ func EllipseFromFoci(f1, f2 Point, majorAxis float64) (Ellipse, error) {
 func (e Ellipse) Contains(p Point) bool {
 	dx := p.X - e.Center.X
 	dy := p.Y - e.Center.Y
-	cosR := math.Cos(-e.Rotation)
-	sinR := math.Sin(-e.Rotation)
-	xLocal := dx*cosR - dy*sinR
-	yLocal := dx*sinR + dy*cosR
+	cosR := detmath.Cos(-e.Rotation)
+	sinR := detmath.Sin(-e.Rotation)
+	xLocal := float64(dx*cosR) - float64(dy*sinR)
+	yLocal := float64(dx*sinR) + float64(dy*cosR)
 	if e.SemiA == 0 || e.SemiB == 0 {
 		return xLocal == 0 && yLocal == 0
 	}
@@ -119,7 +121,7 @@ func (e Ellipse) Circumference() float64 {
 	}
 	h := (a - b) / (a + b)
 	h2 := h * h
-	return math.Pi * (a + b) * (1 + 3*h2/(10+math.Sqrt(4-3*h2)))
+	return math.Pi * (a + b) * (1 + 3*h2/(10+math.Sqrt(4-float64(3*h2))))
 }
 
 // Bounds returns the axis-aligned bounding box of the rotated
@@ -133,10 +135,10 @@ func (e Ellipse) Circumference() float64 {
 func (e Ellipse) Bounds() Bounds {
 	a := math.Abs(e.SemiA)
 	b := math.Abs(e.SemiB)
-	cosR := math.Cos(e.Rotation)
-	sinR := math.Sin(e.Rotation)
-	xHalf := math.Sqrt(a*a*cosR*cosR + b*b*sinR*sinR)
-	yHalf := math.Sqrt(a*a*sinR*sinR + b*b*cosR*cosR)
+	cosR := detmath.Cos(e.Rotation)
+	sinR := detmath.Sin(e.Rotation)
+	xHalf := math.Sqrt(float64(a*a*cosR*cosR) + float64(b*b*sinR*sinR))
+	yHalf := math.Sqrt(float64(a*a*sinR*sinR) + float64(b*b*cosR*cosR))
 	return Bounds{
 		MinX: e.Center.X - xHalf,
 		MinY: e.Center.Y - yHalf,
@@ -154,16 +156,16 @@ func (e Ellipse) Boundary(nVertices int) Polygon {
 	if nVertices < 4 {
 		nVertices = DefaultBufferSegments
 	}
-	cosR := math.Cos(e.Rotation)
-	sinR := math.Sin(e.Rotation)
+	cosR := detmath.Cos(e.Rotation)
+	sinR := detmath.Sin(e.Rotation)
 	ring := make([]Point, nVertices+1)
 	for i := range nVertices {
 		t := 2 * math.Pi * float64(i) / float64(nVertices)
-		x := e.SemiA * math.Cos(t)
-		y := e.SemiB * math.Sin(t)
+		x := e.SemiA * detmath.Cos(t)
+		y := e.SemiB * detmath.Sin(t)
 		ring[i] = Point{
-			X:        e.Center.X + x*cosR - y*sinR,
-			Y:        e.Center.Y + x*sinR + y*cosR,
+			X:        e.Center.X + float64(x*cosR) - float64(y*sinR),
+			Y:        e.Center.Y + float64(x*sinR) + float64(y*cosR),
 			CRSValue: e.Center.CRSValue,
 		}
 	}
@@ -179,16 +181,16 @@ func (e Ellipse) BoundaryLine(nVertices int) LineString {
 	if nVertices < 4 {
 		nVertices = DefaultBufferSegments
 	}
-	cosR := math.Cos(e.Rotation)
-	sinR := math.Sin(e.Rotation)
+	cosR := detmath.Cos(e.Rotation)
+	sinR := detmath.Sin(e.Rotation)
 	pts := make([]Point, nVertices)
 	for i := range nVertices {
 		t := 2 * math.Pi * float64(i) / float64(nVertices)
-		x := e.SemiA * math.Cos(t)
-		y := e.SemiB * math.Sin(t)
+		x := e.SemiA * detmath.Cos(t)
+		y := e.SemiB * detmath.Sin(t)
 		pts[i] = Point{
-			X:        e.Center.X + x*cosR - y*sinR,
-			Y:        e.Center.Y + x*sinR + y*cosR,
+			X:        e.Center.X + float64(x*cosR) - float64(y*sinR),
+			Y:        e.Center.Y + float64(x*sinR) + float64(y*cosR),
 			CRSValue: e.Center.CRSValue,
 		}
 	}

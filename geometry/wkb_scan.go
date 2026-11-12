@@ -192,12 +192,12 @@ func lineStringCentroidFromCoords(data []byte, bo binary.ByteOrder, n, cs int, b
 		extendBoundsInline(b, x, y)
 		dx := x - px
 		dy := y - py
-		segLen := math.Sqrt(dx*dx + dy*dy)
+		segLen := math.Sqrt(float64(dx*dx) + float64(dy*dy))
 		if segLen != 0 {
 			mx := (px + x) / 2
 			my := (py + y) / 2
-			cx += mx * segLen
-			cy += my * segLen
+			cx += float64(mx * segLen)
+			cy += float64(my * segLen)
 			total += segLen
 		}
 		px, py = x, y
@@ -279,10 +279,13 @@ func polygonRingCentroid(data []byte, bo binary.ByteOrder, nPts, cs int, b *Boun
 		x := math.Float64frombits(bo.Uint64(data[off : off+8]))
 		y := math.Float64frombits(bo.Uint64(data[off+8 : off+16]))
 		extendBoundsInline(b, x, y)
-		cross := px*y - x*py
+		// Relative to the first vertex, exactly as Polygon.Centroid.
+		x0, y0 := px-fx, py-fy
+		x1, y1 := x-fx, y-fy
+		cross := diffOfProducts(x0, y1, x1, y0)
 		areaTwo += cross
-		cx += (px + x) * cross
-		cy += (py + y) * cross
+		cx += float64((x0 + x1) * cross)
+		cy += float64((y0 + y1) * cross)
 		sx += px
 		sy += py
 		px, py = x, y
@@ -293,11 +296,16 @@ func polygonRingCentroid(data []byte, bo binary.ByteOrder, nPts, cs int, b *Boun
 	if px == fx && py == fy {
 		segCount = nPts - 1
 	} else {
-		// Closing segment: (px, py) -> (fx, fy). Add it.
-		cross := px*fy - fx*py
+		// Closing segment: (px, py) -> (fx, fy). Add it. Relative to
+		// the first vertex its far end is the origin, so it adds
+		// nothing unless a coordinate is NaN or infinite, in which
+		// case it must propagate as it does in Polygon.Centroid.
+		x0, y0 := px-fx, py-fy
+		x1, y1 := fx-fx, fy-fy
+		cross := diffOfProducts(x0, y1, x1, y0)
 		areaTwo += cross
-		cx += (px + fx) * cross
-		cy += (py + fy) * cross
+		cx += float64((x0 + x1) * cross)
+		cy += float64((y0 + y1) * cross)
 		sx += px
 		sy += py
 		segCount = nPts
@@ -305,7 +313,7 @@ func polygonRingCentroid(data []byte, bo binary.ByteOrder, nPts, cs int, b *Boun
 	if areaTwo == 0 {
 		return Point{X: sx / float64(segCount), Y: sy / float64(segCount)}
 	}
-	return Point{X: cx / (3 * areaTwo), Y: cy / (3 * areaTwo)}
+	return Point{X: fx + cx/(3*areaTwo), Y: fy + cy/(3*areaTwo)}
 }
 
 // scanMultiPointCentroid computes the arithmetic mean of the
@@ -407,7 +415,7 @@ func scanMultiLineStringCentroid(data []byte, bo binary.ByteOrder, hasZ bool, b 
 				y := math.Float64frombits(innerBO.Uint64(data[base+8 : base+16]))
 				dx := x - px
 				dy := y - py
-				lineLen += math.Sqrt(dx*dx + dy*dy)
+				lineLen += math.Sqrt(float64(dx*dx) + float64(dy*dy))
 				px, py = x, y
 			}
 		}
@@ -428,8 +436,8 @@ func scanMultiLineStringCentroid(data []byte, bo binary.ByteOrder, hasZ bool, b 
 		if err != nil {
 			return Point{}, 0, err
 		}
-		cx += lc.X * lineLen
-		cy += lc.Y * lineLen
+		cx += float64(lc.X * lineLen)
+		cy += float64(lc.Y * lineLen)
 		totalLen += lineLen
 		off = coordsOff + nPts*cs
 	}
@@ -870,20 +878,22 @@ func planarRingAreaFromCoords(data []byte, bo binary.ByteOrder, nPts, cs int) fl
 	}
 	fx := math.Float64frombits(bo.Uint64(data[0:8]))
 	fy := math.Float64frombits(bo.Uint64(data[8:16]))
+	// The same fan of triangles from the first vertex as
+	// ringSignedArea, term for term. The edges that start or end at
+	// the first vertex (the first one, and the closing one whether
+	// stored or implied) are triangles of zero area, so the loop
+	// starts at the second vertex and there is no closing step.
 	var a float64
-	px, py := fx, fy
-	for i := 1; i < nPts; i++ {
+	px := math.Float64frombits(bo.Uint64(data[cs:cs+8])) - fx
+	py := math.Float64frombits(bo.Uint64(data[cs+8:cs+16])) - fy
+	for i := 2; i < nPts; i++ {
 		off := i * cs
-		x := math.Float64frombits(bo.Uint64(data[off : off+8]))
-		y := math.Float64frombits(bo.Uint64(data[off+8 : off+16]))
-		a += px*y - x*py
+		x := math.Float64frombits(bo.Uint64(data[off:off+8])) - fx
+		y := math.Float64frombits(bo.Uint64(data[off+8:off+16])) - fy
+		a += diffOfProducts(px, y, x, py)
 		px, py = x, y
 	}
-	// Closing edge iff ring wasn't already closed.
-	if px != fx || py != fy {
-		a += px*fy - fx*py
-	}
-	return math.Abs(a) / 2
+	return math.Abs(a / 2)
 }
 
 // scanMultiPolygonPlanarArea sums per-polygon planar area.
@@ -1048,7 +1058,7 @@ func scanLineStringPlanarLength(data []byte, bo binary.ByteOrder, hasZ bool) (fl
 		y := math.Float64frombits(bo.Uint64(base[off+8 : off+16]))
 		dx := x - px
 		dy := y - py
-		sum += math.Sqrt(dx*dx + dy*dy)
+		sum += math.Sqrt(float64(dx*dx) + float64(dy*dy))
 		px, py = x, y
 	}
 	return sum, 4 + n*cs, nil

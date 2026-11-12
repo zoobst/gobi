@@ -1027,7 +1027,10 @@ func ringConvexFromXY(xs, ys []float64) bool {
 		ax, ay := xs[i], ys[i]
 		bx, by := xs[(i+1)%n], ys[(i+1)%n]
 		cx, cy := xs[(i+2)%n], ys[(i+2)%n]
-		cross := (bx-ax)*(cy-by) - (by-ay)*(cx-bx)
+		// Products rounded one at a time, as geometry's orientation
+		// tests are: fused (arm64), three collinear vertices don't give
+		// exactly zero.
+		cross := float64((bx-ax)*(cy-by)) - float64((by-ay)*(cx-bx))
 		if cross > 0 {
 			if sign < 0 {
 				return false

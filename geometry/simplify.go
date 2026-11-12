@@ -146,14 +146,14 @@ func douglasPeucker(points []Point, tolerance float64) []Point {
 func perpDistance(p, a, b Point) float64 {
 	dx := b.X - a.X
 	dy := b.Y - a.Y
-	segLen2 := dx*dx + dy*dy
+	segLen2 := float64(dx*dx) + float64(dy*dy)
 	if segLen2 == 0 {
 		ax := p.X - a.X
 		ay := p.Y - a.Y
-		return math.Sqrt(ax*ax + ay*ay)
+		return math.Sqrt(float64(ax*ax) + float64(ay*ay))
 	}
 	// Numerator: |cross((b-a), (p-a))|
-	num := math.Abs(dx*(a.Y-p.Y) - (a.X-p.X)*dy)
+	num := math.Abs(float64(dx*(a.Y-p.Y)) - float64((a.X-p.X)*dy))
 	return num / math.Sqrt(segLen2)
 }
 
@@ -224,7 +224,7 @@ func SimplifyDPFromXY(xs, ys []float64, tolerance float64) (outXs, outYs []float
 		bx, by := xs[hi], ys[hi]
 		dx := bx - ax
 		dy := by - ay
-		segLen2 := dx*dx + dy*dy
+		segLen2 := float64(dx*dx) + float64(dy*dy)
 
 		var (
 			maxMetric float64
@@ -235,7 +235,7 @@ func SimplifyDPFromXY(xs, ys []float64, tolerance float64) (outXs, outYs []float
 			for i := lo + 1; i < hi; i++ {
 				dxi := xs[i] - ax
 				dyi := ys[i] - ay
-				d2 := dxi*dxi + dyi*dyi
+				d2 := float64(dxi*dxi) + float64(dyi*dyi)
 				if d2 > maxMetric {
 					maxMetric = d2
 					maxIdx = i
@@ -250,7 +250,7 @@ func SimplifyDPFromXY(xs, ys []float64, tolerance float64) (outXs, outYs []float
 			for i := lo + 1; i < hi; i++ {
 				pxi := xs[i] - ax
 				pyi := ys[i] - ay
-				cross := dx*pyi - dy*pxi
+				cross := float64(dx*pyi) - float64(dy*pxi)
 				cross2 := cross * cross
 				if cross2 > maxMetric {
 					maxMetric = cross2
@@ -378,7 +378,7 @@ func simplifyDPKeep(xs, ys []float64, tolerance float64) []bool {
 		bx, by := xs[hi], ys[hi]
 		dx := bx - ax
 		dy := by - ay
-		segLen2 := dx*dx + dy*dy
+		segLen2 := float64(dx*dx) + float64(dy*dy)
 
 		var (
 			maxMetric float64
@@ -388,7 +388,7 @@ func simplifyDPKeep(xs, ys []float64, tolerance float64) []bool {
 			for i := lo + 1; i < hi; i++ {
 				dxi := xs[i] - ax
 				dyi := ys[i] - ay
-				d2 := dxi*dxi + dyi*dyi
+				d2 := float64(dxi*dxi) + float64(dyi*dyi)
 				if d2 > maxMetric {
 					maxMetric = d2
 					maxIdx = i
@@ -401,7 +401,7 @@ func simplifyDPKeep(xs, ys []float64, tolerance float64) []bool {
 			for i := lo + 1; i < hi; i++ {
 				pxi := xs[i] - ax
 				pyi := ys[i] - ay
-				cross := dx*pyi - dy*pxi
+				cross := float64(dx*pyi) - float64(dy*pxi)
 				cross2 := cross * cross
 				if cross2 > maxMetric {
 					maxMetric = cross2

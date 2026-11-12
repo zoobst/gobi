@@ -30,8 +30,11 @@ var ErrGeographicCRS = errors.New("geometry: boolean ops require a projected CRS
 // A line is clipped to the mask as a whole: where it passes from one
 // member of a MultiPolygon mask into an adjoining one it stays in one
 // piece, and a stretch running along an edge two members share is
-// returned once. With a Polygon mask, LineString.Clip says how a line
-// touching or running along the boundary is treated.
+// returned once. A stretch running along the mask's boundary counts
+// as inside; a line that only touches the mask at a point gives no
+// piece there.
+//
+// To clip many geometries by one mask, build a ClipMask once.
 //
 // Any other subject returns an error. Unlike the other boolean ops,
 // Clip is not symmetric: a point or line can be the subject but not
@@ -39,7 +42,11 @@ var ErrGeographicCRS = errors.New("geometry: boolean ops require a projected CRS
 func Clip(subject, mask Geometry) (Geometry, error) {
 	switch subject.(type) {
 	case Point, MultiPoint, LineString, MultiLineString:
-		return clipPointsOrLines(subject, mask)
+		m, err := NewClipMask(mask)
+		if err != nil {
+			return nil, err
+		}
+		return m.Clip(subject)
 	}
 	return Boolean(subject, mask, OpIntersection, ClipOptions{})
 }
@@ -298,68 +305,6 @@ func enqueueGeometry(s *clipSession, g Geometry, role polyRole) error {
 		return nil
 	}
 	return fmt.Errorf("geometry: boolean op requires Polygon or MultiPolygon, got %T", g)
-}
-
-// clipPointsOrLines is Clip for a Point, MultiPoint, LineString or
-// MultiLineString subject. See Clip for the result types.
-func clipPointsOrLines(subject, mask Geometry) (Geometry, error) {
-	if mask == nil {
-		return nil, fmt.Errorf("geometry: boolean op: nil geometry")
-	}
-	if err := requirePolygonal(mask); err != nil {
-		return nil, err
-	}
-	if err := validateClipCRS(subject, mask); err != nil {
-		return nil, err
-	}
-	crs := resolveClipCRS(subject, mask)
-	polys := appendPolygons(nil, mask)
-	inside := func(p Point) bool {
-		for _, poly := range polys {
-			if pointInPolygon(p, poly) {
-				return true
-			}
-		}
-		return false
-	}
-	switch t := subject.(type) {
-	case Point:
-		if inside(t) {
-			t.CRSValue = crs
-			return t, nil
-		}
-		return MultiPoint{CRSValue: crs, HasZ: t.HasZ}, nil
-	case MultiPoint:
-		out := MultiPoint{CRSValue: crs, HasZ: t.HasZ}
-		for _, p := range t.Points {
-			if inside(p) {
-				out.Points = append(out.Points, p)
-			}
-		}
-		return out, nil
-	case LineString:
-		pieces := clipLineToMask(t, polys)
-		for i := range pieces {
-			pieces[i].CRSValue = crs
-		}
-		switch len(pieces) {
-		case 0:
-			return LineString{CRSValue: crs, HasZ: t.HasZ}, nil
-		case 1:
-			return pieces[0], nil
-		}
-		return MultiLineString{Lines: pieces, CRSValue: crs, HasZ: t.HasZ}, nil
-	case MultiLineString:
-		out := MultiLineString{CRSValue: crs, HasZ: t.HasZ}
-		for _, l := range t.Lines {
-			out.Lines = append(out.Lines, clipLineToMask(l, polys)...)
-		}
-		for i := range out.Lines {
-			out.Lines[i].CRSValue = crs
-		}
-		return out, nil
-	}
-	return nil, fmt.Errorf("geometry: clip: unsupported subject %T", subject)
 }
 
 // validateClipInputs checks input shape and CRS consistency.

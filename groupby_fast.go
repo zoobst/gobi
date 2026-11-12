@@ -469,7 +469,10 @@ func appendFastAgg(b array.Builder, a Aggregation, v aggView, rows []int) error 
 		n++
 		delta := x - mean
 		mean += delta / float64(n)
-		m2 += delta * (x - mean)
+		// The product is rounded on its own (the conversion) so the
+		// compiler can't fuse it into the add, which it does on arm64 and
+		// not on amd64 or wasm: the result is the same bits everywhere.
+		m2 += float64(delta * (x - mean))
 	}
 	if n == 0 {
 		fb.AppendNull()

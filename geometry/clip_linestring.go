@@ -328,109 +328,6 @@ func clipLineGeneral(ls LineString, p Polygon, wantOutside bool) (inside, outsid
 	return
 }
 
-// clipLineToMask returns the pieces of ls inside the union of polys,
-// in order along ls.
-//
-// One polygon is LineString.Clip. Several are treated as one region:
-// clipping to each member in turn and joining the results would cut
-// the line wherever it passes from one member into an adjoining one,
-// return a stretch along a shared edge once per member, and group the
-// pieces by member instead of along the line. So each segment of ls
-// is split where it meets any ring of any member, and each stretch
-// between two splits is kept if its midpoint is inside some member or
-// on its boundary.
-func clipLineToMask(ls LineString, polys []Polygon) []LineString {
-	if len(polys) == 1 {
-		return ls.Clip(polys[0])
-	}
-	if len(ls.Points) < 2 || len(polys) == 0 {
-		return nil
-	}
-	bounds := make([]Bounds, len(polys))
-	for i, p := range polys {
-		bounds[i] = p.Bounds()
-	}
-	var (
-		pieces []LineString
-		cur    lineBuilder
-		ts     = make([]float64, 0, 8)
-		near   = make([]int, 0, len(polys))
-	)
-	for i := range len(ls.Points) - 1 {
-		a, b := ls.Points[i], ls.Points[i+1]
-		if a.X == b.X && a.Y == b.Y {
-			continue
-		}
-		// Only members whose bounds the segment reaches can split it
-		// or contain part of it.
-		seg := Bounds{MinX: min(a.X, b.X), MinY: min(a.Y, b.Y), MaxX: max(a.X, b.X), MaxY: max(a.Y, b.Y)}
-		near = near[:0]
-		ts = append(ts[:0], 0, 1)
-		for j, p := range polys {
-			if !seg.Intersects(bounds[j]) {
-				continue
-			}
-			near = append(near, j)
-			for _, ring := range p.Rings {
-				r := openRing(ring)
-				for k := range r {
-					if t, ok := segSegParam(a, b, r[k], r[(k+1)%len(r)]); ok && t > 0 && t < 1 {
-						ts = append(ts, t)
-					}
-				}
-			}
-		}
-		sort.Float64s(ts)
-		// The segment's own ends are used as they are; only a point
-		// part-way along is interpolated.
-		at := func(t float64) Point {
-			switch t {
-			case 0:
-				return a
-			case 1:
-				return b
-			}
-			return lerp(a, b, t)
-		}
-		// end is where the current inside run on this segment stops.
-		// It is only written out when the run ends, so a split the
-		// line passes straight through (from one member into the
-		// next) adds no vertex.
-		end, open := 0.0, false
-		for k := 0; k+1 < len(ts); k++ {
-			t0, t1 := ts[k], ts[k+1]
-			if t1-t0 < 1e-15 {
-				continue
-			}
-			mid := lerp(a, b, (t0+t1)/2)
-			inside := false
-			for _, j := range near {
-				if pointInPolygon(mid, polys[j]) {
-					inside = true
-					break
-				}
-			}
-			if !inside {
-				if open {
-					cur.append(at(end))
-					open = false
-				}
-				cur.flush(&pieces, ls)
-				continue
-			}
-			if !open && cur.empty() {
-				cur.append(at(t0))
-			}
-			end, open = t1, true
-		}
-		if open {
-			cur.append(at(end))
-		}
-	}
-	cur.flush(&pieces, ls)
-	return pieces
-}
-
 // segSegParam returns the parameter t on segment a->b where it crosses
 // segment c->d, if the two segments properly intersect in their interiors
 // (or share an endpoint). Parallel/collinear segments return ok=false.
@@ -453,9 +350,9 @@ func segSegParam(a, b, c, d Point) (float64, bool) {
 // interpolated only when both endpoints carry Z; otherwise the result is
 // 2D with Z zeroed.
 func lerp(a, b Point, t float64) Point {
-	p := Point{X: a.X + t*(b.X-a.X), Y: a.Y + t*(b.Y-a.Y)}
+	p := Point{X: a.X + float64(t*(b.X-a.X)), Y: a.Y + float64(t*(b.Y-a.Y))}
 	if a.HasZ && b.HasZ {
-		p.Z = a.Z + t*(b.Z-a.Z)
+		p.Z = a.Z + float64(t*(b.Z-a.Z))
 		p.HasZ = true
 	}
 	return p

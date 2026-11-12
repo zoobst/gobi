@@ -152,7 +152,7 @@ func antimeridianCrossingLat(a, b Point) (float64, bool) {
 		targetLon = -180.0
 	}
 	t := (targetLon - a.X) / (bLon - a.X)
-	return a.Y + t*(b.Y-a.Y), true
+	return a.Y + float64(t*(b.Y-a.Y)), true
 }
 
 // splitLineStringAtAntimeridian walks l and inserts (±180, lat) breaks
@@ -412,17 +412,19 @@ func ringCentroid(ring []Point) Point {
 		return ring[0]
 	}
 	closed := closedRing(ring)
+	// Relative to the first vertex, as in Polygon.Centroid.
+	fx, fy := closed[0].X, closed[0].Y
 	var cx, cy, areaTwo float64
 	for i := range len(closed) - 1 {
-		x0, y0 := closed[i].X, closed[i].Y
-		x1, y1 := closed[i+1].X, closed[i+1].Y
-		cross := x0*y1 - x1*y0
+		x0, y0 := closed[i].X-fx, closed[i].Y-fy
+		x1, y1 := closed[i+1].X-fx, closed[i+1].Y-fy
+		cross := diffOfProducts(x0, y1, x1, y0)
 		areaTwo += cross
-		cx += (x0 + x1) * cross
-		cy += (y0 + y1) * cross
+		cx += float64((x0 + x1) * cross)
+		cy += float64((y0 + y1) * cross)
 	}
 	if areaTwo == 0 {
 		return closed[0]
 	}
-	return Point{X: cx / (3 * areaTwo), Y: cy / (3 * areaTwo)}
+	return Point{X: fx + cx/(3*areaTwo), Y: fy + cy/(3*areaTwo)}
 }

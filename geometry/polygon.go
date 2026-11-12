@@ -3,6 +3,8 @@ package geometry
 import (
 	"math"
 	"strings"
+
+	"github.com/zoobst/gobi/internal/detmath"
 )
 
 // Polygon is a planar surface defined by one exterior linear ring and zero or
@@ -122,6 +124,14 @@ func (p Polygon) Perimeter(u Unit) (float64, error) {
 // Centroid returns the area-weighted centroid of the exterior ring, using the
 // planar (shoelace) formula. For small geographic polygons the result is a
 // close approximation.
+//
+// The sums are taken relative to the ring's first vertex and the
+// result moved back, for the reason ringSignedArea gives: over raw
+// coordinates the terms are huge and cancel, and for a small polygon
+// far from the origin what is left is mostly rounding error.
+// polygonRingCentroid (the WKB scanner) and
+// compute.PolygonCentroidShoelace do the same arithmetic in the same
+// order, so all three agree to the bit.
 func (p Polygon) Centroid() Point {
 	ring := p.Exterior()
 	if len(ring) == 0 {
@@ -133,23 +143,24 @@ func (p Polygon) Centroid() Point {
 		areaTwo float64
 		n               = len(ring) - 1
 		sx, sy  float64 = 0, 0
+		fx, fy          = ring[0].X, ring[0].Y
 	)
 	for i := range n {
-		x0, y0 := ring[i].X, ring[i].Y
-		x1, y1 := ring[i+1].X, ring[i+1].Y
-		cross := x0*y1 - x1*y0
+		x0, y0 := ring[i].X-fx, ring[i].Y-fy
+		x1, y1 := ring[i+1].X-fx, ring[i+1].Y-fy
+		cross := diffOfProducts(x0, y1, x1, y0)
 		areaTwo += cross
-		cx += (x0 + x1) * cross
-		cy += (y0 + y1) * cross
-		sx += x0
-		sy += y0
+		cx += float64((x0 + x1) * cross)
+		cy += float64((y0 + y1) * cross)
+		sx += ring[i].X
+		sy += ring[i].Y
 	}
 	if areaTwo == 0 {
 		return Point{X: sx / float64(n), Y: sy / float64(n), CRSValue: p.CRSValue}
 	}
 	return Point{
-		X:        cx / (3 * areaTwo),
-		Y:        cy / (3 * areaTwo),
+		X:        fx + cx/(3*areaTwo),
+		Y:        fy + cy/(3*areaTwo),
 		CRSValue: p.CRSValue,
 	}
 }
@@ -279,7 +290,9 @@ func closedRing(r []Point) []Point {
 }
 
 // PlanarRingArea returns the planar (unsigned) area of a ring via
-// the shoelace formula. Independent of CRS — callers that need the
+// the shoelace formula, summed relative to the ring's first vertex
+// so that a small ring far from the origin keeps its area (see
+// ringSignedArea). Independent of CRS — callers that need the
 // spherical-area interpretation for geographic coordinates should
 // use Polygon.Area with a Unit instead. Exposed so downstream
 // packages (predicate stats, buffer heuristics) can compute planar
@@ -292,15 +305,7 @@ func PlanarRingArea(ring []Point) float64 {
 }
 
 func planarRingArea(ring []Point) float64 {
-	if len(ring) < 3 {
-		return 0
-	}
-	ring = closedRing(ring)
-	var a float64
-	for i := range len(ring) - 1 {
-		a += ring[i].X*ring[i+1].Y - ring[i+1].X*ring[i].Y
-	}
-	return math.Abs(a) / 2
+	return math.Abs(ringSignedArea(ring))
 }
 
 func sphericalRingArea(ring []Point, radiusM float64) float64 {
@@ -314,7 +319,7 @@ func sphericalRingArea(ring []Point, radiusM float64) float64 {
 		λ2 := degToRad(ring[i+1].X)
 		φ1 := degToRad(ring[i].Y)
 		φ2 := degToRad(ring[i+1].Y)
-		total += (λ2 - λ1) * (math.Sin(φ1) + math.Sin(φ2))
+		total += float64((λ2 - λ1) * (detmath.Sin(φ1) + detmath.Sin(φ2)))
 	}
 	return math.Abs(total*radiusM*radiusM) / 2
 }
@@ -349,5 +354,5 @@ func cross(a, b, c Point) float64 {
 func distSq(a, b Point) float64 {
 	dx := a.X - b.X
 	dy := a.Y - b.Y
-	return dx*dx + dy*dy
+	return float64(dx*dx) + float64(dy*dy)
 }

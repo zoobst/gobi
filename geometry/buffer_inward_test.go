@@ -268,3 +268,34 @@ func TestBuffer_ResultIs2D(t *testing.T) {
 		}
 	}
 }
+
+// A MultiPolygon shrinks as one region: an edge two members share is
+// inside it, so nothing is taken off along that edge.
+func TestBufferInward_AdjoiningMembers(t *testing.T) {
+	mp := MultiPolygon{Polygons: []Polygon{
+		{Rings: [][]Point{inwardRing(0, 0, 10, 0, 10, 10, 0, 10)}},
+		{Rings: [][]Point{inwardRing(10, 0, 20, 0, 20, 10, 10, 10)}},
+		{Rings: [][]Point{inwardRing(40, 0, 46, 0, 46, 6, 40, 6)}}, // on its own
+	}, CRSValue: PseudoMercator}
+	out, got := bufferInwardArea(t, mp, -1)
+	res, ok := out.(MultiPolygon)
+	if !ok || len(res.Polygons) != 2 {
+		t.Fatalf("got %T with %d parts, want a MultiPolygon of 2: the merged pair and the lone square", out, len(appendPolygons(nil, out)))
+	}
+	// [1,19]×[1,9] and [41,45]×[1,5].
+	if math.Abs(got-(18*8+16)) > 1e-9 {
+		t.Errorf("area = %v, want 160", got)
+	}
+	var pair Polygon
+	for _, p := range res.Polygons {
+		if p.Bounds().MinX < 30 {
+			pair = p
+		}
+	}
+	if b := pair.Bounds(); b.MinX != 1 || b.MaxX != 19 || b.MinY != 1 || b.MaxY != 9 {
+		t.Errorf("merged pair bounds = %+v, want 1..19 × 1..9 with no gap at x=10", b)
+	}
+	if !out.CRS().Equal(PseudoMercator) {
+		t.Errorf("CRS = %v, want it kept", out.CRS())
+	}
+}
