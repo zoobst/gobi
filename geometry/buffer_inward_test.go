@@ -241,3 +241,30 @@ func TestBufferInward_MatchesDistanceToBoundary(t *testing.T) {
 		}
 	}
 }
+
+// A buffer is 2D whichever way it goes: the output's vertices are
+// offsets of the input's, so a 3D input's Z values have nowhere to go.
+func TestBuffer_ResultIs2D(t *testing.T) {
+	z := func(x, y float64) Point { return Point{X: x, Y: y, Z: 5, HasZ: true} }
+	poly := Polygon{Rings: [][]Point{{z(0, 0), z(10, 0), z(10, 10), z(0, 10), z(0, 0)}}, HasZ: true}
+	for _, d := range []float64{1, -1} {
+		for name, g := range map[string]Geometry{"Polygon": poly, "MultiPolygon": MultiPolygon{Polygons: []Polygon{poly}, HasZ: true}} {
+			out, err := Buffer(g, d, BufferOptions{})
+			if err != nil {
+				t.Fatalf("%s, distance %v: %v", name, d, err)
+			}
+			if out.Is3D() {
+				t.Errorf("%s, distance %v: result is 3D, want 2D", name, d)
+			}
+			for _, p := range appendPolygons(nil, out) {
+				for _, ring := range p.Rings {
+					for _, v := range ring {
+						if v.HasZ || v.Z != 0 {
+							t.Fatalf("%s, distance %v: vertex %+v carries Z", name, d, v)
+						}
+					}
+				}
+			}
+		}
+	}
+}

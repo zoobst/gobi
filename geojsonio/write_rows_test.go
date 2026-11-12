@@ -383,7 +383,7 @@ func TestWrite_GeometryFallback(t *testing.T) {
 			if got != string(ref) {
 				t.Errorf("got %s, reference %s", got, ref)
 			}
-			if c.want != "" && got != fmt.Sprintf(`{"type":"Feature","geometry":%s}`, c.want) {
+			if c.want != "" && got != fmt.Sprintf(`{"type":"Feature","geometry":%s,"properties":{}}`, c.want) {
 				t.Errorf("got %s, want geometry %s", got, c.want)
 			}
 		})
@@ -420,5 +420,47 @@ func TestMarshal_EmptyGeometries(t *testing.T) {
 		if reflect.TypeOf(back) != reflect.TypeOf(g) || !geometry.IsEmpty(back) {
 			t.Errorf("%s read back as %T %+v", got, back, back)
 		}
+	}
+}
+
+// A Feature always has a "properties" member (RFC 7946 §3.2), also
+// when the frame has no property columns or the map is nil. It used
+// to be left out in both cases.
+func TestWrite_PropertiesAlwaysPresent(t *testing.T) {
+	const want = `{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}`
+	p := geometry.Point{X: 1, Y: 2}
+	for name, props := range map[string]map[string]any{"nil map": nil, "empty map": {}} {
+		got, err := MarshalFeature(p, props)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Errorf("MarshalFeature, %s: %s, want %s", name, got, want)
+		}
+	}
+
+	b := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	defer b.Release()
+	b.Append(geometry.WKB(p))
+	df, err := gobi.NewFrameFromSeries(gobi.SeriesFromArray(gobi.GeometryField("geometry", 4326), b.NewArray()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer df.Release()
+	var out bytes.Buffer
+	if err := Write(df, &out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != `{"type":"FeatureCollection","features":[`+want+`]}` {
+		t.Errorf("Write: %s", got)
+	}
+	// And it reads back: one row, the geometry, no property columns.
+	back, err := Read(&out, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	defer back.Release()
+	if back.NumRows() != 1 || back.NumCols() != 1 {
+		t.Errorf("read back %d rows × %d columns, want 1 × 1", back.NumRows(), back.NumCols())
 	}
 }

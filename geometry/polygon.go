@@ -338,8 +338,12 @@ func pointInRing(pt Point, ring []Point) bool {
 	return inside
 }
 
+// cross is the z component of (b-a) × (c-a): >0 when c is left of
+// a→b, 0 when the three are collinear. Exactly zero matters to the
+// callers that test for it (pointOnSegment, orient); see
+// diffOfProducts.
 func cross(a, b, c Point) float64 {
-	return (b.X-a.X)*(c.Y-a.Y) - (b.Y-a.Y)*(c.X-a.X)
+	return diffOfProducts(b.X-a.X, c.Y-a.Y, b.Y-a.Y, c.X-a.X)
 }
 
 func distSq(a, b Point) float64 {

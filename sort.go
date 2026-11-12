@@ -50,42 +50,53 @@ func (f *Frame) SortBy(keys ...SortKey) (*Frame, error) {
 		return nil, fmt.Errorf("gobi: SortBy requires at least one key")
 	}
 	arrs := make([]arrow.Array, len(keys))
-	cmps := make([]rowComparator, len(keys))
 	for i, k := range keys {
 		s, err := f.Column(k.Column)
 		if err != nil {
 			return nil, err
 		}
-		arr, release, err := sortKeyArray(s)
+		arr, release, err := seriesAsArray(s)
 		if err != nil {
 			return nil, fmt.Errorf("gobi: SortBy key %q: %w", k.Column, err)
 		}
 		defer release()
-		cmp, err := arrayComparator(arr, k.Descending)
-		if err != nil {
-			return nil, fmt.Errorf("gobi: SortBy key %q: %w", k.Column, err)
-		}
-		arrs[i], cmps[i] = arr, cmp
+		arrs[i] = arr
 	}
 
 	// One numeric, temporal or string key (the common case) sorts
-	// (value, row) pairs directly, without a comparator call through
-	// the key array.
+	// (value, row) pairs directly, with no comparators at all.
 	if len(keys) == 1 {
 		if perm, ok := sortSingleKey(arrs[0], keys[0].Descending); ok {
 			return f.take(perm)
 		}
 	}
 
-	n := f.NumRows()
-	perm := make([]int, n)
+	cmps := make([]rowComparator, len(keys))
+	for i, k := range keys {
+		cmp, err := arrayComparator(arrs[i], k.Descending)
+		if err != nil {
+			return nil, fmt.Errorf("gobi: SortBy key %q: %w", k.Column, err)
+		}
+		cmps[i] = cmp
+	}
+	perm := make([]int, f.NumRows())
 	for i := range perm {
 		perm[i] = i
 	}
-	// Breaking ties on the row number makes the order total, so an
-	// unstable sort gives exactly the stable result: rows equal on
-	// every key keep their input order.
-	slices.SortFunc(perm, func(ra, rb int) int {
+	sortRowsBy(perm, cmps)
+	return f.take(perm)
+}
+
+// sortRowsBy sorts row numbers by cmps, key by key, and by row number
+// where every key ties.
+//
+// rows must be in ascending order on entry, as a whole frame's rows
+// or the rows of one partition are. The tie-break then makes this a
+// stable sort (rows equal on every key keep their input order) while
+// using the unstable, reflection-free slices.SortFunc: the order is
+// total, so there is only one result it can give.
+func sortRowsBy(rows []int, cmps []rowComparator) {
+	slices.SortFunc(rows, func(ra, rb int) int {
 		for _, cmp := range cmps {
 			if c := cmp(ra, rb); c != 0 {
 				return c
@@ -93,8 +104,6 @@ func (f *Frame) SortBy(keys ...SortKey) (*Frame, error) {
 		}
 		return ra - rb
 	})
-
-	return f.take(perm)
 }
 
 // keyedRow is one row of a single-key sort: the key's value and the
@@ -107,6 +116,11 @@ type keyedRow[T cmp.Ordered] struct {
 // sortSingleKey returns the row permutation that sorts arr, for the
 // fixed-width numeric and temporal types and the string types. ok is
 // false for every other type, which goes through the comparator path.
+//
+// Every type handled here must also be handled by arrayComparator, or
+// a column would sort as the only key and be rejected as one of
+// several. TestSortBy_SingleKeyTypesHaveComparators checks that, and
+// that both paths give the same order.
 //
 // The result is identical to the comparator path: values in key order
 // with ties in input order, then NaNs, then nulls, the last two groups
@@ -238,10 +252,10 @@ func sortKeyedRows[T cmp.Ordered](rows []keyedRow[T], descending bool, trailing,
 type rowComparator func(i, j int) int
 
 // newRowComparator returns the comparator for key column s. release
-// frees the copy made of a multi-chunk key (see sortKeyArray) and must
+// frees the copy made of a multi-chunk key (see seriesAsArray) and must
 // be called once the comparator is no longer used.
 func newRowComparator(s Series, descending bool) (cmp rowComparator, release func(), err error) {
-	arr, release, err := sortKeyArray(s)
+	arr, release, err := seriesAsArray(s)
 	if err != nil {
 		return nil, release, err
 	}
@@ -253,10 +267,12 @@ func newRowComparator(s Series, descending bool) (cmp rowComparator, release fun
 	return cmp, release, nil
 }
 
-// sortKeyArray returns key column s as one array. A multi-chunk key is
-// concatenated first (the key column only, not the frame); release
-// frees that copy and must be called once the array is no longer used.
-func sortKeyArray(s Series) (arr arrow.Array, release func(), err error) {
+// seriesAsArray returns s's values as one array, for code that indexes
+// a column by row. A single chunk is returned as it is. Several are
+// concatenated (that column only, not its frame), and a column with
+// no chunks gives an empty array; release frees either copy and must
+// be called once the array is no longer used.
+func seriesAsArray(s Series) (arr arrow.Array, release func(), err error) {
 	release = func() {}
 	chunks := s.col.Data().Chunks()
 	switch len(chunks) {
@@ -268,7 +284,7 @@ func sortKeyArray(s Series) (arr arrow.Array, release func(), err error) {
 	default:
 		cat, err := array.Concatenate(chunks, memory.DefaultAllocator)
 		if err != nil {
-			return nil, release, fmt.Errorf("concatenate %d-chunk sort key: %w", len(chunks), err)
+			return nil, release, fmt.Errorf("concatenate %d chunks: %w", len(chunks), err)
 		}
 		arr, release = cat, cat.Release
 	}

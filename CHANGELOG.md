@@ -21,15 +21,19 @@ introduce breaking changes; check this file when upgrading.
     silently lost features. Holes wound the "wrong" way hit it too.
   - **Not affected:** two single-ring convex polygons, which take a
     fast path, and inputs that share no edge.
-- **Polygon boolean ops are now correct on arm64 for shared edges
-  that are not horizontal or vertical.** A union could drop one of two
-  polygons that shared a slanted edge, and `Dissolve` of adjoining
-  polygons could return the wrong shape.
-  - **Cause:** the sweep's collinearity test was compiled to a fused
-    multiply-subtract on arm64 (also ppc64, s390x, riscv64), so it was
-    off by a rounding error for two coincident edges unless they were
-    axis-aligned.
-  - **Not affected:** amd64 and wasm, which don't fuse.
+- **Geometry on arm64 now agrees with amd64 and wasm about edges
+  that are not horizontal or vertical.**
+  - **Polygon boolean ops:** a union could drop one of two polygons
+    that shared a slanted edge, and `Dissolve` of adjoining polygons
+    could return the wrong shape.
+  - **Points and lines on a slanted polygon edge:** `Intersects` and
+    the other predicates that test whether a point is on an edge, and
+    line clipping, could treat a point on the edge as off it.
+  - **Cause:** collinearity tests of the form `a*b - c*d` were
+    compiled to a fused multiply-subtract on arm64 (also ppc64, s390x,
+    riscv64), which is off by a rounding error exactly where the
+    answer should be zero, unless the edge is axis-aligned. They now
+    round each product first, as amd64 and wasm always did.
 - **`SymDifference` no longer keeps an edge the two inputs share from
   opposite sides.** Two squares side by side gave a malformed result
   with the wrong area; they now give the 2×1 rectangle.
@@ -38,12 +42,22 @@ introduce breaking changes; check this file when upgrading.
   at evaluation with "series is not numeric". All six comparisons now
   work between Boolean columns and literals, with `false < true`. A
   null on either side gives null.
+- **`And`, `Or`, `Not` and string `Eq` / `Ne` read every chunk of
+  their columns.** They read the first chunk only, so on a frame built
+  from several batches the result was as long as that chunk, and a
+  column with no chunks panicked. The new Boolean comparisons read
+  every chunk too.
 - **`geojsonio` writes an empty geometry with its `"coordinates"`.**
   An empty LineString came out as `{"type":"LineString"}`, which RFC
   7946 doesn't allow; it is now
   `{"type":"LineString","coordinates":[]}`. The same goes for the
   other types, and for `"geometries"` in an empty GeometryCollection.
   This applies to `Marshal`, `MarshalFeature` and `Write`.
+- **`geojsonio` always writes a Feature's `"properties"`,** which RFC
+  7946 requires. A Feature with none came out with no such member; it
+  now has `"properties":{}`. This applies to `MarshalFeature`, to
+  `Write` on a frame with only a geometry column, and to marshalling a
+  `Feature` value yourself (its struct tag lost `omitempty`).
 
 ### Added
 
@@ -60,26 +74,43 @@ introduce breaking changes; check this file when upgrading.
     corners stay sharp.
   - **Any CRS works,** with the distance in the CRS's unit, as for
     outward buffers.
+  - **The result is 2D,** as an outward buffer's already was: a 3D
+    polygon's Z values are dropped.
   - **A distance of zero or NaN is still an error.**
 - **`geometry.Clip` and `Series.GeomClip` accept points and lines as
   the thing being clipped.** The mask must still be a Polygon or
-  MultiPolygon. Before, any non-polygon row was an error, so a mixed
-  layer couldn't be clipped.
+  MultiPolygon, in a projected CRS. Before, any non-polygon row was an
+  error, so a mixed layer couldn't be clipped.
   - **Point:** kept if it is inside the mask or on its boundary;
     otherwise a MultiPoint with no points (gobi has no empty Point).
   - **MultiPoint:** the points that are inside.
-  - **LineString:** the pieces inside the mask, as a LineString for
-    one piece or none, and a MultiLineString for several.
+  - **LineString:** the pieces inside the mask, in order along the
+    line, as a LineString for one piece or none, and a MultiLineString
+    for several.
   - **MultiLineString:** a MultiLineString of the pieces.
+  - **A MultiPolygon mask is one region.** A line passing from one
+    member into an adjoining one stays in one piece, and a stretch
+    along an edge two members share is returned once.
   - **A `GeomClip` row with nothing inside the mask** is an empty
     geometry of its own kind, not a null.
-  - `Union`, `Difference` and `SymDifference` still need polygons on
-    both sides.
+  - **Only `Clip` does this.** `Boolean`, `Union`, `Difference` and
+    `SymDifference` still need polygons on both sides, so
+    `Boolean(line, polygon, OpIntersection, …)` is an error; call
+    `Clip`.
+- **`geometry.WKBTypePoint` … `geometry.WKBTypeGeometryCollection`**
+  name the type codes `WKBTypeCode` returns.
 
 ### Changed
 
 - **`geojsonio.Write` writes properties in column order.** They used
   to come from a map, so their order varied from feature to feature.
+- **`GeomClip`, `GeomUnion`, `GeomDifference` and `GeomSymDifference`
+  check the mask and the CRS before any row.** A series in a
+  geographic CRS, or a mask that isn't a Polygon or MultiPolygon, is
+  now always an error. Before, the check ran per row and only for rows
+  whose bounds reached the mask, so the same call succeeded or failed
+  depending on where the rows were, and succeeded on a series with
+  none near it.
 
 ### Performance
 
@@ -100,6 +131,7 @@ Measured on an Apple M1, before → after.
   directly. Other keys, and several keys, still go through
   comparators, without `sort.SliceStable`'s reflection-based swaps.
   Results are unchanged: stable, nulls last, NaN before nulls.
+  `Over(…).OrderBy(…)` sorts each partition the same way.
 - **`geojsonio.Write` appends each feature to one reused buffer,**
   reading property values from the Arrow arrays and coordinates from
   the WKB bytes, with no map or decoded geometry per row.

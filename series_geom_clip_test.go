@@ -1,6 +1,7 @@
 package gobi
 
 import (
+	"errors"
 	"math"
 	"testing"
 
@@ -585,5 +586,51 @@ func TestSeries_GeomClip_PointsAndLines(t *testing.T) {
 	// The other boolean ops still need polygon rows.
 	if _, err := s.GeomDifference(mask); err == nil {
 		t.Error("GeomDifference on point rows: expected an error")
+	}
+}
+
+// The mask and CRS are checked once, before any row: whether the call
+// fails must not depend on which rows happen to reach the mask.
+func TestSeries_GeomClip_ChecksInputsUpFront(t *testing.T) {
+	far := geometry.Point{X: 50, Y: 50}
+	mask := geometry.SimplePolygon([]geometry.Point{
+		{X: 0, Y: 0}, {X: 1, Y: 0}, {X: 1, Y: 1}, {X: 0, Y: 1}, {X: 0, Y: 0},
+	}, geometry.CRS{})
+
+	// Geographic CRS: an error even though no row is near the mask,
+	// and even with no rows at all.
+	for name, rows := range map[string][]geometry.Geometry{
+		"rows away from the mask": {far, nil, geometry.LineString{Points: []geometry.Point{{X: 60, Y: 60}, {X: 61, Y: 61}}}},
+		"a row inside the mask":   {far, geometry.Point{X: 0.5, Y: 0.5}},
+		"no rows":                 {},
+	} {
+		s := geomSeries(t, "geom", int32(geometry.WGS84.EPSG), rows)
+		if _, err := s.GeomClip(mask); !errors.Is(err, geometry.ErrGeographicCRS) {
+			t.Errorf("EPSG:4326, %s: err = %v, want ErrGeographicCRS", name, err)
+		}
+	}
+
+	// A mask that isn't a polygon: an error for every op, again
+	// wherever the rows are.
+	s := geomSeries(t, "geom", int32(geometry.PseudoMercator.EPSG), []geometry.Geometry{projectedSquare(100, 100, 1), nil})
+	line := geometry.LineString{Points: []geometry.Point{{X: 0, Y: 0}, {X: 1, Y: 1}}}
+	for name, op := range map[string]func(geometry.Geometry) (Series, error){
+		"GeomClip": s.GeomClip, "GeomUnion": s.GeomUnion, "GeomDifference": s.GeomDifference, "GeomSymDifference": s.GeomSymDifference,
+	} {
+		if _, err := op(line); err == nil {
+			t.Errorf("%s with a LineString mask: expected an error", name)
+		}
+		if _, err := op(nil); err == nil {
+			t.Errorf("%s with a nil mask: expected an error", name)
+		}
+	}
+
+	// A projected CRS with nothing near the mask still works.
+	out, err := s.GeomClip(mask)
+	if err != nil {
+		t.Fatalf("projected CRS: %v", err)
+	}
+	if g, _ := out.Geometry(0); !geometry.IsEmpty(g) {
+		t.Errorf("row 0 = %+v, want an empty polygon", g)
 	}
 }

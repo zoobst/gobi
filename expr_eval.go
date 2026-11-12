@@ -619,6 +619,24 @@ func applyBinaryOp(op binOpKind, left, right Series) (Series, error) {
 	return Series{}, fmt.Errorf("%w: unhandled op %s", ErrExprTypeMismatch, op)
 }
 
+// typedArray returns every row of s as one array of type A (see
+// seriesAsArray: a column in several chunks is concatenated, and one
+// with no chunks is empty). Reading Chunks()[0] instead compares only
+// the first chunk of a multi-chunk column and panics on a column with
+// none. release must be called once the array is no longer used.
+func typedArray[A arrow.Array](s Series) (arr A, release func(), err error) {
+	whole, release, err := seriesAsArray(s)
+	if err != nil {
+		return arr, func() {}, err
+	}
+	arr, ok := whole.(A)
+	if !ok {
+		release()
+		return arr, func() {}, fmt.Errorf("%w: column %q is %s", ErrExprTypeMismatch, s.name, s.DataType())
+	}
+	return arr, release, nil
+}
+
 // boolComparison returns the comparison op as a function of two
 // booleans, with false < true.
 func boolComparison(op binOpKind) func(a, b bool) bool {
@@ -638,15 +656,23 @@ func boolComparison(op binOpKind) func(a, b bool) bool {
 }
 
 // stringCompare returns a Boolean Series of left ==/!= right, element-
-// wise. Both inputs must be single-chunk String columns of the same
-// length; the caller is expected to have already verified that.
+// wise. Both inputs must be String columns of the same length; the
+// caller is expected to have already verified the type.
 func stringCompare(left, right Series, negate bool) (Series, error) {
 	if left.Len() != right.Len() {
 		return Series{}, fmt.Errorf("%w: %d vs %d",
 			ErrColumnLenMismatch, left.Len(), right.Len())
 	}
-	la := left.col.Data().Chunks()[0].(*array.String)
-	ra := right.col.Data().Chunks()[0].(*array.String)
+	la, releaseL, err := typedArray[*array.String](left)
+	if err != nil {
+		return Series{}, err
+	}
+	defer releaseL()
+	ra, releaseR, err := typedArray[*array.String](right)
+	if err != nil {
+		return Series{}, err
+	}
+	defer releaseR()
 	n := la.Len()
 
 	pool := memory.DefaultAllocator
@@ -825,8 +851,16 @@ func boolBinary(a, b Series, op func(x, y bool) bool) (Series, error) {
 		return Series{}, fmt.Errorf("%w: %d vs %d",
 			ErrColumnLenMismatch, a.Len(), b.Len())
 	}
-	aa := a.col.Data().Chunks()[0].(*array.Boolean)
-	bb := b.col.Data().Chunks()[0].(*array.Boolean)
+	aa, releaseA, err := typedArray[*array.Boolean](a)
+	if err != nil {
+		return Series{}, err
+	}
+	defer releaseA()
+	bb, releaseB, err := typedArray[*array.Boolean](b)
+	if err != nil {
+		return Series{}, err
+	}
+	defer releaseB()
 	n := aa.Len()
 
 	pool := memory.DefaultAllocator
@@ -847,7 +881,11 @@ func boolUnary(s Series, op func(bool) bool) (Series, error) {
 	if err := requireBool(s, "operand"); err != nil {
 		return Series{}, err
 	}
-	aa := s.col.Data().Chunks()[0].(*array.Boolean)
+	aa, release, err := typedArray[*array.Boolean](s)
+	if err != nil {
+		return Series{}, err
+	}
+	defer release()
 	n := aa.Len()
 
 	pool := memory.DefaultAllocator

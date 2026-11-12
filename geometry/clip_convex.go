@@ -42,7 +42,7 @@ func ringIsConvex(ring []Point) bool {
 		a := ring[i]
 		b := ring[(i+1)%n]
 		c := ring[(i+2)%n]
-		cross := (b.X-a.X)*(c.Y-b.Y) - (b.Y-a.Y)*(c.X-b.X)
+		cross := diffOfProducts(b.X-a.X, c.Y-b.Y, b.Y-a.Y, c.X-b.X)
 		if cross > 0 {
 			if sign < 0 {
 				return false
@@ -237,7 +237,7 @@ func pointInsideConvexRing(p Point, clip []Point, ccw bool) bool {
 	for i := range n {
 		a := clip[i]
 		b := clip[(i+1)%n]
-		cross := (b.X-a.X)*(p.Y-a.Y) - (b.Y-a.Y)*(p.X-a.X)
+		cross := diffOfProducts(b.X-a.X, p.Y-a.Y, b.Y-a.Y, p.X-a.X)
 		if ccw {
 			if cross < 0 {
 				return false
@@ -285,7 +285,7 @@ func ringSignedArea(ring []Point) float64 {
 // are considered inside — matches Sutherland-Hodgman's canonical
 // treatment and avoids emitting sliver output for shared boundaries.
 func insideClipEdge(a, b, p Point, ccw bool) bool {
-	cross := (b.X-a.X)*(p.Y-a.Y) - (b.Y-a.Y)*(p.X-a.X)
+	cross := diffOfProducts(b.X-a.X, p.Y-a.Y, b.Y-a.Y, p.X-a.X)
 	if ccw {
 		return cross >= 0
 	}
@@ -304,10 +304,10 @@ func lineIntersect(a, b, c, d Point) Point {
 	dy1 := b.Y - a.Y
 	dx2 := d.X - c.X
 	dy2 := d.Y - c.Y
-	denom := dx1*dy2 - dy1*dx2
+	denom := diffOfProducts(dx1, dy2, dy1, dx2)
 	if denom == 0 {
 		return Point{X: (c.X + d.X) / 2, Y: (c.Y + d.Y) / 2}
 	}
-	t := ((c.X-a.X)*dy2 - (c.Y-a.Y)*dx2) / denom
+	t := diffOfProducts(c.X-a.X, dy2, c.Y-a.Y, dx2) / denom
 	return Point{X: a.X + t*dx1, Y: a.Y + t*dy1}
 }

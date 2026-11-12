@@ -7,6 +7,10 @@ import (
 	"slices"
 	"sort"
 	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // TestSortBy_MatchesStableReference checks SortBy against a plain
@@ -121,6 +125,127 @@ func TestSortBy_MatchesStableReference(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+// Every key type the single-key path sorts directly must also have a
+// comparator, or it would sort as the only key and be rejected as one
+// of several; and the two paths must agree on the order.
+func TestSortBy_SingleKeyTypesHaveComparators(t *testing.T) {
+	pool := memory.DefaultAllocator
+	// Three values with a tie and a null: v[0] > v[1] == v[3], row 2 null.
+	build := func(b array.Builder, appendAt func(i int)) arrow.Array {
+		defer b.Release()
+		for i := range 4 {
+			if i == 2 {
+				b.AppendNull()
+				continue
+			}
+			appendAt(i)
+		}
+		return b.NewArray()
+	}
+	n := []int64{7, 3, 0, 3}
+	arrays := map[string]arrow.Array{}
+	{
+		b := array.NewInt64Builder(pool)
+		arrays["int64"] = build(b, func(i int) { b.Append(n[i]) })
+	}
+	{
+		b := array.NewInt32Builder(pool)
+		arrays["int32"] = build(b, func(i int) { b.Append(int32(n[i])) })
+	}
+	{
+		b := array.NewInt16Builder(pool)
+		arrays["int16"] = build(b, func(i int) { b.Append(int16(n[i])) })
+	}
+	{
+		b := array.NewInt8Builder(pool)
+		arrays["int8"] = build(b, func(i int) { b.Append(int8(n[i])) })
+	}
+	{
+		b := array.NewUint64Builder(pool)
+		arrays["uint64"] = build(b, func(i int) { b.Append(uint64(n[i])) })
+	}
+	{
+		b := array.NewUint32Builder(pool)
+		arrays["uint32"] = build(b, func(i int) { b.Append(uint32(n[i])) })
+	}
+	{
+		b := array.NewUint16Builder(pool)
+		arrays["uint16"] = build(b, func(i int) { b.Append(uint16(n[i])) })
+	}
+	{
+		b := array.NewUint8Builder(pool)
+		arrays["uint8"] = build(b, func(i int) { b.Append(uint8(n[i])) })
+	}
+	{
+		b := array.NewFloat64Builder(pool)
+		arrays["float64"] = build(b, func(i int) { b.Append(float64(n[i])) })
+	}
+	{
+		b := array.NewFloat32Builder(pool)
+		arrays["float32"] = build(b, func(i int) { b.Append(float32(n[i])) })
+	}
+	{
+		b := array.NewTimestampBuilder(pool, &arrow.TimestampType{Unit: arrow.Microsecond})
+		arrays["timestamp"] = build(b, func(i int) { b.Append(arrow.Timestamp(n[i])) })
+	}
+	{
+		b := array.NewDate32Builder(pool)
+		arrays["date32"] = build(b, func(i int) { b.Append(arrow.Date32(n[i])) })
+	}
+	{
+		b := array.NewDate64Builder(pool)
+		arrays["date64"] = build(b, func(i int) { b.Append(arrow.Date64(n[i])) })
+	}
+	{
+		b := array.NewTime32Builder(pool, &arrow.Time32Type{Unit: arrow.Second})
+		arrays["time32"] = build(b, func(i int) { b.Append(arrow.Time32(n[i])) })
+	}
+	{
+		b := array.NewTime64Builder(pool, &arrow.Time64Type{Unit: arrow.Microsecond})
+		arrays["time64"] = build(b, func(i int) { b.Append(arrow.Time64(n[i])) })
+	}
+	{
+		b := array.NewDurationBuilder(pool, &arrow.DurationType{Unit: arrow.Second})
+		arrays["duration"] = build(b, func(i int) { b.Append(arrow.Duration(n[i])) })
+	}
+	{
+		b := array.NewStringBuilder(pool)
+		arrays["string"] = build(b, func(i int) { b.Append(fmt.Sprint(n[i])) })
+	}
+	{
+		b := array.NewLargeStringBuilder(pool)
+		arrays["large_string"] = build(b, func(i int) { b.Append(fmt.Sprint(n[i])) })
+	}
+	{
+		b := array.NewStringViewBuilder(pool)
+		arrays["string_view"] = build(b, func(i int) { b.Append(fmt.Sprint(n[i])) })
+	}
+	for name, arr := range arrays {
+		defer arr.Release()
+		for _, desc := range []bool{false, true} {
+			got, ok := sortSingleKey(arr, desc)
+			if !ok {
+				t.Errorf("%s: not on the single-key path; drop it from this test or add it to sortSingleKey", name)
+				continue
+			}
+			cmp, err := arrayComparator(arr, desc)
+			if err != nil {
+				t.Errorf("%s: sorts as a single key but has no comparator: %v", name, err)
+				continue
+			}
+			want := []int{0, 1, 2, 3}
+			sortRowsBy(want, []rowComparator{cmp})
+			if !slices.Equal(got, want) {
+				t.Errorf("%s (descending=%v): single-key order %v, comparator order %v", name, desc, got, want)
+			}
+			// Rows 1 and 3 tie and stay in input order; the null is last.
+			if i1, i3 := slices.Index(got, 1), slices.Index(got, 3); i1 > i3 || got[3] != 2 {
+				t.Errorf("%s (descending=%v): order %v breaks tie order or null-last", name, desc, got)
+			}
 		}
 	}
 }

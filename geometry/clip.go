@@ -21,14 +21,26 @@ var ErrGeographicCRS = errors.New("geometry: boolean ops require a projected CRS
 //   - Point: the point itself if it is inside mask or on its boundary,
 //     otherwise a MultiPoint with no points (gobi has no empty Point).
 //   - MultiPoint: a MultiPoint of the points that are inside.
-//   - LineString: the pieces inside mask, as a LineString when there is
-//     one piece or none (none is a LineString with no points) and a
-//     MultiLineString when there are several. See LineString.Clip for
-//     how a line touching or running along the boundary is treated.
-//   - MultiLineString: a MultiLineString of the pieces.
+//   - LineString: the pieces inside mask, in order along the line, as
+//     a LineString when there is one piece or none (none is a
+//     LineString with no points) and a MultiLineString when there are
+//     several.
+//   - MultiLineString: a MultiLineString of the pieces, line by line.
 //
-// Any other subject returns an error.
+// A line is clipped to the mask as a whole: where it passes from one
+// member of a MultiPolygon mask into an adjoining one it stays in one
+// piece, and a stretch running along an edge two members share is
+// returned once. With a Polygon mask, LineString.Clip says how a line
+// touching or running along the boundary is treated.
+//
+// Any other subject returns an error. Unlike the other boolean ops,
+// Clip is not symmetric: a point or line can be the subject but not
+// the mask. Boolean takes polygons only, on both sides.
 func Clip(subject, mask Geometry) (Geometry, error) {
+	switch subject.(type) {
+	case Point, MultiPoint, LineString, MultiLineString:
+		return clipPointsOrLines(subject, mask)
+	}
 	return Boolean(subject, mask, OpIntersection, ClipOptions{})
 }
 
@@ -52,12 +64,6 @@ func SymDifference(a, b Geometry) (Geometry, error) {
 // Boolean applies op to a and b using the given options. Boolean is the
 // shared entry point that Clip/Union/Difference/SymDifference route through.
 func Boolean(a, b Geometry, op BoolOp, opts ClipOptions) (Geometry, error) {
-	if op == OpIntersection {
-		switch a.(type) {
-		case Point, MultiPoint, LineString, MultiLineString:
-			return clipPointsOrLines(a, b)
-		}
-	}
 	if err := validateClipInputs(a, b); err != nil {
 		return nil, err
 	}
@@ -332,12 +338,7 @@ func clipPointsOrLines(subject, mask Geometry) (Geometry, error) {
 		}
 		return out, nil
 	case LineString:
-		// The members of a valid MultiPolygon don't overlap, so
-		// clipping to each in turn gives every inside piece once.
-		var pieces []LineString
-		for _, poly := range polys {
-			pieces = append(pieces, t.Clip(poly)...)
-		}
+		pieces := clipLineToMask(t, polys)
 		for i := range pieces {
 			pieces[i].CRSValue = crs
 		}
@@ -350,8 +351,8 @@ func clipPointsOrLines(subject, mask Geometry) (Geometry, error) {
 		return MultiLineString{Lines: pieces, CRSValue: crs, HasZ: t.HasZ}, nil
 	case MultiLineString:
 		out := MultiLineString{CRSValue: crs, HasZ: t.HasZ}
-		for _, poly := range polys {
-			out.Lines = append(out.Lines, t.Clip(poly)...)
+		for _, l := range t.Lines {
+			out.Lines = append(out.Lines, clipLineToMask(l, polys)...)
 		}
 		for i := range out.Lines {
 			out.Lines[i].CRSValue = crs

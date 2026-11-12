@@ -2,7 +2,6 @@ package gobi
 
 import (
 	"fmt"
-	"sort"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -432,7 +431,9 @@ func (n *overNode) evalShapePreservingGeneral(input, projected *Frame, nRows int
 			return fmt.Errorf("Over.OrderBy: %w", err)
 		}
 		for _, rows := range partitions {
-			sortRowIndicesBy(rows, cmps)
+			// Each partition's rows are in ascending order, as
+			// sortRowsBy needs for a stable result.
+			sortRowsBy(rows, cmps)
 		}
 		release()
 	}
@@ -607,21 +608,6 @@ func buildOrderComparators(input *Frame, orderBy []SortKey) (cmps []rowComparato
 		cmps[i] = cmp
 	}
 	return cmps, release, nil
-}
-
-// sortRowIndicesBy sorts rows in place by cmps (lex, stable,
-// null-last per rowComparator semantics).
-func sortRowIndicesBy(rows []int, cmps []rowComparator) {
-	sort.SliceStable(rows, func(a, b int) bool {
-		ra, rb := rows[a], rows[b]
-		for _, cmp := range cmps {
-			c := cmp(ra, rb)
-			if c != 0 {
-				return c < 0
-			}
-		}
-		return false
-	})
 }
 
 // -----------------------------------------------------------------------------

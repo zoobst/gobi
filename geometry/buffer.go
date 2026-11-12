@@ -75,6 +75,10 @@ func (o BufferOptions) segments() int {
 //   - Corners that point into the polygon come out rounded, using
 //     opts.Segments, in both styles. Other corners stay sharp.
 //
+// The result is always 2D, for either sign of distance: its vertices
+// are offset from the input's, so there is no Z to carry over, and a
+// 3D input's Z values are dropped.
+//
 // A distance of zero or NaN returns (nil, error).
 func Buffer(g Geometry, distance float64, opts BufferOptions) (Geometry, error) {
 	if distance == 0 || math.IsNaN(distance) {

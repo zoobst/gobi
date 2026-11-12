@@ -3,6 +3,10 @@ package gobi
 import (
 	"slices"
 	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // Comparing Boolean values passed the expression type check but failed
@@ -72,5 +76,113 @@ func TestExpr_BoolComparison(t *testing.T) {
 				t.Errorf("Lazy kept %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// Boolean (and string) comparisons and the logical ops read every
+// chunk of their operands. They used to read the first chunk only, so
+// a column in two chunks gave a result as long as its first chunk,
+// and a column with no chunks panicked.
+func TestExpr_BoolAndStringOps_MultiChunk(t *testing.T) {
+	pool := memory.DefaultAllocator
+	boolCol := func(name string, chunks ...[]bool) arrow.Column {
+		field := arrow.Field{Name: name, Type: arrow.FixedWidthTypes.Boolean, Nullable: true}
+		arrs := make([]arrow.Array, len(chunks))
+		for i, vals := range chunks {
+			b := array.NewBooleanBuilder(pool)
+			b.AppendValues(vals, nil)
+			arrs[i] = b.NewArray()
+			b.Release()
+		}
+		ch := arrow.NewChunked(field.Type, arrs)
+		defer ch.Release()
+		for _, a := range arrs {
+			a.Release()
+		}
+		return *arrow.NewColumn(field, ch)
+	}
+	strCol := func(name string, chunks ...[]string) arrow.Column {
+		field := arrow.Field{Name: name, Type: arrow.BinaryTypes.String, Nullable: true}
+		arrs := make([]arrow.Array, len(chunks))
+		for i, vals := range chunks {
+			b := array.NewStringBuilder(pool)
+			b.AppendValues(vals, nil)
+			arrs[i] = b.NewArray()
+			b.Release()
+		}
+		ch := arrow.NewChunked(field.Type, arrs)
+		defer ch.Release()
+		for _, a := range arrs {
+			a.Release()
+		}
+		return *arrow.NewColumn(field, ch)
+	}
+	frame := func(cols ...arrow.Column) *Frame {
+		t.Helper()
+		fields := make([]arrow.Field, len(cols))
+		for i, c := range cols {
+			fields[i] = c.Field()
+		}
+		f, err := NewFrame(arrow.NewSchema(fields, nil), cols)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	bools := func(t *testing.T, s Series) []bool {
+		t.Helper()
+		v, err := s.Bools()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	// flag is split 2 + 3, other 4 + 1, name 1 + 4: no two columns
+	// share chunk boundaries.
+	f := frame(
+		boolCol("flag", []bool{true, false}, []bool{true, true, false}),
+		boolCol("other", []bool{true, true, false, true}, []bool{true}),
+		strCol("name", []string{"a"}, []string{"b", "a", "c", "a"}),
+		strCol("name2", []string{"a", "x", "a"}, []string{"c", "z"}),
+	)
+	defer f.Release()
+	for name, c := range map[string]struct {
+		expr Expr
+		want []bool
+	}{
+		"bool = literal":   {Col("flag").Eq(Lit(true)), []bool{true, false, true, true, false}},
+		"bool = bool":      {Col("flag").Eq(Col("other")), []bool{true, false, false, true, false}},
+		"bool < bool":      {Col("flag").Lt(Col("other")), []bool{false, true, false, false, true}},
+		"and":              {Col("flag").And(Col("other")), []bool{true, false, false, true, false}},
+		"or":               {Col("flag").Or(Col("other")), []bool{true, true, true, true, true}},
+		"not":              {Col("flag").Not(), []bool{false, true, false, false, true}},
+		"string = string":  {Col("name").Eq(Col("name2")), []bool{true, false, true, true, false}},
+		"string != string": {Col("name").Ne(Col("name2")), []bool{false, true, false, false, true}},
+	} {
+		out, err := c.expr.node.Eval(f)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if got := bools(t, out); !slices.Equal(got, c.want) {
+			t.Errorf("%s = %v, want %v", name, got, c.want)
+		}
+	}
+
+	// A column with no chunks at all is an empty column, not a panic.
+	empty := frame(boolCol("flag"), boolCol("other"), strCol("name"), strCol("name2"))
+	defer empty.Release()
+	for name, e := range map[string]Expr{
+		"bool = bool": Col("flag").Eq(Col("other")), "not": Col("flag").Not(), "string = string": Col("name").Eq(Col("name2")),
+	} {
+		out, err := e.node.Eval(empty)
+		if err != nil {
+			t.Errorf("no chunks, %s: %v", name, err)
+			continue
+		}
+		if out.Len() != 0 {
+			t.Errorf("no chunks, %s: len = %d, want 0", name, out.Len())
+		}
 	}
 }

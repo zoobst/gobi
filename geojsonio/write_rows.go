@@ -87,24 +87,22 @@ func forEachFeature(df *gobi.Frame, geomIdx int, fn func(row int, featJSON []byt
 				return fmt.Errorf("geojsonio: geometry row %d: %w", row, err)
 			}
 		}
-		// A frame with no property columns omits the member, as the
-		// Feature struct's omitempty does.
-		if len(props) > 0 {
-			buf = append(buf, `,"properties":{`...)
-			for j := range props {
-				c := &props[j]
-				if j > 0 {
-					buf = append(buf, ',')
-				}
-				buf = append(buf, c.key...)
-				chunk, i := c.next()
-				var err error
-				if buf, err = appendPropertyCell(buf, chunk, i); err != nil {
-					return fmt.Errorf("geojsonio: %s row %d: %w", c.name, row, err)
-				}
+		// RFC 7946 §3.2 requires the member, so a frame with no
+		// property columns writes an empty object.
+		buf = append(buf, `,"properties":{`...)
+		for j := range props {
+			c := &props[j]
+			if j > 0 {
+				buf = append(buf, ',')
 			}
-			buf = append(buf, '}')
+			buf = append(buf, c.key...)
+			chunk, i := c.next()
+			var err error
+			if buf, err = appendPropertyCell(buf, chunk, i); err != nil {
+				return fmt.Errorf("geojsonio: %s row %d: %w", c.name, row, err)
+			}
 		}
+		buf = append(buf, '}')
 		buf = append(buf, '}')
 		if err := fn(row, buf); err != nil {
 			return err
@@ -233,41 +231,25 @@ type wkbToJSON struct {
 	bad bool
 }
 
-// WKB geometry type codes; the Z variants add 1000.
-const (
-	wkbPoint = iota + 1
-	wkbLineString
-	wkbPolygon
-	wkbMultiPoint
-	wkbMultiLineString
-	wkbMultiPolygon
-	wkbGeometryCollection
-)
-
-// header reads a byte-order mark and type code.
+// header reads a byte-order mark and type code. The code is decoded
+// by geometry.WKBTypeCode, so this package and geometry.ParseWKB
+// always agree on which codes exist: one it rejects is one the
+// transcoder declines.
 func (t *wkbToJSON) header() (code uint32, hasZ bool, order binary.ByteOrder) {
-	if t.bad || len(t.src)-t.pos < 5 {
+	if t.bad {
+		return 0, false, nil
+	}
+	code, hasZ, err := geometry.WKBTypeCode(t.src[t.pos:])
+	if err != nil {
 		t.bad = true
 		return 0, false, nil
 	}
-	switch t.src[t.pos] {
-	case 0:
-		order = binary.BigEndian
-	case 1:
+	order = binary.BigEndian
+	if t.src[t.pos] == 1 {
 		order = binary.LittleEndian
-	default:
-		t.bad = true
-		return 0, false, nil
 	}
-	code = order.Uint32(t.src[t.pos+1:])
 	t.pos += 5
-	if code > 1000 && code <= 1000+wkbGeometryCollection {
-		return code - 1000, true, order
-	}
-	if code < wkbPoint || code > wkbGeometryCollection {
-		t.bad = true
-	}
-	return code, false, order
+	return code, hasZ, order
 }
 
 // count reads a uint32 element count. Each element takes at least
@@ -365,31 +347,31 @@ func (t *wkbToJSON) members(order binary.ByteOrder, want uint32, hasZ bool) {
 // header has been read.
 func (t *wkbToJSON) coordinates(code uint32, hasZ bool, order binary.ByteOrder) {
 	switch code {
-	case wkbPoint:
+	case geometry.WKBTypePoint:
 		t.position(order, hasZ)
-	case wkbLineString:
+	case geometry.WKBTypeLineString:
 		t.positions(order, hasZ)
-	case wkbPolygon:
+	case geometry.WKBTypePolygon:
 		t.rings(order, hasZ)
-	case wkbMultiPoint:
-		t.members(order, wkbPoint, hasZ)
-	case wkbMultiLineString:
-		t.members(order, wkbLineString, hasZ)
-	case wkbMultiPolygon:
-		t.members(order, wkbPolygon, hasZ)
+	case geometry.WKBTypeMultiPoint:
+		t.members(order, geometry.WKBTypePoint, hasZ)
+	case geometry.WKBTypeMultiLineString:
+		t.members(order, geometry.WKBTypeLineString, hasZ)
+	case geometry.WKBTypeMultiPolygon:
+		t.members(order, geometry.WKBTypePolygon, hasZ)
 	default:
 		t.bad = true
 	}
 }
 
 var geoJSONTypeNames = [...]string{
-	wkbPoint:              "Point",
-	wkbLineString:         "LineString",
-	wkbPolygon:            "Polygon",
-	wkbMultiPoint:         "MultiPoint",
-	wkbMultiLineString:    "MultiLineString",
-	wkbMultiPolygon:       "MultiPolygon",
-	wkbGeometryCollection: "GeometryCollection",
+	geometry.WKBTypePoint:              "Point",
+	geometry.WKBTypeLineString:         "LineString",
+	geometry.WKBTypePolygon:            "Polygon",
+	geometry.WKBTypeMultiPoint:         "MultiPoint",
+	geometry.WKBTypeMultiLineString:    "MultiLineString",
+	geometry.WKBTypeMultiPolygon:       "MultiPolygon",
+	geometry.WKBTypeGeometryCollection: "GeometryCollection",
 }
 
 // geometry appends one complete geometry object.
@@ -400,7 +382,7 @@ func (t *wkbToJSON) geometry() {
 	}
 	t.dst = append(t.dst, `{"type":"`...)
 	t.dst = append(t.dst, geoJSONTypeNames[code]...)
-	if code == wkbGeometryCollection {
+	if code == geometry.WKBTypeGeometryCollection {
 		// RFC 7946 doesn't allow nesting, so only a flat collection
 		// is transcoded here.
 		n := t.count(order, 5)
@@ -409,15 +391,10 @@ func (t *wkbToJSON) geometry() {
 			if i > 0 {
 				t.dst = append(t.dst, ',')
 			}
-			if len(t.src)-t.pos >= 5 {
-				// Peek: a nested collection is left to the slow path.
-				inner := t.src[t.pos+1 : t.pos+5]
-				if c := binary.LittleEndian.Uint32(inner); c == wkbGeometryCollection || c == 1000+wkbGeometryCollection {
-					t.bad = true
-				}
-				if c := binary.BigEndian.Uint32(inner); c == wkbGeometryCollection || c == 1000+wkbGeometryCollection {
-					t.bad = true
-				}
+			// Peek: a nested collection is left to the slow path.
+			if inner, _, err := geometry.WKBTypeCode(t.src[t.pos:]); err == nil && inner == geometry.WKBTypeGeometryCollection {
+				t.bad = true
+				return
 			}
 			t.geometry()
 			if t.bad {

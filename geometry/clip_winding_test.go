@@ -73,35 +73,33 @@ func TestBoolean_WindingIndependent(t *testing.T) {
 			t.Errorf("%s area = %v, want %v", what, got, want)
 		}
 	}
-	bools := []bool{true, false}
+	// Five independent switches, so 32 combinations per case: whether
+	// the operands are wrapped in MultiPolygons, and whether each of the
+	// four rings (a's shell and hole, b's shell and hole) is wound
+	// counter-clockwise. Each bit of combo is one switch.
+	const switches = 5
 	for _, c := range cases {
-		for _, multi := range bools {
-			for _, aShell := range bools {
-				for _, aHole := range bools {
-					for _, bShell := range bools {
-						for _, bHole := range bools {
-							name := fmt.Sprintf("%s/multi=%v/a=%v,%v/b=%v,%v", c.name, multi, aShell, aHole, bShell, bHole)
-							t.Run(name, func(t *testing.T) {
-								var a, b Geometry = build(c.a, aShell, aHole), build(c.b, bShell, bHole)
-								if multi {
-									a = MultiPolygon{Polygons: []Polygon{a.(Polygon)}}
-									b = MultiPolygon{Polygons: []Polygon{b.(Polygon)}}
-								}
-								g, err := Clip(a, b)
-								check(t, "Clip", g, err, c.inter)
-								g, err = Union(a, b)
-								check(t, "Union", g, err, c.union)
-								g, err = Difference(a, b)
-								check(t, "Difference", g, err, c.diff)
-								g, err = SymDifference(a, b)
-								check(t, "SymDifference", g, err, c.symdif)
-								g, err = Dissolve([]Geometry{a, b})
-								check(t, "Dissolve", g, err, c.union)
-							})
-						}
-					}
+		for combo := range 1 << switches {
+			on := func(bit int) bool { return combo&(1<<bit) != 0 }
+			multi, aShell, aHole, bShell, bHole := on(0), on(1), on(2), on(3), on(4)
+			name := fmt.Sprintf("%s/multi=%v/a=%v,%v/b=%v,%v", c.name, multi, aShell, aHole, bShell, bHole)
+			t.Run(name, func(t *testing.T) {
+				var a, b Geometry = build(c.a, aShell, aHole), build(c.b, bShell, bHole)
+				if multi {
+					a = MultiPolygon{Polygons: []Polygon{a.(Polygon)}}
+					b = MultiPolygon{Polygons: []Polygon{b.(Polygon)}}
 				}
-			}
+				g, err := Clip(a, b)
+				check(t, "Clip", g, err, c.inter)
+				g, err = Union(a, b)
+				check(t, "Union", g, err, c.union)
+				g, err = Difference(a, b)
+				check(t, "Difference", g, err, c.diff)
+				g, err = SymDifference(a, b)
+				check(t, "SymDifference", g, err, c.symdif)
+				g, err = Dissolve([]Geometry{a, b})
+				check(t, "Dissolve", g, err, c.union)
+			})
 		}
 	}
 }

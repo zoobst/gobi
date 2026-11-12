@@ -1034,4 +1034,137 @@ func TestClip_PointAndLineSubjects(t *testing.T) {
 	if _, err := Union(line, mask); err == nil {
 		t.Error("Union with a line: expected an error")
 	}
+	// Only Clip takes a point or line. Boolean is polygons-only on
+	// both sides, whichever way round the operands are.
+	if _, err := Boolean(line, mask, OpIntersection, ClipOptions{}); err == nil {
+		t.Error("Boolean(line, mask): expected an error")
+	}
+	if _, err := Boolean(mask, line, OpIntersection, ClipOptions{}); err == nil {
+		t.Error("Boolean(mask, line): expected an error")
+	}
+}
+
+// A line is clipped to a MultiPolygon mask as one region, not member
+// by member: it isn't cut where it passes between adjoining members,
+// a stretch along a shared edge comes back once, and the pieces are
+// in order along the line.
+func TestClip_LineAcrossMaskMembers(t *testing.T) {
+	// Two squares sharing the edge x=1, and a third on its own.
+	mask := MultiPolygon{Polygons: []Polygon{unitSquare(0, 0, 1), unitSquare(1, 0, 1), unitSquare(3, 0, 1)}}
+	line := func(xy ...float64) LineString {
+		var l LineString
+		for i := 0; i < len(xy); i += 2 {
+			l.Points = append(l.Points, pt(xy[i], xy[i+1]))
+		}
+		return l
+	}
+	// ends is a piece's first and last point, rounded so a crossing
+	// computed a rounding error off the mask edge still compares
+	// equal. It is the zero value for a piece with extra vertices: a
+	// straight line cut by a mask gives two-point pieces.
+	ends := func(l LineString) [4]float64 {
+		if len(l.Points) != 2 {
+			return [4]float64{}
+		}
+		r := func(v float64) float64 { return math.Round(v*1e9) / 1e9 }
+		a, b := l.Points[0], l.Points[1]
+		return [4]float64{r(a.X), r(a.Y), r(b.X), r(b.Y)}
+	}
+
+	got, err := Clip(line(0.5, 0.5, 1.5, 0.5), mask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l, ok := got.(LineString); !ok || ends(l) != [4]float64{0.5, 0.5, 1.5, 0.5} {
+		t.Errorf("across the shared edge: got %T %+v, want one piece from x=0.5 to x=1.5", got, got)
+	}
+
+	got, err = Clip(line(1, 0, 1, 1), mask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l, ok := got.(LineString); !ok || ends(l) != [4]float64{1, 0, 1, 1} {
+		t.Errorf("along the shared edge: got %T %+v, want the line once", got, got)
+	}
+
+	// Walking right to left: the lone square first, then the pair.
+	got, err = Clip(line(3.5, 0.5, -1, 0.5), mask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ml, ok := got.(MultiLineString)
+	if !ok || len(ml.Lines) != 2 ||
+		ends(ml.Lines[0]) != [4]float64{3.5, 0.5, 3, 0.5} || ends(ml.Lines[1]) != [4]float64{2, 0.5, 0, 0.5} {
+		t.Errorf("right to left: got %T %+v, want [3.5→3] then [2→0]", got, got)
+	}
+
+	// A MultiLineString keeps its lines in order too, each clipped to
+	// the whole mask.
+	got, err = Clip(MultiLineString{Lines: []LineString{line(3.2, 0.2, 3.8, 0.2), line(0.2, 0.2, 1.8, 0.2)}}, mask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ml, ok = got.(MultiLineString)
+	if !ok || len(ml.Lines) != 2 ||
+		ends(ml.Lines[0]) != [4]float64{3.2, 0.2, 3.8, 0.2} || ends(ml.Lines[1]) != [4]float64{0.2, 0.2, 1.8, 0.2} {
+		t.Errorf("MultiLineString: got %T %+v, want both lines whole, in order", got, got)
+	}
+
+	// The same pair of squares turned 30°, so the shared edge is
+	// slanted: still one piece across it, and once along it.
+	sin, cos := math.Sincos(math.Pi / 6)
+	turn := func(x, y float64) Point { return pt(x*cos-y*sin, x*sin+y*cos) }
+	square := func(x float64) Polygon {
+		return Polygon{Rings: [][]Point{{turn(x, 0), turn(x+1, 0), turn(x+1, 1), turn(x, 1), turn(x, 0)}}}
+	}
+	slanted := MultiPolygon{Polygons: []Polygon{square(0), square(1)}}
+	for name, l := range map[string]LineString{
+		"across": {Points: []Point{turn(0.5, 0.5), turn(1.5, 0.5)}},
+		"along":  {Points: []Point{turn(1, 0), turn(1, 1)}},
+	} {
+		got, err := Clip(l, slanted)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if piece, ok := got.(LineString); !ok || ends(piece) != ends(l) {
+			t.Errorf("slanted, %s the shared edge: got %T %+v, want the whole line once", name, got, got)
+		}
+	}
+}
+
+// A point on a slanted edge is on the boundary on every platform. The
+// collinearity test was fused into one multiply-subtract on arm64 and
+// came out a rounding error away from zero there, so the same point
+// was inside the mask on amd64 and outside on arm64.
+func TestClip_PointOnSlantedEdge(t *testing.T) {
+	// The hypotenuse runs from (0,0) to (0.7,0.7).
+	tri := SimplePolygon([]Point{pt(0, 0), pt(0.7, 0.7), pt(0, 0.7), pt(0, 0)}, CRS{})
+	on := []Point{pt(0.3, 0.3), pt(0.1, 0.1), pt(0.35, 0.35), pt(0.7, 0.7), pt(0, 0)}
+	for _, p := range on {
+		got, err := Clip(p, tri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := got.(Point); !ok {
+			t.Errorf("Clip(%v, %v) = %T, want the point kept", p.X, p.Y, got)
+		}
+		if !Intersects(p, tri) {
+			t.Errorf("Intersects((%v, %v), triangle) = false, want true", p.X, p.Y)
+		}
+	}
+	got, err := Clip(MultiPoint{Points: append(on, pt(0.5, 0.2))}, tri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mp, ok := got.(MultiPoint); !ok || len(mp.Points) != len(on) {
+		t.Errorf("MultiPoint: got %T %+v, want the %d points on the edge and not the one outside", got, got, len(on))
+	}
+	// A line lying along the slanted edge is inside too.
+	got, err = Clip(LineString{Points: []Point{pt(0.1, 0.1), pt(0.35, 0.35)}}, tri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l, ok := got.(LineString); !ok || len(l.Points) != 2 {
+		t.Errorf("line along the edge: got %T %+v, want it kept", got, got)
+	}
 }

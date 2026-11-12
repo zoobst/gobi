@@ -29,6 +29,18 @@ const (
 	wkbGeometryCollectionZ uint32 = 1007
 )
 
+// The geometry type codes WKBTypeCode returns: the 2D code, whether or
+// not the geometry has Z.
+const (
+	WKBTypePoint              = wkbPoint
+	WKBTypeLineString         = wkbLineString
+	WKBTypePolygon            = wkbPolygon
+	WKBTypeMultiPoint         = wkbMultiPoint
+	WKBTypeMultiLineString    = wkbMultiLineString
+	WKBTypeMultiPolygon       = wkbMultiPolygon
+	WKBTypeGeometryCollection = wkbGeometryCollection
+)
+
 // coordSize returns the byte size of a single coordinate tuple: 16 for XY,
 // 24 for XYZ.
 func coordSize(hasZ bool) int {

@@ -13,8 +13,11 @@ import (
 
 // GeomClip returns a geometry Series holding the part of each geometry
 // in s that lies inside the mask. Null inputs pass through as null.
-// Both s and mask must be in a projected CRS (or unset), and mask must
-// be a Polygon or MultiPolygon.
+// s must be in a projected CRS (or unset), and mask must be a Polygon
+// or MultiPolygon, which is taken to be in s's CRS. Both are checked
+// before any row is clipped, so the call fails or not on its inputs
+// and never on where the rows happen to sit; the same goes for
+// GeomUnion, GeomDifference and GeomSymDifference.
 //
 // Rows may be polygons, points or lines, mixed freely; see
 // geometry.Clip for what each gives. A row with nothing inside the
@@ -313,6 +316,18 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 	}
 	epsg := geometryCRSFromField(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
+	// The mask and the CRS are the same for every row, so they are
+	// checked once, here. Rows whose bounds miss the mask never reach
+	// the geometry package's own checks, and left to those the call
+	// would fail or not depending on where the rows happen to sit.
+	switch other.(type) {
+	case geometry.Polygon, geometry.MultiPolygon:
+	default:
+		return Series{}, fmt.Errorf("gobi: boolean op requires a Polygon or MultiPolygon to apply to each row, got %T", other)
+	}
+	if !crs.Zero() && !crs.Projected() {
+		return Series{}, fmt.Errorf("%w: got %s", geometry.ErrGeographicCRS, crs)
+	}
 	other = attachCRS(other, crs)
 	otherBounds := other.Bounds()
 	// Pre-compute canonical outputs for the bbox-disjoint fast paths.
@@ -325,14 +340,16 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 	// The empty result for a row that misses the mask entirely, by the
 	// row's WKB type code (see geometry.Clip). Codes without an entry
 	// take the general path, which reports unsupported types.
-	var emptyByType [7][]byte
+	var emptyByType [geometry.WKBTypeGeometryCollection][]byte
 	if op == geometry.OpIntersection {
 		emptyPolygonWKB = geometry.WKB(geometry.Polygon{CRSValue: crs})
 		emptyPoints := geometry.WKB(geometry.MultiPoint{CRSValue: crs})
-		emptyByType[1], emptyByType[4] = emptyPoints, emptyPoints
-		emptyByType[2] = geometry.WKB(geometry.LineString{CRSValue: crs})
-		emptyByType[5] = geometry.WKB(geometry.MultiLineString{CRSValue: crs})
-		emptyByType[3], emptyByType[6] = emptyPolygonWKB, emptyPolygonWKB
+		emptyByType[geometry.WKBTypePoint] = emptyPoints
+		emptyByType[geometry.WKBTypeMultiPoint] = emptyPoints
+		emptyByType[geometry.WKBTypeLineString] = geometry.WKB(geometry.LineString{CRSValue: crs})
+		emptyByType[geometry.WKBTypeMultiLineString] = geometry.WKB(geometry.MultiLineString{CRSValue: crs})
+		emptyByType[geometry.WKBTypePolygon] = emptyPolygonWKB
+		emptyByType[geometry.WKBTypeMultiPolygon] = emptyPolygonWKB
 	}
 	if op == geometry.OpUnion || op == geometry.OpSymDifference {
 		otherWKB = geometry.WKB(other)
@@ -371,7 +388,7 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 						// path, which keeps the Z flag on its empty result.
 						typ, hasZ, err := geometry.WKBTypeCode(wkb)
 						if err == nil && typ < uint32(len(emptyByType)) && emptyByType[typ] != nil &&
-							(!hasZ || typ == 3 || typ == 6) {
+							(!hasZ || typ == geometry.WKBTypePolygon || typ == geometry.WKBTypeMultiPolygon) {
 							b.Append(emptyByType[typ])
 							continue
 						}
@@ -398,7 +415,14 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 				return Series{}, err
 			}
 			g = attachCRS(g, crs)
-			result, err := geometry.Boolean(g, other, op, geometry.ClipOptions{})
+			// Clip, not Boolean, for the intersection: it is the one
+			// that takes point and line rows.
+			var result geometry.Geometry
+			if op == geometry.OpIntersection {
+				result, err = geometry.Clip(g, other)
+			} else {
+				result, err = geometry.Boolean(g, other, op, geometry.ClipOptions{})
+			}
 			if err != nil {
 				return Series{}, err
 			}

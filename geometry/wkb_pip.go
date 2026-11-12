@@ -363,7 +363,7 @@ func ringCrossingAndBoundary(data []byte, bo binary.ByteOrder, n, cs int, tx, ty
 // check. Reads coords directly — no Point struct materialization.
 func pointOnSegmentInline(tx, ty, ax, ay, bx, by float64) bool {
 	// Collinearity: cross((b-a), (t-a)) == 0.
-	if (bx-ax)*(ty-ay)-(by-ay)*(tx-ax) != 0 {
+	if diffOfProducts(bx-ax, ty-ay, by-ay, tx-ax) != 0 {
 		return false
 	}
 	// Within-segment bbox.

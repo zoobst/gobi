@@ -61,9 +61,11 @@ var ErrInvalidGeoJSON = errors.New("geojson: invalid input")
 // value types, so JSON's usual (float64 / string / bool / nil / []any
 // / map[string]any) shapes apply.
 type Feature struct {
-	Type       string         `json:"type"`
-	Geometry   jsontext.Value `json:"geometry"`
-	Properties map[string]any `json:"properties,omitempty"`
+	Type     string         `json:"type"`
+	Geometry jsontext.Value `json:"geometry"`
+	// Properties is always written, as RFC 7946 §3.2 requires: a
+	// Feature with none has `"properties":{}`.
+	Properties map[string]any `json:"properties"`
 	ID         any            `json:"id,omitempty"`
 }
 

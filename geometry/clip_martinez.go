@@ -309,7 +309,7 @@ func segmentSegmentIntersect(a1, a2, b1, b2 Point, tol float64) (p, q Point, kin
 	dy1 := a2.Y - a1.Y
 	dx2 := b2.X - b1.X
 	dy2 := b2.Y - b1.Y
-	denom := dx1*dy2 - dy1*dx2
+	denom := diffOfProducts(dx1, dy2, dy1, dx2)
 
 	if math.Abs(denom) < tol*math.Max(1, math.Max(math.Abs(dx1)+math.Abs(dy1), math.Abs(dx2)+math.Abs(dy2))) {
 		// Parallel. Test collinearity via signed area at b1 against line a1-a2.
@@ -344,8 +344,8 @@ func segmentSegmentIntersect(a1, a2, b1, b2 Point, tol float64) (p, q Point, kin
 		return p, q, intersectOverlap
 	}
 
-	t := ((b1.X-a1.X)*dy2 - (b1.Y-a1.Y)*dx2) / denom
-	u := ((b1.X-a1.X)*dy1 - (b1.Y-a1.Y)*dx1) / denom
+	t := diffOfProducts(b1.X-a1.X, dy2, b1.Y-a1.Y, dx2) / denom
+	u := diffOfProducts(b1.X-a1.X, dy1, b1.Y-a1.Y, dx1) / denom
 	if t < -tol || t > 1+tol || u < -tol || u > 1+tol {
 		return Point{}, Point{}, intersectNone
 	}
@@ -633,17 +633,30 @@ func lessEvent(a, b *sweepEvent) bool {
 // signedArea returns 2× the signed area of triangle (a, b, c). Sign
 // indicates orientation: >0 CCW, <0 CW, 0 collinear.
 //
+// It must be exactly zero for coincident edges (c == b); see
+// diffOfProducts. When it wasn't, the sweep ordered such edges by
+// rounding noise instead of by the coincident-edge rules, and a
+// polygon sharing a slanted edge with another was dropped from their
+// union.
+func signedArea(a, b, c Point) float64 {
+	return diffOfProducts(b.X-a.X, c.Y-a.Y, c.X-a.X, b.Y-a.Y)
+}
+
+// diffOfProducts returns a*b - c*d with each product rounded to
+// float64 before the subtraction. Every cross product whose sign or
+// zero-ness decides something goes through it.
+//
 // The float64 conversions are load-bearing: they stop the compiler
 // from fusing the multiply and subtract into one FMA instruction,
 // which Go does on arm64 (and ppc64, s390x, riscv64) but not on amd64
-// or wasm. A fused x*y - z*w rounds only one of the two products, so
-// it is not exactly zero when the products are equal: two coincident
-// edges (c == b) came out "not collinear" by a rounding error unless
-// they were axis-aligned. The sweep then ordered them by that noise
-// instead of by the coincident-edge rules, and a polygon sharing a
-// slanted edge with another was dropped from their union.
-func signedArea(a, b, c Point) float64 {
-	return float64((b.X-a.X)*(c.Y-a.Y)) - float64((c.X-a.X)*(b.Y-a.Y))
+// or wasm. A fused a*b - c*d rounds only one of the two products, so
+// it is not zero when the products are equal: a point on a slanted
+// edge, or two coincident slanted edges, came out "not collinear" by
+// a rounding error on those platforms and collinear on the others.
+// Horizontal and vertical edges hid it, because a product with zero
+// is exact.
+func diffOfProducts(a, b, c, d float64) float64 {
+	return float64(a*b) - float64(c*d)
 }
 
 // eventQueue is a min-heap of sweep events ordered by lessEvent.
