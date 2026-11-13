@@ -166,36 +166,33 @@ func (n *coalesceNode) Eval(input *Frame) (Series, error) {
 		}
 	}
 
-	pool := memory.DefaultAllocator
-	b, err := builderForType(pool, outType)
-	if err != nil {
-		return Series{}, fmt.Errorf("Coalesce: %w", err)
+	// Pick, per row, the first non-null operand; all-null rows stay null.
+	// Then gather those rows from every operand's chunks laid end to end
+	// (operand i's row r is at i*nRows + r), which copies values of any
+	// type, nested ones included, in bulk.
+	var chunks []arrow.Array
+	for _, s := range series {
+		chunks = append(chunks, s.col.Data().Chunks()...)
 	}
-	defer b.Release()
-
-	// Row-by-row: pick the first non-null operand, copy its value.
-	// All-null rows emit null.
+	pick := make([]int, nRows)
 	for row := range nRows {
-		picked := -1
+		pick[row] = -1
 		for i, s := range series {
 			null, err := isNullAtSeries(s, row)
 			if err != nil {
 				return Series{}, fmt.Errorf("Coalesce row %d op %d: %w", row, i, err)
 			}
 			if !null {
-				picked = i
+				pick[row] = i*nRows + row
 				break
 			}
 		}
-		if picked < 0 {
-			b.AppendNull()
-			continue
-		}
-		if err := copyRowValue(b, series[picked], row); err != nil {
-			return Series{}, fmt.Errorf("Coalesce row %d op %d: %w", row, picked, err)
-		}
 	}
-	return buildSeries("coalesce", outType, b.NewArray()), nil
+	out, err := takeChunks(memory.DefaultAllocator, outType, chunks, pick, true)
+	if err != nil {
+		return Series{}, fmt.Errorf("Coalesce: %w", err)
+	}
+	return buildSeries("coalesce", outType, out), nil
 }
 
 func (n *coalesceNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
@@ -238,54 +235,4 @@ func (n *coalesceNode) String() string {
 		parts[i] = op.String()
 	}
 	return "coalesce(" + strings.Join(parts, ", ") + ")"
-}
-
-// copyRowValue copies src[row] to b. Handles primitive types via
-// readScalarAt + appendCustomValue, and List<T> via a per-element copy
-// that walks the offsets and uses appendArrayValueAt for primitive
-// elements. Returns an error for unsupported types (Struct nesting).
-func copyRowValue(b array.Builder, src Series, row int) error {
-	dt := src.DataType()
-	if dt.ID() != arrow.LIST {
-		v, err := readScalarAt(src, row)
-		if err != nil {
-			return err
-		}
-		return appendCustomValue(b, v)
-	}
-	// List<T> path — walk to the chunk holding row, copy elements.
-	lb, ok := b.(*array.ListBuilder)
-	if !ok {
-		return fmt.Errorf("copyRowValue: dest builder is %T, want *array.ListBuilder for List type", b)
-	}
-	offset := 0
-	for _, chunk := range src.col.Data().Chunks() {
-		if row < offset+chunk.Len() {
-			local := row - offset
-			la, ok := chunk.(*array.List)
-			if !ok {
-				return fmt.Errorf("copyRowValue: list chunk not *array.List (%T)", chunk)
-			}
-			if la.IsNull(local) {
-				lb.AppendNull()
-				return nil
-			}
-			lb.Append(true)
-			start, end := la.ValueOffsets(local)
-			values := la.ListValues()
-			inner := lb.ValueBuilder()
-			for j := int(start); j < int(end); j++ {
-				if values.IsNull(j) {
-					inner.AppendNull()
-					continue
-				}
-				if err := appendArrayValueAt(inner, values, j); err != nil {
-					return fmt.Errorf("copyRowValue elem %d: %w", j, err)
-				}
-			}
-			return nil
-		}
-		offset += chunk.Len()
-	}
-	return fmt.Errorf("copyRowValue: row %d out of range", row)
 }

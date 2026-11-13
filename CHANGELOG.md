@@ -9,17 +9,38 @@ introduce breaking changes; check this file when upgrading.
 
 ### Fixed
 
-- **`Take`, sorting and joins work on lists of structs.** A column such
-  as Overture's `sources` (`List<Struct<...>>`) failed with
-  "unsupported list element array type \*array.Struct".
-  - **Affected:** whatever gathers rows of such a column, on one chunk
-    or several: `Frame.Take`, `SortBy`, `SortByHilbert`, `Unique`,
-    `Explode` (the other columns), `Join` and `SJoin`.
-  - **Cause:** the hand-written list path copies only simple element
-    types (strings, booleans, numbers, binary, timestamps). Other
-    element types now go through arrow-go's `compute.Take`, which
-    handles every Arrow type; lists of nested lists, dates and
-    decimals were affected the same way and are fixed too.
+- **List columns work whatever their element type.** Lists of structs
+  (Overture's `sources`), of lists, of dates and of decimals failed
+  with "unsupported list element array type", because list elements
+  were copied one at a time through a switch that knew only strings,
+  booleans, numbers, binary and timestamps. They are now gathered with
+  arrow-go's `compute.Take`, which handles every Arrow type. Fixed, on
+  one chunk or several:
+  - Gathering rows of a frame that has such a column: `Frame.Take`,
+    `SortBy`, `Unique`, and `Join` (unmatched rows get a null list).
+  - Taking elements out of the list: `Explode`, `ListGet` (and
+    `ListFirst` / `ListLast`) and `ListSlice`.
+  - `Coalesce` over list columns.
+- **Lists with non-nullable elements no longer panic** in `Take`,
+  `SortBy` and `Join` ("inconsistent data type list<item: utf8,
+  nullable> vs list<item: utf8>"). Such lists come from
+  `arrow.ListOfNonNullable` and from Parquet lists with required
+  elements. Rows of a list column now keep its exact type.
+
+### Changed
+
+- **Gathering rows of a list column is about twice as fast** when it
+  moves many rows, and needs about half the memory: reordering 1M
+  `List<Float64>` rows takes 53 ms instead of 112 ms (39 MB instead of
+  77 MB). A small take, such as a 200-row page, costs about 5 µs more,
+  `compute.Take`'s fixed overhead. Multi-chunk list columns no longer
+  scan their chunks for every row.
+
+### Known limitations
+
+- `ListUnion` still handles only lists of simple element types: it
+  removes duplicates by hashing elements, which structs and lists
+  don't support.
 
 ## [v0.5.6]
 

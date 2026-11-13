@@ -136,55 +136,40 @@ func (f *Frame) explodeList(s Series, listCol string) (*Frame, error) {
 		return nil, fmt.Errorf("%w: list column %q not *arrow.ListType (%T)",
 			ErrColumnTypeMismatch, listCol, s.DataType())
 	}
-	pool := memory.DefaultAllocator
-	elemBuilder, err := builderForType(pool, lt.Elem())
+	chunks, err := listChunks(s, "explode "+listCol)
 	if err != nil {
-		return nil, fmt.Errorf("explode list %q: %w", listCol, err)
+		return nil, err
 	}
-	defer elemBuilder.Release()
-
+	pool := memory.DefaultAllocator
+	gather := elemGather{pool: pool}
+	defer gather.release()
 	var parentIdx []int
 	rowIdx := 0
-	for _, chunk := range s.col.Data().Chunks() {
-		la, ok := chunk.(*array.List)
-		if !ok {
-			return nil, fmt.Errorf("%w: list column %q chunk not *array.List (%T)",
-				ErrColumnTypeMismatch, listCol, chunk)
-		}
-		values := la.ListValues()
+	for _, la := range chunks {
+		var pos []int // positions into this chunk's values; -1 = null
 		for i := range la.Len() {
-			if la.IsNull(i) {
-				parentIdx = append(parentIdx, rowIdx)
-				elemBuilder.AppendNull()
-				rowIdx++
-				continue
-			}
 			start, end := la.ValueOffsets(i)
-			n := int(end - start)
-			if n == 0 {
-				// Empty list — polars-parity: one output row with null
-				// element.
+			if la.IsNull(i) || end == start {
+				// Null and empty lists give one null element (polars-parity).
 				parentIdx = append(parentIdx, rowIdx)
-				elemBuilder.AppendNull()
-				rowIdx++
-				continue
+				pos = append(pos, -1)
 			}
-			for j := range n {
-				idx := int(start) + j
-				parentIdx = append(parentIdx, rowIdx)
-				if values.IsNull(idx) {
-					elemBuilder.AppendNull()
-					continue
-				}
-				if err := appendArrayValueAt(elemBuilder, values, idx); err != nil {
-					return nil, fmt.Errorf("explode list %q elem %d: %w", listCol, idx, err)
+			if !la.IsNull(i) {
+				for j := start; j < end; j++ {
+					parentIdx = append(parentIdx, rowIdx)
+					pos = append(pos, int(j))
 				}
 			}
 			rowIdx++
 		}
+		if err := gather.add(la.ListValues(), pos); err != nil {
+			return nil, fmt.Errorf("explode list %q: %w", listCol, err)
+		}
 	}
-
-	elemArr := elemBuilder.NewArray()
+	elemArr, err := gather.finish(lt.Elem())
+	if err != nil {
+		return nil, fmt.Errorf("explode list %q: %w", listCol, err)
+	}
 	defer elemArr.Release()
 
 	outFields := make([]arrow.Field, 0, len(f.series))
@@ -214,27 +199,12 @@ func (f *Frame) explodeList(s Series, listCol string) (*Frame, error) {
 	return NewFrame(schema, outCols)
 }
 
-// listCopyable reports whether appendListRowFromArray can copy a list
-// column of type dt: its element type must be one appendArrayValueAt
-// handles. Keep the two in step.
-func listCopyable(dt arrow.DataType) bool {
-	lt, ok := dt.(*arrow.ListType)
-	if !ok {
-		return false
-	}
-	switch lt.Elem().ID() {
-	case arrow.STRING, arrow.BOOL, arrow.BINARY, arrow.TIMESTAMP,
-		arrow.INT64, arrow.INT32, arrow.INT16, arrow.INT8,
-		arrow.UINT64, arrow.UINT32, arrow.UINT16, arrow.UINT8,
-		arrow.FLOAT64, arrow.FLOAT32:
-		return true
-	}
-	return false
-}
-
 // appendArrayValueAt copies one non-null element from an arrow.Array
 // into a matching Builder. Dispatch mirrors the read-side switch in
-// from_structs.go's assignListElement.
+// from_structs.go's assignListElement, so it covers simple element
+// types only. ListUnion uses it; it also needs elements it can hash
+// for deduplication. Code that copies elements of any type gathers
+// them with compute.Take instead (see list_gather.go).
 func appendArrayValueAt(b array.Builder, arr arrow.Array, idx int) error {
 	switch a := arr.(type) {
 	case *array.String:
@@ -267,36 +237,6 @@ func appendArrayValueAt(b array.Builder, arr arrow.Array, idx int) error {
 		b.(*array.TimestampBuilder).Append(a.Value(idx))
 	default:
 		return fmt.Errorf("unsupported list element array type %T", arr)
-	}
-	return nil
-}
-
-// appendListRowFromArray copies the list at src[idx] into dst,
-// preserving null lists (via AppendNull on the outer builder) and null
-// elements (via AppendNull on the inner value builder). Used by the
-// take-family helpers to carry `List<T>` columns through Explode /
-// Join / Take without losing the list shape.
-//
-// It copies only the element types appendArrayValueAt handles; check
-// listCopyable first and send other lists (List<Struct<...>>,
-// List<List<T>>, dates, decimals, ...) to compute.Take.
-func appendListRowFromArray(dst *array.ListBuilder, src *array.List, idx int) error {
-	if src.IsNull(idx) {
-		dst.AppendNull()
-		return nil
-	}
-	dst.Append(true)
-	start, end := src.ValueOffsets(idx)
-	values := src.ListValues()
-	inner := dst.ValueBuilder()
-	for j := int(start); j < int(end); j++ {
-		if values.IsNull(j) {
-			inner.AppendNull()
-			continue
-		}
-		if err := appendArrayValueAt(inner, values, j); err != nil {
-			return fmt.Errorf("appendListRowFromArray elem %d: %w", j, err)
-		}
 	}
 	return nil
 }

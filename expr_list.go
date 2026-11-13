@@ -140,44 +140,37 @@ func (n *listGetNode) Eval(input *Frame) (Series, error) {
 		return Series{}, fmt.Errorf("%w: list_get requires List column, got %s",
 			ErrExprTypeMismatch, s.DataType())
 	}
-	pool := memory.DefaultAllocator
-	b, err := builderForType(pool, lt.Elem())
+	chunks, err := listChunks(s, "list_get")
 	if err != nil {
-		return Series{}, fmt.Errorf("list_get: %w", err)
+		return Series{}, err
 	}
-	defer b.Release()
-	for _, chunk := range s.col.Data().Chunks() {
-		la, ok := chunk.(*array.List)
-		if !ok {
-			return Series{}, fmt.Errorf("list column chunk not *array.List (%T)", chunk)
-		}
-		values := la.ListValues()
-		for i := 0; i < la.Len(); i++ {
+	gather := elemGather{pool: memory.DefaultAllocator}
+	defer gather.release()
+	for _, la := range chunks {
+		pos := make([]int, la.Len()) // per row: position in values, -1 = null
+		for i := range la.Len() {
+			pos[i] = -1
 			if la.IsNull(i) {
-				b.AppendNull()
 				continue
 			}
 			start, end := la.ValueOffsets(i)
-			length := int(end - start)
 			idx := n.index
 			if idx < 0 {
-				idx += length
+				idx += int(end - start)
 			}
-			if idx < 0 || idx >= length {
-				b.AppendNull()
-				continue
-			}
-			abs := int(start) + idx
-			if values.IsNull(abs) {
-				b.AppendNull()
-				continue
-			}
-			if err := appendArrayValueAt(b, values, abs); err != nil {
-				return Series{}, fmt.Errorf("list_get elem: %w", err)
+			if idx >= 0 && idx < int(end-start) {
+				pos[i] = int(start) + idx
 			}
 		}
+		if err := gather.add(la.ListValues(), pos); err != nil {
+			return Series{}, fmt.Errorf("list_get: %w", err)
+		}
 	}
-	return buildSeries("list_get", lt.Elem(), b.NewArray()), nil
+	out, err := gather.finish(lt.Elem())
+	if err != nil {
+		return Series{}, fmt.Errorf("list_get: %w", err)
+	}
+	return buildSeries("list_get", lt.Elem(), out), nil
 }
 
 func (n *listGetNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
@@ -215,38 +208,51 @@ func (n *listSliceNode) Eval(input *Frame) (Series, error) {
 		return Series{}, fmt.Errorf("%w: list_slice requires List column, got %s",
 			ErrExprTypeMismatch, s.DataType())
 	}
-	pool := memory.DefaultAllocator
-	lb := array.NewListBuilder(pool, lt.Elem())
-	defer lb.Release()
-	inner := lb.ValueBuilder()
-	for _, chunk := range s.col.Data().Chunks() {
-		la, ok := chunk.(*array.List)
-		if !ok {
-			return Series{}, fmt.Errorf("list column chunk not *array.List (%T)", chunk)
-		}
-		values := la.ListValues()
-		for i := range la.Len() {
-			if la.IsNull(i) {
-				lb.AppendNull()
-				continue
-			}
-			startOff, endOff := la.ValueOffsets(i)
-			length := int(endOff - startOff)
-			lo, hi := clampSlice(n.start, n.stop, length)
-			lb.Append(true)
-			for j := lo; j < hi; j++ {
-				abs := int(startOff) + j
-				if values.IsNull(abs) {
-					inner.AppendNull()
-					continue
-				}
-				if err := appendArrayValueAt(inner, values, abs); err != nil {
-					return Series{}, fmt.Errorf("list_slice elem: %w", err)
-				}
-			}
-		}
+	chunks, err := listChunks(s, "list_slice")
+	if err != nil {
+		return Series{}, err
 	}
-	return buildSeries("list_slice", arrow.ListOf(lt.Elem()), lb.NewArray()), nil
+	outType := arrow.ListOf(lt.Elem())
+	pool := memory.DefaultAllocator
+	var pieces []arrow.Array
+	defer func() {
+		for _, p := range pieces {
+			p.Release()
+		}
+	}()
+	for _, la := range chunks {
+		offsets := make([]int32, 1, la.Len()+1)
+		valid := make([]bool, la.Len())
+		var pos []int
+		for i := range la.Len() {
+			valid[i] = !la.IsNull(i)
+			if valid[i] {
+				startOff, endOff := la.ValueOffsets(i)
+				lo, hi := clampSlice(n.start, n.stop, int(endOff-startOff))
+				for j := lo; j < hi; j++ {
+					pos = append(pos, int(startOff)+j)
+				}
+			}
+			offsets = append(offsets, int32(len(pos)))
+		}
+		gather := elemGather{pool: pool}
+		if err := gather.add(la.ListValues(), pos); err != nil {
+			gather.release()
+			return Series{}, fmt.Errorf("list_slice: %w", err)
+		}
+		values, err := gather.finish(lt.Elem())
+		if err != nil {
+			return Series{}, fmt.Errorf("list_slice: %w", err)
+		}
+		pieces = append(pieces, newListArray(outType, offsets, valid, values))
+		values.Release()
+	}
+	out, err := concatOwned(pool, outType, pieces)
+	pieces = nil // released by concatOwned
+	if err != nil {
+		return Series{}, fmt.Errorf("list_slice: %w", err)
+	}
+	return buildSeries("list_slice", outType, out), nil
 }
 
 func (n *listSliceNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
