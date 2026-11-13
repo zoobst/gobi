@@ -551,6 +551,9 @@ func takeArrayWithNulls(pool memory.Allocator, s Series, indexes []int) (arrow.A
 		}
 		return b.NewArray(), nil
 	case arrow.LIST:
+		if !listCopyable(dt) {
+			return takeComputeSeries(pool, s, indexes, true)
+		}
 		lt := dt.(*arrow.ListType)
 		lb := array.NewListBuilder(pool, lt.Elem())
 		defer lb.Release()

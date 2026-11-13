@@ -283,6 +283,9 @@ func takeArrayFast(pool memory.Allocator, chunk arrow.Array, indexes []int) (arr
 		}
 		return b.NewArray(), nil
 	case *array.List:
+		if !listCopyable(a.DataType()) {
+			break // e.g. List<Struct>: compute.Take below handles every type
+		}
 		lt := a.DataType().(*arrow.ListType)
 		lb := array.NewListBuilder(pool, lt.Elem())
 		defer lb.Release()
@@ -515,6 +518,9 @@ func takeArraySlow(pool memory.Allocator, s Series, indexes []int) (arrow.Array,
 		}
 		return b.NewArray(), nil
 	case arrow.LIST:
+		if !listCopyable(dt) {
+			return takeComputeSeries(pool, s, indexes, false)
+		}
 		lt := dt.(*arrow.ListType)
 		lb := array.NewListBuilder(pool, lt.Elem())
 		defer lb.Release()

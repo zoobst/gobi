@@ -214,6 +214,24 @@ func (f *Frame) explodeList(s Series, listCol string) (*Frame, error) {
 	return NewFrame(schema, outCols)
 }
 
+// listCopyable reports whether appendListRowFromArray can copy a list
+// column of type dt: its element type must be one appendArrayValueAt
+// handles. Keep the two in step.
+func listCopyable(dt arrow.DataType) bool {
+	lt, ok := dt.(*arrow.ListType)
+	if !ok {
+		return false
+	}
+	switch lt.Elem().ID() {
+	case arrow.STRING, arrow.BOOL, arrow.BINARY, arrow.TIMESTAMP,
+		arrow.INT64, arrow.INT32, arrow.INT16, arrow.INT8,
+		arrow.UINT64, arrow.UINT32, arrow.UINT16, arrow.UINT8,
+		arrow.FLOAT64, arrow.FLOAT32:
+		return true
+	}
+	return false
+}
+
 // appendArrayValueAt copies one non-null element from an arrow.Array
 // into a matching Builder. Dispatch mirrors the read-side switch in
 // from_structs.go's assignListElement.
@@ -259,9 +277,9 @@ func appendArrayValueAt(b array.Builder, arr arrow.Array, idx int) error {
 // take-family helpers to carry `List<T>` columns through Explode /
 // Join / Take without losing the list shape.
 //
-// Deep-nested lists (List<List<T>>, List<Struct<...>>) fall through
-// appendArrayValueAt's primitive-only dispatch and surface an error
-// at the element-copy step — noted as a follow-up.
+// It copies only the element types appendArrayValueAt handles; check
+// listCopyable first and send other lists (List<Struct<...>>,
+// List<List<T>>, dates, decimals, ...) to compute.Take.
 func appendListRowFromArray(dst *array.ListBuilder, src *array.List, idx int) error {
 	if src.IsNull(idx) {
 		dst.AppendNull()

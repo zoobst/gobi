@@ -5,6 +5,22 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.5.7]
+
+### Fixed
+
+- **`Take`, sorting and joins work on lists of structs.** A column such
+  as Overture's `sources` (`List<Struct<...>>`) failed with
+  "unsupported list element array type \*array.Struct".
+  - **Affected:** whatever gathers rows of such a column, on one chunk
+    or several: `Frame.Take`, `SortBy`, `SortByHilbert`, `Unique`,
+    `Explode` (the other columns), `Join` and `SJoin`.
+  - **Cause:** the hand-written list path copies only simple element
+    types (strings, booleans, numbers, binary, timestamps). Other
+    element types now go through arrow-go's `compute.Take`, which
+    handles every Arrow type; lists of nested lists, dates and
+    decimals were affected the same way and are fixed too.
+
 ## [v0.5.6]
 
 ### Fixed
