@@ -5,6 +5,24 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.5.8]
+
+### Added
+
+- **`parquetio.ReadOptions.Metadata`: read with a footer parsed
+  earlier.** Every read used to read and parse the file's footer
+  again. A caller that reads one file many times, a few row groups at
+  a time (a map loading the row groups in view), can now parse it once
+  (`file.NewParquetReader(...).MetaData()`) and pass it to each read
+  and to `ReadSchemaReader`. On a file with 200 row groups and 40
+  columns, reading one column of one row group takes 32 µs instead of
+  4.4 ms (86 KB allocated instead of 5.3 MB). In WASM, reading 12 row
+  groups of Overture's buildings (1.3 MB footer) one at a time drops
+  from 0.86 s to 0.54 s for the geometry, from 2.7 s to 2.2 s for every
+  column. The metadata must come from the same file: nothing checks
+  that it does. Not for encrypted files, whose decryption is set up
+  while the footer is parsed.
+
 ## [v0.5.7]
 
 ### Fixed
