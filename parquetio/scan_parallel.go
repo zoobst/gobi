@@ -9,6 +9,27 @@ import (
 	"github.com/zoobst/gobi"
 )
 
+// countRowGroups is path's row-group count: from opts.Metadata when
+// set (no I/O, as for the reads it partitions), else from the footer.
+// ok is false when the footer can't be read: the serial path then
+// surfaces the real error at Collect time.
+func countRowGroups(path string, opts *ReadOptions) (int, bool) {
+	if opts != nil && opts.Metadata != nil {
+		return opts.Metadata.NumRowGroups(), true
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	pf, err := file.NewParquetReader(f)
+	if err != nil {
+		return 0, false
+	}
+	defer pf.Close()
+	return pf.NumRowGroups(), true
+}
+
 // partitionRowGroups peeks at path's row-group count and splits it
 // into `workers` contiguous ranges. Each range gets its own read
 // closure that runs ReadFileChunksFunc restricted to that range
@@ -24,21 +45,10 @@ import (
 //	opts.ScanWorkers == 1 → nil (caller falls back to serial WithStreamRead)
 //	opts.ScanWorkers >= 2 → min(opts.ScanWorkers, NumRowGroups)
 func partitionRowGroups(path string, opts *ReadOptions) []func(cb func(*gobi.Frame) error) error {
-	// Peek at NumRowGroups. If any step fails, fall back to serial
-	// — the serial WithStreamRead callback will surface the real
-	// error at Collect time.
-	f, err := os.Open(path)
-	if err != nil {
+	numRG, ok := countRowGroups(path, opts)
+	if !ok {
 		return nil
 	}
-	pf, err := file.NewParquetReader(f)
-	if err != nil {
-		_ = f.Close()
-		return nil
-	}
-	numRG := pf.NumRowGroups()
-	_ = pf.Close()
-	_ = f.Close()
 
 	workers := effectiveScanWorkers(opts, numRG)
 	if workers <= 1 {

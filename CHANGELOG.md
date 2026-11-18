@@ -9,19 +9,27 @@ introduce breaking changes; check this file when upgrading.
 
 ### Added
 
-- **`parquetio.ReadOptions.Metadata`: read with a footer parsed
-  earlier.** Every read used to read and parse the file's footer
-  again. A caller that reads one file many times, a few row groups at
-  a time (a map loading the row groups in view), can now parse it once
-  (`file.NewParquetReader(...).MetaData()`) and pass it to each read
-  and to `ReadSchemaReader`. On a file with 200 row groups and 40
-  columns, reading one column of one row group takes 32 µs instead of
+- **Read with a footer parsed earlier: `parquetio.ReadMetadata` and
+  `ReadOptions.Metadata`.** Every read used to read and parse the
+  file's footer again. A caller that reads one file many times, a few
+  row groups at a time (a map loading the row groups in view), can now
+  parse it once with `ReadMetadata(r, size)` and pass it to each read:
+  `ReadReader`, `ReadFile`, the chunked readers, `ReadSchemaReader` and
+  `ScanFile` (whose parallel workers also count row groups from it
+  instead of opening the file). On a file with 200 row groups and 40
+  columns, reading one column of one row group takes 33 µs instead of
   4.4 ms (86 KB allocated instead of 5.3 MB). In WASM, reading 12 row
   groups of Overture's buildings (1.3 MB footer) one at a time drops
   from 0.86 s to 0.54 s for the geometry, from 2.7 s to 2.2 s for every
-  column. The metadata must come from the same file: nothing checks
-  that it does. Not for encrypted files, whose decryption is set up
-  while the footer is parsed.
+  column.
+  - Concurrent reads may share one `Metadata`: each read works on its
+    own copy, since arrow-go can fill fields in on first use.
+  - The metadata must come from the same file. A read checks that the
+    column chunks it reads lie within the file, so metadata from a
+    smaller or truncated file is an error, not garbage; metadata from
+    another file of at least the same size isn't caught.
+  - Encrypted files are refused with an error: their decryption is set
+    up while the footer is parsed.
 
 ## [v0.5.7]
 

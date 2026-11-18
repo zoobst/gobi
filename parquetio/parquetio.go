@@ -185,17 +185,21 @@ type ReadOptions struct {
 	// high-latency object storage. 0 (default) reads whole chunks.
 	BufferedStreamBytes int64
 
-	// Metadata is the file's already-parsed footer, so the read skips
-	// reading and parsing it again. It must come from the same file
-	// (for example file.NewParquetReader(...).MetaData(), or an earlier
-	// read's); nothing checks that it does. nil (default) reads the
-	// footer.
+	// Metadata is the file's already-parsed footer (from ReadMetadata),
+	// so the read skips reading and parsing it again. nil (default)
+	// reads the footer.
 	//
 	// Worth it when one file is read many times, a few row groups at a
 	// time: a big footer (Overture's is 1.3 MB for 128 row groups)
 	// takes milliseconds to parse natively and tens of milliseconds in
-	// WASM, on every read. Not for encrypted files: decryption is set
-	// up while the footer is parsed.
+	// WASM, on every read.
+	//
+	// It must come from the same file. A read checks that the column
+	// chunks it reads lie within the file, which catches metadata from
+	// a smaller or truncated file, but not from another file of at
+	// least the same size. Reads don't modify it, so concurrent reads
+	// may share it. Encrypted files are refused: decryption is set up
+	// while the footer is parsed.
 	Metadata *metadata.FileMetaData
 }
 
@@ -1293,8 +1297,17 @@ func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOpt
 		rp.BufferSize = opts.BufferedStreamBytes
 	}
 	readOpts := []file.ReadOption{file.WithReadProps(rp)}
+	var size int64
 	if opts.Metadata != nil {
-		readOpts = append(readOpts, file.WithMetadata(opts.Metadata))
+		md, err := metadataForRead(opts.Metadata)
+		if err == nil {
+			size, err = fileSize(rs)
+		}
+		if err != nil {
+			_ = closer.Close()
+			return nil, err
+		}
+		readOpts = append(readOpts, file.WithMetadata(md))
 	}
 	pf, err := file.NewParquetReader(rs, readOpts...)
 	if err != nil {
@@ -1351,6 +1364,13 @@ func openReaderFromRS(rs parquet.ReaderAtSeeker, closer io.Closer, opts *ReadOpt
 	// that could have been skipped) just costs a bit of extra I/O.
 	// filterRowGroupsByPredicate handles a nil Predicate as a no-op.
 	rowGroups = filterRowGroupsByPredicate(pf, opts.Predicate, rowGroups)
+	if opts.Metadata != nil {
+		if err := checkMetadataFits(opts.Metadata, rowGroups, size); err != nil {
+			_ = pf.Close()
+			_ = closer.Close()
+			return nil, err
+		}
+	}
 
 	return &readerContext{
 		closer:       closer,
