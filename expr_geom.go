@@ -707,6 +707,13 @@ func (n *geomForceZNode) outputName(leftName string) string {
 	return leftName + "_forcez"
 }
 
+// OutputFieldMetadata: a geometry field in the input's CRS (as
+// Series.GeomForceZ emits).
+func (n *geomForceZNode) OutputFieldMetadata(schema *arrow.Schema) (arrow.Metadata, bool) {
+	in := PlannedFieldMetadata(Expr{node: n.left}, schema)
+	return GeometryField("", geometryCRSFromField(arrow.Field{Metadata: in})).Metadata, true
+}
+
 func (n *geomForceZNode) Children() []Expr { return []Expr{{node: n.left}} }
 func (n *geomForceZNode) Type(*arrow.Schema) (arrow.DataType, error) {
 	return arrow.BinaryTypes.Binary, nil

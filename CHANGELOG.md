@@ -5,6 +5,85 @@ All notable changes to gobi are documented here. Format follows
 follow [SemVer](https://semver.org). Pre-1.0 minor versions may
 introduce breaking changes; check this file when upgrading.
 
+## [v0.5.9]
+
+### Added
+
+- **New `h3` package: Uber's H3 hexagonal grid as expressions.** It is
+  built on `github.com/uber/h3-go/v4`, which is pure Go from v4.6.0,
+  so gobi stays cgo-free and the package builds for wasm. Each
+  function returns a `gobi.Expr`, usable eagerly or in lazy plans:
+
+  | Function | Result |
+  |---|---|
+  | `LatLngToCell(gobi.PointExpr{Lat, Lon}, res)` | Int64 cell |
+  | `GeomToCell(geom, res)` | Int64 cell, from a point geometry column |
+  | `Parent(cell, res)`, `Resolution(cell)`, `IsValid(cell)` | Int64 / Int32 / Boolean |
+  | `CellToPoint(cell)`, `CellToBoundary(cell)` | point / polygon geometry, EPSG:4326 |
+  | `GridDisk(cell, k)` | `List<Int64>` (pair with `Explode`) |
+  | `CellToString(cell)` | hexadecimal String |
+
+  - **Cell type:** cells are Int64. Every valid H3 index fits, and
+    Athena, Hive, Iceberg and Spark have no unsigned 64-bit type.
+    Functions that take a cell also accept Uint64 columns.
+  - **Nulls and invalid values:** a null input, an invalid cell, a
+    non-finite coordinate, or a parent resolution finer than the cell
+    gives null rather than failing the batch.
+  - **Errors:** these are errors, since they can't be per-row data:
+    - a resolution outside 0–15;
+    - a negative `k`;
+    - a wrong column type;
+    - `GeomToCell` on a projected CRS (`ErrProjectedCRS`; it doesn't
+      reproject);
+    - `GeomToCell` on coordinates outside longitude/latitude range
+      (`ErrNotLonLat`), which usually means unlabeled projected data.
+  - **Column names:** `h3_<res>` for `LatLngToCell`, `GeomToCell` and
+    `Parent`; `<input>_res`, `_is_valid`, `_point`, `_boundary`,
+    `_disk<k>` and `_str` for the others.
+  - **Antimeridian:** `CellToBoundary` keeps H3's -180..180 longitudes,
+    so split cells that straddle the antimeridian with
+    `geometry.SplitAtAntimeridian` when that matters.
+  - **Validation:** golden tests compare every function against h3-py
+    (the H3 C library), over 514 points at all 16 resolutions plus 200
+    cells. Cells match exactly. Within 0.1° of a pole, coordinates can
+    differ by up to 1.8e-7°, because h3-go has a precision fix that the
+    C library only adds in 4.6 (uber/h3-go#167).
+- **CI builds gobi with cgo off** for linux/arm, and builds the core,
+  `geometry` and `h3` packages for `js/wasm` and `wasip1/wasm`.
+
+### Fixed
+
+- **Computed geometry columns keep their geometry tag through
+  `LazyFrame.Collect`.** A geometry column produced by an expression in
+  a lazy `Select` or `WithColumn`, such as `GeomForceZ`, came back as
+  plain Binary.
+  - **Cause:** the result was assembled with the plan's declared schema,
+    built from `ExprNode.Type`, which carries only a data type.
+  - **Fix:** expressions can now declare their output field's metadata
+    through the new optional `FieldMetadataProvider` interface. `Select`
+    and `WithColumn` build their schemas with it, so
+    `LazyFrame.Schema()` and zero-row results show the tag too.
+    - **Implemented by:** `Col` (forwards the column's metadata), `Alias`,
+      `Shift`, `Over`, `If`, `Coalesce`, `GeomForceZ`, and h3's
+      `CellToPoint` / `CellToBoundary`.
+    - **Custom nodes:** they can implement it, and
+      `PlannedFieldMetadata(e, schema)` forwards an input's metadata.
+    - **Fallback:** for nodes that don't implement it, `Collect` still
+      takes a field's metadata from the batches when the declared field
+      has none and the types match.
+- **`Over`, `If` and `Coalesce` keep a geometry column's tag.** They
+  rebuilt their output with a bare field, so a geometry column passed
+  through them came back as plain Binary. A geometry operation later in
+  the same plan then failed with `ErrNotGeometry`, for example
+  `Col("g").Shift(1).Over("k")` followed by `GeomForceZ`.
+  - **Over:** a shape-preserving `Over` keeps its inner expression's
+    field.
+  - **If and Coalesce:** they keep the field metadata their value
+    operands share. Literal operands such as `LitNull` are skipped, so
+    `If(c, Col("geom"), LitNull(...))` stays geometry. Operands with
+    different metadata, such as two CRSs, still give an untagged
+    result.
+
 ## [v0.5.8]
 
 ### Added

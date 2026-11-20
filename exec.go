@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -99,6 +100,7 @@ func concatBatchesToFrame(schema *arrow.Schema, batches []arrow.RecordBatch) (*F
 		return emptyFrame(schema)
 	}
 	pool := memory.DefaultAllocator
+	schema = withBatchFieldMetadata(schema, batches[0].Schema())
 	numCols := len(schema.Fields())
 	outCols := make([]arrow.Column, numCols)
 
@@ -118,6 +120,33 @@ func concatBatchesToFrame(schema *arrow.Schema, batches []arrow.RecordBatch) (*F
 		chunked.Release()
 	}
 	return NewFrame(schema, outCols)
+}
+
+// withBatchFieldMetadata fills in field metadata the declared schema
+// lacks from the schema the batches actually carry. A plan's declared
+// schema comes from ExprNode.Type, which returns only a data type, so
+// a computed column's field tags — a geometry column's
+// gobi:geometry_type / gobi:crs_epsg — exist only on the batches.
+// Fields whose types differ, or that already have metadata, are kept.
+func withBatchFieldMetadata(declared, actual *arrow.Schema) *arrow.Schema {
+	if declared.NumFields() != actual.NumFields() {
+		return declared
+	}
+	var fields []arrow.Field
+	for i, f := range declared.Fields() {
+		bf := actual.Field(i)
+		if f.HasMetadata() || !bf.HasMetadata() || !arrow.TypeEqual(f.Type, bf.Type) {
+			continue
+		}
+		if fields == nil {
+			fields = slices.Clone(declared.Fields())
+		}
+		fields[i].Metadata = bf.Metadata
+	}
+	if fields == nil {
+		return declared
+	}
+	return arrow.NewSchemaWithEndian(fields, schemaMetadataPtr(declared), declared.Endianness())
 }
 
 // -----------------------------------------------------------------------------

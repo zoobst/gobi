@@ -25,6 +25,7 @@
 //   - geometry:  2D primitives, WKB/WKT, CRS, area/distance/hull
 //   - csvio:     typed CSV read/write, plus an all-strings reader
 //   - jsonio:    JSON array / NDJSON records with type inference
+//   - h3:        Uber H3 hexagonal grid as expressions (pure Go)
 //   - parquetio: Parquet + GeoParquet read/write, LazyFrame scan
 //   - geojsonio: GeoJSON encoding/decoding for individual features
 //   - gpkgio:    OGC GeoPackage read/write with RTree spatial index

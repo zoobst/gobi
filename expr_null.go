@@ -192,7 +192,14 @@ func (n *coalesceNode) Eval(input *Frame) (Series, error) {
 	if err != nil {
 		return Series{}, fmt.Errorf("Coalesce: %w", err)
 	}
-	return buildSeries("coalesce", outType, out), nil
+	md, _ := n.OutputFieldMetadata(input.Schema())
+	return metadataSeries("coalesce", outType, md, out), nil
+}
+
+// OutputFieldMetadata: the operands' shared field metadata (see
+// commonFieldMetadata).
+func (n *coalesceNode) OutputFieldMetadata(schema *arrow.Schema) (arrow.Metadata, bool) {
+	return commonFieldMetadata(schema, n.operands...)
 }
 
 func (n *coalesceNode) Type(schema *arrow.Schema) (arrow.DataType, error) {

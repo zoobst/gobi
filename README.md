@@ -823,6 +823,7 @@ _ = shpio.WriteFile(counties, "counties_out", nil)  // writes all four files
 | `github.com/zoobst/gobi`  | `Frame`, `Series`, `GroupBy`, `Join`, `SJoin`, `Explode`, datetime + rolling + resample, options |
 | `.../gobi/geometry`       | 2D + 3D primitives (Point/LineString/Polygon + `ExtrudedPolygon`/`Sphere`/`Capsule`), WKB / WKT, CRS + reprojection (incl. WGS84 ECEF), predicates, R-tree, Buffer / Simplify / Centroid, geodesic 3D distance |
 | `.../gobi/csvio`          | Typed CSV read + streaming (`ReadFileChunksFunc`), gzip / zstd / bzip2 auto-detect; `ReadStrings` for CSVs with no struct (every column String); `WriteFile` / streaming `NewWriter` (gzip / zstd) |
+| `.../gobi/h3`             | Uber H3 hexagonal grid as expressions: `LatLngToCell` / `GeomToCell`, `Parent`, `CellToBoundary`, `GridDisk`, … Int64 cells; pure Go via h3-go ≥ 4.6 |
 | `.../gobi/jsonio`         | JSON array or NDJSON records → Frame with lossless type inference (int64 IDs above 2^53 survive), or `AllStrings` |
 | `.../gobi/parquetio`      | Parquet read/write + streaming + column projection + row-group + bloom-filter tuning; snappy/gzip/brotli/zstd/lz4 + GeoParquet 1.1 |
 | `.../gobi/geojsonio`      | Full RFC 7946 GeoJSON (all geometry types + XYZ) — Frame-level `ReadFile`/`WriteFile`/`ScanFile`, `.geojsonl` streaming |

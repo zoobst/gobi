@@ -338,6 +338,12 @@ func (s *shiftNode) Eval(input *Frame) (Series, error) {
 	return src.Shift(s.n)
 }
 
+// OutputFieldMetadata: Shift keeps its input's field.
+func (s *shiftNode) OutputFieldMetadata(schema *arrow.Schema) (arrow.Metadata, bool) {
+	md := PlannedFieldMetadata(Expr{node: s.inner}, schema)
+	return md, md.Len() > 0
+}
+
 func (s *shiftNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 	if s.inner == nil {
 		return nil, fmt.Errorf("gobi: Shift on nil inner expression")

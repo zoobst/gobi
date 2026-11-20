@@ -126,7 +126,14 @@ func (n *ifNode) Eval(input *Frame) (Series, error) {
 			return Series{}, fmt.Errorf("If row %d emit: %w", row, err)
 		}
 	}
-	return buildSeries("if", outType, b.NewArray()), nil
+	md, _ := n.OutputFieldMetadata(input.Schema())
+	return metadataSeries("if", outType, md, b.NewArray()), nil
+}
+
+// OutputFieldMetadata: the branches' shared field metadata (see
+// commonFieldMetadata).
+func (n *ifNode) OutputFieldMetadata(schema *arrow.Schema) (arrow.Metadata, bool) {
+	return commonFieldMetadata(schema, n.then, n.otherwise)
 }
 
 func (n *ifNode) Type(schema *arrow.Schema) (arrow.DataType, error) {

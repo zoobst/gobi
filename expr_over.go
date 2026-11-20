@@ -202,6 +202,16 @@ func (n *overNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 	return n.inner.Type(schema)
 }
 
+// OutputFieldMetadata: a shape-preserving inner keeps its field; a
+// scalar aggregate broadcast doesn't.
+func (n *overNode) OutputFieldMetadata(schema *arrow.Schema) (arrow.Metadata, bool) {
+	if _, ok := n.inner.(*scalarAggNode); ok {
+		return arrow.Metadata{}, false
+	}
+	md := PlannedFieldMetadata(Expr{node: n.inner}, schema)
+	return md, md.Len() > 0
+}
+
 func (n *overNode) Children() []Expr { return []Expr{{node: n.inner}} }
 func (n *overNode) String() string {
 	if len(n.orderBy) == 0 {
@@ -417,7 +427,8 @@ func (n *overNode) evalShapePreserving(input *Frame) (Series, error) {
 			return Series{}, fmt.Errorf("Over: emit: %w", err)
 		}
 	}
-	return buildSeries("over", outType, b.NewArray()), nil
+	md, _ := n.OutputFieldMetadata(input.Schema())
+	return metadataSeries("over", outType, md, b.NewArray()), nil
 }
 
 // evalShapePreservingGeneral walks hash-bucketed partitions,

@@ -49,6 +49,15 @@ func (n *colRefNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 	return fields[0].Type, nil
 }
 
+// OutputFieldMetadata forwards the referenced column's field metadata.
+func (n *colRefNode) OutputFieldMetadata(schema *arrow.Schema) (arrow.Metadata, bool) {
+	fields, ok := schema.FieldsByName(n.name)
+	if !ok || len(fields) == 0 || !fields[0].HasMetadata() {
+		return arrow.Metadata{}, false
+	}
+	return fields[0].Metadata, true
+}
+
 func (n *colRefNode) Children() []Expr { return nil }
 func (n *colRefNode) String() string   { return fmt.Sprintf("col(%q)", n.name) }
 
@@ -770,6 +779,12 @@ func (n *aliasNode) Eval(input *Frame) (Series, error) {
 
 func (n *aliasNode) Type(schema *arrow.Schema) (arrow.DataType, error) {
 	return n.inner.Type(schema)
+}
+
+// OutputFieldMetadata: an alias renames, so the inner's metadata stands.
+func (n *aliasNode) OutputFieldMetadata(schema *arrow.Schema) (arrow.Metadata, bool) {
+	md := PlannedFieldMetadata(Expr{node: n.inner}, schema)
+	return md, md.Len() > 0
 }
 
 func (n *aliasNode) Children() []Expr { return []Expr{{node: n.inner}} }

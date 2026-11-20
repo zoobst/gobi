@@ -122,6 +122,63 @@ func plannedType(e Expr, schema *arrow.Schema) arrow.DataType {
 	return dt
 }
 
+// FieldMetadataProvider is an optional ExprNode extension for nodes
+// whose output column carries field metadata — a geometry column's
+// gobi:geometry_type / gobi:crs_epsg tags, for instance. Type reports
+// only a data type, so without this a plan's schema (LazyFrame.Schema,
+// and a zero-row Collect) would show such a column untagged.
+//
+// OutputFieldMetadata returns the metadata the node's output field
+// will carry for an input of the given schema, and ok=false when it
+// carries none or can't tell.
+type FieldMetadataProvider interface {
+	OutputFieldMetadata(schema *arrow.Schema) (md arrow.Metadata, ok bool)
+}
+
+// PlannedFieldMetadata is the field metadata e's output will carry for
+// an input of schema, per FieldMetadataProvider; empty when e doesn't
+// implement it or reports none. Custom nodes that pass a column
+// through can call it on their input to forward its metadata.
+func PlannedFieldMetadata(e Expr, schema *arrow.Schema) arrow.Metadata {
+	if p, ok := e.node.(FieldMetadataProvider); ok {
+		if md, ok := p.OutputFieldMetadata(schema); ok {
+			return md
+		}
+	}
+	return arrow.Metadata{}
+}
+
+// commonFieldMetadata is the field metadata shared by every value
+// operand of a node that picks values from several operands (If,
+// Coalesce). Literal operands (Lit, LitNull) carry none and are
+// skipped, so If(c, Col("geom"), LitNull(...)) stays a geometry
+// column. When the other operands' metadata differ — two geometry
+// columns in different CRSs, say — the result carries none.
+func commonFieldMetadata(schema *arrow.Schema, operands ...ExprNode) (arrow.Metadata, bool) {
+	var out arrow.Metadata
+	seen := false
+	for _, op := range operands {
+		switch op.(type) {
+		case *literalNode, *literalNullNode:
+			continue
+		}
+		md := PlannedFieldMetadata(Expr{node: op}, schema)
+		if !seen {
+			out, seen = md, true
+			continue
+		}
+		if !out.Equal(md) {
+			return arrow.Metadata{}, false
+		}
+	}
+	return out, seen && out.Len() > 0
+}
+
+// metadataSeries is buildSeries with field metadata.
+func metadataSeries(name string, dtype arrow.DataType, md arrow.Metadata, arr arrow.Array) Series {
+	return SeriesFromArray(arrow.Field{Name: name, Type: dtype, Nullable: true, Metadata: md}, arr)
+}
+
 // -----------------------------------------------------------------------------
 // projectNode: reshape output schema to a set of expressions
 // -----------------------------------------------------------------------------
@@ -145,6 +202,7 @@ func newProjectNode(input LogicalPlan, exprs []Expr) *projectNode {
 			Name:     exprOutputName(e, i),
 			Type:     plannedType(e, inSchema),
 			Nullable: true,
+			Metadata: PlannedFieldMetadata(e, inSchema),
 		}
 	}
 	return &projectNode{
@@ -189,7 +247,7 @@ type withColumnNode struct {
 
 func newWithColumnNode(input LogicalPlan, name string, e Expr) *withColumnNode {
 	inSchema := input.Schema()
-	newField := arrow.Field{Name: name, Type: plannedType(e, inSchema), Nullable: true}
+	newField := arrow.Field{Name: name, Type: plannedType(e, inSchema), Nullable: true, Metadata: PlannedFieldMetadata(e, inSchema)}
 
 	replaceIdx := -1
 	for i, f := range inSchema.Fields() {

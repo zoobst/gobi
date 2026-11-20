@@ -6,6 +6,7 @@ require (
 	github.com/apache/arrow-go/v18 v18.7.0
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/klauspost/compress v1.20.3
+	github.com/uber/h3-go/v4 v4.6.0
 	modernc.org/sqlite v1.61.1
 )
 
