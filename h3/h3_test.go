@@ -311,7 +311,7 @@ func TestErrors(t *testing.T) {
 		"negative k":          {nums, h3.GridDisk(gobi.Col("cell"), -1), nil},
 		"string cell":         {nums, h3.Resolution(gobi.Col("s")), gobi.ErrExprTypeMismatch},
 		"string lat":          {nums, h3.LatLngToCell(gobi.PointExpr{Lat: gobi.Col("s"), Lon: gobi.Col("lat")}, 8), gobi.ErrExprTypeMismatch},
-		"projected CRS":       {ptf(3857, 500000, 6000000), h3.GeomToCell(gobi.Col("geometry"), 8), h3.ErrProjectedCRS},
+		"projected CRS":       {ptf(3857, 500000, 6000000), h3.GeomToCell(gobi.Col("geometry"), 8), h3.ErrNotWGS84},
 		"unlabeled projected": {ptf(0, 500000, 6000000), h3.GeomToCell(gobi.Col("geometry"), 8), h3.ErrNotLonLat},
 		"non-point":           {lineFrame(), h3.GeomToCell(gobi.Col("geometry"), 8), nil},
 		"not geometry":        {nums, h3.GeomToCell(gobi.Col("s"), 8), gobi.ErrExprTypeMismatch},
@@ -433,8 +433,19 @@ func TestReviewRegressions2(t *testing.T) {
 	mercator := frame(t, gobi.SeriesFromArray(gobi.GeometryField("geometry", 3395), gb.NewArray()))
 	gb.Release()
 	_, err := mercator.Lazy().Select(h3.GeomToCell(gobi.Col("geometry"), 8)).Collect()
-	if !errors.Is(err, h3.ErrUnknownCRS) || !errors.Is(err, geometry.ErrUnknownCRS) {
-		t.Errorf("EPSG:3395: err = %v, want ErrUnknownCRS", err)
+	if !errors.Is(err, h3.ErrNotWGS84) || !errors.Is(err, geometry.ErrUnknownCRS) {
+		t.Errorf("EPSG:3395: err = %v, want ErrNotWGS84 wrapping geometry.ErrUnknownCRS", err)
+	}
+
+	// A registered geographic CRS that isn't WGS 84 degrees (EPSG:4807,
+	// grads from Paris) is still refused.
+	geometry.RegisterCRS(4807, "NTF (Paris)", false)
+	gb = array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	gb.Append(geometry.WKB(geometry.NewPoint(2, 50, geometry.CRS{})))
+	paris := frame(t, gobi.SeriesFromArray(gobi.GeometryField("geometry", 4807), gb.NewArray()))
+	gb.Release()
+	if _, err := paris.Lazy().Select(h3.GeomToCell(gobi.Col("geometry"), 8)).Collect(); !errors.Is(err, h3.ErrNotWGS84) {
+		t.Errorf("EPSG:4807: err = %v, want ErrNotWGS84", err)
 	}
 
 	pts := frame(t, gobi.NewFloat64Series("lat", []float64{10, 20}, nil))
@@ -454,3 +465,68 @@ func TestReviewRegressions2(t *testing.T) {
 		t.Errorf("scalar lon: %x, want %x", vals, want)
 	}
 }
+
+// TestScalarOperandsBroadcastToFrameRows — one-value operands fill
+// every row of the frame, whatever the other operands' lengths.
+func TestScalarOperandsBroadcastToFrameRows(t *testing.T) {
+	f := frame(t, gobi.NewFloat64Series("lat", []float64{10, 20, 30}, nil))
+	want, _ := uh3LatLngToCell(10, 30, 5)
+
+	both := h3.LatLngToCell(gobi.PointExpr{Lat: gobi.Custom(scalarNode{10}), Lon: gobi.Custom(scalarNode{30})}, 5)
+	out, err := f.Lazy().Select(both).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Release()
+	s, _ := out.Column(out.ColumnNames()[0])
+	if v, _ := s.Int64s(); !slices.Equal(v, []int64{want, want, want}) {
+		t.Errorf("two scalars, Select: %x", v)
+	}
+	wc, err := f.Lazy().WithColumn("cell", both).Collect()
+	if err != nil {
+		t.Fatalf("two scalars, WithColumn: %v", err)
+	}
+	defer wc.Release()
+	if wc.NumRows() != 3 {
+		t.Errorf("WithColumn rows = %d", wc.NumRows())
+	}
+
+	// One-value cell and geometry inputs broadcast too.
+	cell := gobi.Custom(cellScalar{want})
+	res, err := f.Lazy().Select(h3.Resolution(cell)).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Release()
+	if r, _ := res.Column(res.ColumnNames()[0]); r.Len() != 3 {
+		t.Errorf("one-value cell: %d rows", r.Len())
+	}
+
+	// A length that is neither the frame's nor 1 is an error.
+	short := gobi.Custom(lenNode{2})
+	if _, err := f.Lazy().Select(h3.LatLngToCell(gobi.PointExpr{Lat: short, Lon: gobi.Col("lat")}, 5)).Collect(); !errors.Is(err, gobi.ErrColumnLenMismatch) {
+		t.Errorf("2-row lat on 3-row frame: err = %v", err)
+	}
+}
+
+type cellScalar struct{ c int64 }
+
+func (n cellScalar) Eval(*gobi.Frame) (gobi.Series, error) {
+	return gobi.NewInt64Series("c", []int64{n.c}, nil), nil
+}
+func (n cellScalar) Type(*arrow.Schema) (arrow.DataType, error) {
+	return arrow.PrimitiveTypes.Int64, nil
+}
+func (n cellScalar) Children() []gobi.Expr { return nil }
+func (n cellScalar) String() string        { return "cell" }
+
+type lenNode struct{ n int }
+
+func (n lenNode) Eval(*gobi.Frame) (gobi.Series, error) {
+	return gobi.NewFloat64Series("l", make([]float64, n.n), nil), nil
+}
+func (n lenNode) Type(*arrow.Schema) (arrow.DataType, error) {
+	return arrow.PrimitiveTypes.Float64, nil
+}
+func (n lenNode) Children() []gobi.Expr { return nil }
+func (n lenNode) String() string        { return "len" }

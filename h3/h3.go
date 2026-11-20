@@ -28,7 +28,8 @@
 // finer than the cell's — rather than failing the whole batch. Use
 // IsValid to find invalid cells. Misuse that can't be per-row data is
 // an error: a resolution outside 0..15, a negative k, a column of the
-// wrong type, or (GeomToCell) a geometry column in a projected CRS.
+// wrong type, or (GeomToCell) a geometry column in any CRS but
+// EPSG:4326.
 //
 // # Ordering for pruning
 //
@@ -42,6 +43,7 @@ package h3
 import (
 	"errors"
 	"fmt"
+	"iter"
 	"math"
 	"strings"
 
@@ -61,13 +63,13 @@ const MaxResolution = 15
 var (
 	// ErrResolution: a resolution outside 0..MaxResolution.
 	ErrResolution = errors.New("gobi/h3: resolution must be in 0..15")
-	// ErrProjectedCRS: GeomToCell on a geometry column whose CRS is
-	// projected; H3 needs longitude / latitude. Transform first.
-	ErrProjectedCRS = errors.New("gobi/h3: geometry column is in a projected CRS; H3 needs longitude/latitude (EPSG:4326)")
-	// ErrUnknownCRS: GeomToCell on a geometry column whose EPSG code
-	// isn't in gobi's CRS registry, so it can't be confirmed geographic.
-	// Wraps geometry.ErrUnknownCRS.
-	ErrUnknownCRS = fmt.Errorf("gobi/h3: %w: can't confirm it is longitude/latitude; transform to EPSG:4326, or register it with geometry.RegisterCRS(code, name, false) if it is geographic", geometry.ErrUnknownCRS)
+	// ErrNotWGS84: GeomToCell on a geometry column whose CRS is set to
+	// anything but EPSG:4326. H3 indexes WGS 84 longitude/latitude in
+	// degrees; another CRS — projected, unregistered, or geographic
+	// with different units, datum or prime meridian (EPSG:4807 is in
+	// grads from Paris) — would index the wrong place. GeomToCell
+	// doesn't reproject: transform the column to EPSG:4326 first.
+	ErrNotWGS84 = errors.New("gobi/h3: geometry column must be WGS 84 longitude/latitude (EPSG:4326) or have no CRS; transform it to EPSG:4326 first")
 	// ErrNotLonLat: GeomToCell found a coordinate outside
 	// longitude/latitude range, which usually means projected data in a
 	// column with no CRS recorded.
@@ -88,7 +90,7 @@ func LatLngToCell(p gobi.PointExpr, res int) gobi.Expr {
 		want:   []typeCheck{wantFloat64, wantFloat64},
 		out:    arrow.PrimitiveTypes.Int64,
 	}
-	n.eval = func(in []gobi.Series, pool memory.Allocator) (arrow.Array, error) {
+	n.eval = func(in []gobi.Series, rows int, pool memory.Allocator) (arrow.Array, error) {
 		lat, latNull, err := floats(in[0])
 		if err != nil {
 			return nil, err
@@ -98,10 +100,9 @@ func LatLngToCell(p gobi.PointExpr, res int) gobi.Expr {
 			return nil, err
 		}
 		// A custom operand may return one value for every row
-		// (ExprNode's contract); broadcast it.
-		rows := max(len(lat), len(lng))
+		// (ExprNode's contract); broadcast it to the frame's rows.
 		if (len(lat) != rows && len(lat) != 1) || (len(lng) != rows && len(lng) != 1) {
-			return nil, fmt.Errorf("%w: h3_latlng_to_cell: lat has %d rows, lon has %d", gobi.ErrColumnLenMismatch, len(lat), len(lng))
+			return nil, fmt.Errorf("%w: h3_latlng_to_cell: frame has %d rows, lat %d, lon %d", gobi.ErrColumnLenMismatch, rows, len(lat), len(lng))
 		}
 		at := func(n, i int) int {
 			if n == 1 {
@@ -127,10 +128,9 @@ func LatLngToCell(p gobi.PointExpr, res int) gobi.Expr {
 }
 
 // GeomToCell returns the Int64 cell containing each point of a point
-// geometry column at resolution res. The column's CRS must be unset or
-// registered in gobi as geographic (EPSG:4326, for one); a projected
-// CRS is ErrProjectedCRS rather than an implicit reprojection, and an
-// EPSG code gobi doesn't know is ErrUnknownCRS. A coordinate
+// geometry column at resolution res. The column's CRS must be EPSG:4326
+// or unset; any other CRS is ErrNotWGS84 rather than an implicit
+// reprojection. A coordinate
 // outside longitude/latitude range is ErrNotLonLat, since it usually
 // means unlabeled projected data. A non-point geometry is an error; an
 // empty point, or a non-finite coordinate, gives null. The result column is named h3_<res>.
@@ -143,47 +143,49 @@ func GeomToCell(geom gobi.Expr, res int) gobi.Expr {
 		want:   []typeCheck{wantBinary},
 		out:    arrow.PrimitiveTypes.Int64,
 	}
-	n.eval = func(in []gobi.Series, pool memory.Allocator) (arrow.Array, error) {
+	n.eval = func(in []gobi.Series, rows int, pool memory.Allocator) (arrow.Array, error) {
 		s := in[0]
 		if !s.IsGeometry() {
 			return nil, fmt.Errorf("%w: GeomToCell: %q is not a geometry column", gobi.ErrNotGeometry, s.Name())
 		}
-		if err := checkGeographic(s); err != nil {
+		if err := checkWGS84(s); err != nil {
+			return nil, err
+		}
+		cells, err := rowsOf(s, rows)
+		if err != nil {
 			return nil, err
 		}
 		b := array.NewInt64Builder(pool)
 		defer b.Release()
-		b.Reserve(s.Len())
+		b.Reserve(rows)
 		row := 0
-		for _, chunk := range s.Column().Data().Chunks() {
+		for chunk, i := range cells {
 			a := chunk.(*array.Binary)
-			for i := range a.Len() {
-				if a.IsNull(i) {
-					b.AppendNull()
-					row++
-					continue
-				}
-				x, y, _, ok, err := geometry.PointXYZFromWKB(a.Value(i))
-				if err != nil {
-					return nil, fmt.Errorf("gobi/h3: GeomToCell row %d: %w", row, err)
-				}
-				if !ok {
-					return nil, fmt.Errorf("gobi/h3: GeomToCell row %d: not a point geometry", row)
-				}
-				// Empty point (NaN), or a non-finite coordinate: null,
-				// as for LatLngToCell.
-				if math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
-					b.AppendNull()
-					row++
-					continue
-				}
-				if math.Abs(y) > 90 || math.Abs(x) > 180 {
-					return nil, fmt.Errorf("%w: GeomToCell row %d: (%g, %g)", ErrNotLonLat, row, x, y)
-				}
-				c, err := uh3.LatLngToCell(uh3.NewLatLng(y, x), res)
-				appendCell(b, c, err)
+			if a.IsNull(i) {
+				b.AppendNull()
 				row++
+				continue
 			}
+			x, y, _, ok, err := geometry.PointXYZFromWKB(a.Value(i))
+			if err != nil {
+				return nil, fmt.Errorf("gobi/h3: GeomToCell row %d: %w", row, err)
+			}
+			if !ok {
+				return nil, fmt.Errorf("gobi/h3: GeomToCell row %d: not a point geometry", row)
+			}
+			// Empty point (NaN), or a non-finite coordinate: null,
+			// as for LatLngToCell.
+			if math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
+				b.AppendNull()
+				row++
+				continue
+			}
+			if math.Abs(y) > 90 || math.Abs(x) > 180 {
+				return nil, fmt.Errorf("%w: GeomToCell row %d: (%g, %g)", ErrNotLonLat, row, x, y)
+			}
+			c, err := uh3.LatLngToCell(uh3.NewLatLng(y, x), res)
+			appendCell(b, c, err)
+			row++
 		}
 		return b.NewArray(), nil
 	}
@@ -352,7 +354,7 @@ type node struct {
 	// keepInvalid: pass invalid cells to the per-cell function instead
 	// of emitting null (IsValid).
 	keepInvalid bool
-	eval        func(in []gobi.Series, pool memory.Allocator) (arrow.Array, error)
+	eval        func(in []gobi.Series, rows int, pool memory.Allocator) (arrow.Array, error)
 }
 
 func (n *node) Eval(input *gobi.Frame) (gobi.Series, error) {
@@ -370,7 +372,7 @@ func (n *node) Eval(input *gobi.Frame) (gobi.Series, error) {
 		}
 		in[i] = s
 	}
-	arr, err := n.eval(in, memory.DefaultAllocator)
+	arr, err := n.eval(in, input.NumRows(), memory.DefaultAllocator)
 	if err != nil {
 		return gobi.Series{}, err
 	}
@@ -490,36 +492,75 @@ func suffix(sfx string) func(string) string {
 }
 
 // mapCells runs f over each non-null cell of the node's input, with a
-// null for a null input or (unless keepInvalid) an invalid cell.
-func mapCells(n *node, f func(b array.Builder, c uh3.Cell) error) func([]gobi.Series, memory.Allocator) (arrow.Array, error) {
-	return func(in []gobi.Series, pool memory.Allocator) (arrow.Array, error) {
+// null for a null input or (unless keepInvalid) an invalid cell. A
+// one-value input is broadcast to every row of the frame.
+func mapCells(n *node, f func(b array.Builder, c uh3.Cell) error) func([]gobi.Series, int, memory.Allocator) (arrow.Array, error) {
+	return func(in []gobi.Series, rows int, pool memory.Allocator) (arrow.Array, error) {
+		cells, err := rowsOf(in[0], rows)
+		if err != nil {
+			return nil, err
+		}
 		b := array.NewBuilder(pool, n.out)
 		defer b.Release()
-		b.Reserve(in[0].Len())
-		for _, chunk := range in[0].Column().Data().Chunks() {
-			for i := range chunk.Len() {
-				if chunk.IsNull(i) {
-					b.AppendNull()
-					continue
-				}
-				var c uh3.Cell
-				switch a := chunk.(type) {
-				case *array.Int64:
-					c = uh3.Cell(a.Value(i))
-				case *array.Uint64:
-					c = uh3.Cell(a.Value(i))
-				}
-				if !n.keepInvalid && !c.IsValid() {
-					b.AppendNull()
-					continue
-				}
-				if err := f(b, c); err != nil {
-					return nil, err
-				}
+		b.Reserve(rows)
+		for chunk, i := range cells {
+			if chunk.IsNull(i) {
+				b.AppendNull()
+				continue
+			}
+			var c uh3.Cell
+			switch a := chunk.(type) {
+			case *array.Int64:
+				c = uh3.Cell(a.Value(i))
+			case *array.Uint64:
+				c = uh3.Cell(a.Value(i))
+			}
+			if !n.keepInvalid && !c.IsValid() {
+				b.AppendNull()
+				continue
+			}
+			if err := f(b, c); err != nil {
+				return nil, err
 			}
 		}
 		return b.NewArray(), nil
 	}
+}
+
+// rowsOf yields (chunk, index) for each of the frame's rows: s's own
+// rows, or — for a one-value s, which ExprNode's contract allows a
+// custom operand to return — its single value repeated. Any other
+// length is ErrColumnLenMismatch.
+func rowsOf(s gobi.Series, rows int) (iter.Seq2[arrow.Array, int], error) {
+	chunks := s.Column().Data().Chunks()
+	switch {
+	case s.Len() == rows:
+		return func(yield func(arrow.Array, int) bool) {
+			for _, c := range chunks {
+				for i := range c.Len() {
+					if !yield(c, i) {
+						return
+					}
+				}
+			}
+		}, nil
+	case s.Len() == 1:
+		var c arrow.Array
+		for _, ch := range chunks {
+			if ch.Len() > 0 {
+				c = ch
+				break
+			}
+		}
+		return func(yield func(arrow.Array, int) bool) {
+			for range rows {
+				if !yield(c, 0) {
+					return
+				}
+			}
+		}, nil
+	}
+	return nil, fmt.Errorf("%w: gobi/h3: input has %d rows, frame has %d", gobi.ErrColumnLenMismatch, s.Len(), rows)
 }
 
 // appendCell appends c, or null when H3 returned an error.
@@ -548,23 +589,21 @@ func floats(s gobi.Series) ([]float64, []bool, error) {
 	return vals, s.Nulls(), nil
 }
 
-// checkGeographic accepts a geometry column whose CRS is unset (its
-// coordinates then get GeomToCell's range check) or registered as
-// geographic. A registered projected CRS is ErrProjectedCRS; an
-// unregistered code is ErrUnknownCRS — CRS.Projected is false for
-// codes gobi doesn't know, which would wrongly pass e.g. EPSG:3395.
-func checkGeographic(s gobi.Series) error {
+// checkWGS84 accepts a geometry column whose CRS is EPSG:4326 or unset
+// (unset coordinates then get GeomToCell's range check). Any other
+// code is ErrNotWGS84, wrapping geometry.ErrUnknownCRS when gobi
+// doesn't know the code. Projected-or-not isn't enough: CRS.Projected
+// is false for unregistered codes (EPSG:3395), and a geographic CRS
+// may use other units or a prime meridian other than Greenwich.
+func checkWGS84(s gobi.Series) error {
 	crs := geometryCRS(s)
-	if crs.Zero() {
+	if crs.Zero() || crs.Equal(geometry.WGS84) {
 		return nil
 	}
 	if _, err := geometry.LookupCRS(crs.EPSG); err != nil {
-		return fmt.Errorf("%w (column %q is EPSG:%d)", ErrUnknownCRS, s.Name(), crs.EPSG)
+		return fmt.Errorf("%w (column %q is EPSG:%d: %w)", ErrNotWGS84, s.Name(), crs.EPSG, err)
 	}
-	if crs.Projected() {
-		return fmt.Errorf("%w (column %q is EPSG:%d)", ErrProjectedCRS, s.Name(), crs.EPSG)
-	}
-	return nil
+	return fmt.Errorf("%w (column %q is EPSG:%d, %s)", ErrNotWGS84, s.Name(), crs.EPSG, crs.Name())
 }
 
 // geometryCRS reads a geometry column's recorded CRS (EPSG 0 if unset).

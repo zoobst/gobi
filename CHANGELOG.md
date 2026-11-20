@@ -36,15 +36,21 @@ introduce breaking changes; check this file when upgrading.
       per row before checking the resolution, so a larger radius would
       exhaust memory or overflow;
     - an empty operand, such as a `PointExpr` with `Lon` unset;
-    - `LatLngToCell` operands of different lengths. A custom operand
-      that returns one value is broadcast to every row, as `ExprNode`
-      allows;
+    - an operand whose length is neither the frame's row count nor 1.
+      A custom operand that returns one value, as `ExprNode` allows, is
+      broadcast to every row of the frame. That applies to every h3
+      function and to both `LatLngToCell` coordinates;
     - a wrong column type;
-    - `GeomToCell` on a projected CRS (`ErrProjectedCRS`; it doesn't
-      reproject), or on an EPSG code gobi's CRS registry doesn't know
-      (`ErrUnknownCRS`), since that can't be confirmed geographic.
-      EPSG:3395 is one example. Register a geographic code with
-      `geometry.RegisterCRS(code, name, false)`;
+    - `GeomToCell` on a geometry column in any CRS other than EPSG:4326
+      or unset (`ErrNotWGS84`). It doesn't reproject. That covers:
+      - projected CRSs;
+      - EPSG codes gobi doesn't know, such as EPSG:3395; the error also
+        wraps `geometry.ErrUnknownCRS`;
+      - geographic CRSs with other units, datum or prime meridian, such
+        as EPSG:4807, which is in grads from Paris.
+
+      H3 indexes WGS 84 degrees, so transform the column to EPSG:4326
+      first;
     - `GeomToCell` on coordinates outside longitude/latitude range
       (`ErrNotLonLat`), which usually means unlabeled projected data.
   - **Column names:** `h3_<res>` for `LatLngToCell`, `GeomToCell` and
@@ -96,7 +102,9 @@ introduce breaking changes; check this file when upgrading.
   - **Over:** a shape-preserving `Over` keeps its inner expression's
     field.
   - **If and Coalesce:** they keep the field metadata their evaluated
-    value operands share, read from the operands themselves. A custom
+    value operands share, read from the operands themselves. Literal
+    operands are skipped even when aliased, as in
+    `LitNull(...).Alias("none")`. A custom
     expression that emits a tagged geometry counts even without
     `FieldMetadataProvider`; `Over` likewise reads its partitions'
     results. Literal operands such as `LitNull` are skipped, so

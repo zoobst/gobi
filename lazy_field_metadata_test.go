@@ -223,10 +223,12 @@ func TestRuntimeMetadata_FromEvaluatedOperands(t *testing.T) {
 	opaque := Custom(&opaqueNode{inner: Col("g").node})
 
 	for name, e := range map[string]Expr{
-		"If":           If(Col("c"), opaque, opaque),
-		"If + LitNull": If(Col("c"), opaque, LitNull(arrow.BinaryTypes.Binary)),
-		"Coalesce":     Coalesce(opaque, Col("g")),
-		"Over":         opaque.Shift(1).Over("k"),
+		"If":                         If(Col("c"), opaque, opaque),
+		"If + LitNull":               If(Col("c"), opaque, LitNull(arrow.BinaryTypes.Binary)),
+		"If + aliased LitNull":       If(Col("c"), opaque, LitNull(arrow.BinaryTypes.Binary).Alias("none").Alias("again")),
+		"Coalesce + aliased LitNull": Coalesce(Col("g"), LitNull(arrow.BinaryTypes.Binary).Alias("none")),
+		"Coalesce":                   Coalesce(opaque, Col("g")),
+		"Over":                       opaque.Shift(1).Over("k"),
 	} {
 		out, err := f.Lazy().WithColumn("x", e).WithColumn("y", Col("x").GeomForceZ(1)).Collect()
 		if err != nil {

@@ -165,10 +165,10 @@ func commonFieldMetadata(schema *arrow.Schema, operands ...ExprNode) (arrow.Meta
 	return a.result()
 }
 
-// isLiteralNode reports a Lit / LitNull operand, which carries no
-// field metadata and so doesn't vote on a shared one.
+// isLiteralNode reports a Lit / LitNull operand, aliased or not, which
+// carries no field metadata and so doesn't vote on a shared one.
 func isLiteralNode(n ExprNode) bool {
-	switch n.(type) {
+	switch unwrapAlias(n).(type) {
 	case *literalNode, *literalNullNode:
 		return true
 	}
