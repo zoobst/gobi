@@ -286,7 +286,10 @@ func computeBboxColumns(pool memory.Allocator, s Series) (xmin, ymin, xmax, ymax
 
 func describeGeometryColumn(s Series) (GeoParquetColumnMeta, error) {
 	col := GeoParquetColumnMeta{Encoding: "WKB"}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return GeoParquetColumnMeta{}, err
+	}
 	col.CRS = crsPROJJSON(epsg)
 
 	types := map[string]struct{}{}

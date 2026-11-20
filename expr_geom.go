@@ -254,8 +254,10 @@ func (n *geomPredicateNode) evalColumnRight(left, right Series) (Series, error) 
 	}
 	defer rightBin.Release()
 
-	lcrs, _ := geometry.LookupCRS(geometryCRSFromField(left.field))
-	rcrs, _ := geometry.LookupCRS(geometryCRSFromField(right.field))
+	lcrs, rcrs, err := columnCRSs(left, right)
+	if err != nil {
+		return Series{}, err
+	}
 
 	// Slice 14: bbox-reject fast path. Skip ParseWKB on both sides
 	// when the row's paired bboxes fail the predicate's necessary
@@ -452,8 +454,10 @@ func (n *geomDWithinNode) evalColumnRight(left, right Series) (Series, error) {
 	}
 	defer rightBin.Release()
 
-	lcrs, _ := geometry.LookupCRS(geometryCRSFromField(left.field))
-	rcrs, _ := geometry.LookupCRS(geometryCRSFromField(right.field))
+	lcrs, rcrs, err := columnCRSs(left, right)
+	if err != nil {
+		return Series{}, err
+	}
 
 	pool := memory.DefaultAllocator
 	b := array.NewBooleanBuilder(pool)
@@ -719,6 +723,23 @@ func (n *geomForce2DNode) OutputFieldMetadata(schema *arrow.Schema) (arrow.Metad
 	return sameCRSGeometryMetadata(n.left, schema)
 }
 
+// columnCRSs reads both columns' CRSs for a column-vs-column op. An
+// unregistered code resolves to the zero CRS, as before; an unreadable
+// tag is ErrInvalidGeometryCRS.
+func columnCRSs(left, right Series) (geometry.CRS, geometry.CRS, error) {
+	le, err := geometryCRSFromField(left.field)
+	if err != nil {
+		return geometry.CRS{}, geometry.CRS{}, err
+	}
+	re, err := geometryCRSFromField(right.field)
+	if err != nil {
+		return geometry.CRS{}, geometry.CRS{}, err
+	}
+	lcrs, _ := geometry.LookupCRS(le)
+	rcrs, _ := geometry.LookupCRS(re)
+	return lcrs, rcrs, nil
+}
+
 // sameCRSGeometryMetadata declares a geometry field in input's CRS,
 // for geometry → geometry ops that keep the CRS. It declares nothing
 // unless input's planned metadata is known to be a geometry field: an
@@ -730,7 +751,13 @@ func sameCRSGeometryMetadata(input ExprNode, schema *arrow.Schema) (arrow.Metada
 	if _, ok := in.GetValue(MetaGeometryType); !ok {
 		return arrow.Metadata{}, false
 	}
-	return GeometryField("", geometryCRSFromField(arrow.Field{Metadata: in})).Metadata, true
+	// An unreadable input tag declares nothing; the op itself reports
+	// ErrInvalidGeometryCRS when it runs.
+	epsg, err := geometryCRSFromField(arrow.Field{Metadata: in})
+	if err != nil {
+		return arrow.Metadata{}, false
+	}
+	return GeometryField("", epsg).Metadata, true
 }
 
 func (n *geomForceZNode) Children() []Expr { return []Expr{{node: n.left}} }

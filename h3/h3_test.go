@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -530,3 +531,30 @@ func (n lenNode) Type(*arrow.Schema) (arrow.DataType, error) {
 }
 func (n lenNode) Children() []gobi.Expr { return nil }
 func (n lenNode) String() string        { return "len" }
+
+// TestGeomToCell_UnreadableCRS — a gobi:crs_epsg value that isn't a
+// plain decimal code is refused, never read as "unset".
+func TestGeomToCell_UnreadableCRS(t *testing.T) {
+	for _, v := range []string{"EPSG:3857", "3857abc", " 4326", "4326.0", "abc"} {
+		gb := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+		gb.Append(geometry.WKB(geometry.NewPoint(100, 50, geometry.CRS{})))
+		md := arrow.NewMetadata([]string{gobi.MetaGeometryType, gobi.MetaGeometryCRS}, []string{"WKB", v})
+		f := frame(t, gobi.SeriesFromArray(arrow.Field{Name: "geometry", Type: arrow.BinaryTypes.Binary, Nullable: true, Metadata: md}, gb.NewArray()))
+		gb.Release()
+		_, err := f.Lazy().Select(h3.GeomToCell(gobi.Col("geometry"), 8)).Collect()
+		if !errors.Is(err, h3.ErrNotWGS84) || !strings.Contains(err.Error(), "unreadable") {
+			t.Errorf("crs_epsg %q: err = %v, want ErrNotWGS84 (unreadable)", v, err)
+		}
+	}
+	// Missing, empty and "0" are unset: accepted, with the range check.
+	for _, v := range []string{"", "0"} {
+		gb := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+		gb.Append(geometry.WKB(geometry.NewPoint(10, 50, geometry.CRS{})))
+		md := arrow.NewMetadata([]string{gobi.MetaGeometryType, gobi.MetaGeometryCRS}, []string{"WKB", v})
+		f := frame(t, gobi.SeriesFromArray(arrow.Field{Name: "geometry", Type: arrow.BinaryTypes.Binary, Nullable: true, Metadata: md}, gb.NewArray()))
+		gb.Release()
+		if _, err := f.Lazy().Select(h3.GeomToCell(gobi.Col("geometry"), 8)).Collect(); err != nil {
+			t.Errorf("crs_epsg %q: %v", v, err)
+		}
+	}
+}

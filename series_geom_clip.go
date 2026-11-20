@@ -56,7 +56,10 @@ func (s Series) GeomEstimateUTMCRS() (geometry.CRS, error) {
 	if !s.IsGeometry() {
 		return geometry.CRS{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return geometry.CRS{}, err
+	}
 	sourceCRS, _ := geometry.LookupCRS(epsg)
 	if sourceCRS.Zero() {
 		sourceCRS = geometry.WGS84
@@ -123,7 +126,10 @@ func (s Series) GeomToCRS(target geometry.CRS) (Series, error) {
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	sourceCRS, _ := geometry.LookupCRS(epsg)
 	pool := memory.DefaultAllocator
 	b := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
@@ -162,7 +168,10 @@ func (s Series) GeomDissolve() (geometry.Geometry, error) {
 	if !s.IsGeometry() {
 		return nil, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return nil, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	geoms := make([]geometry.Geometry, 0, s.Len())
 	for _, chunk := range s.col.Data().Chunks() {
@@ -322,7 +331,10 @@ func geomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuf
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	// The mask and the CRS are the same for every row, so they are
 	// checked once, here. Rows whose bounds miss the mask never reach

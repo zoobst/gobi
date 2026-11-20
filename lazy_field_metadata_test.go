@@ -35,7 +35,7 @@ func TestCollect_KeepsComputedFieldMetadata(t *testing.T) {
 			t.Fatal(err)
 		}
 		s, _ := out.Column(out.ColumnNames()[out.NumCols()-1])
-		if !s.IsGeometry() || geometryCRSFromField(out.Schema().Field(out.NumCols()-1)) != 4326 {
+		if !s.IsGeometry() || crsOf(out.Schema().Field(out.NumCols()-1)) != 4326 {
 			t.Errorf("%s: computed geometry column lost its tag: %v", name, out.Schema())
 		}
 		out.Release()
@@ -72,7 +72,7 @@ func TestPlanSchema_KeepsGeometryTag(t *testing.T) {
 	for name, sch := range map[string]*arrow.Schema{"Schema()": lf.Schema(), "zero-row Collect": out.Schema()} {
 		for i, col := range []string{"g", "g2", "z"} {
 			fld := sch.Field(i)
-			if fld.Name != col || !isGeometryField(fld) || geometryCRSFromField(fld) != 3857 {
+			if fld.Name != col || !isGeometryField(fld) || crsOf(fld) != 3857 {
 				t.Errorf("%s: field %d = %v, want geometry %q in EPSG:3857", name, i, fld, col)
 			}
 		}
@@ -123,7 +123,7 @@ func TestPassThroughExprs_KeepGeometryTag(t *testing.T) {
 			continue
 		}
 		x, _ := out.Column("x")
-		if !x.IsGeometry() || geometryCRSFromField(out.Schema().Field(4)) != 3857 {
+		if !x.IsGeometry() || crsOf(out.Schema().Field(4)) != 3857 {
 			t.Errorf("%s: runtime column untagged: %v", name, out.Schema().Field(4))
 		}
 		out.Release()
@@ -132,7 +132,7 @@ func TestPassThroughExprs_KeepGeometryTag(t *testing.T) {
 			t.Fatal(err)
 		}
 		for where, sch := range map[string]*arrow.Schema{"Schema()": lf.Schema(), "zero-row": empty.Schema()} {
-			if fld := sch.Field(4); !isGeometryField(fld) || geometryCRSFromField(fld) != 3857 {
+			if fld := sch.Field(4); !isGeometryField(fld) || crsOf(fld) != 3857 {
 				t.Errorf("%s: %s field %v untagged", name, where, fld)
 			}
 		}
@@ -190,13 +190,13 @@ func TestGeometryOps_KeepCRSThroughCollect(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := geometryCRSFromField(out.Schema().Field(0)); got != 3857 {
+		if got := crsOf(out.Schema().Field(0)); got != 3857 {
 			t.Errorf("%s: Collect CRS = %d, want 3857", name, got)
 		}
 		out.Release()
 		// The declared schema is either right or silent — never wrong.
-		if fld := lf.Schema().Field(0); isGeometryField(fld) && geometryCRSFromField(fld) != 3857 {
-			t.Errorf("%s: Schema() declares CRS %d", name, geometryCRSFromField(fld))
+		if fld := lf.Schema().Field(0); isGeometryField(fld) && crsOf(fld) != 3857 {
+			t.Errorf("%s: Schema() declares CRS %d", name, crsOf(fld))
 		}
 	}
 }
@@ -235,7 +235,7 @@ func TestRuntimeMetadata_FromEvaluatedOperands(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 			continue
 		}
-		if x, _ := out.Column("x"); !x.IsGeometry() || geometryCRSFromField(out.Schema().Field(3)) != 3857 {
+		if x, _ := out.Column("x"); !x.IsGeometry() || crsOf(out.Schema().Field(3)) != 3857 {
 			t.Errorf("%s: untagged at runtime", name)
 		}
 		out.Release()
@@ -259,10 +259,20 @@ func TestWithBatchFieldMetadata_RequiresAgreement(t *testing.T) {
 	defer a2.Release()
 	defer c.Release()
 
-	if got := withBatchFieldMetadata(declared, []arrow.RecordBatch{a, a2}); geometryCRSFromField(got.Field(0)) != 4326 {
+	if got := withBatchFieldMetadata(declared, []arrow.RecordBatch{a, a2}); crsOf(got.Field(0)) != 4326 {
 		t.Errorf("agreeing batches: %v", got.Field(0))
 	}
 	if got := withBatchFieldMetadata(declared, []arrow.RecordBatch{a, c}); got.Field(0).HasMetadata() {
 		t.Errorf("disagreeing batches tagged with %v", got.Field(0).Metadata)
 	}
+}
+
+// crsOf is GeometryFieldCRS for tests that know the tag is readable;
+// an unreadable one reads as -1, which matches no expected code.
+func crsOf(f arrow.Field) int32 {
+	epsg, err := GeometryFieldCRS(f)
+	if err != nil {
+		return -1
+	}
+	return epsg
 }

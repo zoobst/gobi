@@ -586,7 +586,7 @@ func TestPointsFromXY_CRSStamped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := geometryCRSFromField(geom.field); got != 3857 {
+	if got := crsOf(geom.field); got != 3857 {
 		t.Fatalf("stamped CRS = %d, want 3857", got)
 	}
 }

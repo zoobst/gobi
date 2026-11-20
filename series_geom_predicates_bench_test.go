@@ -75,7 +75,7 @@ func BenchmarkSeries_GeomDWithin_LegacyAoS(b *testing.B) {
 }
 
 func legacyGeomDWithin(s Series, other geometry.Geometry, distance float64) (Series, error) {
-	epsg := geometryCRSFromField(s.field)
+	epsg := crsOf(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
 	other = attachCRS(other, crs)
 	pool := memory.DefaultAllocator
@@ -161,7 +161,7 @@ func legacyGeomType(s Series) (Series, error) {
 // legacyGeomIntersects reproduces the pre-Slice-14 geomPredicateOp
 // body (no BoundsFromWKB pre-reject, full ParseWKB per row).
 func legacyGeomIntersects(s Series, other geometry.Geometry) (Series, error) {
-	epsg := geometryCRSFromField(s.field)
+	epsg := crsOf(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
 	other = attachCRS(other, crs)
 	pool := memory.DefaultAllocator

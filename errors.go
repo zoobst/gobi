@@ -10,6 +10,10 @@ var (
 	ErrRowOutOfRange      = errors.New("gobi: row index out of range")
 	ErrEmptyFrame         = errors.New("gobi: empty dataframe")
 	ErrNotGeometry        = errors.New("gobi: column is not a geometry column")
+	// ErrInvalidGeometryCRS: a geometry field's gobi:crs_epsg tag is
+	// present but isn't a decimal EPSG code. Refused rather than read as
+	// "no CRS", which would mislabel or misread the coordinates.
+	ErrInvalidGeometryCRS = errors.New("gobi: unreadable geometry CRS tag")
 	ErrExprTypeMismatch   = errors.New("gobi: expression type mismatch")
 	ErrUnsupportedLiteral = errors.New("gobi: unsupported literal type")
 

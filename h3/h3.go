@@ -591,12 +591,15 @@ func floats(s gobi.Series) ([]float64, []bool, error) {
 
 // checkWGS84 accepts a geometry column whose CRS is EPSG:4326 or unset
 // (unset coordinates then get GeomToCell's range check). Any other
-// code is ErrNotWGS84, wrapping geometry.ErrUnknownCRS when gobi
+// code, or an unreadable one, is ErrNotWGS84, wrapping geometry.ErrUnknownCRS when gobi
 // doesn't know the code. Projected-or-not isn't enough: CRS.Projected
 // is false for unregistered codes (EPSG:3395), and a geographic CRS
 // may use other units or a prime meridian other than Greenwich.
 func checkWGS84(s gobi.Series) error {
-	crs := geometryCRS(s)
+	crs, err := geometryCRS(s)
+	if err != nil {
+		return err
+	}
 	if crs.Zero() || crs.Equal(geometry.WGS84) {
 		return nil
 	}
@@ -606,13 +609,12 @@ func checkWGS84(s gobi.Series) error {
 	return fmt.Errorf("%w (column %q is EPSG:%d, %s)", ErrNotWGS84, s.Name(), crs.EPSG, crs.Name())
 }
 
-// geometryCRS reads a geometry column's recorded CRS (EPSG 0 if unset).
-func geometryCRS(s gobi.Series) geometry.CRS {
-	f := s.Column().Field()
-	v, _ := f.Metadata.GetValue(gobi.MetaGeometryCRS)
-	var epsg int32
-	if _, err := fmt.Sscan(v, &epsg); err != nil {
-		return geometry.CRS{}
+// geometryCRS reads a geometry column's recorded CRS (zero when unset).
+// An unreadable tag is ErrNotWGS84, wrapping gobi.ErrInvalidGeometryCRS.
+func geometryCRS(s gobi.Series) (geometry.CRS, error) {
+	epsg, err := gobi.GeometryFieldCRS(s.Column().Field())
+	if err != nil {
+		return geometry.CRS{}, fmt.Errorf("%w (%w)", ErrNotWGS84, err)
 	}
-	return geometry.CRS{EPSG: epsg}
+	return geometry.CRS{EPSG: epsg}, nil
 }

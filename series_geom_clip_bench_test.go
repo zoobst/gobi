@@ -107,7 +107,7 @@ func BenchmarkSeries_GeomUnion_LegacyAoS(b *testing.B) {
 // legacyGeomBinaryOp reproduces the pre-Slice-17 body (no
 // BoundsFromWKB reject, full ParseWKB + Boolean per row).
 func legacyGeomBinaryOp(s Series, other geometry.Geometry, op geometry.BoolOp, nameSuffix string) (Series, error) {
-	epsg := geometryCRSFromField(s.field)
+	epsg := crsOf(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
 	other = attachCRS(other, crs)
 	pool := memory.DefaultAllocator

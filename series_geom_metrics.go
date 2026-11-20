@@ -40,7 +40,10 @@ func (s Series) GeomDistance(other geometry.Geometry, u geometry.Unit) (Series, 
 	if other == nil {
 		return Series{}, fmt.Errorf("geometry: nil `other` in GeomDistance")
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	other = attachCRS(other, crs)
 
@@ -140,7 +143,10 @@ func (s Series) GeomDistance3D(other geometry.Geometry, u geometry.Unit) (Series
 		return Series{}, fmt.Errorf("%w: GeomDistance3D requires a 3D `other` Point",
 			geometry.ErrTypeMismatch)
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	// Comma-ok on the type assertion: attachCRS always returns
 	// the same concrete type in current code, but the assertion
@@ -228,7 +234,10 @@ func (s Series) GeomLength3D(u geometry.Unit) (Series, error) {
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	geographic := !crs.Projected() && !crs.Zero()
 	perM, err := geometry.MetersPerUnit(u)
@@ -495,7 +504,10 @@ func forceZRings(in [][]geometry.Point, alt float64) [][]geometry.Point {
 // geomGeomOp is a shared driver for row-by-row geometry → geometry
 // series ops. Emits a Binary column of WKB, preserving null rows.
 func geomGeomOp(s Series, nameSuffix string, fn func(geometry.Geometry) (geometry.Geometry, error)) (Series, error) {
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	pool := memory.DefaultAllocator
 	b := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
 	defer b.Release()

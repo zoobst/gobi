@@ -47,7 +47,10 @@ introduce breaking changes; check this file when upgrading.
       - EPSG codes gobi doesn't know, such as EPSG:3395; the error also
         wraps `geometry.ErrUnknownCRS`;
       - geographic CRSs with other units, datum or prime meridian, such
-        as EPSG:4807, which is in grads from Paris.
+        as EPSG:4807, which is in grads from Paris;
+      - an unreadable `gobi:crs_epsg` tag. The whole value must be a
+        decimal code, so `"EPSG:3857"` or `"3857abc"` is refused rather
+        than read as unset.
 
       H3 indexes WGS 84 degrees, so transform the column to EPSG:4326
       first;
@@ -68,6 +71,26 @@ introduce breaking changes; check this file when upgrading.
   `geometry` and `h3` packages for `js/wasm` and `wasip1/wasm`.
 
 ### Fixed
+
+- **An unreadable geometry CRS tag is an error, not "no CRS".** A
+  `gobi:crs_epsg` value that isn't a plain decimal EPSG code, such as
+  `"EPSG:3857"` or `"3857abc"`, used to be read as 0 (unset). Geometry
+  operations then labeled their output with no CRS, and planar/geodesic
+  choices could go wrong.
+  - **The new parser:** `GeometryFieldCRS(field)` (new, exported) reads
+    the tag strictly. A missing or empty tag, or `"0"`, still means no
+    CRS. Anything else unreadable returns the new
+    `ErrInvalidGeometryCRS`.
+  - **Where the error surfaces:**
+    - the `Series` geometry operations (`GeomArea`, `GeomCentroid`,
+      `GeomToCRS`, …);
+    - column-vs-column predicates;
+    - `GeoParquet` metadata;
+    - `shpio.WriteFile`, which now fails before writing any file
+      instead of silently omitting the `.prj`.
+  - **Display:** `Frame.String` shows the bad value.
+  - **No more duplicate parsers:** h3 and shpio now use the shared
+    parser instead of their own copies.
 
 - **Computed geometry columns keep their geometry tag through
   `LazyFrame.Collect`.** A geometry column produced by an expression in

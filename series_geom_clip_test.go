@@ -134,8 +134,8 @@ func TestSeries_GeomToCRS_WGS84ToUTM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GeomToCRS: %v", err)
 	}
-	if geometryCRSFromField(out.field) != 32611 {
-		t.Errorf("output CRS epsg = %d, want 32611", geometryCRSFromField(out.field))
+	if crsOf(out.field) != 32611 {
+		t.Errorf("output CRS epsg = %d, want 32611", crsOf(out.field))
 	}
 	g, err := out.Geometry(0)
 	if err != nil {

@@ -186,7 +186,7 @@ func BenchmarkSeries_GeomDistance_10k_biggerPolys_LegacyAoS(b *testing.B) {
 // body (universal AoS ParseWKB → geometry.GeomDistance) so the
 // bench captures the SoA wire-in delta.
 func legacyGeomDistance(s Series, other geometry.Geometry, u geometry.Unit) (Series, error) {
-	epsg := geometryCRSFromField(s.field)
+	epsg := crsOf(s.field)
 	crs, _ := geometry.LookupCRS(epsg)
 	other = attachCRS(other, crs)
 	return geomFloat64Op(s, s.name+"_distance", func(g geometry.Geometry) (float64, bool, error) {

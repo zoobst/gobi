@@ -243,7 +243,12 @@ func (f *Frame) String() string {
 	for _, s := range f.series {
 		fmt.Fprintf(&b, "  %s: %s", s.name, s.DataType())
 		if s.IsGeometry() {
-			fmt.Fprintf(&b, " [geometry, EPSG:%d]", geometryCRSFromField(s.field))
+			if epsg, err := geometryCRSFromField(s.field); err == nil {
+				fmt.Fprintf(&b, " [geometry, EPSG:%d]", epsg)
+			} else {
+				v, _ := s.field.Metadata.GetValue(MetaGeometryCRS)
+				fmt.Fprintf(&b, " [geometry, unreadable CRS %q]", v)
+			}
 		}
 		b.WriteByte('\n')
 	}

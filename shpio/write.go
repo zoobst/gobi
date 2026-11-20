@@ -36,6 +36,12 @@ func WriteFile(f *gobi.Frame, base string, opts *WriteOptions) error {
 	if err != nil {
 		return err
 	}
+	// Resolve the .prj text up front, so an unreadable CRS tag fails
+	// before any file is written rather than leaving a partial set.
+	prj, err := prjTextForCol(geomCol)
+	if err != nil {
+		return err
+	}
 
 	// Assemble the .shp records + a bbox for the file header. Every
 	// record's file-offset (in 16-bit words) also feeds the .shx.
@@ -136,7 +142,7 @@ func WriteFile(f *gobi.Frame, base string, opts *WriteOptions) error {
 	}
 
 	// Optional .prj sidecar based on the geometry column's tagged EPSG.
-	if prj := prjTextForCol(geomCol); prj != "" {
+	if prj != "" {
 		if err := os.WriteFile(base+".prj", []byte(prj), 0644); err != nil {
 			return err
 		}
@@ -644,36 +650,19 @@ func chunkCellToDBF(chunk arrow.Array, local int, decimal int) string {
 // prjTextForCol returns a minimal WKT string for the geometry column's
 // CRS if the EPSG code is known and common. Returns "" (skip PRJ) for
 // anything else — better to omit than write a wrong WKT.
-func prjTextForCol(col gobi.Series) string {
+func prjTextForCol(col gobi.Series) (string, error) {
 	if !col.IsGeometry() {
-		return ""
+		return "", nil
 	}
-	epsg := geometryCRSFromField(col)
+	epsg, err := gobi.GeometryFieldCRS(col.Column().Field())
+	if err != nil {
+		return "", err
+	}
 	switch epsg {
 	case 4326:
-		return `GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]`
+		return `GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]`, nil
 	case 3857:
-		return `PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Mercator_1SP"],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1]]`
+		return `PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Mercator_1SP"],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1]]`, nil
 	}
-	return ""
-}
-
-// geometryCRSFromField extracts the EPSG code from a Series' geometry
-// column field metadata. Duplicates the private helper in gobi.
-func geometryCRSFromField(col gobi.Series) int32 {
-	// Unfortunately the field's Metadata methods aren't exposed via
-	// Series; but the tag on the arrow.Field is public.
-	f := col.Column().Field()
-	if !f.HasMetadata() {
-		return 0
-	}
-	v, ok := f.Metadata.GetValue(gobi.MetaGeometryCRS)
-	if !ok || v == "" {
-		return 0
-	}
-	n, err := strconv.ParseInt(v, 10, 32)
-	if err != nil {
-		return 0
-	}
-	return int32(n)
+	return "", nil
 }

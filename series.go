@@ -298,16 +298,22 @@ func GeometryField(name string, epsg int32) arrow.Field {
 	}
 }
 
-// geometryCRSFromField reads the EPSG code stored in a geometry field's
-// schema metadata. Returns 0 if unset or unparseable.
-func geometryCRSFromField(f arrow.Field) int32 {
+// GeometryFieldCRS reads the EPSG code recorded in a geometry field's
+// gobi:crs_epsg tag: 0 when the tag is missing or empty (no CRS). The
+// whole value must be a decimal code; anything else ("EPSG:3857",
+// "3857abc") is ErrInvalidGeometryCRS rather than 0, so a malformed
+// tag can't pass for "no CRS".
+func GeometryFieldCRS(f arrow.Field) (int32, error) {
 	s, ok := f.Metadata.GetValue(MetaGeometryCRS)
 	if !ok || s == "" {
-		return 0
+		return 0, nil
 	}
 	v, err := strconv.ParseInt(s, 10, 32)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("%w: field %q has %s %q", ErrInvalidGeometryCRS, f.Name, MetaGeometryCRS, s)
 	}
-	return int32(v)
+	return int32(v), nil
 }
+
+// geometryCRSFromField is GeometryFieldCRS, for this package's callers.
+func geometryCRSFromField(f arrow.Field) (int32, error) { return GeometryFieldCRS(f) }

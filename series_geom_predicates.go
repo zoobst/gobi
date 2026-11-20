@@ -123,7 +123,10 @@ func (s Series) GeomDWithin(other geometry.Geometry, distance float64) (Series, 
 	if other == nil {
 		return Series{}, fmt.Errorf("geometry: nil `other` in GeomDWithin")
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	other = attachCRS(other, crs)
 	otherBounds := other.Bounds()
@@ -181,7 +184,10 @@ func geomBoolFnOp(s Series, nameSuffix string, fn func(geometry.Geometry) bool) 
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	pool := memory.DefaultAllocator
 	b := array.NewBooleanBuilder(pool)
@@ -235,7 +241,10 @@ func geomPredicateOp(s Series, other geometry.Geometry, pred geometry.Predicate,
 	if other == nil {
 		return Series{}, fmt.Errorf("geometry: nil `other` in predicate op")
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	other = attachCRS(other, crs)
 	otherBounds := other.Bounds()

@@ -23,7 +23,10 @@ func (s Series) GeomArea(u geometry.Unit) (Series, error) {
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	if crs.Projected() {
 		perM, err := geometry.MetersPerUnit(u)
@@ -60,7 +63,10 @@ func (s Series) GeomLength(u geometry.Unit) (Series, error) {
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	if crs.Projected() {
 		perM, err := geometry.MetersPerUnit(u)
@@ -104,7 +110,10 @@ func (s Series) GeomCentroid() (Series, error) {
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	pool := memory.DefaultAllocator
 	b := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
 	defer b.Release()
@@ -406,7 +415,10 @@ func geomTransformOpFast(s Series, nameSuffix string, fast geomFastWKB, fn func(
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	pool := memory.DefaultAllocator
 	b := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
@@ -624,7 +636,10 @@ func (s Series) GeomDistanceToCircle(c geometry.Circle, u geometry.Unit) (Series
 	if err != nil {
 		return Series{}, err
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	return geomFloat64Op(s, s.name+"_dist_to_circle", func(g geometry.Geometry) (float64, bool, error) {
 		g = attachCRS(g, crs)
@@ -649,7 +664,10 @@ func (s Series) GeomFitCircle(opts geometry.CircleFitOptions) (geometry.Circle, 
 	if !s.IsGeometry() {
 		return geometry.Circle{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return geometry.Circle{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	pts := make([]geometry.Point, 0, s.Len())
 	for _, chunk := range s.col.Data().Chunks() {
@@ -705,7 +723,10 @@ func (s Series) GeomDensifyGeodesic(stepMeters float64) (Series, error) {
 	if !s.IsGeometry() {
 		return Series{}, ErrNotGeometry
 	}
-	epsg := geometryCRSFromField(s.field)
+	epsg, err := geometryCRSFromField(s.field)
+	if err != nil {
+		return Series{}, err
+	}
 	crs, _ := geometry.LookupCRS(epsg)
 	if !crs.Zero() && crs.Projected() {
 		return Series{}, fmt.Errorf("%w: got %s",
