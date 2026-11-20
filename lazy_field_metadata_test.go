@@ -155,3 +155,48 @@ func TestPassThroughExprs_KeepGeometryTag(t *testing.T) {
 		out.Release()
 	}
 }
+
+// opaqueNode passes its input through without implementing
+// FieldMetadataProvider: a stand-in for a custom node.
+type opaqueNode struct{ inner ExprNode }
+
+func (n *opaqueNode) Eval(f *Frame) (Series, error)                { return n.inner.Eval(f) }
+func (n *opaqueNode) Type(s *arrow.Schema) (arrow.DataType, error) { return n.inner.Type(s) }
+func (n *opaqueNode) Children() []Expr                             { return []Expr{{node: n.inner}} }
+func (n *opaqueNode) String() string                               { return "opaque(" + n.inner.String() + ")" }
+
+// TestGeometryOps_KeepCRSThroughCollect — a geometry → geometry op must
+// not declare CRS 0 when its input's metadata is unknown: that would
+// override the batches' real CRS at Collect.
+func TestGeometryOps_KeepCRSThroughCollect(t *testing.T) {
+	b := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	b.Append(geometry.WKB(geometry.NewPointZ(1, 2, 3, geometry.CRS{})))
+	g := SeriesFromArray(GeometryField("g", 3857), b.NewArray())
+	b.Release()
+	f, err := NewFrameFromSeries(g)
+	g.Column().Release()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Release()
+
+	for name, e := range map[string]Expr{
+		"Force2D.ForceZ":       Col("g").GeomForce2D().GeomForceZ(1),
+		"ForceZ.Force2D":       Col("g").GeomForceZ(1).GeomForce2D(),
+		"custom node → ForceZ": Custom(&opaqueNode{inner: Col("g").node}).GeomForceZ(1),
+	} {
+		lf := f.Lazy().Select(e.Alias("x"))
+		out, err := lf.Collect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := geometryCRSFromField(out.Schema().Field(0)); got != 3857 {
+			t.Errorf("%s: Collect CRS = %d, want 3857", name, got)
+		}
+		out.Release()
+		// The declared schema is either right or silent — never wrong.
+		if fld := lf.Schema().Field(0); isGeometryField(fld) && geometryCRSFromField(fld) != 3857 {
+			t.Errorf("%s: Schema() declares CRS %d", name, geometryCRSFromField(fld))
+		}
+	}
+}

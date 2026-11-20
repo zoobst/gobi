@@ -115,7 +115,7 @@ func LatLngToCell(p gobi.PointExpr, res int) gobi.Expr {
 // ErrProjectedCRS rather than an implicit reprojection. A coordinate
 // outside longitude/latitude range is ErrNotLonLat, since it usually
 // means unlabeled projected data. A non-point geometry is an error; an
-// empty point gives null. The result column is named h3_<res>.
+// empty point, or a non-finite coordinate, gives null. The result column is named h3_<res>.
 func GeomToCell(geom gobi.Expr, res int) gobi.Expr {
 	n := &node{
 		fn: "h3_geom_to_cell", args: fmt.Sprintf("%d", res),
@@ -152,7 +152,9 @@ func GeomToCell(geom gobi.Expr, res int) gobi.Expr {
 				if !ok {
 					return nil, fmt.Errorf("gobi/h3: GeomToCell row %d: not a point geometry", row)
 				}
-				if math.IsNaN(x) || math.IsNaN(y) { // empty point
+				// Empty point (NaN), or a non-finite coordinate: null,
+				// as for LatLngToCell.
+				if math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
 					b.AppendNull()
 					row++
 					continue
@@ -246,14 +248,23 @@ func CellToBoundary(cell gobi.Expr) gobi.Expr {
 	return gobi.Custom(n)
 }
 
+// MaxGridDiskK is the largest k GridDisk accepts. h3-go allocates room
+// for 3k(k+1)+1 cells per row before it looks at the cell's
+// resolution, so the radius is bounded by memory rather than by H3:
+// k = 2000 reserves about 12 million cells (96 MB) per row, and a
+// radius much past that would exhaust memory or overflow the size
+// computation. For wide areas, use a coarser resolution (each step
+// up is about 2.6× the edge length).
+const MaxGridDiskK = 2000
+
 // GridDisk returns, for each cell, the cells within k grid steps of it
 // (itself included), as List<Int64> in H3's order. Pair it with
-// Explode for one row per neighbor. k must be >= 0. The result column
-// is named <input>_disk<k>.
+// Explode for one row per neighbor. k must be in 0..MaxGridDiskK. The
+// result column is named <input>_disk<k>.
 func GridDisk(cell gobi.Expr, k int) gobi.Expr {
 	n := cellNode("h3_grid_disk", fmt.Sprintf("%d", k), cell, arrow.ListOf(arrow.PrimitiveTypes.Int64), suffix(fmt.Sprintf("_disk%d", k)))
-	if k < 0 {
-		n.err = fmt.Errorf("gobi/h3: GridDisk: k must be >= 0, got %d", k)
+	if k < 0 || k > MaxGridDiskK {
+		n.err = fmt.Errorf("gobi/h3: GridDisk: k must be in 0..%d, got %d", MaxGridDiskK, k)
 	}
 	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) {
 		cells, err := c.GridDisk(k)
@@ -311,8 +322,8 @@ type node struct {
 }
 
 func (n *node) Eval(input *gobi.Frame) (gobi.Series, error) {
-	if n.err != nil {
-		return gobi.Series{}, n.err
+	if err := n.check(); err != nil {
+		return gobi.Series{}, err
 	}
 	in := make([]gobi.Series, len(n.inputs))
 	for i, x := range n.inputs {
@@ -333,8 +344,8 @@ func (n *node) Eval(input *gobi.Frame) (gobi.Series, error) {
 }
 
 func (n *node) Type(schema *arrow.Schema) (arrow.DataType, error) {
-	if n.err != nil {
-		return nil, n.err
+	if err := n.check(); err != nil {
+		return nil, err
 	}
 	for i, x := range n.inputs {
 		dt, err := x.Type(schema)
@@ -346,6 +357,20 @@ func (n *node) Type(schema *arrow.Schema) (arrow.DataType, error) {
 		}
 	}
 	return n.out, nil
+}
+
+// check reports a construction error, or a missing operand — a zero
+// gobi.Expr, such as a PointExpr with Lon left unset.
+func (n *node) check() error {
+	if n.err != nil {
+		return n.err
+	}
+	for i, x := range n.inputs {
+		if x == nil {
+			return fmt.Errorf("gobi/h3: %s: input %d is an empty expression", n.fn, i)
+		}
+	}
+	return nil
 }
 
 func (n *node) typeErr(i int, dt arrow.DataType) error {
@@ -386,6 +411,10 @@ func (n *node) Children() []gobi.Expr {
 func (n *node) String() string {
 	parts := make([]string, 0, len(n.inputs)+1)
 	for _, x := range n.inputs {
+		if x == nil {
+			parts = append(parts, "<nil>")
+			continue
+		}
 		parts = append(parts, x.String())
 	}
 	if n.args != "" {

@@ -20,18 +20,22 @@ introduce breaking changes; check this file when upgrading.
   | `GeomToCell(geom, res)` | Int64 cell, from a point geometry column |
   | `Parent(cell, res)`, `Resolution(cell)`, `IsValid(cell)` | Int64 / Int32 / Boolean |
   | `CellToPoint(cell)`, `CellToBoundary(cell)` | point / polygon geometry, EPSG:4326 |
-  | `GridDisk(cell, k)` | `List<Int64>` (pair with `Explode`) |
+  | `GridDisk(cell, k)` | `List<Int64>` (pair with `Explode`); `k` up to `MaxGridDiskK` (2000) |
   | `CellToString(cell)` | hexadecimal String |
 
   - **Cell type:** cells are Int64. Every valid H3 index fits, and
     Athena, Hive, Iceberg and Spark have no unsigned 64-bit type.
     Functions that take a cell also accept Uint64 columns.
   - **Nulls and invalid values:** a null input, an invalid cell, a
-    non-finite coordinate, or a parent resolution finer than the cell
-    gives null rather than failing the batch.
+    non-finite coordinate (NaN or ±Inf, in `LatLngToCell` and
+    `GeomToCell`), or a parent resolution finer than the cell gives
+    null rather than failing the batch.
   - **Errors:** these are errors, since they can't be per-row data:
     - a resolution outside 0–15;
-    - a negative `k`;
+    - a `k` outside 0..`MaxGridDiskK`. h3-go reserves 3k(k+1)+1 cells
+      per row before checking the resolution, so a larger radius would
+      exhaust memory or overflow;
+    - an empty operand, such as a `PointExpr` with `Lon` unset;
     - a wrong column type;
     - `GeomToCell` on a projected CRS (`ErrProjectedCRS`; it doesn't
       reproject);
@@ -64,8 +68,13 @@ introduce breaking changes; check this file when upgrading.
     and `WithColumn` build their schemas with it, so
     `LazyFrame.Schema()` and zero-row results show the tag too.
     - **Implemented by:** `Col` (forwards the column's metadata), `Alias`,
-      `Shift`, `Over`, `If`, `Coalesce`, `GeomForceZ`, and h3's
-      `CellToPoint` / `CellToBoundary`.
+      `Shift`, `Over`, `If`, `Coalesce`, `GeomForceZ`, `GeomForce2D`,
+      and h3's `CellToPoint` / `CellToBoundary`.
+    - **When unsure, declare nothing:** a node declares metadata only
+      when it knows it. `GeomForceZ` and `GeomForce2D` declare their
+      input's CRS only when the input is known to be geometry; given a
+      custom input, they leave the CRS to the batches rather than
+      overriding it with an unset one.
     - **Custom nodes:** they can implement it, and
       `PlannedFieldMetadata(e, schema)` forwards an input's metadata.
     - **Fallback:** for nodes that don't implement it, `Collect` still

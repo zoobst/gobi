@@ -32,3 +32,5 @@ csvio.test
 # experimental testing
 /experiments/
 testData/
+# h3 golden fixtures are test inputs; keep them tracked.
+!/h3/testdata/

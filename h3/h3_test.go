@@ -370,3 +370,38 @@ func TestNamesAndLazyGroupBy(t *testing.T) {
 		t.Errorf("groupby: %d groups, %d rows counted", counts.NumRows(), total)
 	}
 }
+
+// TestReviewRegressions — a huge GridDisk radius, an unset PointExpr
+// component, and an infinite coordinate.
+func TestReviewRegressions(t *testing.T) {
+	g := loadGolden(t)
+	cells := frame(t, gobi.NewInt64Series("cell", []int64{g.Cells[0].Cell}, nil))
+	for _, k := range []int{h3.MaxGridDiskK + 1, math.MaxInt32} {
+		if _, err := cells.Lazy().Select(h3.GridDisk(gobi.Col("cell"), k)).Collect(); err == nil {
+			t.Errorf("GridDisk(k=%d): no error", k)
+		}
+	}
+
+	pts := frame(t, gobi.NewFloat64Series("lat", []float64{1}, nil))
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("unset Lon: panicked: %v", r)
+			}
+		}()
+		lf := pts.Lazy().Select(h3.LatLngToCell(gobi.PointExpr{Lat: gobi.Lit(1.0)}, 8))
+		if _, err := lf.Collect(); err == nil {
+			t.Error("unset Lon: no error")
+		}
+	}()
+
+	gb := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	gb.Append(geometry.WKB(geometry.NewPoint(1, math.Inf(1), geometry.WGS84)))
+	gb.Append(geometry.WKB(geometry.NewPoint(math.Inf(-1), 1, geometry.WGS84)))
+	inf := frame(t, gobi.SeriesFromArray(gobi.GeometryField("geometry", 4326), gb.NewArray()))
+	gb.Release()
+	s := eval(t, inf, h3.GeomToCell(gobi.Col("geometry"), 8))
+	if !slices.Equal(s.Nulls(), []bool{true, true}) {
+		t.Errorf("infinite coordinates: nulls %v, want all null", s.Nulls())
+	}
+}

@@ -710,7 +710,26 @@ func (n *geomForceZNode) outputName(leftName string) string {
 // OutputFieldMetadata: a geometry field in the input's CRS (as
 // Series.GeomForceZ emits).
 func (n *geomForceZNode) OutputFieldMetadata(schema *arrow.Schema) (arrow.Metadata, bool) {
-	in := PlannedFieldMetadata(Expr{node: n.left}, schema)
+	return sameCRSGeometryMetadata(n.left, schema)
+}
+
+// OutputFieldMetadata: a geometry field in the input's CRS (as
+// Series.GeomForce2D emits).
+func (n *geomForce2DNode) OutputFieldMetadata(schema *arrow.Schema) (arrow.Metadata, bool) {
+	return sameCRSGeometryMetadata(n.left, schema)
+}
+
+// sameCRSGeometryMetadata declares a geometry field in input's CRS,
+// for geometry → geometry ops that keep the CRS. It declares nothing
+// unless input's planned metadata is known to be a geometry field: an
+// unknown input (a custom node, say) would otherwise be declared CRS
+// 0, and that declaration would override the batches' real CRS at
+// Collect.
+func sameCRSGeometryMetadata(input ExprNode, schema *arrow.Schema) (arrow.Metadata, bool) {
+	in := PlannedFieldMetadata(Expr{node: input}, schema)
+	if _, ok := in.GetValue(MetaGeometryType); !ok {
+		return arrow.Metadata{}, false
+	}
 	return GeometryField("", geometryCRSFromField(arrow.Field{Metadata: in})).Metadata, true
 }
 
