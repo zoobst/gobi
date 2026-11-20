@@ -192,7 +192,7 @@ func (n *coalesceNode) Eval(input *Frame) (Series, error) {
 	if err != nil {
 		return Series{}, fmt.Errorf("Coalesce: %w", err)
 	}
-	md, _ := n.OutputFieldMetadata(input.Schema())
+	md := operandsFieldMetadata(n.operands, series)
 	return metadataSeries("coalesce", outType, md, out), nil
 }
 

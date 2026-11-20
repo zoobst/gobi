@@ -15,7 +15,14 @@ import (
 	"github.com/zoobst/gobi"
 	"github.com/zoobst/gobi/geometry"
 	"github.com/zoobst/gobi/h3"
+
+	uh3 "github.com/uber/h3-go/v4"
 )
+
+func uh3LatLngToCell(lat, lng float64, res int) (int64, error) {
+	c, err := uh3.LatLngToCell(uh3.NewLatLng(lat, lng), res)
+	return int64(c), err
+}
 
 // golden is testdata/golden.json, written by gen_golden.py from h3-py
 // (the H3 C library), so it checks h3-go's Go port independently.
@@ -403,5 +410,47 @@ func TestReviewRegressions(t *testing.T) {
 	s := eval(t, inf, h3.GeomToCell(gobi.Col("geometry"), 8))
 	if !slices.Equal(s.Nulls(), []bool{true, true}) {
 		t.Errorf("infinite coordinates: nulls %v, want all null", s.Nulls())
+	}
+}
+
+// scalarNode is a custom expression that returns one value for every
+// row, as ExprNode's contract allows.
+type scalarNode struct{ v float64 }
+
+func (n scalarNode) Eval(*gobi.Frame) (gobi.Series, error) {
+	return gobi.NewFloat64Series("s", []float64{n.v}, nil), nil
+}
+func (n scalarNode) Type(*arrow.Schema) (arrow.DataType, error) {
+	return arrow.PrimitiveTypes.Float64, nil
+}
+func (n scalarNode) Children() []gobi.Expr { return nil }
+func (n scalarNode) String() string        { return "scalar" }
+
+// TestReviewRegressions2 — unregistered CRS codes, scalar operands.
+func TestReviewRegressions2(t *testing.T) {
+	gb := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	gb.Append(geometry.WKB(geometry.NewPoint(100, 50, geometry.CRS{})))
+	mercator := frame(t, gobi.SeriesFromArray(gobi.GeometryField("geometry", 3395), gb.NewArray()))
+	gb.Release()
+	_, err := mercator.Lazy().Select(h3.GeomToCell(gobi.Col("geometry"), 8)).Collect()
+	if !errors.Is(err, h3.ErrUnknownCRS) || !errors.Is(err, geometry.ErrUnknownCRS) {
+		t.Errorf("EPSG:3395: err = %v, want ErrUnknownCRS", err)
+	}
+
+	pts := frame(t, gobi.NewFloat64Series("lat", []float64{10, 20}, nil))
+	got, err := pts.Lazy().Select(h3.LatLngToCell(gobi.PointExpr{Lat: gobi.Col("lat"), Lon: gobi.Custom(scalarNode{30})}, 5)).Collect()
+	if err != nil {
+		t.Fatalf("scalar lon: %v", err)
+	}
+	defer got.Release()
+	cells, _ := got.Column(got.ColumnNames()[0])
+	vals, _ := cells.Int64s()
+	want := make([]int64, 2)
+	for i, lat := range []float64{10, 20} {
+		c, _ := uh3LatLngToCell(lat, 30, 5)
+		want[i] = c
+	}
+	if !slices.Equal(vals, want) {
+		t.Errorf("scalar lon: %x, want %x", vals, want)
 	}
 }

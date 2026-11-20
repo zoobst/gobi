@@ -126,7 +126,7 @@ func (n *ifNode) Eval(input *Frame) (Series, error) {
 			return Series{}, fmt.Errorf("If row %d emit: %w", row, err)
 		}
 	}
-	md, _ := n.OutputFieldMetadata(input.Schema())
+	md := operandsFieldMetadata([]ExprNode{n.then, n.otherwise}, []Series{ts, os})
 	return metadataSeries("if", outType, md, b.NewArray()), nil
 }
 

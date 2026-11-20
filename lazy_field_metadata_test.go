@@ -200,3 +200,67 @@ func TestGeometryOps_KeepCRSThroughCollect(t *testing.T) {
 		}
 	}
 }
+
+// TestRuntimeMetadata_FromEvaluatedOperands — If, Coalesce and Over
+// keep the tag of a custom input that doesn't implement
+// FieldMetadataProvider, reading it from the evaluated series.
+func TestRuntimeMetadata_FromEvaluatedOperands(t *testing.T) {
+	b := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	for i := range 4 {
+		b.Append(geometry.WKB(geometry.NewPoint(float64(i), 0, geometry.CRS{})))
+	}
+	g := SeriesFromArray(GeometryField("g", 3857), b.NewArray())
+	b.Release()
+	series := []Series{g, NewInt64Series("k", []int64{1, 1, 2, 2}, nil), NewBoolSeries("c", []bool{true, false, true, false}, nil)}
+	f, err := NewFrameFromSeries(series...)
+	for _, s := range series {
+		s.Column().Release()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Release()
+	opaque := Custom(&opaqueNode{inner: Col("g").node})
+
+	for name, e := range map[string]Expr{
+		"If":           If(Col("c"), opaque, opaque),
+		"If + LitNull": If(Col("c"), opaque, LitNull(arrow.BinaryTypes.Binary)),
+		"Coalesce":     Coalesce(opaque, Col("g")),
+		"Over":         opaque.Shift(1).Over("k"),
+	} {
+		out, err := f.Lazy().WithColumn("x", e).WithColumn("y", Col("x").GeomForceZ(1)).Collect()
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if x, _ := out.Column("x"); !x.IsGeometry() || geometryCRSFromField(out.Schema().Field(3)) != 3857 {
+			t.Errorf("%s: untagged at runtime", name)
+		}
+		out.Release()
+	}
+}
+
+// TestWithBatchFieldMetadata_RequiresAgreement — Collect adopts a
+// field's batch metadata only when every batch carries the same.
+func TestWithBatchFieldMetadata_RequiresAgreement(t *testing.T) {
+	batch := func(epsg int32) arrow.RecordBatch {
+		b := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+		defer b.Release()
+		b.Append([]byte{1})
+		arr := b.NewArray()
+		defer arr.Release()
+		return array.NewRecordBatch(arrow.NewSchema([]arrow.Field{GeometryField("g", epsg)}, nil), []arrow.Array{arr}, 1)
+	}
+	declared := arrow.NewSchema([]arrow.Field{{Name: "g", Type: arrow.BinaryTypes.Binary, Nullable: true}}, nil)
+	a, a2, c := batch(4326), batch(4326), batch(3857)
+	defer a.Release()
+	defer a2.Release()
+	defer c.Release()
+
+	if got := withBatchFieldMetadata(declared, []arrow.RecordBatch{a, a2}); geometryCRSFromField(got.Field(0)) != 4326 {
+		t.Errorf("agreeing batches: %v", got.Field(0))
+	}
+	if got := withBatchFieldMetadata(declared, []arrow.RecordBatch{a, c}); got.Field(0).HasMetadata() {
+		t.Errorf("disagreeing batches tagged with %v", got.Field(0).Metadata)
+	}
+}

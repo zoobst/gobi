@@ -100,7 +100,7 @@ func concatBatchesToFrame(schema *arrow.Schema, batches []arrow.RecordBatch) (*F
 		return emptyFrame(schema)
 	}
 	pool := memory.DefaultAllocator
-	schema = withBatchFieldMetadata(schema, batches[0].Schema())
+	schema = withBatchFieldMetadata(schema, batches)
 	numCols := len(schema.Fields())
 	outCols := make([]arrow.Column, numCols)
 
@@ -123,25 +123,37 @@ func concatBatchesToFrame(schema *arrow.Schema, batches []arrow.RecordBatch) (*F
 }
 
 // withBatchFieldMetadata fills in field metadata the declared schema
-// lacks from the schema the batches actually carry. A plan's declared
-// schema comes from ExprNode.Type, which returns only a data type, so
-// a computed column's field tags — a geometry column's
-// gobi:geometry_type / gobi:crs_epsg — exist only on the batches.
-// Fields whose types differ, or that already have metadata, are kept.
-func withBatchFieldMetadata(declared, actual *arrow.Schema) *arrow.Schema {
-	if declared.NumFields() != actual.NumFields() {
-		return declared
-	}
+// lacks from the fields the batches actually carry. A plan's declared
+// schema comes from ExprNode.Type (plus FieldMetadataProvider, where a
+// node implements it), so a custom node's field tags — a geometry
+// column's gobi:geometry_type / gobi:crs_epsg — may exist only on the
+// batches. A field's metadata is adopted only when every batch carries
+// the same metadata for it, so batches that disagree (one CRS here,
+// another there) never get relabeled with the first batch's. Fields
+// whose types differ, or that already have metadata, are kept.
+func withBatchFieldMetadata(declared *arrow.Schema, batches []arrow.RecordBatch) *arrow.Schema {
 	var fields []arrow.Field
 	for i, f := range declared.Fields() {
-		bf := actual.Field(i)
-		if f.HasMetadata() || !bf.HasMetadata() || !arrow.TypeEqual(f.Type, bf.Type) {
+		if f.HasMetadata() {
+			continue
+		}
+		var agree fieldMetadataAgreement
+		for _, b := range batches {
+			bs := b.Schema()
+			if bs.NumFields() != declared.NumFields() || !arrow.TypeEqual(f.Type, bs.Field(i).Type) {
+				agree.conflict = true
+				break
+			}
+			agree.add(bs.Field(i).Metadata)
+		}
+		md, ok := agree.result()
+		if !ok {
 			continue
 		}
 		if fields == nil {
 			fields = slices.Clone(declared.Fields())
 		}
-		fields[i].Metadata = bf.Metadata
+		fields[i].Metadata = md
 	}
 	if fields == nil {
 		return declared

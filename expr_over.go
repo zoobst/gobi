@@ -400,18 +400,20 @@ func (n *overNode) evalShapePreserving(input *Frame) (Series, error) {
 	// them in row order at the end. Nil = null; anything else is
 	// consumed by appendCustomValue.
 	outValues := make([]any, nRows)
+	// The inner's field metadata, as its partition results carry it.
+	var agree fieldMetadataAgreement
 
 	if overShapeFastPathApplicable(input.PartitionMetadata(), n.partitionCols, n.orderBy) {
 		// Aligned + sorted: partitions are contiguous ranges.
 		// Slice (zero-copy, ref-count) the projected Frame per
 		// partition instead of the general take() copy.
-		if err := n.evalShapePreservingAligned(projected, nRows, partCols, outValues); err != nil {
+		if err := n.evalShapePreservingAligned(projected, nRows, partCols, outValues, &agree); err != nil {
 			return Series{}, err
 		}
 	} else {
 		// General path: hash-bucket rows, optional per-partition sort,
 		// per-partition take on the projected Frame.
-		if err := n.evalShapePreservingGeneral(input, projected, nRows, partCols, outValues); err != nil {
+		if err := n.evalShapePreservingGeneral(input, projected, nRows, partCols, outValues, &agree); err != nil {
 			return Series{}, err
 		}
 	}
@@ -427,14 +429,14 @@ func (n *overNode) evalShapePreserving(input *Frame) (Series, error) {
 			return Series{}, fmt.Errorf("Over: emit: %w", err)
 		}
 	}
-	md, _ := n.OutputFieldMetadata(input.Schema())
+	md, _ := agree.result()
 	return metadataSeries("over", outType, md, b.NewArray()), nil
 }
 
 // evalShapePreservingGeneral walks hash-bucketed partitions,
 // optionally sorts each partition by orderBy, then per-partition
 // take()s from `projected` (already narrowed to referenced columns).
-func (n *overNode) evalShapePreservingGeneral(input, projected *Frame, nRows int, partCols []Series, outValues []any) error {
+func (n *overNode) evalShapePreservingGeneral(input, projected *Frame, nRows int, partCols []Series, outValues []any, agree *fieldMetadataAgreement) error {
 	partitions := collectHashedPartitions(nRows, partCols)
 	if len(n.orderBy) > 0 {
 		cmps, release, err := buildOrderComparators(input, n.orderBy)
@@ -465,6 +467,7 @@ func (n *overNode) evalShapePreservingGeneral(input, projected *Frame, nRows int
 				"Over: inner returned %d rows for a partition of %d — Over requires a shape-preserving inner",
 				miniResult.Len(), len(rows))
 		}
+		agree.add(miniResult.field.Metadata)
 		if err := scatterPartitionByRows(miniResult, rows, outValues); err != nil {
 			return err
 		}
@@ -477,7 +480,7 @@ func (n *overNode) evalShapePreservingGeneral(input, projected *Frame, nRows int
 // so we can slice `projected` per partition instead of take-copying.
 // Slice is a ref-count carry — the mini-Frame shares buffers with
 // projected, no allocation proportional to partition size.
-func (n *overNode) evalShapePreservingAligned(projected *Frame, nRows int, partCols []Series, outValues []any) error {
+func (n *overNode) evalShapePreservingAligned(projected *Frame, nRows int, partCols []Series, outValues []any, agree *fieldMetadataAgreement) error {
 	if nRows == 0 {
 		return nil
 	}
@@ -500,6 +503,7 @@ func (n *overNode) evalShapePreservingAligned(projected *Frame, nRows int, partC
 				"Over: inner returned %d rows for a partition of %d — Over requires a shape-preserving inner",
 				miniResult.Len(), end-start)
 		}
+		agree.add(miniResult.field.Metadata)
 		return scatterPartitionByRange(miniResult, start, end, outValues)
 	}
 

@@ -155,23 +155,69 @@ func PlannedFieldMetadata(e Expr, schema *arrow.Schema) arrow.Metadata {
 // column. When the other operands' metadata differ — two geometry
 // columns in different CRSs, say — the result carries none.
 func commonFieldMetadata(schema *arrow.Schema, operands ...ExprNode) (arrow.Metadata, bool) {
-	var out arrow.Metadata
-	seen := false
+	var a fieldMetadataAgreement
 	for _, op := range operands {
-		switch op.(type) {
-		case *literalNode, *literalNullNode:
+		if isLiteralNode(op) {
 			continue
 		}
-		md := PlannedFieldMetadata(Expr{node: op}, schema)
-		if !seen {
-			out, seen = md, true
-			continue
-		}
-		if !out.Equal(md) {
-			return arrow.Metadata{}, false
-		}
+		a.add(PlannedFieldMetadata(Expr{node: op}, schema))
 	}
-	return out, seen && out.Len() > 0
+	return a.result()
+}
+
+// isLiteralNode reports a Lit / LitNull operand, which carries no
+// field metadata and so doesn't vote on a shared one.
+func isLiteralNode(n ExprNode) bool {
+	switch n.(type) {
+	case *literalNode, *literalNullNode:
+		return true
+	}
+	return false
+}
+
+// fieldMetadataAgreement collects field metadata from several sources
+// (operands, partitions, batches) and yields it only when every source
+// agrees — so a column whose parts disagree, e.g. on CRS, is never
+// tagged with just one of them.
+type fieldMetadataAgreement struct {
+	md       arrow.Metadata
+	seen     bool
+	conflict bool
+}
+
+func (a *fieldMetadataAgreement) add(md arrow.Metadata) {
+	switch {
+	case a.conflict:
+	case !a.seen:
+		a.md, a.seen = md, true
+	case !a.md.Equal(md):
+		a.conflict = true
+	}
+}
+
+// result is the agreed metadata; ok=false on a conflict or when none.
+func (a *fieldMetadataAgreement) result() (arrow.Metadata, bool) {
+	if !a.seen || a.conflict || a.md.Len() == 0 {
+		return arrow.Metadata{}, false
+	}
+	return a.md, true
+}
+
+// operandsFieldMetadata is the runtime counterpart of
+// commonFieldMetadata: the metadata shared by the evaluated value
+// operands, skipping literal ones. It reads the series themselves, so
+// a custom node that emits tagged output without implementing
+// FieldMetadataProvider is covered.
+func operandsFieldMetadata(nodes []ExprNode, series []Series) arrow.Metadata {
+	var a fieldMetadataAgreement
+	for i, s := range series {
+		if isLiteralNode(nodes[i]) {
+			continue
+		}
+		a.add(s.field.Metadata)
+	}
+	md, _ := a.result()
+	return md
 }
 
 // metadataSeries is buildSeries with field metadata.

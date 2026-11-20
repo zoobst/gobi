@@ -64,6 +64,10 @@ var (
 	// ErrProjectedCRS: GeomToCell on a geometry column whose CRS is
 	// projected; H3 needs longitude / latitude. Transform first.
 	ErrProjectedCRS = errors.New("gobi/h3: geometry column is in a projected CRS; H3 needs longitude/latitude (EPSG:4326)")
+	// ErrUnknownCRS: GeomToCell on a geometry column whose EPSG code
+	// isn't in gobi's CRS registry, so it can't be confirmed geographic.
+	// Wraps geometry.ErrUnknownCRS.
+	ErrUnknownCRS = fmt.Errorf("gobi/h3: %w: can't confirm it is longitude/latitude; transform to EPSG:4326, or register it with geometry.RegisterCRS(code, name, false) if it is geographic", geometry.ErrUnknownCRS)
 	// ErrNotLonLat: GeomToCell found a coordinate outside
 	// longitude/latitude range, which usually means projected data in a
 	// column with no CRS recorded.
@@ -93,15 +97,28 @@ func LatLngToCell(p gobi.PointExpr, res int) gobi.Expr {
 		if err != nil {
 			return nil, err
 		}
+		// A custom operand may return one value for every row
+		// (ExprNode's contract); broadcast it.
+		rows := max(len(lat), len(lng))
+		if (len(lat) != rows && len(lat) != 1) || (len(lng) != rows && len(lng) != 1) {
+			return nil, fmt.Errorf("%w: h3_latlng_to_cell: lat has %d rows, lon has %d", gobi.ErrColumnLenMismatch, len(lat), len(lng))
+		}
+		at := func(n, i int) int {
+			if n == 1 {
+				return 0
+			}
+			return i
+		}
 		b := array.NewInt64Builder(pool)
 		defer b.Release()
-		b.Reserve(len(lat))
-		for i := range lat {
-			if latNull[i] || lngNull[i] {
+		b.Reserve(rows)
+		for i := range rows {
+			li, gi := at(len(lat), i), at(len(lng), i)
+			if latNull[li] || lngNull[gi] {
 				b.AppendNull()
 				continue
 			}
-			c, err := uh3.LatLngToCell(uh3.NewLatLng(lat[i], lng[i]), res)
+			c, err := uh3.LatLngToCell(uh3.NewLatLng(lat[li], lng[gi]), res)
 			appendCell(b, c, err)
 		}
 		return b.NewArray(), nil
@@ -110,9 +127,10 @@ func LatLngToCell(p gobi.PointExpr, res int) gobi.Expr {
 }
 
 // GeomToCell returns the Int64 cell containing each point of a point
-// geometry column at resolution res. The column must be in a
-// geographic CRS (EPSG:4326 or unset); a projected CRS is
-// ErrProjectedCRS rather than an implicit reprojection. A coordinate
+// geometry column at resolution res. The column's CRS must be unset or
+// registered in gobi as geographic (EPSG:4326, for one); a projected
+// CRS is ErrProjectedCRS rather than an implicit reprojection, and an
+// EPSG code gobi doesn't know is ErrUnknownCRS. A coordinate
 // outside longitude/latitude range is ErrNotLonLat, since it usually
 // means unlabeled projected data. A non-point geometry is an error; an
 // empty point, or a non-finite coordinate, gives null. The result column is named h3_<res>.
@@ -130,8 +148,8 @@ func GeomToCell(geom gobi.Expr, res int) gobi.Expr {
 		if !s.IsGeometry() {
 			return nil, fmt.Errorf("%w: GeomToCell: %q is not a geometry column", gobi.ErrNotGeometry, s.Name())
 		}
-		if crs := geometryCRS(s); crs.Projected() {
-			return nil, fmt.Errorf("%w (column %q is EPSG:%d)", ErrProjectedCRS, s.Name(), crs.EPSG)
+		if err := checkGeographic(s); err != nil {
+			return nil, err
 		}
 		b := array.NewInt64Builder(pool)
 		defer b.Release()
@@ -179,9 +197,10 @@ func Parent(cell gobi.Expr, res int) gobi.Expr {
 	n := cellNode("h3_parent", fmt.Sprintf("%d", res), cell, arrow.PrimitiveTypes.Int64,
 		func(string) string { return fmt.Sprintf("h3_%d", res) })
 	n.err = checkRes(res)
-	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) {
+	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) error {
 		p, err := c.Parent(res)
 		appendCell(b.(*array.Int64Builder), p, err)
+		return nil
 	})
 	return gobi.Custom(n)
 }
@@ -190,8 +209,9 @@ func Parent(cell gobi.Expr, res int) gobi.Expr {
 // result column is named <input>_res.
 func Resolution(cell gobi.Expr) gobi.Expr {
 	n := cellNode("h3_resolution", "", cell, arrow.PrimitiveTypes.Int32, suffix("_res"))
-	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) {
+	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) error {
 		b.(*array.Int32Builder).Append(int32(c.Resolution()))
+		return nil
 	})
 	return gobi.Custom(n)
 }
@@ -201,8 +221,9 @@ func Resolution(cell gobi.Expr) gobi.Expr {
 func IsValid(cell gobi.Expr) gobi.Expr {
 	n := cellNode("h3_is_valid", "", cell, arrow.FixedWidthTypes.Boolean, suffix("_is_valid"))
 	n.keepInvalid = true
-	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) {
+	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) error {
 		b.(*array.BooleanBuilder).Append(c.IsValid())
+		return nil
 	})
 	return gobi.Custom(n)
 }
@@ -212,13 +233,14 @@ func IsValid(cell gobi.Expr) gobi.Expr {
 func CellToPoint(cell gobi.Expr) gobi.Expr {
 	n := cellNode("h3_cell_to_point", "", cell, arrow.BinaryTypes.Binary, suffix("_point"))
 	n.geomOut = true
-	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) {
+	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) error {
 		ll, err := c.LatLng()
 		if err != nil {
 			b.AppendNull()
-			return
+			return nil
 		}
 		b.(*array.BinaryBuilder).Append(geometry.WKB(geometry.NewPoint(ll.Lng, ll.Lat, geometry.WGS84)))
+		return nil
 	})
 	return gobi.Custom(n)
 }
@@ -232,11 +254,11 @@ func CellToPoint(cell gobi.Expr) gobi.Expr {
 func CellToBoundary(cell gobi.Expr) gobi.Expr {
 	n := cellNode("h3_cell_to_boundary", "", cell, arrow.BinaryTypes.Binary, suffix("_boundary"))
 	n.geomOut = true
-	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) {
+	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) error {
 		cb, err := c.Boundary()
 		if err != nil {
 			b.AppendNull()
-			return
+			return nil
 		}
 		ring := make([]geometry.Point, 0, len(cb)+1)
 		for _, v := range cb {
@@ -244,9 +266,14 @@ func CellToBoundary(cell gobi.Expr) gobi.Expr {
 		}
 		ring = append(ring, ring[0])
 		b.(*array.BinaryBuilder).Append(geometry.WKB(geometry.NewPolygon([][]geometry.Point{ring}, geometry.WGS84)))
+		return nil
 	})
 	return gobi.Custom(n)
 }
+
+// listChildLimit is List<Int64>'s capacity for child values in one
+// array (int32 offsets). A variable so tests can lower it.
+var listChildLimit = math.MaxInt32
 
 // MaxGridDiskK is the largest k GridDisk accepts. h3-go allocates room
 // for 3k(k+1)+1 cells per row before it looks at the cell's
@@ -266,18 +293,24 @@ func GridDisk(cell gobi.Expr, k int) gobi.Expr {
 	if k < 0 || k > MaxGridDiskK {
 		n.err = fmt.Errorf("gobi/h3: GridDisk: k must be in 0..%d, got %d", MaxGridDiskK, k)
 	}
-	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) {
+	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) error {
 		cells, err := c.GridDisk(k)
 		if err != nil {
 			b.AppendNull()
-			return
+			return nil
 		}
 		lb := b.(*array.ListBuilder)
-		lb.Append(true)
 		vb := lb.ValueBuilder().(*array.Int64Builder)
+		// List<Int64> offsets are int32: one batch's neighbors can't
+		// pass 2^31-1 in total (about 179 rows at k = 2000).
+		if vb.Len() > listChildLimit-len(cells) {
+			return fmt.Errorf("gobi/h3: GridDisk: the batch's disks exceed %d cells in total, the List<Int64> limit; use smaller batches (ChunkRows) or a smaller k", listChildLimit)
+		}
+		lb.Append(true)
 		for _, d := range cells {
 			vb.Append(int64(d))
 		}
+		return nil
 	})
 	return gobi.Custom(n)
 }
@@ -287,8 +320,9 @@ func GridDisk(cell gobi.Expr, k int) gobi.Expr {
 // <input>_str.
 func CellToString(cell gobi.Expr) gobi.Expr {
 	n := cellNode("h3_cell_to_string", "", cell, arrow.BinaryTypes.String, suffix("_str"))
-	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) {
+	n.eval = mapCells(n, func(b array.Builder, c uh3.Cell) error {
 		b.(*array.StringBuilder).Append(uh3.CellToString(c))
+		return nil
 	})
 	return gobi.Custom(n)
 }
@@ -457,7 +491,7 @@ func suffix(sfx string) func(string) string {
 
 // mapCells runs f over each non-null cell of the node's input, with a
 // null for a null input or (unless keepInvalid) an invalid cell.
-func mapCells(n *node, f func(b array.Builder, c uh3.Cell)) func([]gobi.Series, memory.Allocator) (arrow.Array, error) {
+func mapCells(n *node, f func(b array.Builder, c uh3.Cell) error) func([]gobi.Series, memory.Allocator) (arrow.Array, error) {
 	return func(in []gobi.Series, pool memory.Allocator) (arrow.Array, error) {
 		b := array.NewBuilder(pool, n.out)
 		defer b.Release()
@@ -479,7 +513,9 @@ func mapCells(n *node, f func(b array.Builder, c uh3.Cell)) func([]gobi.Series, 
 					b.AppendNull()
 					continue
 				}
-				f(b, c)
+				if err := f(b, c); err != nil {
+					return nil, err
+				}
 			}
 		}
 		return b.NewArray(), nil
@@ -510,6 +546,25 @@ func floats(s gobi.Series) ([]float64, []bool, error) {
 		return nil, nil, err
 	}
 	return vals, s.Nulls(), nil
+}
+
+// checkGeographic accepts a geometry column whose CRS is unset (its
+// coordinates then get GeomToCell's range check) or registered as
+// geographic. A registered projected CRS is ErrProjectedCRS; an
+// unregistered code is ErrUnknownCRS — CRS.Projected is false for
+// codes gobi doesn't know, which would wrongly pass e.g. EPSG:3395.
+func checkGeographic(s gobi.Series) error {
+	crs := geometryCRS(s)
+	if crs.Zero() {
+		return nil
+	}
+	if _, err := geometry.LookupCRS(crs.EPSG); err != nil {
+		return fmt.Errorf("%w (column %q is EPSG:%d)", ErrUnknownCRS, s.Name(), crs.EPSG)
+	}
+	if crs.Projected() {
+		return fmt.Errorf("%w (column %q is EPSG:%d)", ErrProjectedCRS, s.Name(), crs.EPSG)
+	}
+	return nil
 }
 
 // geometryCRS reads a geometry column's recorded CRS (EPSG 0 if unset).

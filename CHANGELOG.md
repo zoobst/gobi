@@ -20,7 +20,7 @@ introduce breaking changes; check this file when upgrading.
   | `GeomToCell(geom, res)` | Int64 cell, from a point geometry column |
   | `Parent(cell, res)`, `Resolution(cell)`, `IsValid(cell)` | Int64 / Int32 / Boolean |
   | `CellToPoint(cell)`, `CellToBoundary(cell)` | point / polygon geometry, EPSG:4326 |
-  | `GridDisk(cell, k)` | `List<Int64>` (pair with `Explode`); `k` up to `MaxGridDiskK` (2000) |
+  | `GridDisk(cell, k)` | `List<Int64>` (pair with `Explode`); `k` up to `MaxGridDiskK` (2000). A batch whose disks total more than 2^31-1 cells (List offsets are int32) is an error. |
   | `CellToString(cell)` | hexadecimal String |
 
   - **Cell type:** cells are Int64. Every valid H3 index fits, and
@@ -36,9 +36,15 @@ introduce breaking changes; check this file when upgrading.
       per row before checking the resolution, so a larger radius would
       exhaust memory or overflow;
     - an empty operand, such as a `PointExpr` with `Lon` unset;
+    - `LatLngToCell` operands of different lengths. A custom operand
+      that returns one value is broadcast to every row, as `ExprNode`
+      allows;
     - a wrong column type;
     - `GeomToCell` on a projected CRS (`ErrProjectedCRS`; it doesn't
-      reproject);
+      reproject), or on an EPSG code gobi's CRS registry doesn't know
+      (`ErrUnknownCRS`), since that can't be confirmed geographic.
+      EPSG:3395 is one example. Register a geographic code with
+      `geometry.RegisterCRS(code, name, false)`;
     - `GeomToCell` on coordinates outside longitude/latitude range
       (`ErrNotLonLat`), which usually means unlabeled projected data.
   - **Column names:** `h3_<res>` for `LatLngToCell`, `GeomToCell` and
@@ -77,9 +83,11 @@ introduce breaking changes; check this file when upgrading.
       overriding it with an unset one.
     - **Custom nodes:** they can implement it, and
       `PlannedFieldMetadata(e, schema)` forwards an input's metadata.
-    - **Fallback:** for nodes that don't implement it, `Collect` still
-      takes a field's metadata from the batches when the declared field
-      has none and the types match.
+    - **Fallback:** for nodes that don't implement it, `Collect` takes
+      a field's metadata from the batches when the declared field has
+      none, the types match, and every batch carries the same metadata.
+      Batches that disagree, such as on CRS, leave the column untagged
+      rather than all relabeled with the first batch's.
 - **`Over`, `If` and `Coalesce` keep a geometry column's tag.** They
   rebuilt their output with a bare field, so a geometry column passed
   through them came back as plain Binary. A geometry operation later in
@@ -87,8 +95,11 @@ introduce breaking changes; check this file when upgrading.
   `Col("g").Shift(1).Over("k")` followed by `GeomForceZ`.
   - **Over:** a shape-preserving `Over` keeps its inner expression's
     field.
-  - **If and Coalesce:** they keep the field metadata their value
-    operands share. Literal operands such as `LitNull` are skipped, so
+  - **If and Coalesce:** they keep the field metadata their evaluated
+    value operands share, read from the operands themselves. A custom
+    expression that emits a tagged geometry counts even without
+    `FieldMetadataProvider`; `Over` likewise reads its partitions'
+    results. Literal operands such as `LitNull` are skipped, so
     `If(c, Col("geom"), LitNull(...))` stays geometry. Operands with
     different metadata, such as two CRSs, still give an untagged
     result.
